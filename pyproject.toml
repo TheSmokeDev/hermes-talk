@@ -1,0 +1,46 @@
+[project]
+name = "hermes-talk"
+version = "0.1.0"
+description = "OpenAI Realtime speech-to-speech voice for Hermes Agent: duplex talk with live tool calling."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SmokeDev" }]
+dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
+
+[project.optional-dependencies]
+audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Flat module layout: the plugin ships top-level talk_* modules (not a package).
+# Hermes loads __init__.py by file path at install time; py_modules here is only
+# so `pip install -e .` can resolve the importable modules for local dev and
+# tests. The talk_ prefix keeps pip installs collision-free (the lesson from
+# hermes-homie-memory's generic provider.py/config.py module names).
+[tool.setuptools]
+py-modules = [
+  "talk_config",
+  "talk_wire",
+  "talk_identity",
+  "talk_host",
+  "talk_tools",
+  "talk_runs",
+  "talk_actuators",
+  "talk_relay",
+  "talk_audio",
+  "talk_cli",
+  "talk_flush",
+  "talk_providers",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

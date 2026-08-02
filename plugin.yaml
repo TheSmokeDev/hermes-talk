@@ -1,0 +1,14 @@
+name: hermes-talk
+version: 0.1.0
+manifest_version: 1
+kind: standalone
+description: "OpenAI Realtime speech-to-speech voice for Hermes: duplex talk with live tool calling."
+author: SmokeDev (TheSmokeDev)
+license: MIT
+requires_env:
+  - name: OPENAI_API_KEY
+    description: "OpenAI Platform key for the Realtime API (or TALK_OPENAI_API_KEY to scope one to Talk)."
+    password: true
+provides_tools: []
+provides_hooks:
+  - on_session_end
