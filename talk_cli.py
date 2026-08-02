@@ -183,9 +183,10 @@ async def run_talk_session() -> int:
                 f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={model}",
                 headers={
                     # The ephemeral secret from the mint — the raw key/OAuth
-                    # token never touches the socket.
+                    # token never touches the socket. No OpenAI-Beta header:
+                    # that opts into the RETIRED beta protocol and the GA
+                    # endpoint refuses the call (live-canary finding).
                     "Authorization": f"Bearer {descriptor.client_secret}",
-                    "OpenAI-Beta": "realtime=v1",
                 },
                 timeout=CONNECT_TIMEOUT_S,
                 heartbeat=20.0,
