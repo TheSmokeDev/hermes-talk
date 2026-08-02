@@ -199,9 +199,10 @@ def test_a_nonzero_exit_lands_as_a_failed_run_with_the_reason(monkeypatch):
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     run = _wait_terminal(run_id)
 
-    # The run itself completed — the CHILD failed, and its reason is speakable.
-    assert run["status"] == "done"
-    assert "exited 2" in run["output"]
+    # `failed`, so check_work and the watcher both report it as such — and
+    # the message is plain speakable text, with no exception type in front.
+    assert run["status"] == "failed"
+    assert run["output"].startswith("the agent exited 2")
     assert "no provider configured" in run["output"]
 
 

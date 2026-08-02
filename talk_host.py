@@ -122,7 +122,7 @@ def hermes_binary() -> str | None:
 def _detached_agent_worker(task: str, binary: str) -> Any:
     """Build the worker that runs one headless Hermes one-shot to completion."""
 
-    def worker(_run_id: int) -> str:
+    def worker(run_id: int) -> str:
         # No `env=`: the child inherits this process's environment verbatim,
         # so HERMES_HOME (and the rest of the operator's config) resolves to
         # exactly what the voice session itself is using.
@@ -138,9 +138,15 @@ def _detached_agent_worker(task: str, binary: str) -> Any:
         stdout = (completed.stdout or "").strip()
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip() or stdout or "no output"
-            return f"the agent exited {completed.returncode}: {detail}"[
+            message = f"the agent exited {completed.returncode}: {detail}"[
                 -talk_runs.HISTORY_OUTPUT_CAP :
             ]
+            # Mark it failed HERE rather than raising: an exception would put
+            # a type name in front of a message meant to be spoken. Returning
+            # afterwards is safe — terminal transitions are first-writer-wins,
+            # so the registry's own done-transition is a no-op.
+            talk_runs.finish_run(run_id, "failed", message)
+            return message
         return (stdout or "the agent finished without printing anything")[
             : talk_runs.HISTORY_OUTPUT_CAP
         ]
