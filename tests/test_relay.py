@@ -28,7 +28,12 @@ def test_function_call_round_trip():
 
 def test_barge_in_cancels_and_drains():
     recorder = fr.run_transcript(
-        [fr.audio_delta(b"\x01\x02"), fr.speech_started(), fr.audio_delta(b"\x03\x04")]
+        [
+            fr.response_created(),
+            fr.audio_delta(b"\x01\x02"),
+            fr.speech_started(),
+            fr.audio_delta(b"\x03\x04"),
+        ]
     )
 
     assert recorder.barge_ins == 1
@@ -36,6 +41,38 @@ def test_barge_in_cancels_and_drains():
     # The callback fires so the caller can drop queued audio; the relay itself
     # never owns the playback buffer.
     assert recorder.audio == [b"\x01\x02", b"\x03\x04"]
+
+
+def test_speech_while_idle_drains_but_cancels_nothing():
+    # The operator starting a turn while the model is silent is the NORMAL
+    # case — cancelling then earns "no active response found" on every turn
+    # (live-session finding).
+    recorder = fr.run_transcript([fr.speech_started()])
+
+    assert recorder.barge_ins == 1
+    assert recorder.sent == []
+
+
+def test_response_done_rearms_the_idle_gate():
+    recorder = fr.run_transcript(
+        [fr.response_created(), fr.response_done(), fr.speech_started()]
+    )
+
+    assert recorder.barge_ins == 1
+    assert recorder.sent == []
+
+
+def test_benign_cancel_race_error_stays_silent():
+    recorder = fr.run_transcript(
+        [
+            {
+                "type": "error",
+                "error": {"message": "Cancellation failed: no active response found"},
+            }
+        ]
+    )
+
+    assert recorder.errors == []
 
 
 def test_audio_and_captions_reach_their_callbacks():

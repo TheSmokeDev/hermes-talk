@@ -56,6 +56,11 @@ class RealtimeRelay:
         #: Item the model is currently speaking — the CLI needs it to truncate
         #: the server-side transcript at the point playback actually reached.
         self.last_audio_item_id: str | None = None
+        #: Whether a response is in flight. Gates the barge-in cancel: sending
+        #: response.cancel while the model is idle earns a "Cancellation
+        #: failed: no active response found" error on EVERY operator turn
+        #: (live-session finding).
+        self.response_active: bool = False
 
     def handle_event(self, event: dict) -> list[dict]:
         """Handle one server event; return messages to send back."""
@@ -73,10 +78,17 @@ class RealtimeRelay:
             self.session_id = str(session["id"])
         return []
 
+    def _on_response_created(self, _event: dict) -> list[dict]:
+        self.response_active = True
+        return []
+
     def _on_speech_started(self, _event: dict) -> list[dict]:
-        # Barge-in. The server stops generating; the callback drains whatever
-        # is still queued locally, which is the part every stalled port missed.
+        # Barge-in. The callback drains whatever is still queued locally
+        # (always safe); the cancel goes out only when a response is actually
+        # in flight — the model idling needs nothing cancelled.
         self.on_barge_in()
+        if not self.response_active:
+            return []
         return [dict(BARGE_IN_MESSAGE)]
 
     def _on_audio_delta(self, event: dict) -> list[dict]:
@@ -124,6 +136,11 @@ class RealtimeRelay:
             detail = str(error.get("message") or error.get("type") or "")
         elif isinstance(error, str):
             detail = error
+        # A cancel that lost the race with response.done is not an error the
+        # operator can act on — the state gate makes it rare, this makes the
+        # residue silent instead of a line of noise per turn.
+        if "no active response" in detail.lower():
+            return []
         self.on_error(
             f"Something went wrong on the call: {detail}" if detail
             else "Something went wrong on the call."
@@ -132,6 +149,7 @@ class RealtimeRelay:
 
     def _on_response_done(self, _event: dict) -> list[dict]:
         self.last_audio_item_id = None
+        self.response_active = False
         return []
 
     @staticmethod
@@ -151,6 +169,7 @@ class RealtimeRelay:
     _DISPATCH: ClassVar[dict[str, Callable[[RealtimeRelay, dict], list[dict]]]] = {
         "session.created": _on_session,
         "session.updated": _on_session,
+        "response.created": _on_response_created,
         "input_audio_buffer.speech_started": _on_speech_started,
         "response.output_audio.delta": _on_audio_delta,
         "response.output_audio_transcript.delta": _on_transcript_delta,

@@ -85,6 +85,14 @@ def speech_started() -> dict:
     return {"type": "input_audio_buffer.speech_started"}
 
 
+def response_created() -> dict:
+    return {"type": "response.created"}
+
+
+def response_done() -> dict:
+    return {"type": "response.done"}
+
+
 def function_call(name: str, arguments: str, call_id: str = "call_1") -> dict:
     return {
         "type": "response.function_call_arguments.done",
