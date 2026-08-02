@@ -9,16 +9,16 @@ import talk_audio
 import talk_cli
 
 
-def test_session_update_drops_type_and_model():
+def test_session_update_keeps_type_drops_model():
     message = talk_cli.build_session_update(
         model="gpt-realtime-2.1", voice="cedar", instructions="be brief", tools=None
     )
 
     assert message["type"] == "session.update"
     session = message["session"]
-    # Both are set at connect time; the Realtime session object does not take
-    # either on an update, so leaving them in is a rejected session.
-    assert "type" not in session
+    # GA requires session.type on every update (live-run finding); model is
+    # fixed by the socket URL and not updatable.
+    assert session["type"] == "realtime"
     assert "model" not in session
     assert session["instructions"] == "be brief"
     assert session["audio"]["output"]["voice"] == "cedar"
@@ -91,3 +91,19 @@ def test_setup_cli_adds_no_required_arguments():
     talk_cli.setup_cli(parser)
 
     assert parser.parse_args([]).talk_command == "session"
+
+
+def test_cli_entry_raises_systemexit_on_failure(monkeypatch):
+    async def failing():
+        return 1
+
+    monkeypatch.setattr(talk_cli, "run_talk_session", failing)
+
+    # Hermes's dispatcher discards handler return values, so a nonzero code
+    # must leave as SystemExit or the process exits 0 on a dead session.
+    try:
+        talk_cli.cli_entry()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:  # pragma: no cover - the assertion we are here for
+        raise AssertionError("nonzero session code did not raise SystemExit")

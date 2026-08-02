@@ -55,9 +55,11 @@ def build_session_update(
 ) -> dict:
     """The ``session.update`` message for an already-open socket.
 
-    ``type`` and ``model`` come out of the mint payload: the model is already
-    fixed by the socket URL, and the Realtime session object does not take
-    either field on an update.
+    Only ``model`` comes out of the mint payload — it is fixed by the socket
+    URL and not updatable. ``session.type`` STAYS: the GA API requires it on
+    every update ("Missing required parameter: 'session.type'" — live-run
+    finding; the beta protocol did not take it, which is where the original
+    strip came from).
     """
 
     session = talk_wire.build_session_payload(
@@ -65,7 +67,7 @@ def build_session_update(
     )
     return {
         "type": "session.update",
-        "session": {k: v for k, v in session.items() if k not in ("type", "model")},
+        "session": {k: v for k, v in session.items() if k != "model"},
     }
 
 
@@ -257,13 +259,23 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
 
 
 def cli_entry(args: argparse.Namespace | None = None) -> int:
-    """Synchronous entry point for ``hermes talk``."""
+    """Synchronous entry point for ``hermes talk``.
+
+    A failed session raises ``SystemExit`` rather than returning: Hermes's
+    plugin-command dispatcher discards handler return values
+    (``args.func(args)`` with no exit propagation), so a plain ``return 1``
+    would exit the process 0 on failure — scripts and CI would read a dead
+    session as success.
+    """
 
     try:
-        return asyncio.run(run_talk_session())
+        code = asyncio.run(run_talk_session())
     except KeyboardInterrupt:
         print("\ntalk: hung up.")
         return 0
+    if code:
+        raise SystemExit(code)
+    return 0
 
 
 __all__ = [
