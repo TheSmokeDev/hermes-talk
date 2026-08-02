@@ -1,0 +1,128 @@
+"""Audio — the queue and barge-in logic, with no device and no sounddevice.
+
+Only the pure half is exercised here: everything below is what runs between
+the PortAudio callbacks, which is where a barge-in is won or lost. Opening a
+real device is a canary step, not a CI step.
+"""
+
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+import talk_audio
+
+
+class _Buffer:
+    """Stands in for the writable block PortAudio hands the output callback."""
+
+    def __init__(self, size: int):
+        self.data = bytearray(size)
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+
+def test_lazy_import_failure_names_the_extra(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sounddevice", None)
+
+    with pytest.raises(talk_audio.TalkAudioError, match=r"hermes-talk\[audio\]"):
+        talk_audio.import_sounddevice()
+    assert talk_audio.audio_available() is False
+
+
+def test_device_override_parses_index_or_name():
+    assert talk_audio._device(None) is None
+    assert talk_audio._device("3") == 3
+    assert talk_audio._device("Speakers (Realtek)") == "Speakers (Realtek)"
+
+
+def test_input_chunks_round_trip():
+    audio = talk_audio.DuplexAudio()
+    assert audio.read_input_chunk() is None
+
+    audio._input_callback(b"\x01\x02", 1, None, None)
+
+    assert audio.read_input_chunk() == b"\x01\x02"
+    assert audio.read_input_chunk() is None
+
+
+def test_full_input_queue_drops_instead_of_blocking():
+    audio = talk_audio.DuplexAudio()
+    for _ in range(talk_audio.MAX_INPUT_BLOCKS + 10):
+        audio._input_callback(b"\x00\x00", 1, None, None)
+
+    assert audio._input.qsize() == talk_audio.MAX_INPUT_BLOCKS
+
+
+def test_playback_spans_queue_chunk_boundaries():
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"\x01\x02\x03\x04")
+    audio.queue_playback(b"\x05\x06")
+
+    out = _Buffer(6)
+    audio._output_callback(out, 3, None, None)
+
+    assert bytes(out.data) == b"\x01\x02\x03\x04\x05\x06"
+    assert audio.played_ms == int(3 * 1000 / talk_audio.SAMPLE_RATE)
+
+
+def test_underrun_is_padded_with_silence_and_not_counted():
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"\x01\x02")
+
+    out = _Buffer(8)
+    audio._output_callback(out, 4, None, None)
+
+    assert bytes(out.data) == b"\x01\x02\x00\x00\x00\x00\x00\x00"
+    # Silence the operator never asked for must not inflate the truncate point.
+    assert audio.played_ms == int(1 * 1000 / talk_audio.SAMPLE_RATE)
+
+
+def test_drain_playback_discards_queue_and_residual():
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"\x01\x02\x03\x04\x05\x06")
+    audio._output_callback(_Buffer(2), 1, None, None)
+    assert audio._residual  # a partial block is still buffered
+
+    audio.drain_playback()
+
+    out = _Buffer(4)
+    audio._output_callback(out, 2, None, None)
+    assert bytes(out.data) == b"\x00\x00\x00\x00"
+
+
+def test_played_ms_survives_a_drain_until_reset():
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"\x00\x00" * 2_400)
+    audio._output_callback(_Buffer(4_800), 2_400, None, None)
+
+    assert audio.played_ms == 100
+    # The truncate has to be measured AFTER the drain, so the counter cannot
+    # be cleared by the drain itself.
+    audio.drain_playback()
+    assert audio.played_ms == 100
+
+    audio.reset_played_ms()
+    assert audio.played_ms == 0
+
+
+def test_empty_playback_is_ignored():
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"")
+    assert audio._playback.qsize() == 0
+
+
+def test_full_playback_queue_drops_instead_of_blocking():
+    audio = talk_audio.DuplexAudio()
+    for _ in range(talk_audio.MAX_PLAYBACK_BLOCKS + 10):
+        audio.queue_playback(b"\x00\x00")
+
+    assert audio._playback.qsize() == talk_audio.MAX_PLAYBACK_BLOCKS
+
+
+def test_stop_is_safe_before_start_and_twice():
+    audio = talk_audio.DuplexAudio()
+    audio.stop()
+    audio.stop()
