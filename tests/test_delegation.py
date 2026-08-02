@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 
 import pytest
@@ -26,13 +27,39 @@ _FAKE_HERMES = "/usr/local/bin/hermes"
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+def _clean(monkeypatch, tmp_path):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
     monkeypatch.delenv("TALK_AGENT_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("TALK_AGENT_PROFILE", raising=False)
+    # Point HERMES_HOME at an EMPTY tmp dir and block the host resolver: no
+    # test may read the operator's real ~/.hermes, and profile auto-detection
+    # must never see their actual profiles.
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     yield
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
+
+
+def _write_home(root, *, root_model: bool, profiles: dict[str, bool]) -> None:
+    """Build a Hermes home: root config, and profiles with/without a model."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.yaml").write_text(
+        "_config_version: 31\n"
+        + ("model:\n  provider: openai-codex\n  default: gpt-5.6\n" if root_model else "")
+        + "agent:\n  max_turns: 60\n",
+        encoding="utf-8",
+    )
+    for name, has_model in profiles.items():
+        directory = root / "profiles" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.yaml").write_text(
+            ("model:\n  provider: openai-codex\n  default: gpt-5.5\n" if has_model else "")
+            + "toolsets:\n  - hermes-cli\n",
+            encoding="utf-8",
+        )
 
 
 class _StubCtx:
@@ -271,6 +298,151 @@ def test_binary_is_resolved_through_which(monkeypatch):
     # shutil.which, not a bare "hermes": on Windows the installed entry point
     # is an npm .cmd shim and CreateProcess does no PATHEXT resolution.
     assert talk_host.hermes_binary() == "C:/npm/hermes.cmd"
+
+
+# --- profile resolution: the flag that decides whether the child can run ----
+
+
+def test_root_model_means_no_flag(tmp_path):
+    _write_home(tmp_path / "home", root_model=True, profiles={"alpha": True})
+
+    assert talk_config.detect_agent_profile() is None
+    assert talk_config.agent_profile() is None
+
+
+def test_root_without_a_model_and_one_usable_profile_is_detected(tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"quotemotolab": True})
+
+    assert talk_config.detect_agent_profile() == "quotemotolab"
+
+
+def test_two_usable_profiles_refuse_to_guess(tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"alpha": True, "beta": True})
+
+    # Picking one would be invisible until the WRONG agent had already run.
+    assert talk_config.detect_agent_profile() is None
+
+
+def test_no_usable_profile_adds_no_flag(tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"alpha": False})
+
+    assert talk_config.detect_agent_profile() is None
+
+
+def test_profiles_without_a_model_are_not_candidates(tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"alpha": False, "beta": True})
+
+    assert talk_config.detect_agent_profile() == "beta"
+
+
+def test_missing_home_or_profiles_dir_is_not_an_error(tmp_path):
+    assert talk_config.detect_agent_profile() is None  # nothing written at all
+
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+    assert talk_config.detect_agent_profile() is None
+
+
+def test_a_commented_out_model_block_does_not_count(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "# model:\n#   default: gpt-5.6\nplugins:\n  enabled: []\n", encoding="utf-8"
+    )
+    (home / "profiles" / "alpha").mkdir(parents=True)
+    (home / "profiles" / "alpha" / "config.yaml").write_text(
+        "model:\n  # default: commented\n  default: gpt-5.5\n", encoding="utf-8"
+    )
+
+    assert talk_config.detect_agent_profile() == "alpha"
+
+
+def test_an_empty_model_block_does_not_count(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    # `model:` present but with no default is exactly the shape that produces
+    # "Invalid length for parameter modelId, value: 0".
+    (home / "config.yaml").write_text("model:\nagent:\n  max_turns: 60\n", encoding="utf-8")
+    (home / "profiles" / "alpha").mkdir(parents=True)
+    (home / "profiles" / "alpha" / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.5\n", encoding="utf-8"
+    )
+
+    assert talk_config.detect_agent_profile() == "alpha"
+
+
+def test_inline_model_mapping_counts(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("model: {default: gpt-5.6}\n", encoding="utf-8")
+
+    assert talk_config.detect_agent_profile() is None
+
+
+def test_the_knob_overrides_detection(monkeypatch, tmp_path):
+    _write_home(tmp_path / "home", root_model=True, profiles={})
+    monkeypatch.setenv("TALK_AGENT_PROFILE", "  chosen  ")
+
+    assert talk_config.agent_profile() == "chosen"
+
+
+def test_a_blank_knob_is_an_explicit_opt_out(monkeypatch, tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"alpha": True})
+    monkeypatch.setenv("TALK_AGENT_PROFILE", "   ")
+
+    # Detection WOULD have found alpha; the operator said no flag.
+    assert talk_config.detect_agent_profile() == "alpha"
+    assert talk_config.agent_profile() is None
+
+
+# --- the argv the child actually gets ----------------------------------------
+
+
+def test_argv_without_a_profile():
+    assert talk_host.agent_argv("/bin/hermes", "do it", None) == ["/bin/hermes", "-z", "do it"]
+
+
+def test_argv_puts_the_global_profile_flag_before_oneshot():
+    argv = talk_host.agent_argv("/bin/hermes", "do it", "quotemotolab")
+
+    assert argv == ["/bin/hermes", "--profile", "quotemotolab", "-z", "do it"]
+
+
+def test_a_detected_profile_reaches_the_spawn(monkeypatch, tmp_path):
+    _write_home(tmp_path / "home", root_model=False, profiles={"quotemotolab": True})
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return _fake_completed(stdout="ok")
+
+    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+
+    run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
+    _wait_terminal(run_id)
+
+    assert seen["argv"] == [_FAKE_HERMES, "--profile", "quotemotolab", "-z", "go"]
+    # Recorded on the run, so check_work can say which agent actually ran.
+    assert talk_runs.get_run(run_id)["meta"]["profile"] == "quotemotolab"
+
+
+def test_no_profile_needed_means_a_bare_spawn(monkeypatch, tmp_path):
+    _write_home(tmp_path / "home", root_model=True, profiles={"quotemotolab": True})
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return _fake_completed(stdout="ok")
+
+    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+
+    run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
+    _wait_terminal(run_id)
+
+    assert seen["argv"] == [_FAKE_HERMES, "-z", "go"]
+    assert talk_runs.get_run(run_id)["meta"]["profile"] is None
 
 
 def test_agent_timeout_default_and_override(monkeypatch):

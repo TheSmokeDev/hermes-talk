@@ -10,6 +10,11 @@ method:
 - **Resolve at call time.** The plugin context is bound once by
   ``register(ctx)``; every lookup reads it through the module so a test (or a
   later rebind) is seen immediately.
+
+The detached backend spawns ``hermes [--profile <name>] -z <task>``. The
+profile comes from ``TALK_AGENT_PROFILE`` or, unset, from auto-detection in
+:mod:`talk_config` — on an install whose model config lives only in a profile,
+a bare ``hermes -z`` cannot resolve a model and the child dies immediately.
 """
 
 from __future__ import annotations
@@ -119,15 +124,32 @@ def hermes_binary() -> str | None:
     return shutil.which(HERMES_BINARY)
 
 
+def agent_argv(binary: str, task: str, profile: str | None) -> list[str]:
+    """The one-shot argv. ``--profile`` is global, so it precedes ``-z``.
+
+    Without the flag on an install whose model config lives only in a profile,
+    the child dies with ``Invalid length for parameter modelId, value: 0`` —
+    no model resolved. See :func:`talk_config.detect_agent_profile`.
+    """
+
+    if profile:
+        return [binary, "--profile", profile, "-z", task]
+    return [binary, "-z", task]
+
+
 def _detached_agent_worker(task: str, binary: str) -> Any:
     """Build the worker that runs one headless Hermes one-shot to completion."""
 
     def worker(run_id: int) -> str:
+        # Resolved at spawn time, not at start_run time, and recorded on the
+        # run so check_work can say which agent actually ran.
+        profile = talk_config.agent_profile()
+        talk_runs.annotate_run(run_id, profile=profile)
         # No `env=`: the child inherits this process's environment verbatim,
         # so HERMES_HOME (and the rest of the operator's config) resolves to
         # exactly what the voice session itself is using.
         completed = subprocess.run(
-            [binary, "-z", task],
+            agent_argv(binary, task, profile),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -279,6 +301,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
     "HostAdapter",
+    "agent_argv",
     "bind_ctx",
     "get_ctx",
     "hermes_binary",
