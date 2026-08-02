@@ -15,14 +15,17 @@ method:
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 try:
-    from . import talk_auth, talk_config
+    from . import talk_auth, talk_config, talk_runs
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_auth
     import talk_config
+    import talk_runs
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -32,6 +35,20 @@ MEMORY_TOOL_NAME = "session_search"
 DELEGATE_TOOL_NAME = "delegate_task"
 
 MAX_TOOL_OUTPUT_CHARS = 2_000
+
+#: Errors that mean "this environment has no agent loop to delegate INTO" —
+#: the only two the run_agent chain is allowed to fall through on. Hermes's
+#: own text is ``tool_error("delegate_task requires a parent agent context.")``
+#: (tools/delegate_tool.py:2365); a `hermes talk` CLI session has no
+#: ``_cli_ref``, so ``dispatch_tool`` cannot attach a parent agent and every
+#: delegation lands here. Any OTHER error — spawning paused, depth exceeded, a
+#: real failure — is the host's decision and must NOT be routed around.
+AGENT_LOOP_ABSENT_MARKERS = (
+    "requires a parent agent context",
+    f"unknown tool: {DELEGATE_TOOL_NAME}",
+)
+
+HERMES_BINARY = "hermes"
 
 _CTX: Any | None = None
 
@@ -65,6 +82,70 @@ def _speakable(raw: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
             if isinstance(value, str) and value.strip():
                 return value.strip()[:limit]
     return json.dumps(parsed, default=str)[:limit]
+
+
+def _agent_loop_absent(raw: Any) -> bool:
+    """True when a dispatch result says the AGENT LOOP is missing, not the task.
+
+    Read off the registry's universal error envelope (``{"error": ...}``), and
+    matched against named markers rather than "any error": falling back on a
+    generic failure would route around an operator's paused delegation or a
+    depth limit, which is the host's call, not this plugin's.
+    """
+
+    text = raw if isinstance(raw, str) else json.dumps(raw, default=str)
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    error = parsed.get("error")
+    if not isinstance(error, str):
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in AGENT_LOOP_ABSENT_MARKERS)
+
+
+def hermes_binary() -> str | None:
+    """Absolute path to the ``hermes`` executable, or ``None``.
+
+    Resolved through ``shutil.which`` rather than passed bare: on Windows the
+    installed entry point is an npm ``hermes.cmd`` shim, and CreateProcess
+    does no PATHEXT resolution — a bare ``"hermes"`` argv would simply fail
+    to launch.
+    """
+
+    return shutil.which(HERMES_BINARY)
+
+
+def _detached_agent_worker(task: str, binary: str) -> Any:
+    """Build the worker that runs one headless Hermes one-shot to completion."""
+
+    def worker(_run_id: int) -> str:
+        # No `env=`: the child inherits this process's environment verbatim,
+        # so HERMES_HOME (and the rest of the operator's config) resolves to
+        # exactly what the voice session itself is using.
+        completed = subprocess.run(
+            [binary, "-z", task],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=talk_config.agent_timeout_s(),
+            check=False,
+        )
+        stdout = (completed.stdout or "").strip()
+        if completed.returncode != 0:
+            detail = (completed.stderr or "").strip() or stdout or "no output"
+            return f"the agent exited {completed.returncode}: {detail}"[
+                -talk_runs.HISTORY_OUTPUT_CAP :
+            ]
+        return (stdout or "the agent finished without printing anything")[
+            : talk_runs.HISTORY_OUTPUT_CAP
+        ]
+
+    return worker
 
 
 class HostAdapter:
@@ -122,25 +203,58 @@ class HostAdapter:
         return _speakable(raw)
 
     def run_agent(self, prompt: str, background: bool = True) -> str:
-        """Hand a self-contained task to a Hermes subagent.
+        """Hand a self-contained task to a background Hermes agent.
 
-        ``background`` is accepted for the caller's mental model but is not
-        forwarded: Hermes documents the tool's own ``background`` flag as
-        deprecated and ignored, and backgrounds single-task delegations
-        unconditionally.
+        Three backends, tried in order, and every fall-through is ANNOUNCED in
+        the returned text — a voice surface that quietly downgrades is worse
+        than one that refuses:
+
+        1. **The host's own agent loop** (``dispatch_tool``) when a plugin
+           context is bound and Hermes has a parent agent to delegate into.
+           Its result re-enters the conversation through Hermes itself.
+        2. **A detached headless Hermes** (``hermes -z``) on a registry run
+           thread. This is what makes ``delegate_task`` real in a standalone
+           ``hermes talk``, where there IS no agent loop. Returns the
+           WORK_STARTED sentinel; the session watcher speaks the result.
+        3. Neither available — speakable refusal naming what is missing.
+
+        ``background`` is accepted for the caller's mental model but never
+        forwarded: Hermes documents the tool's own flag as deprecated and
+        ignored, and both real backends are asynchronous regardless.
         """
 
         ctx = get_ctx()
-        if ctx is None:
+        if ctx is not None:
+            try:
+                raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
+            except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+                return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+            if not _agent_loop_absent(raw):
+                return f"WORK_STARTED — {_speakable(raw)}"
+
+        return self._run_detached_agent(prompt)
+
+    def _run_detached_agent(self, prompt: str) -> str:
+        """Tier 2/3: run the task as a detached ``hermes -z`` one-shot."""
+
+        binary = hermes_binary()
+        if binary is None:
             return (
-                "I can't hand off work in this session — I'm running outside a "
-                "Hermes agent, so there's no agent to delegate to."
+                "I can't hand off work right now — there's no Hermes agent "
+                "attached to this call and no `hermes` command on the PATH to "
+                "run one."
             )
+        label = prompt.strip()[:60]
         try:
-            raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
+            run_id = talk_runs.start_run(
+                "agent", label, _detached_agent_worker(prompt, binary)
+            )
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that work: {type(exc).__name__}: {exc}"
-        return f"WORK_STARTED — {_speakable(raw)}"
+        return (
+            f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running as a "
+            "detached Hermes agent; I'll tell you when it lands."
+        )
 
 
 _HOST = HostAdapter()
@@ -153,11 +267,14 @@ def host() -> HostAdapter:
 
 
 __all__ = [
+    "AGENT_LOOP_ABSENT_MARKERS",
     "DELEGATE_TOOL_NAME",
+    "HERMES_BINARY",
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
     "HostAdapter",
     "bind_ctx",
     "get_ctx",
+    "hermes_binary",
     "host",
 ]

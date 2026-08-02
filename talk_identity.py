@@ -60,7 +60,8 @@ VOICE_PREAMBLE = (
     "never heard a word of it. "
     "When a tool returns a WORK_STARTED receipt, say it is running and move "
     "on: the result is handed back to you when it lands and you summarize it "
-    "in a sentence or two. Do not narrate progress you cannot see, and never "
+    "in a sentence or two. If you are asked how the work is going before "
+    "then, use check_work. Do not narrate progress you cannot see, and never "
     "report a result you have not actually been given."
 )
 

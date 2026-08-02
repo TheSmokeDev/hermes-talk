@@ -18,15 +18,17 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import time
 from pathlib import Path
 
 try:
-    from . import talk_audio, talk_auth, talk_config, talk_host
+    from . import talk_audio, talk_auth, talk_config, talk_host, talk_runs
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
     import talk_auth
     import talk_config
     import talk_host
+    import talk_runs
 
 _log = logging.getLogger(__name__)
 
@@ -94,6 +96,26 @@ _TOOL_DELEGATE_TASK: dict = {
     },
 }
 
+_TOOL_CHECK_WORK: dict = {
+    "type": "function",
+    "name": "check_work",
+    "description": (
+        "Check on background work you started. Call with no arguments when "
+        "asked how things are going, or with a run number to check one job. "
+        "Reports what is still running and what has landed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "integer",
+                "description": "A specific run number. Omit for everything recent.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
 _TOOL_TALK_STATUS: dict = {
     "type": "function",
     "name": "talk_status",
@@ -136,7 +158,9 @@ def plugin_version() -> str:
 def default_talk_tools() -> list[dict]:
     """The tool set advertised to a new Talk session (fresh copies per call)."""
 
-    return copy.deepcopy([_TOOL_SEARCH_MEMORY, _TOOL_DELEGATE_TASK, _TOOL_TALK_STATUS])
+    return copy.deepcopy(
+        [_TOOL_SEARCH_MEMORY, _TOOL_DELEGATE_TASK, _TOOL_CHECK_WORK, _TOOL_TALK_STATUS]
+    )
 
 
 def execute_talk_tool(name: str, arguments: dict | None) -> str:
@@ -175,6 +199,51 @@ def _handle_delegate_task(arguments: dict) -> str:
     return talk_host.host().run_agent(task, background is not False)
 
 
+def _describe_age(run: dict) -> str:
+    """How long a run has been going, in words a voice can say."""
+
+    started = run.get("ts")
+    if not isinstance(started, (int, float)):
+        return ""
+    seconds = max(0, int(time.time() - started))
+    if seconds < 60:
+        return f" {seconds}s"
+    if seconds < 3_600:
+        return f" {seconds // 60}m"
+    return f" {seconds // 3600}h"
+
+
+def _describe_run(run: dict) -> str:
+    line = f"run {run.get('runId')} ({run.get('kind')}) {run.get('status')}"
+    if run.get("status") == "running":
+        line += _describe_age(run)
+    if run.get("status") == "lost":
+        line += " (started before this session — I can't see how it ended)"
+    return line
+
+
+def _handle_check_work(arguments: dict) -> str:
+    run_id = arguments.get("run_id")
+    if run_id is not None:
+        try:
+            wanted = int(run_id)
+        except (TypeError, ValueError):
+            return "check_work needs a run number."
+        run = talk_runs.get_run(wanted)
+        if run is None:
+            return f"I don't have a run number {wanted} in this session."
+        body = run.get("output") or "still working"
+        return f"{_describe_run(run)}, {run.get('label')}: {body}"
+
+    # include_history so a run from a PREVIOUS session surfaces as `lost`
+    # rather than vanishing — this process cannot see a detached child it
+    # never spawned, and saying nothing would read as "nothing is running".
+    runs = talk_runs.list_runs(limit=10, include_history=True)
+    if not runs:
+        return "Nothing is running and nothing recent has finished."
+    return "; ".join(_describe_run(run) for run in runs)
+
+
 def _handle_talk_status(arguments: dict) -> str:
     try:
         voice = talk_config.talk_voice()
@@ -197,6 +266,7 @@ def _handle_talk_status(arguments: dict) -> str:
 _HANDLERS = {
     "search_memory": _handle_search_memory,
     "delegate_task": _handle_delegate_task,
+    "check_work": _handle_check_work,
     "talk_status": _handle_talk_status,
 }
 
