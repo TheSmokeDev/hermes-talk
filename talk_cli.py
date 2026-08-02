@@ -12,6 +12,11 @@ Two behaviours are worth stating because they are easy to get wrong:
 - On barge-in the local playback queue is drained first, then the server is
   told to truncate at the millisecond the operator actually heard. Skipping
   the truncate leaves the model believing it said sentences nobody heard.
+- A tool result carrying a WORK_STARTED sentinel spawns a watcher task that
+  polls the run registry and injects the result as a user turn when it lands,
+  so the model speaks it unprompted. Watchers die with the session; the work
+  itself is detached and does not, which is why the run history keeps the
+  record and a later ``check_work`` reports such runs as ``lost``.
 """
 
 from __future__ import annotations
@@ -20,7 +25,9 @@ import argparse
 import asyncio
 import base64
 import json
+import re
 import sys
+import time
 
 try:
     from . import (
@@ -29,6 +36,7 @@ try:
         talk_config,
         talk_host,
         talk_identity,
+        talk_runs,
         talk_tools,
         talk_wire,
     )
@@ -39,6 +47,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_config
     import talk_host
     import talk_identity
+    import talk_runs
     import talk_tools
     import talk_wire
     from talk_relay import RealtimeRelay
@@ -48,6 +57,15 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
 #: idle call is not a spin loop.
 IDLE_POLL_S = 0.01
 CONNECT_TIMEOUT_S = 30.0
+
+#: Mirror of ``talk_runs.started_sentinel``'s format. Kept as a literal
+#: because this is a WIRE contract between a tool's return text and the
+#: watcher, not a function call — if the two drift, background results stop
+#: being spoken and nothing else fails. ``test_watcher_regex_matches_the_sentinel``
+#: is the tripwire.
+WORK_STARTED_RE = re.compile(r"WORK_STARTED #(\d+) kind=(\w+)")
+WATCH_POLL_S = 5.0
+WATCH_OUTPUT_TAIL_CHARS = 1_500
 
 
 def build_session_update(
@@ -69,6 +87,48 @@ def build_session_update(
         "type": "session.update",
         "session": {k: v for k, v in session.items() if k != "model"},
     }
+
+
+def started_run_ids(messages: list[dict]) -> list[int]:
+    """Run ids announced by WORK_STARTED sentinels in outgoing tool results."""
+
+    found: list[int] = []
+    for message in messages:
+        item = message.get("item")
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        for match in WORK_STARTED_RE.finditer(str(item.get("output") or "")):
+            found.append(int(match.group(1)))
+    return found
+
+
+def run_finished_messages(run: dict) -> list[dict]:
+    """The wire messages that make the model SPEAK a finished run's result.
+
+    A user-role item, not an assistant one: the model has to be prompted to
+    say something, and a background result is new information arriving from
+    outside the conversation — which is exactly what a user turn is.
+    """
+
+    tail = str(run.get("output") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
+    verb = "finished" if run.get("status") == "done" else "failed"
+    detail = f": {tail}" if tail else " with no output"
+    return [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"Background run #{run.get('runId')} {verb}{detail}",
+                    }
+                ],
+            },
+        },
+        {"type": "response.create"},
+    ]
 
 
 def _import_aiohttp():
@@ -147,6 +207,8 @@ async def run_talk_session() -> int:
 
     aiohttp = _import_aiohttp()
     pending: list[dict] = []
+    watchers: list[asyncio.Task] = []
+    watched: set[int] = set()
     spoken_item: str | None = None
 
     def on_barge_in() -> None:
@@ -212,6 +274,33 @@ async def run_talk_session() -> int:
                             }
                         )
 
+                async def watch_run(run_id: int) -> None:
+                    """Poll one background run and speak its result when it lands.
+
+                    Sends on the socket directly rather than queueing: if the
+                    operator has gone quiet, no inbound event will arrive to
+                    flush a queue, and the result would sit unspoken until the
+                    next thing they said.
+                    """
+
+                    deadline = time.monotonic() + talk_config.agent_timeout_s()
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(WATCH_POLL_S)
+                        run = talk_runs.get_run(run_id)
+                        if run is None:
+                            return
+                        if run["status"] in talk_runs.TERMINAL_STATUSES:
+                            for out in run_finished_messages(run):
+                                await ws.send_json(out)
+                            return
+
+                def start_watchers(messages: list[dict]) -> None:
+                    for run_id in started_run_ids(messages):
+                        if run_id in watched:
+                            continue
+                        watched.add(run_id)
+                        watchers.append(asyncio.create_task(watch_run(run_id)))
+
                 async def receive_events() -> None:
                     nonlocal spoken_item
                     async for message in ws:
@@ -229,6 +318,7 @@ async def run_talk_session() -> int:
                             pending.clear()
                         for out in outgoing:
                             await ws.send_json(out)
+                        start_watchers(outgoing)
                         if relay.last_audio_item_id != spoken_item:
                             spoken_item = relay.last_audio_item_id
                             audio.reset_played_ms()
@@ -240,7 +330,9 @@ async def run_talk_session() -> int:
                     await receive_events()
                 finally:
                     sender.cancel()
-                    await asyncio.gather(sender, return_exceptions=True)
+                    for watcher in watchers:
+                        watcher.cancel()
+                    await asyncio.gather(sender, *watchers, return_exceptions=True)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
@@ -281,8 +373,13 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
 __all__ = [
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
+    "WATCH_OUTPUT_TAIL_CHARS",
+    "WATCH_POLL_S",
+    "WORK_STARTED_RE",
     "build_session_update",
     "cli_entry",
+    "run_finished_messages",
     "run_talk_session",
     "setup_cli",
+    "started_run_ids",
 ]
