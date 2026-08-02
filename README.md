@@ -2,6 +2,10 @@
 
 **OpenAI Realtime speech-to-speech voice for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — duplex talk with live tool calling.**
 
+![hermes-talk demo — a live voice session delegating real background work (8× speed)](docs/demo.gif)
+
+*Real session, 8× speed: voice in, spoken answers, a background agent delegated mid-conversation, and its results spoken back unprompted. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.2.0) — this is a voice demo; the sound is the point.*
+
 Hermes has voice mode. This is different: full speech-to-speech duplex over the
 OpenAI Realtime API — you talk, it talks back, you can interrupt it
 mid-sentence — with Realtime function calls relayed live into Hermes's own
