@@ -36,7 +36,7 @@ def get_hermes_home() -> Path:
         from hermes_constants import get_hermes_home as _host_home
 
         return Path(_host_home())
-    except Exception:
+    except Exception:  # noqa: BLE001 - any host failure falls back to the env
         env = os.environ.get("HERMES_HOME")
         if env:
             return Path(env).expanduser()

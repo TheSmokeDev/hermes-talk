@@ -21,6 +21,10 @@ build-backend = "setuptools.build_meta"
 # so `pip install -e .` can resolve the importable modules for local dev and
 # tests. The talk_ prefix keeps pip installs collision-free (the lesson from
 # hermes-homie-memory's generic provider.py/config.py module names).
+#
+# Shipped modules only. setuptools silently DROPS a name with no file behind
+# it, so a roadmap entry here (talk_runs, talk_actuators, talk_flush) would
+# read as shipped while the wheel quietly omitted it — add each one as it lands.
 [tool.setuptools]
 py-modules = [
   "talk_config",
@@ -28,12 +32,9 @@ py-modules = [
   "talk_identity",
   "talk_host",
   "talk_tools",
-  "talk_runs",
-  "talk_actuators",
   "talk_relay",
   "talk_audio",
   "talk_cli",
-  "talk_flush",
   "talk_providers",
 ]
 
@@ -44,3 +45,23 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+# Pinned explicitly: CI installs whatever ruff is current, and an implicit
+# default set turns every ruff release into a possible red build. BLE is on
+# because this codebase catches broadly on purpose (a live voice call must not
+# die on a stack trace) — each one carries a noqa stating why.
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "talk_audio",
+  "talk_cli",
+  "talk_config",
+  "talk_host",
+  "talk_identity",
+  "talk_providers",
+  "talk_relay",
+  "talk_tools",
+  "talk_wire",
+]
