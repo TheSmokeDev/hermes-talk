@@ -23,10 +23,19 @@ import json
 import sys
 
 try:
-    from . import talk_audio, talk_config, talk_host, talk_identity, talk_tools, talk_wire
+    from . import (
+        talk_audio,
+        talk_auth,
+        talk_config,
+        talk_host,
+        talk_identity,
+        talk_tools,
+        talk_wire,
+    )
     from .talk_relay import RealtimeRelay
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
+    import talk_auth
     import talk_config
     import talk_host
     import talk_identity
@@ -70,25 +79,68 @@ def _import_aiohttp():
     return aiohttp
 
 
+def _mint_session(
+    auth: talk_auth.TalkAuth, *, model: str, voice: str, instructions: str, tools: list[dict]
+) -> talk_wire.TalkSessionDescriptor:
+    """Mint the ephemeral session, translating a 401 into its remediation.
+
+    Mint-first is the auth-uniformity move: key and ChatGPT-subscription
+    credentials both touch exactly ONE endpoint (the client_secrets mint),
+    and the socket only ever sees the ephemeral secret.
+    """
+
+    try:
+        return talk_wire.mint_ephemeral_session(
+            auth_token=auth.token,
+            model=model,
+            voice=voice,
+            instructions=instructions,
+            tools=tools,
+        )
+    except talk_wire.TalkUpstreamError as exc:
+        if "(401)" in str(exc):
+            remediation = (
+                "the Codex OAuth token was rejected — run `codex login` to refresh "
+                "your ChatGPT sign-in"
+                if auth.source == talk_auth.SOURCE_CODEX_OAUTH
+                else "the configured OpenAI API key was rejected"
+            )
+            raise talk_wire.TalkUpstreamError(
+                f"OpenAI Realtime auth failed (401): {remediation}"
+            ) from exc
+        raise
+
+
 async def run_talk_session() -> int:
     """Run one terminal voice session. Returns a process exit code."""
 
     try:
-        api_key = talk_host.host().resolve_openai_key()
+        auth = talk_host.host().resolve_auth()
         model = talk_config.talk_model()
         voice = talk_config.talk_voice()
-    except talk_config.TalkConfigError as exc:
+    except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
         print(f"talk: {exc}", file=sys.stderr)
         return 1
 
     instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
     tools = talk_tools.default_talk_tools()
 
+    # Local checks before network: a missing microphone must fail here, not
+    # after a mint round-trip has already spent an ephemeral secret.
     audio = talk_audio.DuplexAudio()
     try:
         audio.start()
     except talk_audio.TalkAudioError as exc:
         print(f"talk: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        descriptor = _mint_session(
+            auth, model=model, voice=voice, instructions=instructions, tools=tools
+        )
+    except talk_wire.TalkWireError as exc:
+        print(f"talk: {exc}", file=sys.stderr)
+        audio.stop()
         return 1
 
     aiohttp = _import_aiohttp()
@@ -130,14 +182,19 @@ async def run_talk_session() -> int:
             async with http.ws_connect(
                 f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={model}",
                 headers={
-                    "Authorization": f"Bearer {api_key}",
+                    # The ephemeral secret from the mint — the raw key/OAuth
+                    # token never touches the socket.
+                    "Authorization": f"Bearer {descriptor.client_secret}",
                     "OpenAI-Beta": "realtime=v1",
                 },
                 timeout=CONNECT_TIMEOUT_S,
                 heartbeat=20.0,
             ) as ws:
                 await ws.send_json(session_update)
-                print(f"talk: connected ({model}, voice {voice}). Ctrl+C to hang up.\n")
+                print(
+                    f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
+                    "Ctrl+C to hang up.\n"
+                )
 
                 async def send_microphone() -> None:
                     while True:

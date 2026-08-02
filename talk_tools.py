@@ -21,9 +21,10 @@ import logging
 from pathlib import Path
 
 try:
-    from . import talk_audio, talk_config, talk_host
+    from . import talk_audio, talk_auth, talk_config, talk_host
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
+    import talk_auth
     import talk_config
     import talk_host
 
@@ -185,6 +186,8 @@ def _handle_talk_status(arguments: dict) -> str:
         "voice": voice,
         "attached_to_hermes": talk_host.get_ctx() is not None,
         "audio_available": talk_audio.audio_available(),
+        # Which credential lane a session would use — never the token itself.
+        "auth": talk_auth.auth_status(),
     }
     if REGISTRATION_FAILURES:
         status["registration_failures"] = list(REGISTRATION_FAILURES)

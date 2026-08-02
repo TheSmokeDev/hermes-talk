@@ -35,17 +35,19 @@ def test_session_update_carries_tools():
     assert session["tool_choice"] == "auto"
 
 
-def test_missing_key_exits_one_without_opening_audio(monkeypatch, capsys):
+def test_missing_credentials_exit_one_without_opening_audio(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("TALK_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # Hermetic OAuth lane: a dev box's real ~/.codex login must not leak in.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
 
     def never(_self):  # pragma: no cover - must not be reached
-        raise AssertionError("audio opened before the key was resolved")
+        raise AssertionError("audio opened before auth was resolved")
 
     monkeypatch.setattr(talk_audio.DuplexAudio, "start", never)
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
-    assert "no OpenAI key" in capsys.readouterr().err
+    assert "codex login" in capsys.readouterr().err
 
 
 def test_unusable_voice_exits_one(monkeypatch, capsys):

@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import talk_config
+    from . import talk_auth, talk_config
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_auth
     import talk_config
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
@@ -80,9 +81,25 @@ class HostAdapter:
         return {}
 
     def resolve_openai_key(self) -> str:
-        """The OpenAI Platform key. Fail-closed — the one method that raises."""
+        """A literal OpenAI API key. Fail-closed — raises without one.
+
+        Key-lane only, for the REST TTS/STT providers: OAuth entitlement on
+        the ``/v1/audio/*`` endpoints is unproven, so the providers refuse
+        honestly rather than claim availability and 401. The voice session
+        itself uses :meth:`resolve_auth`.
+        """
 
         return talk_config.resolve_openai_key()
+
+    def resolve_auth(self) -> talk_auth.TalkAuth:
+        """The voice-session credential — key OR ChatGPT subscription.
+
+        Fail-closed dual lane: TALK_OPENAI_API_KEY -> OPENAI_API_KEY -> Codex
+        CLI OAuth (the operator's ChatGPT subscription). The other method that
+        raises.
+        """
+
+        return talk_auth.resolve_auth()
 
     def state_dir(self) -> Path:
         """Durable state directory for run history and flush dedup."""
