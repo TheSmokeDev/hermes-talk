@@ -23,7 +23,7 @@ build-backend = "setuptools.build_meta"
 # hermes-homie-memory's generic provider.py/config.py module names).
 #
 # Shipped modules only. setuptools silently DROPS a name with no file behind
-# it, so a roadmap entry here (talk_runs, talk_actuators, talk_flush) would
+# it, so a roadmap entry here (talk_actuators, talk_flush) would
 # read as shipped while the wheel quietly omitted it — add each one as it lands.
 [tool.setuptools]
 py-modules = [
@@ -33,6 +33,7 @@ py-modules = [
   "talk_identity",
   "talk_host",
   "talk_tools",
+  "talk_runs",
   "talk_relay",
   "talk_audio",
   "talk_cli",
@@ -64,6 +65,7 @@ known-first-party = [
   "talk_identity",
   "talk_providers",
   "talk_relay",
+  "talk_runs",
   "talk_tools",
   "talk_wire",
 ]

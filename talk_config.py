@@ -11,6 +11,7 @@ from pathlib import Path
 
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
+DEFAULT_AGENT_TIMEOUT_S = 1_800
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -94,6 +95,24 @@ def resolve_openai_key() -> str:
     )
 
 
+def agent_timeout_s() -> int:
+    """Wall-clock budget for one detached background agent run.
+
+    Bounds both the child process and the watcher that speaks its result, so
+    a wedged agent cannot leave a poll loop running for the whole session.
+    """
+
+    raw = (os.environ.get("TALK_AGENT_TIMEOUT_S") or "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_AGENT_TIMEOUT_S
+
+
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
@@ -109,10 +128,12 @@ def audio_output_device() -> str | None:
 
 
 __all__ = [
+    "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
     "OPENAI_REALTIME_VOICES",
     "TalkConfigError",
+    "agent_timeout_s",
     "audio_input_device",
     "audio_output_device",
     "get_hermes_home",

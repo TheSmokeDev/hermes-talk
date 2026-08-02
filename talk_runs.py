@@ -1,0 +1,400 @@
+"""Async-run registry — voice never blocks.
+
+Anything slower than a couple of seconds starts here, returns a spoken
+receipt immediately, and is polled until it lands. Ported from the proven
+Talk Mode slice (second-brain ``talk_runs.py``), trimmed to the two kinds
+this plugin has: ``agent`` (a detached Hermes one-shot) and ``skill``.
+
+The sentinel string is the contract between a tool handler, the Realtime
+model, and the session watcher: a handler returns
+``WORK_STARTED #<id> kind=<kind> (<label>)`` and the watcher starts polling
+:func:`get_run`.
+
+**Lifetime.** Runs live in memory and die with the process. A voice session
+that ends does NOT stop the work — the detached child keeps going — but the
+watcher that would have spoken the result dies with it. The JSONL history
+tee is what survives: a row still marked ``running`` with no live registry
+entry belonged to a dead process and is reported as ``lost``, never as
+"still running", because this process cannot know either way.
+
+The tee is fail-open at every seam. History IO must never break the
+registry, and the file is compacted in place when it outgrows its cap.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+try:
+    from . import talk_config
+except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_config
+
+_log = logging.getLogger(__name__)
+
+RUN_KINDS = ("agent", "skill")
+TERMINAL_STATUSES = ("done", "failed")
+
+# Eviction policy — terminal runs only; a running entry is never evicted.
+_RUN_TTL_S = 24 * 60 * 60
+_MAX_RUNS = 200
+
+_RUNS: dict[int, dict] = {}
+_RUN_LOCK = threading.Lock()
+_RUN_SEQ = 0
+
+# History tee knobs. Output is capped per record — a run's full text lives in
+# the registry while it lives; history is a telemetry record, not a store.
+_HISTORY_FILENAME = "talk-runs.jsonl"
+_HISTORY_MAX_BYTES = 512_000
+_HISTORY_COMPACT_KEEP = 300
+HISTORY_OUTPUT_CAP = 2_000
+_HISTORY_TAIL_LINES = 600
+# Lock ordering: _HISTORY_LOCK is always taken WITHOUT _RUN_LOCK held (tees
+# happen after the registry mutation completes).
+_HISTORY_LOCK = threading.Lock()
+
+
+def started_sentinel(run_id: int, kind: str, label: str) -> str:
+    """The receipt a tool handler returns so the session starts polling."""
+
+    return f"WORK_STARTED #{run_id} kind={kind} ({label})"
+
+
+def _history_path():
+    """State dir resolved at call time (Rule 1) — tests repoint it."""
+
+    return talk_config.state_dir() / _HISTORY_FILENAME
+
+
+def _history_enabled() -> bool:
+    """Inert under pytest unless a test explicitly opts in.
+
+    Suites exercise this registry transitively WITHOUT repointing the state
+    dir — an always-on tee would write test junk into the operator's real
+    Hermes home from any of them. History tests monkeypatch this to
+    ``lambda: True`` alongside a repointed ``HERMES_HOME``.
+    """
+
+    return "PYTEST_CURRENT_TEST" not in os.environ
+
+
+def _append_history(record: dict) -> None:
+    """Fail-open tee. History IO must never break the registry."""
+
+    if not _history_enabled():
+        return
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if path.stat().st_size > _HISTORY_MAX_BYTES:
+                _compact_history_locked(path)
+    except Exception as exc:  # noqa: BLE001 — telemetry, not truth
+        _log.warning("talk run history append failed: %s", exc)
+
+
+def _compact_history_locked(path) -> None:
+    """Rewrite keeping the newest record per run, oldest runs dropped first.
+
+    Caller holds ``_HISTORY_LOCK``. Atomic via tmp + ``os.replace``.
+    ``errors="replace"`` so one torn byte cannot wedge compaction forever (a
+    strict decode would raise BEFORE per-line handling, letting the file grow
+    unbounded) — the torn line fails ``json.loads`` and is dropped, which is
+    the designed degradation.
+    """
+
+    records: dict[int, dict] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            rec = json.loads(line)
+            records[int(rec["runId"])] = rec
+        except Exception:  # noqa: BLE001 — a torn line is dropped, not fatal
+            continue
+    keep = sorted(records.keys(), reverse=True)[:_HISTORY_COMPACT_KEEP]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        "".join(json.dumps(records[rid], ensure_ascii=False) + "\n" for rid in sorted(keep)),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _history_seed_floor() -> int:
+    """Highest persisted run id, distinguishing 'no history' from 'unreadable'.
+
+    An absent file (or a disabled tee) seeds from zero. A file that EXISTS but
+    cannot be read must NOT — seeding from zero would mint ids that collide
+    with the persisted history the merge and compactor key on. Wall-clock
+    seconds is a floor no plausible sequence has reached, so the restarted
+    process stays collision-free at the cost of a big id.
+    """
+
+    if not _history_enabled():
+        return 0
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            if not path.exists():
+                return 0
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        ids = []
+        for line in lines:
+            try:
+                ids.append(int(json.loads(line)["runId"]))
+            except Exception:  # noqa: BLE001 — a torn line costs itself only
+                continue
+        return max(ids, default=0)
+    except Exception as exc:  # noqa: BLE001 — unreadable-but-present history
+        _log.warning("talk run history unreadable at seed time: %s", exc)
+        return int(time.time())
+
+
+def _load_history() -> dict[int, dict]:
+    """Newest record per run from the JSONL tail. Fail-open to empty."""
+
+    if not _history_enabled():
+        return {}
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            if not path.exists():
+                return {}
+            # errors="replace": a torn byte must cost one line, not the file.
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        records: dict[int, dict] = {}
+        for line in lines[-_HISTORY_TAIL_LINES:]:
+            try:
+                rec = json.loads(line)
+                records[int(rec["runId"])] = rec
+            except Exception:  # noqa: BLE001 — a torn line costs itself only
+                continue
+        return records
+    except Exception as exc:  # noqa: BLE001 — history is telemetry, not truth
+        _log.warning("talk run history read failed: %s", exc)
+        return {}
+
+
+def _evict_locked() -> None:
+    """Drop stale terminal runs. Caller holds the lock."""
+
+    if not _RUNS:
+        return
+    cutoff = time.time() - _RUN_TTL_S
+    for run_id in [
+        rid
+        for rid, run in _RUNS.items()
+        if run["status"] in TERMINAL_STATUSES and run["updated"] < cutoff
+    ]:
+        _RUNS.pop(run_id, None)
+    if len(_RUNS) <= _MAX_RUNS:
+        return
+    terminal = sorted(
+        (rid for rid, run in _RUNS.items() if run["status"] in TERMINAL_STATUSES),
+        key=lambda rid: _RUNS[rid]["updated"],
+    )
+    for run_id in terminal[: len(_RUNS) - _MAX_RUNS]:
+        _RUNS.pop(run_id, None)
+
+
+def start_run(
+    kind: str,
+    label: str,
+    worker: Callable[[int], str],
+    *,
+    meta: dict | None = None,
+) -> int:
+    """Register a run and spawn its daemon worker thread.
+
+    ``worker(run_id)`` returns the final text to speak. Raising marks the run
+    ``failed`` with the exception text — the registry always terminates.
+    """
+
+    if kind not in RUN_KINDS:
+        raise ValueError(f"unknown run kind: {kind!r}")
+
+    global _RUN_SEQ
+    # Seed the sequence past the persisted history once per process so run ids
+    # stay monotonic across restarts — the history merge keys on runId, and a
+    # restarted process must not mint colliding ids.
+    if _RUN_SEQ == 0:
+        floor = _history_seed_floor()
+        with _RUN_LOCK:
+            if _RUN_SEQ == 0:
+                _RUN_SEQ = floor
+    with _RUN_LOCK:
+        _RUN_SEQ += 1
+        run_id = _RUN_SEQ
+        now = time.time()
+        _RUNS[run_id] = {
+            "kind": kind,
+            "label": label,
+            "status": "running",
+            "output": "",
+            "meta": dict(meta or {}),
+            "ts": now,
+            "updated": now,
+        }
+        # Evict AFTER inserting so the cap holds for the registry as it now
+        # stands; the entry just added is running, so it is never a candidate.
+        _evict_locked()
+    _append_history(
+        {
+            "runId": run_id,
+            "kind": kind,
+            "label": label,
+            "status": "running",
+            "ts": now,
+            "updated": now,
+        }
+    )
+    thread = threading.Thread(
+        target=_run_worker,
+        args=(run_id, worker),
+        name=f"talk-run-{kind}-{run_id}",
+        daemon=True,
+    )
+    thread.start()
+    return run_id
+
+
+def _run_worker(run_id: int, worker: Callable[[int], str]) -> None:
+    try:
+        output = worker(run_id)
+        finish_run(run_id, "done", output)
+    except Exception as exc:  # noqa: BLE001 — a run must always terminate
+        _log.warning("talk run %s failed: %s: %s", run_id, type(exc).__name__, exc)
+        finish_run(run_id, "failed", f"{type(exc).__name__}: {exc}")
+
+
+def finish_run(run_id: int, status: str, output: str) -> bool:
+    """Mark a run terminal. Unknown ids and double-finishes are no-ops.
+
+    Terminal transitions are compare-and-set under ``_RUN_LOCK`` — FIRST
+    WRITER WINS, so a later finish from any path can never overwrite the
+    status or output. Returns True when THIS call performed the transition.
+    """
+
+    if status not in TERMINAL_STATUSES:
+        raise ValueError(f"not a terminal status: {status!r}")
+    with _RUN_LOCK:
+        run = _RUNS.get(run_id)
+        if run is None or run["status"] in TERMINAL_STATUSES:
+            return False
+        run["status"] = status
+        run["output"] = output
+        run["updated"] = time.time()
+        tee = _terminal_tee_locked(run_id, run)
+    _append_history(tee)
+    return True
+
+
+def _terminal_tee_locked(run_id: int, run: dict) -> dict:
+    """The history record for a terminal transition. Caller holds the lock."""
+
+    return {
+        "runId": run_id,
+        "kind": run["kind"],
+        "label": run["label"],
+        "status": run["status"],
+        "output": str(run["output"] or "")[:HISTORY_OUTPUT_CAP],
+        "ts": run["ts"],
+        "updated": run["updated"],
+    }
+
+
+def annotate_run(run_id: int, **fields: Any) -> None:
+    """Merge worker-observed facts (pid, phase) into the entry."""
+
+    with _RUN_LOCK:
+        run = _RUNS.get(run_id)
+        if run is None:
+            return
+        run["meta"].update(fields)
+        run["updated"] = time.time()
+
+
+def get_run(run_id: int) -> dict | None:
+    """Snapshot one run for the watcher; ``None`` for unknown ids."""
+
+    with _RUN_LOCK:
+        run = _RUNS.get(run_id)
+        if run is None:
+            return None
+        snapshot = dict(run)
+        snapshot["meta"] = dict(run["meta"])
+        snapshot["runId"] = run_id
+        return snapshot
+
+
+def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
+    """Most-recent runs first, newest ``limit`` entries.
+
+    With ``include_history`` the live registry is merged over the persisted
+    JSONL tail: live entries win, history-only entries carry
+    ``fromHistory: True``, and a history entry still marked ``running`` with
+    no live counterpart is reported as ``lost`` — it belonged to a process
+    that died, and this one cannot know whether the detached child finished.
+    """
+
+    limit = max(1, min(int(limit), 100))
+    with _RUN_LOCK:
+        live: dict[int, dict] = {}
+        for run_id, run in _RUNS.items():
+            snapshot = dict(run)
+            snapshot["meta"] = dict(run["meta"])
+            snapshot["runId"] = run_id
+            live[run_id] = snapshot
+
+    if not include_history:
+        run_ids = sorted(live.keys(), reverse=True)[:limit]
+        return [live[rid] for rid in run_ids]
+
+    merged: dict[int, dict] = {}
+    for rid, rec in _load_history().items():
+        status = str(rec.get("status") or "")
+        merged[rid] = {
+            "runId": rid,
+            "kind": rec.get("kind"),
+            "label": rec.get("label") or "",
+            "status": status if status in TERMINAL_STATUSES else "lost",
+            "output": str(rec.get("output") or ""),
+            "meta": {},
+            "ts": rec.get("ts"),
+            "updated": rec.get("updated"),
+            "fromHistory": True,
+        }
+    merged.update(live)
+    run_ids = sorted(merged.keys(), reverse=True)[:limit]
+    return [merged[rid] for rid in run_ids]
+
+
+def reset_for_tests() -> None:
+    """Clear registry state between tests (never called in production)."""
+
+    global _RUN_SEQ
+    with _RUN_LOCK:
+        _RUNS.clear()
+        _RUN_SEQ = 0
+
+
+__all__ = [
+    "HISTORY_OUTPUT_CAP",
+    "RUN_KINDS",
+    "TERMINAL_STATUSES",
+    "annotate_run",
+    "finish_run",
+    "get_run",
+    "list_runs",
+    "reset_for_tests",
+    "start_run",
+    "started_sentinel",
+]
