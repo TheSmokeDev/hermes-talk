@@ -58,7 +58,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 208 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 273 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 ## Auth — no API key needed if you have ChatGPT
 
@@ -94,7 +94,7 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
 ![The Talk tab running inside the Hermes dashboard — a live voice session with background runs landing beside it (8× speed)](docs/dashboard.gif)
 
-*Real session in the Hermes dashboard, 8× speed. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.3.0)*
+*Real session in the Hermes dashboard, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) (2:27 — delegate, keep talking, hear the result land)*
 
 The same session in a browser. Start the dashboard and Talk appears as a tab:
 
