@@ -80,6 +80,20 @@
   background: var(--background, #0b0b0b);
   color: var(--foreground, #ededed);
   font-size: 0.875rem;
+  /* The dropdown list is painted by the OS, not by this element, so it does
+     NOT inherit the colors above. Without this the options render dark text
+     on a dark popup and only the highlighted row is legible (seen on Windows
+     Chrome against the dashboard's dark theme). `color-scheme` is what tells
+     the platform to draw its own widget dark-aware. */
+  color-scheme: dark;
+}
+
+/* Belt and braces: engines that ignore `color-scheme` for the popup still
+   honour explicit option colors. Literals, not the host's vars — a var()
+   declared on the page does not reliably resolve inside a native popup. */
+.ht-select option {
+  background-color: #0b0b0b;
+  color: #ededed;
 }
 
 .ht-select:disabled {
