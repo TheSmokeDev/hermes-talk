@@ -192,15 +192,21 @@ every note gets a receipt with a state the substrate can actually prove:
 | State | What proves it |
 |---|---|
 | `queued` | the steer call was accepted — the only claim made at call time |
-| `landed` | the host's own drain log line fired (watched live, in-process) |
+| `landed` | one of the host's own drain artifacts fired: the post-tool-batch log line (matched by the correlation token each note carries), or the pre-API drain attributed to that exact agent |
+| `redirected` | `AIAgent.redirect()` returned True on a live turn — the return value IS the artifact; that path emits no log line |
 | `unconfirmed` | the agent finished and no landing was ever observed |
 | `missed` | a patched host reported the note back as undelivered |
 | `superseded` | the agent was stopped — stopping drops unread notes, by design |
 
 Ask `check_work` and you hear the note's state in those words — never "they
-got it" unless the artifact that proves it exists.
+got it" unless the artifact that proves it exists. Since v0.6 every note
+travels as `[tk-xxxxxxxx] note` — the token is what the drain preview is
+matched on, so two agents holding identical text can never land each
+other's receipts. And you often don't have to ask: the host's
+`subagent_stop` hook announces a finished background agent into the live
+call the moment it lands.
 
-Three tools carry the surface, discovery-first:
+Four tools carry the surface, discovery-first:
 
 - **`list_agents`** — everything running, tagged `can steer` (live subagent
   ids) or `stop only` (run numbers). The model resolves "the research one"
@@ -210,6 +216,12 @@ Three tools carry the surface, discovery-first:
   when present; otherwise resolves the same delegation registry directly and
   calls the public `AIAgent.steer()`. A genuine host error is spoken, never
   routed around.
+- **`redirect_agent`** — the stronger correction, for "stop, wrong repo":
+  the host's public `AIAgent.redirect()` (0.20+) aborts the agent's
+  in-flight thinking and retries with your correction, instead of waiting
+  for the next tool boundary. Mid-tool it degrades to the steer queue and
+  says so; on a pre-0.20 host it falls back to `steer_agent` entirely.
+  Never cancels the work.
 - **`stop_work`** — the one verb every lane supports: subagents via the
   host's `interrupt_subagent()`, api-server runs via `POST /v1/runs/{id}/stop`,
   detached one-shots via their retained process handle. Every "want me to
@@ -296,8 +308,10 @@ The three that shaped everything else:
 
 ## Status
 
-v0.5 — under active development. Roadmap: `computer_use` relay, session-end
-memory debrief, gateway platform adapter.
+v0.6 — under active development. Roadmap: barge-in latch + spoken-text
+normalizer, Gemini Live backend
+([#3](https://github.com/TheSmokeDev/hermes-talk/issues/3)), `computer_use`
+relay, session-end memory debrief, gateway platform adapter.
 
 Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)
 proposes a `RealtimeVoiceProvider` ABC in Hermes core — four open PRs are
