@@ -2,9 +2,9 @@
 
 **Realtime voice as an orchestrator for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
 
-![hermes-talk demo — a live voice session delegating real background work (8× speed)](docs/demo.gif)
+![The Talk tab in the Hermes dashboard — a live voice session, a background agent delegated mid-conversation, its result landing in the runs panel (8× speed)](docs/dashboard.gif)
 
-*Real session, 8× speed. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.2.0) — this is a voice demo; the sound is the point.*
+*Real session, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — 2:27: delegate, keep talking, hear the result land. This is a voice demo; the sound is the point.*
 
 ## What this actually is
 
@@ -92,11 +92,8 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
 ## Dashboard tab
 
-![The Talk tab running inside the Hermes dashboard — a live voice session with background runs landing beside it (8× speed)](docs/dashboard.gif)
-
-*Real session in the Hermes dashboard, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) (2:27 — delegate, keep talking, hear the result land)*
-
-The same session in a browser. Start the dashboard and Talk appears as a tab:
+The demo at the top of this README is this tab. Start the dashboard and Talk
+appears in the nav:
 
 ```bash
 hermes plugins enable hermes-talk   # already done by `install --enable`
