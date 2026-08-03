@@ -22,12 +22,13 @@ import time
 from pathlib import Path
 
 try:
-    from . import talk_audio, talk_auth, talk_config, talk_host, talk_runs
+    from . import talk_audio, talk_auth, talk_config, talk_host, talk_identity, talk_runs
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
     import talk_auth
     import talk_config
     import talk_host
+    import talk_identity
     import talk_runs
 
 _log = logging.getLogger(__name__)
@@ -244,6 +245,23 @@ def _handle_check_work(arguments: dict) -> str:
     return "; ".join(_describe_run(run) for run in runs)
 
 
+def _identity_summary() -> dict[str, int]:
+    """Resolved identity sections as ``{NAME: char_count}``. Never content.
+
+    Counts are POST-cap, so the number is what actually rides the prompt
+    rather than what the host happened to hand over.
+    """
+
+    try:
+        sections = talk_host.host().identity_sections()
+    except Exception as exc:  # noqa: BLE001 — status must survive a bad host
+        _log.debug("identity summary unavailable: %s: %s", type(exc).__name__, exc)
+        return {}
+    return {
+        name: len(talk_identity.cap_section(name, body)) for name, body in sections.items()
+    }
+
+
 def _handle_talk_status(arguments: dict) -> str:
     try:
         voice = talk_config.talk_voice()
@@ -255,6 +273,11 @@ def _handle_talk_status(arguments: dict) -> str:
         "voice": voice,
         "attached_to_hermes": talk_host.get_ctx() is not None,
         "audio_available": talk_audio.audio_available(),
+        # Which identity sections resolved and how big they are — NEVER the
+        # content. This is spoken aloud and lands in transcripts; the whole
+        # point of the sections is that they hold things about the operator
+        # that should not be read back out on request.
+        "identity": _identity_summary(),
         # Which credential lane a session would use — never the token itself.
         "auth": talk_auth.auth_status(),
     }

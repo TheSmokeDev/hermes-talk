@@ -20,6 +20,7 @@ a bare ``hermes -z`` cannot resolve a model and the child dies immediately.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,6 +32,8 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_auth
     import talk_config
     import talk_runs
+
+_log = logging.getLogger(__name__)
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -176,18 +179,135 @@ def _detached_agent_worker(task: str, binary: str) -> Any:
     return worker
 
 
+#: Session id handed to a provider we initialize ourselves. Marked so a
+#: provider that scopes storage by session cannot mistake a read-only probe
+#: for a real conversation.
+PROBE_SESSION_ID = "hermes-talk-identity-probe"
+
+
+def _resolve_persona() -> str:
+    """The operator's SOUL.md, via Hermes's own loader.
+
+    ``agent.prompt_builder.load_soul_md`` needs no agent instance, so this
+    works in a standalone ``hermes talk`` too. Deliberately NO raw-file
+    fallback: that loader also runs Hermes's injection scan over the content,
+    and reading the file directly would silently drop that check to gain a
+    section. No Hermes, no persona.
+    """
+
+    try:
+        from agent.prompt_builder import load_soul_md
+
+        return (load_soul_md() or "").strip()
+    except Exception as exc:  # noqa: BLE001 — a missing section, never an outage
+        _log.debug("persona section unavailable: %s: %s", type(exc).__name__, exc)
+        return ""
+
+
+def _memory_block_from_agent() -> str:
+    """The LIVE agent's already-assembled memory block, when there is one.
+
+    Preferred over loading a provider ourselves: this instance is already
+    initialized, so reading it costs nothing and has no lifecycle side
+    effects. The traversal mirrors ``PluginContext.dispatch_tool``'s own
+    route to the parent agent (plugins.py:604-608) and is guarded at every
+    hop — these are framework internals and may simply not be there.
+    """
+
+    ctx = get_ctx()
+    if ctx is None:
+        return ""
+    try:
+        cli = getattr(getattr(ctx, "_manager", None), "_cli_ref", None)
+        manager = getattr(getattr(cli, "agent", None), "_memory_manager", None)
+        if manager is None:
+            return ""
+        return (manager.build_system_prompt() or "").strip()
+    except Exception as exc:  # noqa: BLE001 — a missing section, never an outage
+        _log.debug("agent memory block unavailable: %s: %s", type(exc).__name__, exc)
+        return ""
+
+
+def _memory_block_from_provider() -> str:
+    """Load the configured memory provider ourselves and ask it for its block.
+
+    The standalone path, where no agent exists to borrow one from. The
+    lifecycle is deliberate: ``system_prompt_block()`` is empty before
+    ``initialize()`` for a real provider (hermes-homie-memory returns "" until
+    its index exists), so initializing is required — and every provider we
+    initialize we also shut down, because we own this instance. It is safe to
+    do so: ``load_memory_provider`` builds a FRESH instance per call, so a
+    running agent's own provider is untouched.
+    """
+
+    try:
+        from plugins.memory import _get_active_memory_provider, load_memory_provider
+    except Exception as exc:  # noqa: BLE001 — no Hermes, no provider section
+        _log.debug("memory provider plugins unavailable: %s: %s", type(exc).__name__, exc)
+        return ""
+
+    provider = None
+    try:
+        active = _get_active_memory_provider()
+        if not active:
+            return ""
+        provider = load_memory_provider(active)
+        if provider is None or not provider.is_available():
+            return ""
+        provider.initialize(
+            PROBE_SESSION_ID,
+            platform="cli",
+            hermes_home=str(talk_config.get_hermes_home()),
+            # Non-primary: the ABC's contract is that providers skip writes
+            # outside a primary agent context, and a voice prompt probe must
+            # never write to the operator's memory store.
+            agent_context="flush",
+        )
+        return (provider.system_prompt_block() or "").strip()
+    except Exception as exc:  # noqa: BLE001 — a missing section, never an outage
+        _log.debug("memory provider block unavailable: %s: %s", type(exc).__name__, exc)
+        return ""
+    finally:
+        if provider is not None:
+            try:
+                provider.shutdown()
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                _log.debug("provider shutdown failed: %s: %s", type(exc).__name__, exc)
+
+
+def _resolve_memory_block() -> str:
+    """The memory section: the live agent's block, else the configured one."""
+
+    return _memory_block_from_agent() or _memory_block_from_provider()
+
+
 class HostAdapter:
     """Binds hermes-talk to Hermes, degrading to speakable text off-host."""
 
     def identity_sections(self) -> dict[str, str]:
-        """Host identity context for the session prompt.
+        """What the host knows, as ordered named sections for the prompt.
 
-        v0.1 returns nothing and the voice preamble carries the whole
-        contract. TODO(v0.2): read the active Hermes persona + system prompt
-        off ``ctx`` and return them as ``PERSONA``/``USER`` sections.
+        This is what makes a voice session start already knowing the
+        operator instead of having to ask. Every section is optional and
+        independently defensive: a broken memory provider costs the MEMORY
+        section, never the call. Returns ``{}`` when nothing resolves.
+
+        Resolution is call-time, so a provider enabled after this module was
+        imported is seen by the very next session.
         """
 
-        return {}
+        sections: dict[str, str] = {}
+        persona = _resolve_persona()
+        if persona:
+            sections["PERSONA"] = persona
+        memory = _resolve_memory_block()
+        if memory:
+            sections["MEMORY"] = memory
+
+        include = talk_config.identity_include()
+        if include is None:
+            return sections
+        return {name: body for name, body in sections.items() if name in include}
 
     def resolve_openai_key(self) -> str:
         """A literal OpenAI API key. Fail-closed — raises without one.
@@ -300,6 +420,7 @@ __all__ = [
     "HERMES_BINARY",
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
+    "PROBE_SESSION_ID",
     "HostAdapter",
     "agent_argv",
     "bind_ctx",
