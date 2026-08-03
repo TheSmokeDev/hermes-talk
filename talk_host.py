@@ -665,12 +665,15 @@ class HostAdapter:
 
         The receipt comes from the RETURN VALUE, not a log line: the
         model-request path emits no Delivered line, so ``True`` is itself
-        the artifact (request aborted, correction stashed for the retry).
-        The one wording fork is advisory: ``_executing_tools`` peeked before
-        the call decides whether to speak queued-language (the degrade path,
-        drain artifacts still confirm) or redirected-language. The peek can
-        race the host's state; both failure modes UNDER-claim (a delivered
-        correction spoken as queued), never over.
+        the artifact — but ``True`` means ACCEPTED, and only that. The host
+        picks the mechanism internally (abort-and-retry, Codex native
+        steer, or a steer-queue write when a tool is executing), and the
+        ``_executing_tools`` peek below can be stale by the time
+        ``redirect()`` runs. So no spoken sentence may claim the abort:
+        every ``True`` is worded to be true on EITHER path ("current step,
+        or its very next one"). The peek only picks between that sentence
+        and the more specific mid-tool queued-language, where a stale peek
+        under-claims (queued wording for an aborted turn) — never over.
 
         ``False`` means no live turn — the correction falls back to the
         steer queue, spoken as exactly that.
@@ -762,9 +765,11 @@ class HostAdapter:
             )
 
         talk_steer.record_redirected(agent_id, wire_text, token=token, agent=agent)
+        # True on this branch is abort-and-retry OR a steer-queue write that
+        # raced the peek — the sentence must hold on both.
         return (
-            f"Redirect accepted — {agent_id} drops what it was doing and "
-            "takes the correction now."
+            f"Redirect accepted — {agent_id} takes the correction at its "
+            "current step, or its very next one if a tool was mid-flight."
         )
 
     def list_agents(self) -> str:

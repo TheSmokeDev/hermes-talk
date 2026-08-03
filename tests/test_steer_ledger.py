@@ -205,7 +205,12 @@ def test_token_match_still_batch_lands_the_same_agents_later_notes():
 
 def test_redirected_is_recorded_and_spoken():
     talk_steer.record_redirected("sa-0-aaaa", "[tk-00000000] wrong repo")
-    assert "redirected — it took the correction mid-step" in talk_steer.notes_summary()
+    # "accepted … current or next step" — never a claim that the in-flight
+    # work was dropped (the host may have taken the steer-queue path).
+    assert (
+        "redirect accepted — applied at its current or next step"
+        in talk_steer.notes_summary()
+    )
 
 
 def test_redirected_is_not_downgraded_by_gone_or_stop():
@@ -214,7 +219,7 @@ def test_redirected_is_not_downgraded_by_gone_or_stop():
     talk_steer.record_redirected("sa-0-aaaa", "[tk-00000000] wrong repo")
     talk_steer.mark_child_gone("sa-0-aaaa")
     talk_steer.mark_superseded("sa-0-aaaa")
-    assert "redirected" in talk_steer.notes_summary()
+    assert "redirect accepted" in talk_steer.notes_summary()
     assert "sa-0-aaaa" not in talk_steer.queued_subagent_ids()
 
 
@@ -343,6 +348,49 @@ def test_pre_api_watcher_is_idempotent(monkeypatch):
     assert talk_steer.ensure_pre_api_watcher() is True
     assert len(logger.handlers) == 1
     assert len(logger.filters) == 1
+
+
+class _PendingAgent(_Steerable):
+    """A draining agent whose queue already holds a POST-drain note."""
+
+    def __init__(self, pending: str = ""):
+        self._pending_steer = pending
+
+
+def test_drain_sweep_spares_a_note_queued_after_the_drain():
+    # THE race Codex round 1 reproduced: the host drains, another thread
+    # queues note B, THEN the log line fires. B's token is still sitting in
+    # the agent's pending queue at emit time — it was not delivered and must
+    # not be swept into landed with A's batch.
+    token_a = talk_steer.new_token()
+    token_b = talk_steer.new_token()
+    wire_a = talk_steer.compose_wire_text(token_a, "first note about auth")
+    wire_b = talk_steer.compose_wire_text(token_b, "late note that missed the drain")
+    agent = _PendingAgent(pending=wire_b)
+    talk_steer.record_queued("sa-0-aaaa", wire_a, token=token_a, agent=agent)
+    talk_steer.record_queued("sa-0-aaaa", wire_b, token=token_b, agent=agent)
+    flipped = talk_steer.mark_landed_from_preview(
+        wire_a[: talk_steer.DRAIN_PREVIEW_CHARS], agent=agent
+    )
+    assert flipped == 1
+    summary = talk_steer.notes_summary()
+    assert "landed" in summary and "queued" in summary
+
+
+def test_pre_api_sweep_spares_a_note_queued_after_the_drain():
+    token_a = talk_steer.new_token()
+    token_b = talk_steer.new_token()
+    wire_b = talk_steer.compose_wire_text(token_b, "late note that missed the drain")
+    agent = _PendingAgent(pending=wire_b)
+    talk_steer.record_queued(
+        "sa-0-aaaa",
+        talk_steer.compose_wire_text(token_a, "first note about auth"),
+        token=token_a,
+        agent=agent,
+    )
+    talk_steer.record_queued("sa-0-aaaa", wire_b, token=token_b, agent=agent)
+    assert talk_steer.mark_landed_for_agent(agent) == 1
+    assert "queued" in talk_steer.notes_summary()
 
 
 def test_reset_restores_the_borrowed_logger_exactly(monkeypatch):

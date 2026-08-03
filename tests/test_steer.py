@@ -402,17 +402,22 @@ def test_redirect_without_host_module_refuses(monkeypatch):
     assert "doesn't let me redirect" in out.lower()
 
 
-def test_redirect_accepted_mid_thought_claims_redirected(monkeypatch):
+def test_redirect_accepted_mid_thought_claims_accepted_never_the_abort(monkeypatch):
     agent = _FakeRedirectAgent()
     _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
     out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo, use taskchad-ship")
     assert "redirect accepted" in out.lower()
+    # The peek can be stale (redirect() may have degraded to a steer-queue
+    # write and still returned True) — so the sentence must hold on either
+    # path and may NEVER claim the current work was dropped.
+    assert "current step, or its very next one" in out.lower()
+    assert "drops what it was doing" not in out.lower()
     # The wire text leads with the correlation token — both verbs share it.
     assert len(agent.redirected) == 1
     assert re.fullmatch(
         r"\[tk-[0-9a-f]{8}\] wrong repo, use taskchad-ship", agent.redirected[0]
     )
-    assert "redirected" in talk_steer.notes_summary()
+    assert "redirect accepted" in talk_steer.notes_summary()
 
 
 def test_redirect_mid_tool_speaks_queued_not_redirected(monkeypatch):
@@ -423,7 +428,7 @@ def test_redirect_mid_tool_speaks_queued_not_redirected(monkeypatch):
     out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
     assert "mid-tool" in out.lower()
     assert "queued" in talk_steer.notes_summary()
-    assert "redirected" not in talk_steer.notes_summary()
+    assert "redirect accepted" not in talk_steer.notes_summary()
 
 
 def test_redirect_false_falls_back_to_the_steer_queue(monkeypatch):

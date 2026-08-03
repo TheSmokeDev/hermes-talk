@@ -69,6 +69,13 @@ def on_subagent_start(**kwargs: Any) -> None:
         parent_subagent_id = kwargs.get("parent_subagent_id")
         entry = {
             "subagent_id": subagent_id,
+            # Retained for scoping: the announce path currently exists only
+            # in the terminal `hermes talk` process (one operator's session
+            # tree — the browser lane never attaches), but the id rides the
+            # roster and every event so a future host session oracle can
+            # filter foreign-parent completions without a schema change.
+            # Tracked: hermes-talk#4.
+            "parent_session_id": kwargs.get("parent_session_id"),
             "role": kwargs.get("child_role"),
             "goal": str(kwargs.get("child_goal") or "")[:200],
             # Top-level children have no parent subagent — nested
@@ -110,6 +117,7 @@ def on_subagent_stop(**kwargs: Any) -> None:
             {
                 "kind": "subagent_stop",
                 "subagent_id": subagent_id,
+                "parent_session_id": entry.get("parent_session_id"),
                 "role": entry.get("role") or kwargs.get("child_role"),
                 "goal": entry.get("goal") or "",
                 "status": kwargs.get("child_status"),

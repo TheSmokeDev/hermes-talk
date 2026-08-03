@@ -142,7 +142,10 @@ class _DrainWatcher(logging.Handler):
             if DRAIN_LINE_PREFIX not in message:
                 return
             _, _, preview = message.partition(": ")
-            mark_landed_from_preview(preview)
+            # The drain frame's agent, when reachable, closes the
+            # drained-then-requeued race: a note whose token still sits in
+            # the agent's pending queue was queued AFTER this drain.
+            mark_landed_from_preview(preview, agent=_draining_agent_from_stack())
         except Exception:  # noqa: BLE001 — a logging handler must never raise
             return
 
@@ -192,13 +195,19 @@ class _DebugGate(logging.Filter):
             return True
 
 
+#: The files whose frames may hold the draining agent: the pre-API drain
+#: logs from conversation_loop.py, the post-tool drain from
+#: agent_runtime_helpers.py (``apply_pending_steer_to_tool_results(agent,…)``).
+_DRAIN_FRAME_FILES = ("conversation_loop.py", "agent_runtime_helpers.py")
+
+
 def _draining_agent_from_stack() -> object | None:
-    """The ``agent`` local of the conversation-loop frame below us, if any.
+    """The ``agent`` local of the drain frame below us, if any.
 
     CPython-specific by design (the host supports CPython only): the logging
-    call stack at ``emit`` time still contains the frame that called
-    ``logger.debug``, and on the pre-API drain path that frame is inside
-    ``agent/conversation_loop.py`` with the draining agent as a local.
+    call stack at ``emit`` time still contains the frame that called the
+    logger, and on both drain paths that frame holds the draining agent as a
+    local named ``agent``.
     """
 
     try:
@@ -207,13 +216,31 @@ def _draining_agent_from_stack() -> object | None:
         return None
     depth = 0
     while frame is not None and depth < 30:
-        if frame.f_code.co_filename.endswith("conversation_loop.py"):
+        if frame.f_code.co_filename.endswith(_DRAIN_FRAME_FILES):
             candidate = frame.f_locals.get("agent")
             if candidate is not None and hasattr(candidate, "_drain_pending_steer"):
                 return candidate
         frame = frame.f_back
         depth += 1
     return None
+
+
+def _still_pending_text(agent: object | None) -> str:
+    """The agent's CURRENT pending-steer text — the drained-vs-not oracle.
+
+    The drain empties the queue BEFORE the log line fires, so anything found
+    here at emit time was queued AFTER the drain and must not be swept into
+    ``landed``. A bare snapshot read is enough: the token search only needs
+    the text of notes that provably were not part of the drained batch.
+    """
+
+    if agent is None:
+        return ""
+    try:
+        pending = getattr(agent, "_pending_steer", None)
+    except Exception:  # noqa: BLE001 — a foreign object must not break emit
+        return ""
+    return pending if isinstance(pending, str) else ""
 
 
 def ensure_watcher() -> bool:
@@ -360,13 +387,21 @@ def record_redirected(
     return receipt["id"]
 
 
-def mark_landed_from_preview(preview: str) -> int:
-    """Land receipts matching a drained preview. Returns how many flipped."""
+def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> int:
+    """Land receipts matching a drained preview. Returns how many flipped.
+
+    ``agent`` is the draining agent when the watcher could resolve it from
+    the drain frame. Its CURRENT pending queue is the drained-vs-requeued
+    oracle: the host drains before it logs, so a note whose token is still
+    pending at emit time was queued after this drain and stays ``queued``
+    instead of being swept into ``landed`` with the batch.
+    """
 
     preview = (preview or "").strip()
     if not preview:
         return 0
     tokens = set(_TOKEN_RE.findall(preview))
+    still_pending = _still_pending_text(agent)
     flipped = 0
     with _LOCK:
         matched_agents: set[str] = set()
@@ -374,6 +409,8 @@ def mark_landed_from_preview(preview: str) -> int:
             if receipt["state"] != STATE_QUEUED:
                 continue
             token = receipt.get("token")
+            if token is not None and token in still_pending:
+                continue  # queued after this drain — not part of the batch
             if token is not None and token in tokens:
                 receipt["state"] = STATE_LANDED
                 flipped += 1
@@ -395,12 +432,16 @@ def mark_landed_from_preview(preview: str) -> int:
             # Steers concatenate WITHIN one agent's pending queue and drain
             # as a single batch — so a match on any receipt lands every
             # queued receipt for that same agent, even ones whose text (and
-            # token) the 120-char preview truncated away.
+            # token) the 120-char preview truncated away. Except, again,
+            # anything provably still sitting in the pending queue.
             for receipt in _RECEIPTS:
                 if (
                     receipt["state"] == STATE_QUEUED
                     and receipt["subagent_id"] in matched_agents
                 ):
+                    token = receipt.get("token")
+                    if token is not None and token in still_pending:
+                        continue
                     receipt["state"] = STATE_LANDED
                     flipped += 1
     return flipped
@@ -412,17 +453,23 @@ def mark_landed_for_agent(agent: object) -> int:
     The pre-API drain empties the ENTIRE pending queue for one agent, so a
     hit lands every queued receipt attributed to it — by captured reference
     first (exact), then by subagent id for receipts recorded without one
-    (same batch, same agent).
+    (same batch, same agent). Receipts whose token is STILL in the agent's
+    pending queue at emit time were queued after the drain and are skipped
+    on both passes.
     """
 
     if agent is None:
         return 0
+    still_pending = _still_pending_text(agent)
     flipped = 0
     with _LOCK:
         matched_agents: set[str] = set()
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:
                 continue
+            token = receipt.get("token")
+            if token is not None and token in still_pending:
+                continue  # queued after this drain — not part of the batch
             ref = receipt.get("agent_ref")
             target = ref() if ref is not None else None
             if target is not None and target is agent:
@@ -435,6 +482,9 @@ def mark_landed_for_agent(agent: object) -> int:
                     receipt["state"] == STATE_QUEUED
                     and receipt["subagent_id"] in matched_agents
                 ):
+                    token = receipt.get("token")
+                    if token is not None and token in still_pending:
+                        continue
                     receipt["state"] = STATE_LANDED
                     flipped += 1
     return flipped
@@ -481,7 +531,7 @@ def apply_missed_steer(subagent_id: str, entry: dict) -> bool:
 SPOKEN = {
     STATE_QUEUED: "queued — I'll confirm when it lands",
     STATE_LANDED: "landed",
-    STATE_REDIRECTED: "redirected — it took the correction mid-step",
+    STATE_REDIRECTED: "redirect accepted — applied at its current or next step",
     STATE_UNCONFIRMED: "finished before I could confirm the note got in",
     STATE_MISSED: "never saw the note — it finished first",
     STATE_SUPERSEDED: "stopped — the note may not have been read",

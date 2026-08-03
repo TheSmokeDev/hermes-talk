@@ -143,6 +143,15 @@ def test_stop_announces_a_top_level_child_through_the_loop():
     assert event["subagent_id"] == "sa-0-aaaa"
     assert event["status"] == "ok"
     assert event["summary"] == "found three issues"
+    # Scoping handle: every event names the parent session that owns the
+    # child, so a consumer with a session oracle can drop foreign-parent
+    # completions (hermes-talk#4).
+    assert event["parent_session_id"] == "parent-sess"
+
+
+def test_roster_retains_the_parent_session():
+    _start()
+    assert talk_lifecycle.roster_snapshot()[0]["parent_session_id"] == "parent-sess"
 
 
 def test_nested_children_stop_silently():
