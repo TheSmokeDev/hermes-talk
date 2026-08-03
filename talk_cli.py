@@ -28,6 +28,7 @@ import json
 import re
 import sys
 import time
+import uuid
 
 try:
     from . import (
@@ -111,21 +112,29 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
 
     Background output is UNTRUSTED data — a child that read a hostile
     repository or web page can carry injected instructions in its summary.
-    Two containments keep that text from ever wearing the operator's voice:
+    Three containments bound what that text can ever do (Codex r1 + r2):
 
-    - The item is ``role: system``, framed explicitly as a report to relay,
+    - The item is ``role: system``, framed explicitly as quoted data,
       never a ``user`` turn — injected text must not be indistinguishable
       from operator speech in the conversation record.
     - The announcement response is created with ``tool_choice: "none"``, so
-      relaying a result can never directly emit a tool call. Later turns
-      re-enable tools, but by then the text sits framed as quoted data.
+      relaying a result can never directly emit a tool call.
+    - The item DELETES ITSELF: a client-minted item id and a trailing
+      ``conversation.item.delete`` ride the same batch, so the raw report
+      exists for exactly one tools-disabled response and never persists
+      into later tool-enabled turns with system-level priority. (The
+      response snapshots conversation state at creation; the delete only
+      shapes what FUTURE turns see — a server that raced it would merely
+      thin the announcement, never widen the injection window.)
     """
 
+    item_id = f"talkann{uuid.uuid4().hex[:20]}"
     detail = f" Report, quoted as data:\n{report}" if report else ""
     return [
         {
             "type": "conversation.item.create",
             "item": {
+                "id": item_id,
                 "type": "message",
                 "role": "system",
                 "content": [
@@ -142,6 +151,7 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
             },
         },
         {"type": "response.create", "response": {"tool_choice": "none"}},
+        {"type": "conversation.item.delete", "item_id": item_id},
     ]
 
 

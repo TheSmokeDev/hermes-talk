@@ -355,6 +355,12 @@ def record_queued(
     (drain preview, ``missed_steer``) quotes what was actually queued.
     ``agent`` is the live AIAgent behind the id when the caller could
     resolve one; it is held weakly and used only for pre-API attribution.
+
+    ORDERING INVARIANT (load-bearing for the drain-race exclusion): callers
+    must have already queued the wire text into the host (``steer()`` /
+    ``redirect()``) before ledgering it here. The landing sweeps snapshot
+    the host's pending queue under ``_LOCK`` and rely on a racing note
+    being either visible there or not yet ledgered.
     """
 
     receipt = _make_receipt(subagent_id, text, STATE_QUEUED, token, agent)
@@ -401,9 +407,15 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
     if not preview:
         return 0
     tokens = set(_TOKEN_RE.findall(preview))
-    still_pending = _still_pending_text(agent)
     flipped = 0
     with _LOCK:
+        # The pending snapshot MUST happen under _LOCK (Codex r2): every
+        # caller queues into the host BEFORE ledgering here, and
+        # record_queued needs _LOCK — so while we hold it, a racing note is
+        # either already visible in _pending_steer (excluded below) or not
+        # yet in _RECEIPTS (nothing to flip). Snapshotting before the lock
+        # reopened exactly the race the exclusion exists to close.
+        still_pending = _still_pending_text(agent)
         matched_agents: set[str] = set()
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:
@@ -460,9 +472,11 @@ def mark_landed_for_agent(agent: object) -> int:
 
     if agent is None:
         return 0
-    still_pending = _still_pending_text(agent)
     flipped = 0
     with _LOCK:
+        # Snapshot under _LOCK — same atomicity argument as
+        # mark_landed_from_preview (queue-before-ledger caller invariant).
+        still_pending = _still_pending_text(agent)
         matched_agents: set[str] = set()
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:

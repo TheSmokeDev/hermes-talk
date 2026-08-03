@@ -393,6 +393,26 @@ def test_pre_api_sweep_spares_a_note_queued_after_the_drain():
     assert "queued" in talk_steer.notes_summary()
 
 
+def test_pending_snapshot_is_taken_under_the_ledger_lock(monkeypatch):
+    # Codex r2: a snapshot taken BEFORE _LOCK reopens the drain race — a
+    # note queued into the host and ledgered in the gap gets swept into
+    # landed. The closure is structural: the snapshot may only ever run
+    # while the ledger lock is held (record_queued then can't interleave).
+    observed: list[bool] = []
+    real = talk_steer._still_pending_text
+
+    def instrumented(agent):
+        observed.append(talk_steer._LOCK.locked())
+        return real(agent)
+
+    monkeypatch.setattr(talk_steer, "_still_pending_text", instrumented)
+    agent = _PendingAgent()
+    talk_steer.record_queued("sa-0-aaaa", "a note about auth", agent=agent)
+    talk_steer.mark_landed_from_preview("a note about auth", agent=agent)
+    talk_steer.mark_landed_for_agent(agent)
+    assert observed and all(observed)
+
+
 def test_reset_restores_the_borrowed_logger_exactly(monkeypatch):
     logger = _fake_conversation_loop(monkeypatch, level=logging.INFO)
     talk_steer.ensure_pre_api_watcher()

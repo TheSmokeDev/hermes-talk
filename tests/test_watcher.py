@@ -94,10 +94,15 @@ def test_finished_run_is_injected_as_a_contained_announcement():
         {"runId": 7, "status": "done", "output": "the index is rebuilt"}
     )
 
-    create, respond = messages
+    create, respond, delete = messages
     # The announcement response cannot emit a tool call — run output is
     # untrusted data (v0.6 injection containment).
     assert respond == {"type": "response.create", "response": {"tool_choice": "none"}}
+    # And the raw output does not persist past that one response.
+    assert delete == {
+        "type": "conversation.item.delete",
+        "item_id": create["item"]["id"],
+    }
     item = create["item"]
     # A system item, never a user turn: the model still gets PROMPTED to
     # speak, but injected text in the output cannot wear the operator's
