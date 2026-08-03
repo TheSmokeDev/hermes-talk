@@ -20,7 +20,7 @@ while it's still going:
 > *…later, unprompted:*
 > **Hermes:** that audit finished — three gaps, starting with the token refresh swallowing exceptions…
 
-Three properties make that possible, and each one is the part other voice
+Four properties make that possible, and each one is the part other voice
 integrations don't have:
 
 1. **Duplex.** One bidirectional audio session — turn-taking, interruption,
@@ -32,6 +32,12 @@ integrations don't have:
 3. **Work outlives the sentence.** Delegation spawns a real background Hermes
    agent. You keep talking. The result is spoken when it lands — you don't
    poll, you don't wait, you don't go check a terminal.
+4. **It starts already knowing you.** The session prompt is assembled from
+   what Hermes itself knows — your `SOUL.md`, and whatever your configured
+   memory provider contributes. Install one (e.g.
+   [hermes-homie-memory](https://github.com/TheSmokeDev/hermes-homie-memory))
+   and the first thing you say lands on an agent that already has context. No
+   tool call, no "let me look that up", no warm-up turn.
 
 **Why this exists:** OpenAI shipped this exact pattern for Codex on 2026-07-23
 — voice as a control layer over concurrent agents. It's excellent, and it's
@@ -52,7 +58,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 182 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 208 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 ## Auth — no API key needed if you have ChatGPT
 
@@ -129,6 +135,33 @@ If your model config lives in a **profile** rather than the root
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
+| `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
+
+### `TALK_IDENTITY_INCLUDE` — what the session starts knowing
+
+Two sections are resolved at session start, each independently and each
+optional:
+
+- **`PERSONA`** — your `SOUL.md`, read through Hermes's own loader (so it gets
+  the same injection scan the text agent's copy does).
+- **`MEMORY`** — the system-prompt block your configured memory provider
+  contributes. Inside `/talk` this is the live agent's already-assembled
+  block; standalone, Talk loads the configured provider itself, reads the
+  block, and shuts it down again.
+
+A broken or missing provider costs that section and nothing else — the call
+still starts. `talk_status` reports which sections resolved and how many
+characters each contributes, never their content.
+
+Set `TALK_IDENTITY_INCLUDE=MEMORY,PERSONA` to pin the list. **The trap: this
+REPLACES the default rather than extending it** — `TALK_IDENTITY_INCLUDE=MEMORY`
+means memory *and nothing else*, and the only symptom is a session that has
+quietly stopped knowing who it's talking to. Unknown names are dropped
+silently, so a typo narrows the prompt instead of taking voice down.
+
+Sections are capped (`PERSONA` 4,000 chars, `MEMORY` 6,000). A Realtime
+session's instructions are resident for the whole call and paid on every turn,
+so these are a budget, not a nicety.
 
 ## Design rules
 
@@ -145,7 +178,7 @@ The three that shaped everything else:
 
 ## Status
 
-v0.2 — under active development. Roadmap: run steering by voice, browser
+v0.3 — under active development. Roadmap: run steering by voice, browser
 dashboard tab, session-end memory debrief, gateway platform adapter.
 
 Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)
