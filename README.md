@@ -109,13 +109,9 @@ call back into the plugin's real tool surface, and shows the transcript plus a
 live list of background runs. Nothing to install — the bundle ships with the
 plugin and the host serves it.
 
-**The honest limitation.** The dashboard runs in the web-server process, which
-has no bound agent context, so the agent-loop-only tools degrade there exactly
-as they do in a standalone `hermes talk`: `search_memory` says it can't reach
-memory, and `delegate_task` falls through to a detached `hermes -z` one-shot
-(which does work, and whose result is still spoken when it lands). Full
-in-loop tools need the session to run where the agent loop is — `/talk`
-today, and the `api_server` gateway platform when the adapter lands.
+The tile at the top of the tab reads **attached**, **api-server**, or **out of
+process** — which of the three agent lanes below this session would actually
+use. It is not a guess; it is the lane the next tool call will take.
 
 ### `TALK_DASHBOARD_TOKEN` — the tab's own gate
 
@@ -133,20 +129,58 @@ fails open:
 
 Set it whenever the dashboard is reachable from anywhere but this machine.
 
+## Reaching a real agent — the three lanes
+
+Everything that needs an actual Hermes agent — a memory lookup, a delegated
+task — goes down the same chain, and **every fall-through is said out loud**:
+
+1. **Attached** — the agent loop this session is running inside. Only `/talk`
+   has one. Answers come back inline, in the same breath.
+2. **api-server** — a real, fully-tooled Hermes agent reached over the
+   [api_server gateway platform](#turning-the-api-server-lane-on). This is what
+   makes the dashboard tab and a standalone `hermes talk` more than a fallback.
+3. **Out of process** — no agent lane. Delegation still spawns a detached
+   `hermes -z` one-shot; a memory lookup refuses, naming exactly what's missing.
+
+Lanes 2 and 3 answer with a receipt rather than the answer, and speak the
+result when it lands. That is not a shortcut: an agent run takes seconds to
+minutes, and the tool call that starts it runs on the same thread carrying your
+microphone. Waiting there wouldn't be patience, it would be dead air.
+
+### Turning the api-server lane on
+
+```bash
+# in your gateway environment
+API_SERVER_ENABLED=true
+API_SERVER_KEY=<a key you choose>
+```
+
+Restart the gateway. Talk finds it by itself — no Talk-side configuration is
+needed, because `API_SERVER_KEY` is the same variable the gateway reads. If you
+want Talk to use a *different* key or a non-default address, set
+`TALK_API_SERVER_KEY` / `TALK_API_SERVER_URL`.
+
+Talk probes `GET /v1/capabilities` (which is authenticated, on purpose) at
+session start, so a wrong key is reported as **"running but rejected my key"**
+rather than as "not reachable" — those send you to two different places.
+
 ## Background work
 
 Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
-The backend is picked in this order, and **every fall-through is said out
-loud** — the plugin never silently does less than you asked:
+Delegation walks the [three lanes](#reaching-a-real-agent--the-three-lanes) and
+then one more, and **every fall-through is said out loud** — the plugin never
+silently does less than you asked:
 
 1. **Hermes's own agent loop** — inside `/talk`, where there's a parent agent
    to delegate into.
-2. **A detached `hermes -z` one-shot** — in a standalone `hermes talk`, which
-   has no agent loop. This is what makes background work real there.
-3. Neither available — a refusal naming what's missing.
+2. **A real agent over the api_server** — preferred over a spawn: it reuses a
+   warm, fully-tooled agent instead of paying a process start.
+3. **A detached `hermes -z` one-shot** — needs nothing enabled, so this is the
+   lane that always exists as long as `hermes` is on the PATH.
+4. None available — a refusal naming all three missing lanes.
 
 Runs are tracked in `$HERMES_HOME/state/talk-runs.jsonl`. The work is
 detached, so ending the call does **not** stop it — but the watcher that would
@@ -177,6 +211,8 @@ If your model config lives in a **profile** rather than the root
 | `TALK_VOICE` | `cedar` | Realtime voice (fail-closed on unknown ids) |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |
+| `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Where the api-server lane looks |
+| `TALK_API_SERVER_KEY` | `API_SERVER_KEY` | Key for the api-server lane (blank = send none) |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
 | `TALK_DASHBOARD_TOKEN` | unset | Token for the dashboard tab's routes (unset = loopback only) |
