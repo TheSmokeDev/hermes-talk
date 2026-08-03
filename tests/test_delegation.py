@@ -84,8 +84,33 @@ def _wait_terminal(run_id: int, timeout: float = 3.0) -> dict:
     raise AssertionError(f"run {run_id} never finished")
 
 
+class _FakePopen:
+    """Popen-shaped: the worker retains the handle and calls communicate()."""
+
+    def __init__(self, stdout="", stderr="", returncode=0, raises=None):
+        self._out, self._err, self._raises = stdout, stderr, raises
+        self.returncode = returncode
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        if self._raises is not None and not self.killed:
+            raise self._raises
+        return self._out, self._err
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._raises = None
+        self.returncode = -9
+
+    def terminate(self):
+        self.kill()
+
+
 def _fake_completed(stdout="", stderr="", returncode=0):
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+    return _FakePopen(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
 # --- the degradation detector ------------------------------------------------
@@ -170,7 +195,7 @@ def test_missing_agent_loop_falls_through_to_a_detached_run(monkeypatch):
         seen["kwargs"] = kwargs
         return _fake_completed(stdout="  the index is rebuilt  \n")
 
-    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+    monkeypatch.setattr(talk_host.subprocess, "Popen", fake_run)
     talk_host.bind_ctx(_StubCtx(_NO_PARENT))
 
     result = talk_host.host().run_agent("rebuild the index")
@@ -191,9 +216,19 @@ def test_detached_run_inherits_the_environment_and_bounds_itself(monkeypatch):
 
     def fake_run(argv, **kwargs):
         seen.update(kwargs)
-        return _fake_completed(stdout="ok")
+        proc = _fake_completed(stdout="ok")
+        original = proc.communicate
 
-    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+        def communicate(timeout=None):
+            # The budget moved from run(timeout=) to communicate(timeout=)
+            # when the worker switched to a retained Popen handle.
+            seen["timeout"] = timeout
+            return original()
+
+        proc.communicate = communicate
+        return proc
+
+    monkeypatch.setattr(talk_host.subprocess, "Popen", fake_run)
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     _wait_terminal(run_id)
@@ -209,7 +244,7 @@ def test_detached_run_inherits_the_environment_and_bounds_itself(monkeypatch):
 def test_no_ctx_at_all_goes_straight_to_the_detached_backend(monkeypatch):
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
     monkeypatch.setattr(
-        talk_host.subprocess, "run", lambda *a, **k: _fake_completed(stdout="done")
+        talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="done")
     )
 
     assert "WORK_STARTED #" in talk_host.host().run_agent("go")
@@ -219,7 +254,7 @@ def test_a_nonzero_exit_lands_as_a_failed_run_with_the_reason(monkeypatch):
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
     monkeypatch.setattr(
         talk_host.subprocess,
-        "run",
+        "Popen",
         lambda *a, **k: _fake_completed(stderr="no provider configured", returncode=2),
     )
 
@@ -239,7 +274,7 @@ def test_a_timeout_lands_as_a_failed_run(monkeypatch):
     def timeout(*a, **k):
         raise subprocess.TimeoutExpired(cmd="hermes", timeout=1)
 
-    monkeypatch.setattr(talk_host.subprocess, "run", timeout)
+    monkeypatch.setattr(talk_host.subprocess, "Popen", timeout)
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     run = _wait_terminal(run_id)
@@ -250,7 +285,7 @@ def test_a_timeout_lands_as_a_failed_run(monkeypatch):
 
 def test_silent_child_still_says_something(monkeypatch):
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
-    monkeypatch.setattr(talk_host.subprocess, "run", lambda *a, **k: _fake_completed(stdout="  "))
+    monkeypatch.setattr(talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="  "))
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
 
@@ -260,7 +295,7 @@ def test_silent_child_still_says_something(monkeypatch):
 def test_output_is_capped(monkeypatch):
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
     monkeypatch.setattr(
-        talk_host.subprocess, "run", lambda *a, **k: _fake_completed(stdout="x" * 99_999)
+        talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="x" * 99_999)
     )
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
@@ -270,7 +305,7 @@ def test_output_is_capped(monkeypatch):
 
 def test_label_is_the_task_head(monkeypatch):
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
-    monkeypatch.setattr(talk_host.subprocess, "run", lambda *a, **k: _fake_completed(stdout="ok"))
+    monkeypatch.setattr(talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="ok"))
 
     task = "audit " + "the site " * 40
     run_id = int(talk_host.host().run_agent(task).split("#", 1)[1].split(" ", 1)[0])
@@ -417,7 +452,7 @@ def test_a_detected_profile_reaches_the_spawn(monkeypatch, tmp_path):
         seen["argv"] = argv
         return _fake_completed(stdout="ok")
 
-    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+    monkeypatch.setattr(talk_host.subprocess, "Popen", fake_run)
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     _wait_terminal(run_id)
@@ -436,7 +471,7 @@ def test_no_profile_needed_means_a_bare_spawn(monkeypatch, tmp_path):
         seen["argv"] = argv
         return _fake_completed(stdout="ok")
 
-    monkeypatch.setattr(talk_host.subprocess, "run", fake_run)
+    monkeypatch.setattr(talk_host.subprocess, "Popen", fake_run)
 
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     _wait_terminal(run_id)

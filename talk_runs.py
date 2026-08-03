@@ -377,6 +377,46 @@ def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
     return [merged[rid] for rid in run_ids]
 
 
+# -- detached process handles -------------------------------------------------
+# In-memory only, NEVER in the JSONL history: a Popen handle is meaningless
+# outside this process, and persisting a pid would invite killing a recycled
+# one after restart. Holding the handle here is what makes the detached lane
+# stoppable at all — stop_work's only channel to a `hermes -z` one-shot.
+
+_PROCESSES: dict[int, object] = {}
+_PROCESS_LOCK = threading.Lock()
+
+
+def register_process(run_id: int, process: object) -> None:
+    """Retain the detached child's Popen so stop_work can reach it."""
+
+    with _PROCESS_LOCK:
+        _PROCESSES[run_id] = process
+
+
+def release_process(run_id: int) -> None:
+    """Drop the handle once the child has been reaped."""
+
+    with _PROCESS_LOCK:
+        _PROCESSES.pop(run_id, None)
+
+
+def terminate_process(run_id: int) -> bool:
+    """Terminate a retained detached child. True iff a live handle was hit."""
+
+    with _PROCESS_LOCK:
+        process = _PROCESSES.get(run_id)
+    if process is None:
+        return False
+    try:
+        if process.poll() is not None:  # type: ignore[attr-defined]
+            return False
+        process.terminate()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — a dead/foreign handle is "not stopped"
+        return False
+    return True
+
+
 def reset_for_tests() -> None:
     """Clear registry state between tests (never called in production)."""
 
@@ -384,6 +424,8 @@ def reset_for_tests() -> None:
     with _RUN_LOCK:
         _RUNS.clear()
         _RUN_SEQ = 0
+    with _PROCESS_LOCK:
+        _PROCESSES.clear()
 
 
 __all__ = [
@@ -394,7 +436,10 @@ __all__ = [
     "finish_run",
     "get_run",
     "list_runs",
+    "register_process",
+    "release_process",
     "reset_for_tests",
     "start_run",
     "started_sentinel",
+    "terminate_process",
 ]

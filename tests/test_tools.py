@@ -47,7 +47,9 @@ def test_default_tools_are_fresh_copies():
         "search_memory",
         "delegate_task",
         "check_work",
-        "steer_run",
+        "list_agents",
+        "steer_agent",
+        "stop_work",
         "talk_status",
     ]
 

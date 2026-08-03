@@ -22,7 +22,15 @@ import time
 from pathlib import Path
 
 try:
-    from . import talk_audio, talk_auth, talk_config, talk_host, talk_identity, talk_runs
+    from . import (
+        talk_audio,
+        talk_auth,
+        talk_config,
+        talk_host,
+        talk_identity,
+        talk_runs,
+        talk_steer,
+    )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
     import talk_auth
@@ -30,6 +38,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_host
     import talk_identity
     import talk_runs
+    import talk_steer
 
 _log = logging.getLogger(__name__)
 
@@ -117,24 +126,42 @@ _TOOL_CHECK_WORK: dict = {
     },
 }
 
-_TOOL_STEER_RUN: dict = {
+_TOOL_LIST_AGENTS: dict = {
     "type": "function",
-    "name": "steer_run",
+    "name": "list_agents",
     "description": (
-        "Redirect background work that is ALREADY RUNNING, without stopping "
-        "it — 'tell it to focus on pricing instead', 'have it skip the tests'. "
-        "The note reaches the agent after its next step, so say you passed it "
-        "along rather than that it is done. This never cancels work: if the "
-        "user wants something stopped, say so instead of calling this."
+        "List running and recent background work, each entry tagged with "
+        "what it supports: 'can steer' (a live subagent id), 'stop only' (a "
+        "run number), or unreachable. ALWAYS call this first when the user "
+        "refers to work by description ('the audit', 'that research one') — "
+        "resolve the id here, never from memory of earlier speech."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+_TOOL_STEER_AGENT: dict = {
+    "type": "function",
+    "name": "steer_agent",
+    "description": (
+        "Queue a redirection note into background work that is ALREADY "
+        "RUNNING, without stopping it — 'focus on pricing instead', 'skip "
+        "the tests'. The note is QUEUED, not delivered: the agent sees it "
+        "after its current step, and delivery is confirmed separately. Never "
+        "say the agent already has it. Only subagent ids (like "
+        "sa-0-a1b2c3d4, from list_agents) can be steered — run numbers "
+        "cannot; offer stop_work for those. This never cancels work."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "target": {
+            "agent_id": {
                 "type": "string",
                 "description": (
-                    "Which job to redirect — the subagent id you were given "
-                    "when the work started, or a run number."
+                    "The subagent id from list_agents. Not a run number."
                 ),
             },
             "text": {
@@ -145,7 +172,33 @@ _TOOL_STEER_RUN: dict = {
                 ),
             },
         },
-        "required": ["target", "text"],
+        "required": ["agent_id", "text"],
+        "additionalProperties": False,
+    },
+}
+
+_TOOL_STOP_WORK: dict = {
+    "type": "function",
+    "name": "stop_work",
+    "description": (
+        "Stop background work on any lane: a subagent id or a run number "
+        "(both from list_agents). Stopping drops any queued-but-unread "
+        "steering note. Use only when the user clearly wants the work "
+        "cancelled, not redirected."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "A run number or a subagent id from list_agents.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional short reason, for the record.",
+            },
+        },
+        "required": ["target"],
         "additionalProperties": False,
     },
 }
@@ -197,7 +250,9 @@ def default_talk_tools() -> list[dict]:
             _TOOL_SEARCH_MEMORY,
             _TOOL_DELEGATE_TASK,
             _TOOL_CHECK_WORK,
-            _TOOL_STEER_RUN,
+            _TOOL_LIST_AGENTS,
+            _TOOL_STEER_AGENT,
+            _TOOL_STOP_WORK,
             _TOOL_TALK_STATUS,
         ]
     )
@@ -279,19 +334,39 @@ def _handle_check_work(arguments: dict) -> str:
     # rather than vanishing — this process cannot see a detached child it
     # never spawned, and saying nothing would read as "nothing is running".
     runs = talk_runs.list_runs(limit=10, include_history=True)
-    if not runs:
-        return "Nothing is running and nothing recent has finished."
-    return "; ".join(_describe_run(run) for run in runs)
+    lines = "; ".join(_describe_run(run) for run in runs) if runs else ""
+    # Steer receipts ride along: "did my note land?" is a check_work
+    # question, and the ledger is the only place the answer lives.
+    notes = talk_steer.notes_summary()
+    if lines and notes:
+        return f"{lines}. {notes}"
+    if notes:
+        return notes
+    if lines:
+        return lines
+    return "Nothing is running and nothing recent has finished."
 
 
-def _handle_steer_run(arguments: dict) -> str:
-    target = str(arguments.get("target") or "").strip()
-    if not target:
-        return "steer_run needs to know which job to redirect."
+def _handle_list_agents(arguments: dict) -> str:
+    return talk_host.host().list_agents()
+
+
+def _handle_steer_agent(arguments: dict) -> str:
+    agent_id = str(arguments.get("agent_id") or "").strip()
+    if not agent_id:
+        return "steer_agent needs the subagent id — call list_agents first."
     text = str(arguments.get("text") or "").strip()
     if not text:
-        return "steer_run needs something to tell it."
-    return talk_host.host().steer_run(target, text)
+        return "steer_agent needs the note itself."
+    return talk_host.host().steer_agent(agent_id, text)
+
+
+def _handle_stop_work(arguments: dict) -> str:
+    target = str(arguments.get("target") or "").strip()
+    if not target:
+        return "stop_work needs to know which job to stop."
+    reason = str(arguments.get("reason") or "").strip() or None
+    return talk_host.host().stop_work(target, reason)
 
 
 def _identity_summary() -> dict[str, int]:
@@ -343,7 +418,9 @@ _HANDLERS = {
     "search_memory": _handle_search_memory,
     "delegate_task": _handle_delegate_task,
     "check_work": _handle_check_work,
-    "steer_run": _handle_steer_run,
+    "list_agents": _handle_list_agents,
+    "steer_agent": _handle_steer_agent,
+    "stop_work": _handle_stop_work,
     "talk_status": _handle_talk_status,
 }
 

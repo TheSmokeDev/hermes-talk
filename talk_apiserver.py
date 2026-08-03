@@ -43,6 +43,7 @@ at a tool handler.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -333,7 +334,12 @@ def get_run(run_id: str) -> dict:
     return payload
 
 
-def run_to_completion(prompt: str, *, session_id: str | None = None) -> str:
+def run_to_completion(
+    prompt: str,
+    *,
+    session_id: str | None = None,
+    on_start=None,
+) -> str:
     """Run one agent turn and return its answer as speakable text.
 
     BLOCKS until the run terminates or the budget expires, so this belongs on
@@ -343,6 +349,9 @@ def run_to_completion(prompt: str, *, session_id: str | None = None) -> str:
     """
 
     run_id = start_run(prompt, session_id=session_id)
+    if on_start is not None:
+        with contextlib.suppress(Exception):  # a bookkeeping hook is never fatal
+            on_start(run_id)
     poll = talk_config.api_server_poll_s()
     deadline = time.monotonic() + talk_config.agent_timeout_s()
     while time.monotonic() < deadline:
@@ -364,6 +373,30 @@ def run_to_completion(prompt: str, *, session_id: str | None = None) -> str:
         "the agent run is still going after its whole time budget — it may "
         "still finish, but I stopped waiting"
     )
+
+
+def stop_run(run_id: str) -> None:
+    """POST /v1/runs/{id}/stop — hard-interrupt a running api_server agent.
+
+    The lane's ONE lifecycle verb (api_server.py routes: create/get/events/
+    approval/stop). Raises :class:`TalkApiServerError` with speakable text on
+    any failure; returns None on any 2xx.
+    """
+
+    try:
+        response = httpx.post(
+            f"{talk_config.api_server_url()}{RUNS_PATH}/{run_id}/stop",
+            headers=_auth_headers(),
+            timeout=talk_config.api_server_probe_timeout_s() * 4,
+        )
+    except httpx.HTTPError as exc:
+        raise TalkApiServerError(
+            f"I couldn't reach the Hermes api server ({type(exc).__name__})"
+        ) from exc
+    if response.status_code // 100 != 2:
+        raise TalkApiServerError(
+            f"the Hermes api server refused the stop ({response.status_code})"
+        )
 
 
 def reset_for_tests() -> None:
@@ -396,6 +429,7 @@ __all__ = [
     "run_to_completion",
     "start_run",
     "status",
+    "stop_run",
     "warm",
     "warm_in_background",
 ]

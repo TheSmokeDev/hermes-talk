@@ -58,7 +58,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 296 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 314 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 ## Auth — no API key needed if you have ChatGPT
 
@@ -181,30 +181,44 @@ silently does less than you asked:
 
 ### Redirecting work that's already running
 
-Say "tell that audit to focus on the token refresh instead" and `steer_run`
-passes the note to the agent mid-run. It does not interrupt: the text reaches
-the agent **after its next tool call**, so the current step always finishes.
-A job already past its last tool call has no boundary left to receive it, and
-you're told that rather than left assuming it landed.
+Say "tell that audit to focus on the token refresh instead" and `steer_agent`
+queues the note into the running agent. Steering is not stopping: the agent
+sees the note after its current step, and the current step always finishes.
 
-Only the attached lane can carry a steer, and the other two say why:
+The honest part — and the reason this surface looks the way it does — is that
+the host's steer primitive is a **queue write**. Queued is not delivered. So
+every note gets a receipt with a state the substrate can actually prove:
 
-| Lane | Steering |
+| State | What proves it |
 |---|---|
-| **Attached** (`/talk`) | Yes — the child is live in this process |
-| **api-server** | No. `/v1/runs` exposes `stop` and nothing else, so it offers to stop instead |
-| **Detached `hermes -z`** | No. A one-shot process has no inbound channel at all |
+| `queued` | the steer call was accepted — the only claim made at call time |
+| `landed` | the host's own drain log line fired (watched live, in-process) |
+| `unconfirmed` | the agent finished and no landing was ever observed |
+| `missed` | a patched host reported the note back as undelivered |
+| `superseded` | the agent was stopped — stopping drops unread notes, by design |
 
-On the attached lane it prefers Hermes's own `steer_subagent` tool
-([hermes-agent#76805](https://github.com/NousResearch/hermes-agent/pull/76805));
-on an install that predates it, Talk resolves the same delegation registry
-itself, since `AIAgent.steer()` has shipped in `main` far longer than the tool
-that addresses a child by id. Either way a genuine host error — paused
-delegation, a depth limit — is spoken, never routed around.
+Ask `check_work` and you hear the note's state in those words — never "they
+got it" unless the artifact that proves it exists.
 
-Distinct from Hermes's `/steer`, which redirects the agent **you're talking
-to**. This redirects a named background worker while you keep talking to
-someone else.
+Three tools carry the surface, discovery-first:
+
+- **`list_agents`** — everything running, tagged `can steer` (live subagent
+  ids) or `stop only` (run numbers). The model resolves "the research one"
+  here, against ids that exist right now.
+- **`steer_agent`** — subagent ids only. Prefers the host's public
+  `steer_subagent` ([hermes-agent#76805](https://github.com/NousResearch/hermes-agent/pull/76805))
+  when present; otherwise resolves the same delegation registry directly and
+  calls the public `AIAgent.steer()`. A genuine host error is spoken, never
+  routed around.
+- **`stop_work`** — the one verb every lane supports: subagents via the
+  host's `interrupt_subagent()`, api-server runs via `POST /v1/runs/{id}/stop`,
+  detached one-shots via their retained process handle. Every "want me to
+  stop it?" the refusals offer is backed by this tool — no offered action is
+  fictional.
+
+Runs on the api-server and detached lanes cannot be steered at all — those
+lanes have no inbound channel — and the refusal says exactly that, then
+offers the stop that actually works.
 
 Runs are tracked in `$HERMES_HOME/state/talk-runs.jsonl`. The work is
 detached, so ending the call does **not** stop it — but the watcher that would
@@ -282,7 +296,7 @@ The three that shaped everything else:
 
 ## Status
 
-v0.4 — under active development. Roadmap: `computer_use` relay, session-end
+v0.5 — under active development. Roadmap: `computer_use` relay, session-end
 memory debrief, gateway platform adapter.
 
 Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)

@@ -151,7 +151,9 @@ def test_mint_advertises_the_full_tool_surface(minted):
         "search_memory",
         "delegate_task",
         "check_work",
-        "steer_run",
+        "list_agents",
+        "steer_agent",
+        "stop_work",
         "talk_status",
     ]
     assert minted["session"]["tool_choice"] == "auto"

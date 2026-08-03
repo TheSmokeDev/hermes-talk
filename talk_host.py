@@ -39,16 +39,18 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 try:
-    from . import talk_apiserver, talk_auth, talk_config, talk_runs
+    from . import talk_apiserver, talk_auth, talk_config, talk_runs, talk_steer
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
     import talk_auth
     import talk_config
     import talk_runs
+    import talk_steer
 
 _log = logging.getLogger(__name__)
 
@@ -113,8 +115,14 @@ def _speakable(raw: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     except (TypeError, ValueError):
         return text.strip()[:limit]
     if isinstance(parsed, dict):
-        if parsed.get("success") is False:
-            return f"that failed: {parsed.get('error') or 'no reason given'}"[:limit]
+        # A bare {"error": ...} envelope (the registry's universal failure
+        # shape) must read as failure even without a success key — otherwise
+        # a refusal gets a success prefix bolted in front of it downstream.
+        error = parsed.get("error")
+        if parsed.get("success") is False or (
+            parsed.get("success") is not True and isinstance(error, str) and error.strip()
+        ):
+            return f"that failed: {error or 'no reason given'}"[:limit]
         for key in ("result", "output", "transcript", "content", "message"):
             value = parsed.get(key)
             if isinstance(value, str) and value.strip():
@@ -187,19 +195,30 @@ def _detached_agent_worker(task: str, binary: str) -> Any:
         # No `env=`: the child inherits this process's environment verbatim,
         # so HERMES_HOME (and the rest of the operator's config) resolves to
         # exactly what the voice session itself is using.
-        completed = subprocess.run(
+        #
+        # Popen (not subprocess.run) so the handle can be RETAINED — that
+        # handle is the detached lane's only stop channel (stop_work →
+        # talk_runs.terminate_process). run() would discard it.
+        process = subprocess.Popen(
             agent_argv(binary, task, profile),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=talk_config.agent_timeout_s(),
-            check=False,
         )
-        stdout = (completed.stdout or "").strip()
-        if completed.returncode != 0:
-            detail = (completed.stderr or "").strip() or stdout or "no output"
-            message = f"the agent exited {completed.returncode}: {detail}"[
+        talk_runs.register_process(run_id, process)
+        try:
+            out, err = process.communicate(timeout=talk_config.agent_timeout_s())
+        except subprocess.TimeoutExpired:
+            process.kill()
+            out, err = process.communicate()
+        finally:
+            talk_runs.release_process(run_id)
+        stdout = (out or "").strip()
+        if process.returncode != 0:
+            detail = (err or "").strip() or stdout or "no output"
+            message = f"the agent exited {process.returncode}: {detail}"[
                 -talk_runs.HISTORY_OUTPUT_CAP :
             ]
             # Mark it failed HERE rather than raising: an exception would put
@@ -227,9 +246,16 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
     def worker(run_id: int) -> str:
         talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
         try:
-            return talk_apiserver.run_to_completion(task, session_id=session_id)[
-                : talk_runs.HISTORY_OUTPUT_CAP
-            ]
+            return talk_apiserver.run_to_completion(
+                task,
+                session_id=session_id,
+                # The remote id is stop_work's only address for this run —
+                # without it the lane is stop-capable in theory and
+                # unstoppable in practice.
+                on_start=lambda api_run_id: talk_runs.annotate_run(
+                    run_id, api_run_id=api_run_id
+                ),
+            )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
             message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
             talk_runs.finish_run(run_id, "failed", message)
@@ -546,58 +572,163 @@ class HostAdapter:
         )
 
 
-    def steer_run(self, target: str, text: str) -> str:
-        """Redirect a RUNNING background job without stopping it.
+    def steer_agent(self, agent_id: str, text: str) -> str:
+        """Queue a redirection note into a RUNNING delegated child.
 
-        Only one of the three delegation lanes can carry a steer, so the other
-        two name the reason instead of failing quietly:
+        The substrate contract this wording obeys: ``AIAgent.steer()`` is a
+        QUEUE WRITE — ``True`` means queued, never delivered. Delivery has its
+        own artifact (the drain INFO line, watched by :mod:`talk_steer`), so
+        the call-time sentence claims queueing only and the ledger upgrades
+        it to "landed" when the artifact fires.
 
-        1. **Attached** — the child is live in this process. Preferred path is
-           the host's own ``steer_subagent`` tool; on an install that predates
-           it (hermes-agent#76805) we resolve the same registry ourselves,
-           because ``AIAgent.steer()`` and ``_active_subagents`` have both
-           shipped in ``main`` far longer than the tool that addresses a child
-           by id.
-        2. **api_server** — ``/v1/runs/{id}`` exposes ``stop`` and nothing
-           else. A run there can be killed, never redirected.
-        3. **detached ``hermes -z``** — a one-shot process with no inbound
-           channel at all.
+        The ladder, most sanctioned first:
 
-        Steering is not interrupting. The text arrives at the agent AFTER its
-        next tool call, so a job already past its final tool call finishes
-        without ever seeing it — which is why the reply says "passed it along"
-        rather than promising the agent acted on it.
+        1. ``delegate_tool.steer_subagent()`` when the host has it — the
+           public module function from hermes-agent#76805 (`hasattr`-gated;
+           merge day is a silent upgrade).
+        2. The registry bridge (:func:`_steer_via_registry`) — one guarded
+           read of the host's delegation registry, then the PUBLIC
+           ``AIAgent.steer()``.
+
+        Run NUMBERS are the api_server/detached lanes, which have no steer
+        channel at all — those refuse with the one thing they CAN do (a real
+        ``stop_work``).
         """
 
         text = (text or "").strip()
         if not text:
-            return "I need something to tell it before I can redirect it."
+            return "I need the note itself before I can pass it along."
 
         # A bare number is a talk_runs id — the api_server and detached lanes.
-        # Resolve it FIRST so those get their own lane-specific refusal rather
+        # Resolve it FIRST so those get their lane-specific refusal rather
         # than being tried as a subagent id and coming back "no such job".
-        run = _registry_run(target)
+        run = _registry_run(agent_id)
         if run is not None:
             return _unsteerable_run(run)
 
-        ctx = get_ctx()
-        if ctx is None:
+        module = _delegation_module()
+        if module is None:
             return (
-                "I can't redirect that from here — I'm running outside a Hermes "
-                "agent, so there's no live job in this process to reach."
+                "This Hermes build doesn't let me redirect running work — "
+                "I can stop it instead."
             )
 
+        steer = getattr(module, "steer_subagent", None)
+        if callable(steer):
+            try:
+                accepted = bool(steer(agent_id, text))
+            except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+                return f"I couldn't get that through: {type(exc).__name__}: {exc}"
+            if not accepted:
+                # steer_subagent() False = unknown id / no live agent — the
+                # child already finished and unregistered, or never existed.
+                # (Empty text was rejected above, so that's not this.)
+                return (
+                    f"I don't see a running job called {agent_id}. "
+                    "Want me to list what's running?"
+                )
+            return _queued_reply(agent_id, text)
+
+        # The host predates steer_subagent. Same registry, resolved here.
+        return _steer_via_registry(agent_id, text)
+
+    def list_agents(self) -> str:
+        """Everything running or recent, tagged with what each can do.
+
+        Discovery-first steering: the model resolves "the research one" HERE,
+        against ids that exist right now, instead of reconstructing an id it
+        heard once. Children come from the host's delegation registry
+        (steerable); runs come from :mod:`talk_runs` (stop-only lanes).
+        """
+
+        lines: list[str] = []
+        module = _delegation_module()
+        if module is not None:
+            try:
+                children = module.list_active_subagents()
+            except Exception as exc:  # noqa: BLE001 — a listing is never fatal
+                _log.debug("list_active_subagents failed: %s", exc)
+                children = []
+            for child in children:
+                sid = child.get("subagent_id")
+                goal = str(child.get("goal") or "")[:60]
+                age = ""
+                started = child.get("started_at")
+                if isinstance(started, (int, float)):
+                    age = f", {max(0, int(time.time() - started))}s in"
+                last_tool = child.get("last_tool")
+                doing = f", running {last_tool}" if last_tool else ""
+                lines.append(f"{sid} — {goal}{age}{doing} (can steer or stop)")
+        for run in talk_runs.list_runs(limit=8, include_history=True):
+            meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+            lane = meta.get("lane")
+            status = run.get("status")
+            if status == "running":
+                tag = (
+                    "stop only — api server run"
+                    if lane == LANE_API_SERVER
+                    else "stop only — detached run"
+                )
+            elif status == "lost":
+                tag = "unreachable — started before this session"
+            else:
+                tag = status
+            lines.append(f"run {run.get('runId')} — {run.get('label')} ({tag})")
+        if not lines:
+            return "Nothing is running and nothing recent has finished."
+        return "; ".join(lines)
+
+    def stop_work(self, target: str, reason: str | None = None) -> str:
+        """Stop a running job on whichever lane it lives on.
+
+        The one lifecycle verb every lane actually supports: children via the
+        host's public ``interrupt_subagent()``, api_server runs via
+        ``POST /v1/runs/{id}/stop``, detached one-shots via the retained
+        process handle. Stopping a child DROPS any queued steer note by
+        design (the host's ``clear_interrupt``), so matching receipts flip to
+        superseded rather than lingering as "queued".
+        """
+
+        target = (target or "").strip()
+        if not target:
+            return "stop_work needs to know which job to stop."
+
+        run = _registry_run(target)
+        if run is not None:
+            if run.get("status") in talk_runs.TERMINAL_STATUSES:
+                return f"run {run.get('runId')} already finished."
+            meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+            if meta.get("lane") == LANE_API_SERVER:
+                api_run_id = meta.get("api_run_id")
+                if not isinstance(api_run_id, str) or not api_run_id:
+                    return (
+                        "I can't stop that one — the api server never told me "
+                        "its run id."
+                    )
+                try:
+                    talk_apiserver.stop_run(api_run_id)
+                except talk_apiserver.TalkApiServerError as exc:
+                    return f"the stop didn't go through: {exc}"
+                return f"Stopped run {run.get('runId')}."
+            if talk_runs.terminate_process(int(run["runId"])):
+                return f"Stopped run {run.get('runId')}."
+            return (
+                "I couldn't stop that one — I don't hold a handle to its "
+                "process anymore."
+            )
+
+        module = _delegation_module()
+        interrupt = getattr(module, "interrupt_subagent", None) if module else None
+        if not callable(interrupt):
+            return "This Hermes build doesn't let me stop running work from here."
         try:
-            raw = ctx.dispatch_tool(
-                STEER_TOOL_NAME, {"subagent_id": target, "text": text}
-            )
+            stopped = bool(interrupt(target))
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"I couldn't get that through: {type(exc).__name__}: {exc}"
-        if not _agent_loop_absent(raw, STEER_TOOL_NAME):
-            return f"passed it along to {target}: {_speakable(raw)}"
-
-        # The host has no steer_subagent tool. Same registry, resolved here.
-        return _steer_via_registry(target, text)
+            return f"the stop didn't go through: {type(exc).__name__}: {exc}"
+        if not stopped:
+            return f"I don't see a running job called {target}."
+        talk_steer.mark_superseded(target)
+        return f"Stopped {target}. Anything it hadn't read yet is dropped."
 
 
 _HOST = HostAdapter()
@@ -617,8 +748,49 @@ def _registry_run(target: str) -> dict | None:
     return talk_runs.get_run(run_id)
 
 
+def _delegation_module() -> Any | None:
+    """The host's ``tools.delegate_tool`` module, or ``None`` off-host.
+
+    The ladder's single import seam: everything steer/stop touches on the
+    attached lane resolves through this one guarded lookup, so a host without
+    the module degrades to one refusal instead of scattered exceptions.
+    """
+
+    try:
+        from tools import delegate_tool  # host-only import, lazy by design
+    except Exception as exc:  # noqa: BLE001 — no Hermes tools in this process
+        _log.debug("delegation module unavailable: %s: %s", type(exc).__name__, exc)
+        return None
+    return delegate_tool
+
+
+def _queued_reply(subagent_id: str, text: str) -> str:
+    """The call-time sentence for an ACCEPTED steer — claims queueing only.
+
+    Ledgers the receipt and arms the drain watcher; "landed" is spoken later,
+    by check_work, when (and only when) the drain artifact fires.
+    """
+
+    talk_steer.record_queued(subagent_id, text)
+    watching = talk_steer.ensure_watcher()
+    if watching:
+        return (
+            f"Passed it along to {subagent_id} — it's queued for their next "
+            "step. I'll confirm when it lands."
+        )
+    return (
+        f"Passed it along to {subagent_id} — it's queued for their next step. "
+        "I can't watch for delivery on this build, so I won't know if it lands."
+    )
+
+
 def _unsteerable_run(run: dict) -> str:
-    """Why this registry run cannot be steered, in words a voice can say."""
+    """Why this registry run cannot be steered, in words a voice can say.
+
+    Every stop offered here is REAL: api_server runs stop via
+    ``POST /v1/runs/{id}/stop``, detached runs via the retained process
+    handle — both wired in :meth:`HostAdapter.stop_work`.
+    """
 
     if run.get("status") in talk_runs.TERMINAL_STATUSES:
         return (
@@ -632,14 +804,13 @@ def _unsteerable_run(run: dict) -> str:
     lane = meta.get("lane") if isinstance(meta, dict) else None
     if lane == LANE_API_SERVER:
         return (
-            f"I can't redirect run {run.get('runId')} — it's running on a Hermes "
-            "agent through the api server, and that only lets me stop a run, "
-            "not steer it. Want me to stop it and start over?"
+            f"Run {run.get('runId')} goes through the api server — I can't "
+            "pass it notes, but I can stop it and restart it with your "
+            "change. Want that?"
         )
     return (
-        f"I can't redirect run {run.get('runId')} — it's a detached one-shot "
-        "Hermes process, so there's no way to reach it once it's going. Want me "
-        "to stop it and start over?"
+        f"Run {run.get('runId')} is a detached one-shot — no way to reach it "
+        "mid-run, but I can stop it and restart with your change. Want that?"
     )
 
 
@@ -648,17 +819,16 @@ def _steer_via_registry(subagent_id: str, text: str) -> str:
 
     The bridge for installs without ``steer_subagent``. Everything it touches
     is module state inside the SAME process, so this is a lookup rather than
-    an RPC — but it is private host internals, so every step is guarded and a
-    missing piece degrades to a spoken refusal instead of an exception.
+    an RPC — one private dict read (``_active_subagents``), then the PUBLIC
+    ``AIAgent.steer()``. Every step is guarded and a missing piece degrades
+    to a spoken refusal instead of an exception.
     """
 
-    try:
-        from tools import delegate_tool  # host-only import, lazy by design
-    except Exception as exc:  # noqa: BLE001 — no Hermes tools importable here
-        _log.debug("steer bridge unavailable: %s: %s", type(exc).__name__, exc)
+    delegate_tool = _delegation_module()
+    if delegate_tool is None:
         return (
-            "I can't redirect running work on this Hermes version — it has no "
-            "steer_subagent tool and I can't reach the delegation registry."
+            "This Hermes build doesn't let me redirect running work — "
+            "I can stop it instead."
         )
 
     registry = getattr(delegate_tool, "_active_subagents", None)
@@ -698,17 +868,15 @@ def _steer_via_registry(subagent_id: str, text: str) -> str:
         return f"I couldn't get that through to {subagent_id}: {type(exc).__name__}: {exc}"
 
     if not accepted:
+        # AIAgent.steer() returns False ONLY for empty text (run_agent.py:
+        # 3218-3219) — and empty text was rejected before the ladder. So a
+        # False here is a contract change on the host side, not a state of
+        # the child; say that instead of inventing a diagnosis.
         return (
-            f"{subagent_id} didn't take it — it's most likely past its last "
-            "tool call, so it'll finish on the original brief."
+            f"That didn't go through — {subagent_id} refused the note in a "
+            "way this Hermes version shouldn't."
         )
-    # "Queued", not "done": delivery happens at the child's next tool-result
-    # boundary, and a child with no boundary left never sees it. Promising
-    # more than that is the failure mode the whole plugin is built against.
-    return (
-        f"Passed it along to {subagent_id} — it'll pick that up after its next "
-        "step."
-    )
+    return _queued_reply(subagent_id, text)
 
 
 def host() -> HostAdapter:
