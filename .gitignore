@@ -5,6 +5,11 @@ venv/
 .pytest_cache/
 .ruff_cache/
 dist/
+# The dashboard bundle is SOURCE, not a build artifact — it is hand-authored
+# and the host serves it straight from the installed plugin, so an operator
+# who clones this repo must get it. Same reason the in-tree kanban and
+# achievements plugins commit theirs.
+!dashboard/dist/
 build/
 *.egg-info/
 .env
