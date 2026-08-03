@@ -516,7 +516,7 @@
             type: "password",
             value: tokenDraft,
             placeholder: "TALK_DASHBOARD_TOKEN",
-            onInput: (e) => setTokenDraft(e.target.value),
+            onChange: (e) => setTokenDraft(e.target.value),
           }),
           h(C.Button, { onClick: saveToken }, "Use token")
         )
