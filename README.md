@@ -11,14 +11,14 @@
 Not dictation. Not read-my-reply-aloud. A conversation you can hand work to
 while it's still going:
 
-> **You:** go review taskchad.com and report back
+> **You:** audit the auth module for error-handling gaps and report back
 > **Hermes:** starting that now — run one.
-> **You:** cool, while that runs, what did we decide about the pricing page?
-> **Hermes:** *(searches your sessions)* you moved it under /plans on the 14th…
-> **You:** how's that review going?
+> **You:** while that runs — what did we decide about the retry policy?
+> **Hermes:** *(searches your past sessions)* three attempts with exponential backoff, decided on the 14th…
+> **You:** how's that audit going?
 > **Hermes:** run one's still working, about two minutes in.
 > *…later, unprompted:*
-> **Hermes:** that review finished — three things: the hero CTA 404s, …
+> **Hermes:** that audit finished — three gaps, starting with the token refresh swallowing exceptions…
 
 Three properties make that possible, and each one is the part other voice
 integrations don't have:

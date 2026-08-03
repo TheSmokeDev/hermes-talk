@@ -311,9 +311,9 @@ def test_root_model_means_no_flag(tmp_path):
 
 
 def test_root_without_a_model_and_one_usable_profile_is_detected(tmp_path):
-    _write_home(tmp_path / "home", root_model=False, profiles={"quotemotolab": True})
+    _write_home(tmp_path / "home", root_model=False, profiles={"devbox": True})
 
-    assert talk_config.detect_agent_profile() == "quotemotolab"
+    assert talk_config.detect_agent_profile() == "devbox"
 
 
 def test_two_usable_profiles_refuse_to_guess(tmp_path):
@@ -403,13 +403,13 @@ def test_argv_without_a_profile():
 
 
 def test_argv_puts_the_global_profile_flag_before_oneshot():
-    argv = talk_host.agent_argv("/bin/hermes", "do it", "quotemotolab")
+    argv = talk_host.agent_argv("/bin/hermes", "do it", "devbox")
 
-    assert argv == ["/bin/hermes", "--profile", "quotemotolab", "-z", "do it"]
+    assert argv == ["/bin/hermes", "--profile", "devbox", "-z", "do it"]
 
 
 def test_a_detected_profile_reaches_the_spawn(monkeypatch, tmp_path):
-    _write_home(tmp_path / "home", root_model=False, profiles={"quotemotolab": True})
+    _write_home(tmp_path / "home", root_model=False, profiles={"devbox": True})
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
     seen: dict = {}
 
@@ -422,13 +422,13 @@ def test_a_detected_profile_reaches_the_spawn(monkeypatch, tmp_path):
     run_id = int(talk_host.host().run_agent("go").split("#", 1)[1].split(" ", 1)[0])
     _wait_terminal(run_id)
 
-    assert seen["argv"] == [_FAKE_HERMES, "--profile", "quotemotolab", "-z", "go"]
+    assert seen["argv"] == [_FAKE_HERMES, "--profile", "devbox", "-z", "go"]
     # Recorded on the run, so check_work can say which agent actually ran.
-    assert talk_runs.get_run(run_id)["meta"]["profile"] == "quotemotolab"
+    assert talk_runs.get_run(run_id)["meta"]["profile"] == "devbox"
 
 
 def test_no_profile_needed_means_a_bare_spawn(monkeypatch, tmp_path):
-    _write_home(tmp_path / "home", root_model=True, profiles={"quotemotolab": True})
+    _write_home(tmp_path / "home", root_model=True, profiles={"devbox": True})
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
     seen: dict = {}
 
