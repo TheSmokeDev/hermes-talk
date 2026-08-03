@@ -149,8 +149,9 @@ _TOOL_STEER_AGENT: dict = {
     "description": (
         "Queue a redirection note into background work that is ALREADY "
         "RUNNING, without stopping it — 'focus on pricing instead', 'skip "
-        "the tests'. The note is QUEUED, not delivered: the agent sees it "
-        "after its current step, and delivery is confirmed separately. Never "
+        "the tests'. The note is QUEUED, not delivered: if the agent takes "
+        "another step it sees the note then, and delivery is confirmed "
+        "separately. Never "
         "say the agent already has it. Only subagent ids (like "
         "sa-0-a1b2c3d4, from list_agents) can be steered — run numbers "
         "cannot; offer stop_work for those. This never cancels work."
@@ -336,7 +337,10 @@ def _handle_check_work(arguments: dict) -> str:
     runs = talk_runs.list_runs(limit=10, include_history=True)
     lines = "; ".join(_describe_run(run) for run in runs) if runs else ""
     # Steer receipts ride along: "did my note land?" is a check_work
-    # question, and the ledger is the only place the answer lives.
+    # question, and the ledger is the only place the answer lives. First
+    # degrade notes whose child left the registry — "queued" with nobody
+    # left to drain it is exactly the overclaim the ledger exists to stop.
+    talk_host.degrade_gone_children()
     notes = talk_steer.notes_summary()
     if lines and notes:
         return f"{lines}. {notes}"

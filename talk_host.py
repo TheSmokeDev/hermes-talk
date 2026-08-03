@@ -521,7 +521,12 @@ class HostAdapter:
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
                 return f"I couldn't start that work: {type(exc).__name__}: {exc}"
             if not _agent_loop_absent(raw):
-                return f"WORK_STARTED — {_speakable(raw)}"
+                spoken = _speakable(raw)
+                if spoken.startswith("that failed"):
+                    # A host refusal (paused delegation, depth limit) must
+                    # never ride behind a WORK_STARTED prefix.
+                    return f"I couldn't start that work — {spoken}"
+                return f"WORK_STARTED — {spoken}"
 
         via_api_server = self._run_api_server_agent(prompt)
         if via_api_server is not None:
@@ -615,17 +620,21 @@ class HostAdapter:
 
         steer = getattr(module, "steer_subagent", None)
         if callable(steer):
+            # Arm the watcher BEFORE the queue write — a fast drain must
+            # not beat the handler onto the logger.
+            talk_steer.ensure_watcher()
             try:
                 accepted = bool(steer(agent_id, text))
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
                 return f"I couldn't get that through: {type(exc).__name__}: {exc}"
             if not accepted:
-                # steer_subagent() False = unknown id / no live agent — the
-                # child already finished and unregistered, or never existed.
-                # (Empty text was rejected above, so that's not this.)
+                # steer_subagent() False = unknown id, no live agent, OR a
+                # steer failure the host swallowed — it cannot distinguish.
+                # Say both possibilities instead of inventing one.
                 return (
-                    f"I don't see a running job called {agent_id}. "
-                    "Want me to list what's running?"
+                    f"That didn't take — either {agent_id} already "
+                    "finished, or the host refused the note. Want me to "
+                    "list what's running?"
                 )
             return _queued_reply(agent_id, text)
 
@@ -709,9 +718,16 @@ class HostAdapter:
                     talk_apiserver.stop_run(api_run_id)
                 except talk_apiserver.TalkApiServerError as exc:
                     return f"the stop didn't go through: {exc}"
-                return f"Stopped run {run.get('runId')}."
+                # 2xx = the server ACCEPTED the stop ("stopping"), not
+                # that the agent is gone — say the request, not the outcome.
+                return (
+                    f"Sent the stop for run {run.get('runId')} — the "
+                    "server is winding it down."
+                )
             if talk_runs.terminate_process(int(run["runId"])):
-                return f"Stopped run {run.get('runId')}."
+                # terminate() is a signal, not a wait — winding down, not
+                # proven gone.
+                return f"Sent the stop for run {run.get('runId')} — it's winding down."
             return (
                 "I couldn't stop that one — I don't hold a handle to its "
                 "process anymore."
@@ -728,7 +744,12 @@ class HostAdapter:
         if not stopped:
             return f"I don't see a running job called {target}."
         talk_steer.mark_superseded(target)
-        return f"Stopped {target}. Anything it hadn't read yet is dropped."
+        # interrupt_subagent() REQUESTS an interrupt at the next boundary —
+        # the child is stopping, not proven stopped.
+        return (
+            f"Asked {target} to stop — it winds down at its next step, "
+            "and any note it hadn't read is dropped."
+        )
 
 
 _HOST = HostAdapter()
@@ -762,6 +783,25 @@ def _delegation_module() -> Any | None:
         _log.debug("delegation module unavailable: %s: %s", type(exc).__name__, exc)
         return None
     return delegate_tool
+
+
+def degrade_gone_children() -> None:
+    """Flip queued notes to unconfirmed when their child left the registry.
+
+    A note that stays 'queued' after its agent is gone is the exact
+    overclaim the ledger exists to prevent — nobody is left to drain it.
+    """
+
+    module = _delegation_module()
+    if module is None:
+        return
+    try:
+        live = {c.get("subagent_id") for c in module.list_active_subagents()}
+    except Exception:  # noqa: BLE001 — a bookkeeping sweep is never fatal
+        return
+    for sid in talk_steer.queued_subagent_ids():
+        if sid not in live:
+            talk_steer.mark_child_gone(sid)
 
 
 def _queued_reply(subagent_id: str, text: str) -> str:
@@ -805,12 +845,13 @@ def _unsteerable_run(run: dict) -> str:
     if lane == LANE_API_SERVER:
         return (
             f"Run {run.get('runId')} goes through the api server — I can't "
-            "pass it notes, but I can stop it and restart it with your "
-            "change. Want that?"
+            "pass it notes, but I can try stopping it and restarting with "
+            "your change. Want that?"
         )
     return (
         f"Run {run.get('runId')} is a detached one-shot — no way to reach it "
-        "mid-run, but I can stop it and restart with your change. Want that?"
+        "mid-run, but I can try stopping it and restarting with your change. "
+        "Want that?"
     )
 
 

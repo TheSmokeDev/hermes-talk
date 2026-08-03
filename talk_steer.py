@@ -72,14 +72,17 @@ class _DrainWatcher(logging.Handler):
     """
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no branch
+        # The ENTIRE body is contained: this runs on the host agent's own
+        # thread mid-drain, and an exception here would surface inside the
+        # child's logging call — the one place this plugin must never break.
         try:
             message = record.getMessage()
+            if DRAIN_LINE_PREFIX not in message:
+                return
+            _, _, preview = message.partition(": ")
+            mark_landed_from_preview(preview)
         except Exception:  # noqa: BLE001 — a logging handler must never raise
             return
-        if DRAIN_LINE_PREFIX not in message:
-            return
-        _, _, preview = message.partition(": ")
-        mark_landed_from_preview(preview)
 
 
 def ensure_watcher() -> bool:
@@ -142,7 +145,11 @@ def mark_landed_from_preview(preview: str) -> int:
                 continue
             own = receipt["preview"].strip()
             head = own[: len(preview)] or own
-            if preview.startswith(head) or own in preview:
+            # Loose containment only for substantial text: a five-char
+            # note like "focus" must not match an unrelated "focus
+            # elsewhere" drain. Prefix matches stay exact.
+            loose_ok = len(own) >= 20 and own in preview
+            if preview.startswith(head) or loose_ok:
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
@@ -204,8 +211,15 @@ SPOKEN = {
     STATE_LANDED: "landed",
     STATE_UNCONFIRMED: "finished before I could confirm the note got in",
     STATE_MISSED: "never saw the note — it finished first",
-    STATE_SUPERSEDED: "stopped before the note was read",
+    STATE_SUPERSEDED: "stopped — the note may not have been read",
 }
+
+
+def queued_subagent_ids() -> set[str]:
+    """Subagent ids that still hold a queued note — the gone-sweep's input."""
+
+    with _LOCK:
+        return {r["subagent_id"] for r in _RECEIPTS if r["state"] == STATE_QUEUED}
 
 
 def notes_summary() -> str:
@@ -244,6 +258,7 @@ __all__ = [
     "mark_landed_from_preview",
     "mark_superseded",
     "notes_summary",
+    "queued_subagent_ids",
     "record_queued",
     "reset_for_tests",
 ]

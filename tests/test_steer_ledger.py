@@ -71,7 +71,7 @@ def test_child_gone_degrades_to_unconfirmed_never_landed():
 def test_stop_supersedes_queued_notes():
     talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
     talk_steer.mark_superseded("sa-0-aaaa")
-    assert "stopped before the note was read" in talk_steer.notes_summary()
+    assert "the note may not have been read" in talk_steer.notes_summary()
 
 
 def test_missed_steer_from_a_patched_host_marks_missed():

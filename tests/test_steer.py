@@ -112,7 +112,7 @@ def test_api_server_run_refuses_and_offers_a_real_stop():
         out = talk_host.host().steer_agent(str(run_id), "focus on pricing")
     finally:
         hung.set()
-    assert "api server" in out.lower() and "stop it" in out.lower()
+    assert "api server" in out.lower() and "stopping it" in out.lower()
 
 
 def test_detached_run_refuses_and_offers_a_real_stop():
@@ -121,7 +121,7 @@ def test_detached_run_refuses_and_offers_a_real_stop():
         out = talk_host.host().steer_agent(str(run_id), "focus on pricing")
     finally:
         hung.set()
-    assert "detached" in out.lower() and "stop it" in out.lower()
+    assert "detached" in out.lower() and "stopping it" in out.lower()
 
 
 def test_finished_run_says_finished():
@@ -155,7 +155,9 @@ def test_host_steer_subagent_is_preferred_and_queues(monkeypatch):
 def test_host_steer_subagent_false_means_unknown_job(monkeypatch):
     _install_host(monkeypatch, steer_subagent=lambda sid, text: False)
     out = talk_host.host().steer_agent("sa-0-gone", "x")
-    assert "don't see a running job" in out.lower()
+    # False is ambiguous on the host side (finished OR refused) — the reply
+    # must say both, not invent one diagnosis.
+    assert "already" in out.lower() and "refused" in out.lower()
     assert "list what's running" in out.lower()
 
 
@@ -244,7 +246,9 @@ def test_stop_api_server_run_uses_the_remote_id(monkeypatch):
     finally:
         hung.set()
     assert stopped == ["run-777"]
-    assert "stopped" in out.lower()
+    # A 2xx is an accepted REQUEST — the wording must not claim completion.
+    assert "sent the stop" in out.lower()
+    assert not out.lower().startswith("stopped")
 
 
 def test_stop_api_server_run_without_remote_id_refuses(monkeypatch):
@@ -281,7 +285,7 @@ def test_stop_detached_run_terminates_the_retained_handle():
     finally:
         hung.set()
     assert proc.terminated is True
-    assert "stopped" in out.lower()
+    assert "sent the stop" in out.lower()
 
 
 def test_stop_detached_run_without_handle_refuses():
@@ -297,10 +301,11 @@ def test_stop_subagent_interrupts_and_supersedes_its_notes(monkeypatch):
     _install_host(monkeypatch, interrupt_subagent=lambda sid: True)
     talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
     out = talk_host.host().stop_work("sa-0-aaaa")
-    assert "stopped sa-0-aaaa" in out.lower()
+    # interrupt_subagent REQUESTS the stop — "asked ... to stop", never done.
+    assert "asked sa-0-aaaa to stop" in out.lower()
     # A hard interrupt drops pending steer text (clear_interrupt) — the
     # ledger must not keep claiming the note is queued.
-    assert "stopped before the note was read" in talk_steer.notes_summary()
+    assert "the note may not have been read" in talk_steer.notes_summary()
 
 
 def test_stop_unknown_subagent_says_so(monkeypatch):
