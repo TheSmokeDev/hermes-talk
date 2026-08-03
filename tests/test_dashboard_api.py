@@ -147,7 +147,13 @@ def test_mint_advertises_the_full_tool_surface(minted):
     call(api.create_session, FakeRequest(body={}))
     names = [tool["name"] for tool in minted["session"]["tools"]]
 
-    assert names == ["search_memory", "delegate_task", "check_work", "talk_status"]
+    assert names == [
+        "search_memory",
+        "delegate_task",
+        "check_work",
+        "steer_run",
+        "talk_status",
+    ]
     assert minted["session"]["tool_choice"] == "auto"
 
 

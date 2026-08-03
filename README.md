@@ -58,7 +58,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 273 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 296 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 ## Auth — no API key needed if you have ChatGPT
 
@@ -179,6 +179,33 @@ silently does less than you asked:
    lane that always exists as long as `hermes` is on the PATH.
 4. None available — a refusal naming all three missing lanes.
 
+### Redirecting work that's already running
+
+Say "tell that audit to focus on the token refresh instead" and `steer_run`
+passes the note to the agent mid-run. It does not interrupt: the text reaches
+the agent **after its next tool call**, so the current step always finishes.
+A job already past its last tool call has no boundary left to receive it, and
+you're told that rather than left assuming it landed.
+
+Only the attached lane can carry a steer, and the other two say why:
+
+| Lane | Steering |
+|---|---|
+| **Attached** (`/talk`) | Yes — the child is live in this process |
+| **api-server** | No. `/v1/runs` exposes `stop` and nothing else, so it offers to stop instead |
+| **Detached `hermes -z`** | No. A one-shot process has no inbound channel at all |
+
+On the attached lane it prefers Hermes's own `steer_subagent` tool
+([hermes-agent#76805](https://github.com/NousResearch/hermes-agent/pull/76805));
+on an install that predates it, Talk resolves the same delegation registry
+itself, since `AIAgent.steer()` has shipped in `main` far longer than the tool
+that addresses a child by id. Either way a genuine host error — paused
+delegation, a depth limit — is spoken, never routed around.
+
+Distinct from Hermes's `/steer`, which redirects the agent **you're talking
+to**. This redirects a named background worker while you keep talking to
+someone else.
+
 Runs are tracked in `$HERMES_HOME/state/talk-runs.jsonl`. The work is
 detached, so ending the call does **not** stop it — but the watcher that would
 have spoken the result dies with the session, so a run from a previous session
@@ -255,7 +282,7 @@ The three that shaped everything else:
 
 ## Status
 
-v0.3 — under active development. Roadmap: run steering by voice, session-end
+v0.4 — under active development. Roadmap: `computer_use` relay, session-end
 memory debrief, gateway platform adapter.
 
 Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)

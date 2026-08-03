@@ -59,6 +59,12 @@ _log = logging.getLogger(__name__)
 MEMORY_TOOL_NAME = "session_search"
 DELEGATE_TOOL_NAME = "delegate_task"
 
+#: Hermes's child-scoped steering tool (hermes-agent#76805). Distinct from the
+#: SESSION-scoped ``/steer`` that ships today: that one redirects the agent you
+#: are talking to, this one redirects a named background child. Installs
+#: without it fall back to :func:`_steer_via_registry`.
+STEER_TOOL_NAME = "steer_subagent"
+
 MAX_TOOL_OUTPUT_CHARS = 2_000
 
 #: Errors that mean "this environment has no agent loop to delegate INTO" —
@@ -540,7 +546,169 @@ class HostAdapter:
         )
 
 
+    def steer_run(self, target: str, text: str) -> str:
+        """Redirect a RUNNING background job without stopping it.
+
+        Only one of the three delegation lanes can carry a steer, so the other
+        two name the reason instead of failing quietly:
+
+        1. **Attached** — the child is live in this process. Preferred path is
+           the host's own ``steer_subagent`` tool; on an install that predates
+           it (hermes-agent#76805) we resolve the same registry ourselves,
+           because ``AIAgent.steer()`` and ``_active_subagents`` have both
+           shipped in ``main`` far longer than the tool that addresses a child
+           by id.
+        2. **api_server** — ``/v1/runs/{id}`` exposes ``stop`` and nothing
+           else. A run there can be killed, never redirected.
+        3. **detached ``hermes -z``** — a one-shot process with no inbound
+           channel at all.
+
+        Steering is not interrupting. The text arrives at the agent AFTER its
+        next tool call, so a job already past its final tool call finishes
+        without ever seeing it — which is why the reply says "passed it along"
+        rather than promising the agent acted on it.
+        """
+
+        text = (text or "").strip()
+        if not text:
+            return "I need something to tell it before I can redirect it."
+
+        # A bare number is a talk_runs id — the api_server and detached lanes.
+        # Resolve it FIRST so those get their own lane-specific refusal rather
+        # than being tried as a subagent id and coming back "no such job".
+        run = _registry_run(target)
+        if run is not None:
+            return _unsteerable_run(run)
+
+        ctx = get_ctx()
+        if ctx is None:
+            return (
+                "I can't redirect that from here — I'm running outside a Hermes "
+                "agent, so there's no live job in this process to reach."
+            )
+
+        try:
+            raw = ctx.dispatch_tool(
+                STEER_TOOL_NAME, {"subagent_id": target, "text": text}
+            )
+        except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+            return f"I couldn't get that through: {type(exc).__name__}: {exc}"
+        if not _agent_loop_absent(raw, STEER_TOOL_NAME):
+            return f"passed it along to {target}: {_speakable(raw)}"
+
+        # The host has no steer_subagent tool. Same registry, resolved here.
+        return _steer_via_registry(target, text)
+
+
 _HOST = HostAdapter()
+
+
+def _registry_run(target: str) -> dict | None:
+    """The talk_runs record ``target`` names, or ``None`` if it names none.
+
+    Only a bare integer can be a run id. A subagent id is an opaque string and
+    must never be coerced into one.
+    """
+
+    try:
+        run_id = int(str(target).strip())
+    except (TypeError, ValueError):
+        return None
+    return talk_runs.get_run(run_id)
+
+
+def _unsteerable_run(run: dict) -> str:
+    """Why this registry run cannot be steered, in words a voice can say."""
+
+    if run.get("status") in talk_runs.TERMINAL_STATUSES:
+        return (
+            f"run {run.get('runId')} already finished, so there's nothing left "
+            "to redirect."
+        )
+    # Worker-observed facts land under ``meta`` (talk_runs.annotate_run), never
+    # at the top level — reading ``run["lane"]`` silently mislabels every
+    # api_server run as detached.
+    meta = run.get("meta")
+    lane = meta.get("lane") if isinstance(meta, dict) else None
+    if lane == LANE_API_SERVER:
+        return (
+            f"I can't redirect run {run.get('runId')} — it's running on a Hermes "
+            "agent through the api server, and that only lets me stop a run, "
+            "not steer it. Want me to stop it and start over?"
+        )
+    return (
+        f"I can't redirect run {run.get('runId')} — it's a detached one-shot "
+        "Hermes process, so there's no way to reach it once it's going. Want me "
+        "to stop it and start over?"
+    )
+
+
+def _steer_via_registry(subagent_id: str, text: str) -> str:
+    """Steer a live child by resolving Hermes's own subagent registry.
+
+    The bridge for installs without ``steer_subagent``. Everything it touches
+    is module state inside the SAME process, so this is a lookup rather than
+    an RPC — but it is private host internals, so every step is guarded and a
+    missing piece degrades to a spoken refusal instead of an exception.
+    """
+
+    try:
+        from tools import delegate_tool  # host-only import, lazy by design
+    except Exception as exc:  # noqa: BLE001 — no Hermes tools importable here
+        _log.debug("steer bridge unavailable: %s: %s", type(exc).__name__, exc)
+        return (
+            "I can't redirect running work on this Hermes version — it has no "
+            "steer_subagent tool and I can't reach the delegation registry."
+        )
+
+    registry = getattr(delegate_tool, "_active_subagents", None)
+    if not isinstance(registry, dict):
+        return (
+            "I can't redirect running work on this Hermes version — its "
+            "delegation registry isn't in the shape I know how to read."
+        )
+
+    lock = getattr(delegate_tool, "_active_subagents_lock", None)
+    if lock is not None:
+        with lock:
+            record = registry.get(subagent_id)
+            live = sorted(registry)
+    else:  # pragma: no cover - every shipped Hermes has the lock
+        record = registry.get(subagent_id)
+        live = sorted(registry)
+
+    if record is None:
+        if not live:
+            return "Nothing is running right now, so there's nothing to redirect."
+        return (
+            f"I don't have a running job called {subagent_id}. Running now: "
+            f"{', '.join(live[:5])}."
+        )
+
+    agent = record.get("agent")
+    if agent is None or not hasattr(agent, "steer"):
+        return (
+            f"I found {subagent_id} but can't reach it to redirect — it has no "
+            "live agent behind it anymore."
+        )
+
+    try:
+        accepted = bool(agent.steer(text))
+    except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+        return f"I couldn't get that through to {subagent_id}: {type(exc).__name__}: {exc}"
+
+    if not accepted:
+        return (
+            f"{subagent_id} didn't take it — it's most likely past its last "
+            "tool call, so it'll finish on the original brief."
+        )
+    # "Queued", not "done": delivery happens at the child's next tool-result
+    # boundary, and a child with no boundary left never sees it. Promising
+    # more than that is the failure mode the whole plugin is built against.
+    return (
+        f"Passed it along to {subagent_id} — it'll pick that up after its next "
+        "step."
+    )
 
 
 def host() -> HostAdapter:
@@ -559,6 +727,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
     "PROBE_SESSION_ID",
+    "STEER_TOOL_NAME",
     "HostAdapter",
     "agent_argv",
     "bind_ctx",

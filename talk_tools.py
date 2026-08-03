@@ -117,6 +117,39 @@ _TOOL_CHECK_WORK: dict = {
     },
 }
 
+_TOOL_STEER_RUN: dict = {
+    "type": "function",
+    "name": "steer_run",
+    "description": (
+        "Redirect background work that is ALREADY RUNNING, without stopping "
+        "it — 'tell it to focus on pricing instead', 'have it skip the tests'. "
+        "The note reaches the agent after its next step, so say you passed it "
+        "along rather than that it is done. This never cancels work: if the "
+        "user wants something stopped, say so instead of calling this."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": (
+                    "Which job to redirect — the subagent id you were given "
+                    "when the work started, or a run number."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": (
+                    "The redirection, written to the agent doing the work. It "
+                    "never sees this conversation, so make it stand alone."
+                ),
+            },
+        },
+        "required": ["target", "text"],
+        "additionalProperties": False,
+    },
+}
+
 _TOOL_TALK_STATUS: dict = {
     "type": "function",
     "name": "talk_status",
@@ -160,7 +193,13 @@ def default_talk_tools() -> list[dict]:
     """The tool set advertised to a new Talk session (fresh copies per call)."""
 
     return copy.deepcopy(
-        [_TOOL_SEARCH_MEMORY, _TOOL_DELEGATE_TASK, _TOOL_CHECK_WORK, _TOOL_TALK_STATUS]
+        [
+            _TOOL_SEARCH_MEMORY,
+            _TOOL_DELEGATE_TASK,
+            _TOOL_CHECK_WORK,
+            _TOOL_STEER_RUN,
+            _TOOL_TALK_STATUS,
+        ]
     )
 
 
@@ -245,6 +284,16 @@ def _handle_check_work(arguments: dict) -> str:
     return "; ".join(_describe_run(run) for run in runs)
 
 
+def _handle_steer_run(arguments: dict) -> str:
+    target = str(arguments.get("target") or "").strip()
+    if not target:
+        return "steer_run needs to know which job to redirect."
+    text = str(arguments.get("text") or "").strip()
+    if not text:
+        return "steer_run needs something to tell it."
+    return talk_host.host().steer_run(target, text)
+
+
 def _identity_summary() -> dict[str, int]:
     """Resolved identity sections as ``{NAME: char_count}``. Never content.
 
@@ -294,6 +343,7 @@ _HANDLERS = {
     "search_memory": _handle_search_memory,
     "delegate_task": _handle_delegate_task,
     "check_work": _handle_check_work,
+    "steer_run": _handle_steer_run,
     "talk_status": _handle_talk_status,
 }
 
