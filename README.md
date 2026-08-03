@@ -92,6 +92,10 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
 ## Dashboard tab
 
+![The Talk tab running inside the Hermes dashboard — a live voice session with background runs landing beside it (8× speed)](docs/dashboard.gif)
+
+*Real session in the Hermes dashboard, 8× speed. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.3.0)*
+
 The same session in a browser. Start the dashboard and Talk appears as a tab:
 
 ```bash
