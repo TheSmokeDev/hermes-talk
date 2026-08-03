@@ -37,6 +37,7 @@ try:
         talk_config,
         talk_host,
         talk_identity,
+        talk_lifecycle,
         talk_runs,
         talk_tools,
         talk_wire,
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_config
     import talk_host
     import talk_identity
+    import talk_lifecycle
     import talk_runs
     import talk_tools
     import talk_wire
@@ -125,6 +127,59 @@ def run_finished_messages(run: dict) -> list[dict]:
                     {
                         "type": "input_text",
                         "text": f"Background run #{run.get('runId')} {verb}{detail}",
+                    }
+                ],
+            },
+        },
+        {"type": "response.create"},
+    ]
+
+
+#: ``child_status`` → the verb the model is prompted with. Values from
+#: ``tools/delegate_tool.py`` completion entries on the 0.20 host; anything
+#: unrecognized falls back to "finished" plus the raw status in parentheses —
+#: never silence, never an invented outcome.
+_SUBAGENT_STOP_VERBS = {
+    "ok": "finished",
+    "error": "failed",
+    "timeout": "timed out",
+    "interrupted": "was stopped",
+}
+
+
+def subagent_stop_messages(event: dict) -> list[dict]:
+    """The wire messages that make the model SPEAK a finished child's result.
+
+    Same user-turn shape as :func:`run_finished_messages`, for the same
+    reason: a background completion is new information arriving from outside
+    the conversation. The event comes from :mod:`talk_lifecycle`'s
+    ``subagent_stop`` hook, already filtered to top-level children.
+    """
+
+    subagent_id = str(event.get("subagent_id") or "")
+    if not subagent_id:
+        return []
+    status = str(event.get("status") or "").strip().lower()
+    verb = _SUBAGENT_STOP_VERBS.get(status)
+    if verb is None:
+        verb = f"finished ({status})" if status else "finished"
+    role = str(event.get("role") or "").strip()
+    role_part = f" ({role})" if role else ""
+    tail = str(event.get("summary") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
+    detail = f": {tail}" if tail else " with no summary"
+    return [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Background agent {subagent_id}{role_part} "
+                            f"{verb}{detail}"
+                        ),
                     }
                 ],
             },
@@ -333,20 +388,50 @@ async def run_talk_session() -> int:
                         if event.get("type") == "response.done":
                             print(flush=True)
 
+                announcements: set[asyncio.Task] = set()
+
+                def on_subagent_event(event: dict) -> None:
+                    """Speak a finished child. Runs ON the loop thread —
+                    :mod:`talk_lifecycle` marshals hook threads here via
+                    ``call_soon_threadsafe``; this only schedules the send."""
+
+                    async def _announce() -> None:
+                        try:
+                            for out in subagent_stop_messages(event):
+                                await ws.send_json(out)
+                        except Exception:  # noqa: BLE001 — a closing socket must
+                            # never surface back into the host's hook bus.
+                            pass
+
+                    task = loop.create_task(_announce())
+                    announcements.add(task)
+                    task.add_done_callback(announcements.discard)
+
+                loop = asyncio.get_running_loop()
+                talk_lifecycle.attach_session(loop, on_subagent_event)
+
                 sender = asyncio.create_task(send_microphone())
                 try:
                     await receive_events()
                 finally:
+                    talk_lifecycle.detach_session()
                     sender.cancel()
                     for watcher in watchers:
                         watcher.cancel()
-                    await asyncio.gather(sender, *watchers, return_exceptions=True)
+                    for announcement in list(announcements):
+                        announcement.cancel()
+                    await asyncio.gather(
+                        sender, *watchers, *announcements, return_exceptions=True
+                    )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
         print(f"\ntalk: session ended: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
+        # Idempotent belt for the inner detach: no exit path may leave the
+        # hook bus holding a callback into a dead session's loop.
+        talk_lifecycle.detach_session()
         audio.stop()
 
     return 0
@@ -390,4 +475,5 @@ __all__ = [
     "run_talk_session",
     "setup_cli",
     "started_run_ids",
+    "subagent_stop_messages",
 ]

@@ -2,21 +2,48 @@
 
 The substrate fact this module exists for: ``AIAgent.steer()`` is a queue
 write. It returns ``True`` for any non-empty text and says nothing about
-delivery. The only positive delivery artifact in the host is the INFO line
-the drain emits on the ``run_agent`` module logger::
+delivery. The host has exactly two positive delivery artifacts, and this
+module watches both:
 
-    "Delivered /steer to agent after tool batch (%d chars): %s"
+1. The post-tool-batch drain — an INFO line on the ``run_agent`` module
+   logger (``agent/agent_runtime_helpers.py:3959-3963`` on the 0.20 host)::
 
-(agent_runtime_helpers.py:3889-3893 — the preview is the first 120 chars of
-the JOINED pending text). Delegate children run as threads of THIS process,
-so a logging.Handler attached to that module's logger sees the line live.
+       "Delivered /steer to agent after tool batch (%d chars): %s"
+
+   The preview is the first 120 chars of the JOINED pending text. Notes are
+   matched by the correlation token each wire text carries (exact), with the
+   v0.5 text-prefix match kept as the tokenless fallback.
+
+2. The pre-API-call drain — a DEBUG line on ``agent.conversation_loop``'s
+   logger (``agent/conversation_loop.py:1505`` on the 0.20 host)::
+
+       "Pre-API-call steer drain: injected into tool msg at index %d"
+
+   This line fires ONLY on the injected path (the no-tool-message put-back
+   path stays silent), carries no text, and names no agent. Attribution
+   comes from the emitting frame instead: the handler runs synchronously on
+   the draining child's own thread, so the conversation-loop frame holding
+   the ``agent`` local is on the stack, and identity against the agent
+   reference captured at steer time is exact. Visibility is forced by
+   lowering ONLY that module's logger to DEBUG, with a gate filter that
+   drops its other DEBUG records so operator log output is unchanged
+   (except the drain line itself, which is rare and informative).
+
+Delegate children run as threads of THIS process, so logging handlers
+attached to those module loggers see both lines live.
 
 So a note has exactly these knowable states:
 
 - ``queued``      — ``steer()`` accepted it. The only call-time claim.
-- ``landed``      — the drain line matched this receipt. Positive-only:
-                    the pre-API drain logs at DEBUG on a different logger,
-                    so ABSENCE of a match never proves absence of delivery.
+- ``landed``      — a drain artifact matched this receipt. Positive-only:
+                    absence of a match never proves absence of delivery
+                    (the pre-API put-back path is silent by design).
+- ``redirected``  — ``AIAgent.redirect()`` returned True on a live turn.
+                    The artifact is the return value itself: the model
+                    request was aborted (or Codex accepted a native steer),
+                    so the correction applies to the CURRENT step. The
+                    model-request path emits no Delivered line — this state
+                    never waits on one.
 - ``unconfirmed`` — the child is gone and no landing was observed.
 - ``missed``      — the host's completion entry carried the note back as
                     undelivered (``missed_steer`` — present only on hosts
@@ -33,20 +60,37 @@ exception on the voice path, and never a claim without its artifact.
 from __future__ import annotations
 
 import logging
+import re
+import sys
 import threading
 import time
 import uuid
+import weakref
 
 _log = logging.getLogger(__name__)
 
-#: The stable prefix of the drain line (agent_runtime_helpers.py:3889).
+#: The stable prefix of the post-tool-batch drain line
+#: (agent_runtime_helpers.py:3959).
 DRAIN_LINE_PREFIX = "Delivered /steer to agent after tool batch"
+
+#: The stable prefix of the pre-API-call drain line (conversation_loop.py:1505).
+#: Only the INJECTED branch logs — the put-back branch is silent, which is
+#: exactly why this line (and not a ``_drain_pending_steer`` wrapper) is the
+#: truthful delivery artifact.
+PRE_API_LINE_PREFIX = "Pre-API-call steer drain: injected"
 
 #: The drain preview carries at most this many chars of the joined text.
 DRAIN_PREVIEW_CHARS = 120
 
+#: Correlation tokens ride the wire text as ``[tk-xxxxxxxx] <note>``. Short
+#: enough that a token always survives the 120-char preview truncation of the
+#: FIRST note in a batch; unique enough that two live notes can never collide
+#: the way free text can (the v0.5 false-positive bound, hermes-talk#1).
+_TOKEN_RE = re.compile(r"\[(tk-[0-9a-f]{8})\]")
+
 STATE_QUEUED = "queued"
 STATE_LANDED = "landed"
+STATE_REDIRECTED = "redirected"
 STATE_UNCONFIRMED = "unconfirmed"
 STATE_MISSED = "missed"
 STATE_SUPERSEDED = "superseded"
@@ -58,18 +102,35 @@ _MAX_RECEIPTS = 50
 _WATCHER: _DrainWatcher | None = None
 _WATCHER_LOGGER: logging.Logger | None = None
 
+_PRE_API_WATCHER: _PreApiDrainWatcher | None = None
+_PRE_API_LOGGER: logging.Logger | None = None
+_PRE_API_GATE: _DebugGate | None = None
+_PRE_API_PREV_LEVEL: int | None = None
+
+
+def new_token() -> str:
+    """A fresh correlation token for one steered note."""
+
+    return f"tk-{uuid.uuid4().hex[:8]}"
+
+
+def compose_wire_text(token: str, text: str) -> str:
+    """The note as it goes over the wire — token first, so the drain
+    preview's truncation can never cut it off the oldest note in a batch."""
+
+    return f"[{token}] {text}"
+
 
 class _DrainWatcher(logging.Handler):
-    """Flips queued receipts to ``landed`` when the drain line fires.
+    """Flips queued receipts to ``landed`` when the post-tool drain line fires.
 
-    The line does not name WHICH agent drained, so matching is text-based:
-    a receipt lands when its own preview prefix-matches the drained preview.
-    Steers queued before one drain concatenate with newlines, so the joined
-    preview's FIRST segment is the oldest note — a match on it lands every
-    receipt queued at or before that moment (the whole batch drained
-    together). A text collision between two live steers flips both; that is
-    a false POSITIVE bound, accepted because the state is advisory and the
-    alternative (an id in the log line) needs a core edit.
+    The line does not name WHICH agent drained, so matching is token-first:
+    a receipt lands when its correlation token appears in the drained
+    preview (exact). The v0.5 text match stays as the tokenless fallback —
+    prefix matches stay exact, loose containment only for substantial text.
+    Steers queued before one drain concatenate with newlines, so a match on
+    any receipt lands every queued receipt for that same agent (the whole
+    batch drained together).
     """
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no branch
@@ -86,12 +147,81 @@ class _DrainWatcher(logging.Handler):
             return
 
 
+class _PreApiDrainWatcher(logging.Handler):
+    """Flips queued receipts to ``landed`` when the pre-API drain line fires.
+
+    The line carries no text and no agent id, so attribution is by frame:
+    ``emit`` runs synchronously on the draining child's thread, inside the
+    conversation-loop call that holds the ``agent`` local. Identity against
+    the reference captured at steer time is exact — no text heuristics. A
+    stack that doesn't yield the agent flips nothing: positive-only, the
+    receipt stays queued and terminates ``unconfirmed`` at worst, exactly
+    the v0.5 behaviour.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no branch
+        try:
+            if PRE_API_LINE_PREFIX not in record.getMessage():
+                return
+            agent = _draining_agent_from_stack()
+            if agent is None:
+                return
+            mark_landed_for_agent(agent)
+        except Exception:  # noqa: BLE001 — a logging handler must never raise
+            return
+
+
+class _DebugGate(logging.Filter):
+    """Keeps our forced-DEBUG private.
+
+    Present ONLY when this module lowered ``agent.conversation_loop``'s
+    level itself (operator level was above DEBUG). DEBUG records other than
+    the drain line are dropped at the logger, so they never reach the
+    operator's handlers — the observable log output stays what the
+    operator's own level implies, plus the rare drain line. When the
+    operator already runs DEBUG, this filter is never installed and nothing
+    is suppressed.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno > logging.DEBUG:
+            return True
+        try:
+            return PRE_API_LINE_PREFIX in record.getMessage()
+        except Exception:  # noqa: BLE001 — never make logging worse
+            return True
+
+
+def _draining_agent_from_stack() -> object | None:
+    """The ``agent`` local of the conversation-loop frame below us, if any.
+
+    CPython-specific by design (the host supports CPython only): the logging
+    call stack at ``emit`` time still contains the frame that called
+    ``logger.debug``, and on the pre-API drain path that frame is inside
+    ``agent/conversation_loop.py`` with the draining agent as a local.
+    """
+
+    try:
+        frame = sys._getframe(1)
+    except Exception:  # noqa: BLE001 — no frame introspection, no attribution
+        return None
+    depth = 0
+    while frame is not None and depth < 30:
+        if frame.f_code.co_filename.endswith("conversation_loop.py"):
+            candidate = frame.f_locals.get("agent")
+            if candidate is not None and hasattr(candidate, "_drain_pending_steer"):
+                return candidate
+        frame = frame.f_back
+        depth += 1
+    return None
+
+
 def ensure_watcher() -> bool:
     """Attach the drain watcher to the host's ``run_agent`` logger. Idempotent.
 
-    Returns ``True`` when the watcher is live. ``False`` means every steer
-    will terminate as ``unconfirmed`` at best — callers surface that in
-    status, not as an error.
+    Returns ``True`` when the watcher is live. ``False`` means the
+    post-tool-batch artifact is invisible in this process — callers surface
+    that in status, not as an error.
     """
 
     global _WATCHER
@@ -118,22 +248,112 @@ def ensure_watcher() -> bool:
     return _watcher_effective(logger)
 
 
+def ensure_pre_api_watcher() -> bool:
+    """Attach the pre-API drain watcher to ``agent.conversation_loop``.
+
+    Idempotent. Unlike :func:`ensure_watcher`, a ``True`` here is always
+    effective: when the module logger's effective level is above DEBUG we
+    lower it ourselves and install :class:`_DebugGate` so only the drain
+    line escapes at that level. ``False`` means no host module in this
+    process — the pre-API artifact is simply unavailable.
+    """
+
+    global _PRE_API_WATCHER, _PRE_API_LOGGER, _PRE_API_GATE, _PRE_API_PREV_LEVEL
+    try:
+        from agent import conversation_loop
+    except Exception:  # noqa: BLE001 — no host in this process
+        return False
+    logger = getattr(conversation_loop, "logger", None)
+    if not isinstance(logger, logging.Logger):
+        return False
+    with _LOCK:
+        for handler in logger.handlers:
+            if isinstance(handler, _PreApiDrainWatcher):
+                _PRE_API_WATCHER = handler
+                _PRE_API_LOGGER = logger
+                return True
+        watcher = _PreApiDrainWatcher(level=logging.DEBUG)
+        if logger.getEffectiveLevel() > logging.DEBUG:
+            _PRE_API_PREV_LEVEL = logger.level
+            gate = _DebugGate()
+            logger.addFilter(gate)
+            _PRE_API_GATE = gate
+            logger.setLevel(logging.DEBUG)
+        logger.addHandler(watcher)
+        _PRE_API_WATCHER = watcher
+        _PRE_API_LOGGER = logger
+    return True
+
+
 def _watcher_effective(logger: logging.Logger) -> bool:
     """The handler only ever fires if the logger emits INFO records at all."""
 
     return logger.getEffectiveLevel() <= logging.INFO
 
 
-def record_queued(subagent_id: str, text: str) -> str:
-    """Ledger a successfully queued steer. Returns the receipt id."""
-
-    receipt = {
+def _make_receipt(
+    subagent_id: str,
+    text: str,
+    state: str,
+    token: str | None,
+    agent: object | None,
+) -> dict:
+    agent_ref = None
+    if agent is not None:
+        try:
+            agent_ref = weakref.ref(agent)
+        except TypeError:  # non-weakref-able stub — attribution just degrades
+            agent_ref = None
+    return {
         "id": uuid.uuid4().hex[:8],
         "subagent_id": subagent_id,
         "preview": text[:DRAIN_PREVIEW_CHARS],
-        "state": STATE_QUEUED,
+        "state": state,
+        "token": token,
+        "agent_ref": agent_ref,
         "ts": time.time(),
     }
+
+
+def record_queued(
+    subagent_id: str,
+    text: str,
+    *,
+    token: str | None = None,
+    agent: object | None = None,
+) -> str:
+    """Ledger a successfully queued steer. Returns the receipt id.
+
+    ``text`` is the WIRE text (token included) — every downstream artifact
+    (drain preview, ``missed_steer``) quotes what was actually queued.
+    ``agent`` is the live AIAgent behind the id when the caller could
+    resolve one; it is held weakly and used only for pre-API attribution.
+    """
+
+    receipt = _make_receipt(subagent_id, text, STATE_QUEUED, token, agent)
+    with _LOCK:
+        _RECEIPTS.append(receipt)
+        del _RECEIPTS[:-_MAX_RECEIPTS]
+    return receipt["id"]
+
+
+def record_redirected(
+    subagent_id: str,
+    text: str,
+    *,
+    token: str | None = None,
+    agent: object | None = None,
+) -> str:
+    """Ledger an accepted redirect. Returns the receipt id.
+
+    The artifact is ``AIAgent.redirect()``'s return value — True on a live
+    turn means the in-flight model request was aborted with the correction
+    stashed for the retry (or Codex accepted a native turn/steer). No log
+    line exists on that path, so this state is terminal at call time and
+    never waits on a drain artifact.
+    """
+
+    receipt = _make_receipt(subagent_id, text, STATE_REDIRECTED, token, agent)
     with _LOCK:
         _RECEIPTS.append(receipt)
         del _RECEIPTS[:-_MAX_RECEIPTS]
@@ -146,17 +366,26 @@ def mark_landed_from_preview(preview: str) -> int:
     preview = (preview or "").strip()
     if not preview:
         return 0
+    tokens = set(_TOKEN_RE.findall(preview))
     flipped = 0
     with _LOCK:
         matched_agents: set[str] = set()
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:
                 continue
+            token = receipt.get("token")
+            if token is not None and token in tokens:
+                receipt["state"] = STATE_LANDED
+                flipped += 1
+                matched_agents.add(receipt["subagent_id"])
+                continue
             own = receipt["preview"].strip()
             head = own[: len(preview)] or own
             # Loose containment only for substantial text: a five-char
             # note like "focus" must not match an unrelated "focus
-            # elsewhere" drain. Prefix matches stay exact.
+            # elsewhere" drain. Prefix matches stay exact. Tokenized
+            # receipts reaching this fallback are still collision-proof —
+            # the token is part of the text being matched.
             loose_ok = len(own) >= 20 and own in preview
             if preview.startswith(head) or loose_ok:
                 receipt["state"] = STATE_LANDED
@@ -165,8 +394,42 @@ def mark_landed_from_preview(preview: str) -> int:
         if matched_agents:
             # Steers concatenate WITHIN one agent's pending queue and drain
             # as a single batch — so a match on any receipt lands every
-            # queued receipt for that same agent, even ones whose text the
-            # 120-char preview truncated away.
+            # queued receipt for that same agent, even ones whose text (and
+            # token) the 120-char preview truncated away.
+            for receipt in _RECEIPTS:
+                if (
+                    receipt["state"] == STATE_QUEUED
+                    and receipt["subagent_id"] in matched_agents
+                ):
+                    receipt["state"] = STATE_LANDED
+                    flipped += 1
+    return flipped
+
+
+def mark_landed_for_agent(agent: object) -> int:
+    """Land queued receipts held against this live agent. Returns count.
+
+    The pre-API drain empties the ENTIRE pending queue for one agent, so a
+    hit lands every queued receipt attributed to it — by captured reference
+    first (exact), then by subagent id for receipts recorded without one
+    (same batch, same agent).
+    """
+
+    if agent is None:
+        return 0
+    flipped = 0
+    with _LOCK:
+        matched_agents: set[str] = set()
+        for receipt in _RECEIPTS:
+            if receipt["state"] != STATE_QUEUED:
+                continue
+            ref = receipt.get("agent_ref")
+            target = ref() if ref is not None else None
+            if target is not None and target is agent:
+                receipt["state"] = STATE_LANDED
+                flipped += 1
+                matched_agents.add(receipt["subagent_id"])
+        if matched_agents:
             for receipt in _RECEIPTS:
                 if (
                     receipt["state"] == STATE_QUEUED
@@ -218,6 +481,7 @@ def apply_missed_steer(subagent_id: str, entry: dict) -> bool:
 SPOKEN = {
     STATE_QUEUED: "queued — I'll confirm when it lands",
     STATE_LANDED: "landed",
+    STATE_REDIRECTED: "redirected — it took the correction mid-step",
     STATE_UNCONFIRMED: "finished before I could confirm the note got in",
     STATE_MISSED: "never saw the note — it finished first",
     STATE_SUPERSEDED: "stopped — the note may not have been read",
@@ -247,6 +511,7 @@ def notes_summary() -> str:
 
 def reset_for_tests() -> None:
     global _WATCHER, _WATCHER_LOGGER
+    global _PRE_API_WATCHER, _PRE_API_LOGGER, _PRE_API_GATE, _PRE_API_PREV_LEVEL
     with _LOCK:
         _RECEIPTS.clear()
     if _WATCHER is not None and _WATCHER_LOGGER is not None:
@@ -255,24 +520,43 @@ def reset_for_tests() -> None:
         _WATCHER_LOGGER.removeHandler(_WATCHER)
     _WATCHER = None
     _WATCHER_LOGGER = None
+    if _PRE_API_LOGGER is not None:
+        if _PRE_API_WATCHER is not None:
+            _PRE_API_LOGGER.removeHandler(_PRE_API_WATCHER)
+        if _PRE_API_GATE is not None:
+            _PRE_API_LOGGER.removeFilter(_PRE_API_GATE)
+        if _PRE_API_PREV_LEVEL is not None:
+            # Restore the level we found — including NOTSET(0).
+            _PRE_API_LOGGER.setLevel(_PRE_API_PREV_LEVEL)
+    _PRE_API_WATCHER = None
+    _PRE_API_LOGGER = None
+    _PRE_API_GATE = None
+    _PRE_API_PREV_LEVEL = None
 
 
 __all__ = [
     "DRAIN_LINE_PREFIX",
     "DRAIN_PREVIEW_CHARS",
+    "PRE_API_LINE_PREFIX",
     "SPOKEN",
     "STATE_LANDED",
     "STATE_MISSED",
     "STATE_QUEUED",
+    "STATE_REDIRECTED",
     "STATE_SUPERSEDED",
     "STATE_UNCONFIRMED",
     "apply_missed_steer",
+    "compose_wire_text",
+    "ensure_pre_api_watcher",
     "ensure_watcher",
     "mark_child_gone",
+    "mark_landed_for_agent",
     "mark_landed_from_preview",
     "mark_superseded",
+    "new_token",
     "notes_summary",
     "queued_subagent_ids",
     "record_queued",
+    "record_redirected",
     "reset_for_tests",
 ]

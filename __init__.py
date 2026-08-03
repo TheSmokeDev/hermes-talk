@@ -1,8 +1,9 @@
 """hermes-talk — OpenAI Realtime speech-to-speech voice for Hermes Agent.
 
-``register(ctx)`` wires four surfaces: the ``hermes talk`` CLI command, the
-``/talk`` slash command, a session-end hook, and (when the host exposes the
-provider ABCs) OpenAI TTS/STT backends.
+``register(ctx)`` wires five surfaces: the ``hermes talk`` CLI command, the
+``/talk`` slash command, lifecycle hooks (session end plus the v0.6
+subagent start/stop pair that powers push-based run control), and (when the
+host exposes the provider ABCs) OpenAI TTS/STT backends.
 
 Each registration is guarded on its own. One surface Hermes does not expose —
 an older host, a partial install — must not take the other three down with it;
@@ -16,10 +17,11 @@ import asyncio
 import logging
 
 try:
-    from . import talk_cli, talk_host, talk_providers, talk_tools
+    from . import talk_cli, talk_host, talk_lifecycle, talk_providers, talk_tools
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
     import talk_host
+    import talk_lifecycle
     import talk_providers
     import talk_tools
 
@@ -94,6 +96,20 @@ def register(ctx) -> None:
         ctx.register_hook("on_session_end", _on_session_end)
     except Exception as exc:  # noqa: BLE001
         _record("session-end hook", exc)
+
+    # Push-based child lifecycle (v0.6): ledger degrades and in-call
+    # announcements ride the host's own subagent hooks instead of waiting
+    # for the next check_work sweep. Each registration guarded on its own —
+    # a host without these hook names keeps every other surface.
+    try:
+        ctx.register_hook("subagent_start", talk_lifecycle.on_subagent_start)
+    except Exception as exc:  # noqa: BLE001
+        _record("subagent-start hook", exc)
+
+    try:
+        ctx.register_hook("subagent_stop", talk_lifecycle.on_subagent_stop)
+    except Exception as exc:  # noqa: BLE001
+        _record("subagent-stop hook", exc)
 
     if talk_providers.providers_available():
         try:

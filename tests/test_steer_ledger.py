@@ -1,16 +1,19 @@
-"""The steer receipt ledger and the drain watcher.
+"""The steer receipt ledger and the drain watchers.
 
 What is being proved: every state transition rides a REAL artifact — the
-drain INFO line for ``landed``, registry disappearance for ``unconfirmed``,
-a patched host's ``missed_steer`` for ``missed`` — and absence of evidence
-never upgrades a claim.
+post-tool drain INFO line or the pre-API drain DEBUG line for ``landed``,
+``AIAgent.redirect()``'s return value for ``redirected``, registry
+disappearance for ``unconfirmed``, a patched host's ``missed_steer`` for
+``missed`` — and absence of evidence never upgrades a claim.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import types
+import uuid
 
 import pytest
 
@@ -140,3 +143,213 @@ def test_watcher_ignores_unrelated_log_lines(monkeypatch):
     talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
     logger.info("Something else entirely: focus on pricing")
     assert "queued" in talk_steer.notes_summary()
+
+
+# -- correlation tokens (hermes-talk#1) ---------------------------------------
+
+
+def test_new_token_shape_and_composition():
+    token = talk_steer.new_token()
+    assert re.fullmatch(r"tk-[0-9a-f]{8}", token)
+    assert (
+        talk_steer.compose_wire_text(token, "focus on pricing")
+        == f"[{token}] focus on pricing"
+    )
+
+
+def test_identical_notes_on_two_agents_land_only_by_token():
+    # THE false positive the token exists to kill (Kimi's v0.5 condition):
+    # two live agents holding the SAME >=20-char note must not land each
+    # other when one of them drains.
+    note = "refocus the whole investigation on pricing"
+    token_a = talk_steer.new_token()
+    token_b = talk_steer.new_token()
+    talk_steer.record_queued(
+        "sa-0-aaaa", talk_steer.compose_wire_text(token_a, note), token=token_a
+    )
+    talk_steer.record_queued(
+        "sa-1-bbbb", talk_steer.compose_wire_text(token_b, note), token=token_b
+    )
+    preview = talk_steer.compose_wire_text(token_a, note)[
+        : talk_steer.DRAIN_PREVIEW_CHARS
+    ]
+    assert talk_steer.mark_landed_from_preview(preview) == 1
+    summary = talk_steer.notes_summary()
+    assert "note to sa-0-aaaa: landed" in summary
+    assert "note to sa-1-bbbb: queued" in summary
+
+
+def test_token_match_still_batch_lands_the_same_agents_later_notes():
+    # One agent, two notes queued before one drain: the joined preview only
+    # shows the FIRST token, but the whole batch drained together.
+    token_a = talk_steer.new_token()
+    token_b = talk_steer.new_token()
+    talk_steer.record_queued(
+        "sa-0-aaaa",
+        talk_steer.compose_wire_text(token_a, "first note about auth"),
+        token=token_a,
+    )
+    talk_steer.record_queued(
+        "sa-0-aaaa",
+        talk_steer.compose_wire_text(token_b, "second note far past the preview"),
+        token=token_b,
+    )
+    preview = talk_steer.compose_wire_text(token_a, "first note about auth")[
+        : talk_steer.DRAIN_PREVIEW_CHARS
+    ]
+    assert talk_steer.mark_landed_from_preview(preview) == 2
+
+
+# -- the redirected state (return-value artifact) -----------------------------
+
+
+def test_redirected_is_recorded_and_spoken():
+    talk_steer.record_redirected("sa-0-aaaa", "[tk-00000000] wrong repo")
+    assert "redirected — it took the correction mid-step" in talk_steer.notes_summary()
+
+
+def test_redirected_is_not_downgraded_by_gone_or_stop():
+    # The claim came from the return value at call time; a later stop or
+    # registry disappearance says nothing about it.
+    talk_steer.record_redirected("sa-0-aaaa", "[tk-00000000] wrong repo")
+    talk_steer.mark_child_gone("sa-0-aaaa")
+    talk_steer.mark_superseded("sa-0-aaaa")
+    assert "redirected" in talk_steer.notes_summary()
+    assert "sa-0-aaaa" not in talk_steer.queued_subagent_ids()
+
+
+# -- the pre-API drain watcher ------------------------------------------------
+
+
+class _Steerable:
+    """The minimum shape the frame-walker accepts as a draining agent."""
+
+    def _drain_pending_steer(self):
+        return None
+
+
+#: A function whose code object CLAIMS to live in conversation_loop.py, with
+#: the draining agent in a local named ``agent`` — exactly the frame the
+#: walker keys on. ``exec``/``compile`` is the only way to fake a filename.
+_FAKE_DRAIN_SRC = """
+def fake_pre_api_drain(logger, agent):
+    logger.debug("Pre-API-call steer drain: injected into tool msg at index %d", 2)
+"""
+
+
+def _make_fake_drain():
+    namespace: dict = {}
+    code = compile(_FAKE_DRAIN_SRC, "/hermes/agent/conversation_loop.py", "exec")
+    exec(code, namespace)  # test fixture, fixed source
+    return namespace["fake_pre_api_drain"]
+
+
+def _fake_conversation_loop(monkeypatch, level=logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(f"fake-conv-loop-{uuid.uuid4().hex[:8]}")
+    logger.setLevel(level)
+    module = types.ModuleType("agent.conversation_loop")
+    module.logger = logger
+    package = types.ModuleType("agent")
+    package.conversation_loop = module
+    monkeypatch.setitem(sys.modules, "agent", package)
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", module)
+    return logger
+
+
+class _Recorder(logging.Handler):
+    """What actually escapes the logger to downstream handlers."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_pre_api_drain_lands_by_agent_identity(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch)
+    agent = _Steerable()
+    assert talk_steer.ensure_pre_api_watcher() is True
+    token = talk_steer.new_token()
+    talk_steer.record_queued(
+        "sa-0-aaaa",
+        talk_steer.compose_wire_text(token, "note that never sees a tool batch"),
+        token=token,
+        agent=agent,
+    )
+    _make_fake_drain()(logger, agent)
+    assert "landed" in talk_steer.notes_summary()
+
+
+def test_pre_api_drain_for_another_agent_flips_nothing(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch)
+    mine = _Steerable()
+    talk_steer.ensure_pre_api_watcher()
+    token = talk_steer.new_token()
+    talk_steer.record_queued(
+        "sa-0-aaaa",
+        talk_steer.compose_wire_text(token, "note that never sees a tool batch"),
+        token=token,
+        agent=mine,
+    )
+    _make_fake_drain()(logger, _Steerable())  # somebody else drained
+    assert "queued" in talk_steer.notes_summary()
+
+
+def test_pre_api_batch_lands_same_agent_receipts_without_a_ref():
+    # The pre-API drain empties the agent's WHOLE queue — receipts recorded
+    # without an agent ref still flip when a sibling receipt attributes the
+    # drain to their subagent id.
+    agent = _Steerable()
+    talk_steer.record_queued("sa-0-aaaa", "with a ref", agent=agent)
+    talk_steer.record_queued("sa-0-aaaa", "without a ref")
+    assert talk_steer.mark_landed_for_agent(agent) == 2
+
+
+def test_pre_api_watcher_forces_debug_but_gates_other_lines(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch, level=logging.INFO)
+    recorder = _Recorder()
+    logger.addHandler(recorder)
+    assert talk_steer.ensure_pre_api_watcher() is True
+    logger.debug("some hot-path debug chatter")
+    assert recorder.messages == []  # gated: the operator's level still rules
+    logger.info("a normal INFO line")
+    assert recorder.messages == ["a normal INFO line"]
+    logger.debug("Pre-API-call steer drain: injected into tool msg at index %d", 1)
+    assert recorder.messages[-1].startswith("Pre-API-call steer drain: injected")
+    logger.removeHandler(recorder)
+
+
+def test_pre_api_watcher_leaves_an_operator_debug_level_alone(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch, level=logging.DEBUG)
+    recorder = _Recorder()
+    logger.addHandler(recorder)
+    assert talk_steer.ensure_pre_api_watcher() is True
+    logger.debug("operator debugging line")
+    assert recorder.messages == ["operator debugging line"]  # no gate installed
+    logger.removeHandler(recorder)
+
+
+def test_pre_api_watcher_absent_host_returns_false(monkeypatch):
+    monkeypatch.setitem(sys.modules, "agent", None)
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", None)
+    assert talk_steer.ensure_pre_api_watcher() is False
+
+
+def test_pre_api_watcher_is_idempotent(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch)
+    assert talk_steer.ensure_pre_api_watcher() is True
+    assert talk_steer.ensure_pre_api_watcher() is True
+    assert len(logger.handlers) == 1
+    assert len(logger.filters) == 1
+
+
+def test_reset_restores_the_borrowed_logger_exactly(monkeypatch):
+    logger = _fake_conversation_loop(monkeypatch, level=logging.INFO)
+    talk_steer.ensure_pre_api_watcher()
+    assert logger.level == logging.DEBUG
+    talk_steer.reset_for_tests()
+    assert logger.level == logging.INFO
+    assert logger.handlers == []
+    assert logger.filters == []

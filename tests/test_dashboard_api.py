@@ -153,6 +153,7 @@ def test_mint_advertises_the_full_tool_surface(minted):
         "check_work",
         "list_agents",
         "steer_agent",
+        "redirect_agent",
         "stop_work",
         "talk_status",
     ]

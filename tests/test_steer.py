@@ -11,6 +11,7 @@ install, no processes, no network.
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
 import types
@@ -147,7 +148,10 @@ def test_host_steer_subagent_is_preferred_and_queues(monkeypatch):
 
     _install_host(monkeypatch, steer_subagent=steer_subagent)
     out = talk_host.host().steer_agent("sa-0-aaaa", "focus on pricing")
-    assert calls == [("sa-0-aaaa", "focus on pricing")]
+    # The wire text leads with the correlation token (hermes-talk#1); the
+    # note itself rides behind it, verbatim.
+    assert len(calls) == 1 and calls[0][0] == "sa-0-aaaa"
+    assert re.fullmatch(r"\[tk-[0-9a-f]{8}\] focus on pricing", calls[0][1])
     assert "queued for their next step" in out.lower()
     assert "landed" not in out.split("—")[0].lower()  # call-time claim is queue-only
 
@@ -183,7 +187,8 @@ def test_bridge_steers_and_records_a_receipt(monkeypatch):
     agent = _FakeAgent()
     _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
     out = talk_host.host().steer_agent("sa-0-aaaa", "focus on pricing")
-    assert agent.steered == ["focus on pricing"]
+    assert len(agent.steered) == 1
+    assert re.fullmatch(r"\[tk-[0-9a-f]{8}\] focus on pricing", agent.steered[0])
     assert "queued for their next step" in out.lower()
     assert "sa-0-aaaa" in talk_steer.notes_summary()
 
@@ -350,12 +355,161 @@ def test_list_agents_empty_everywhere(monkeypatch):
     assert "nothing is running" in out.lower()
 
 
+# -- redirect_agent -----------------------------------------------------------
+
+
+class _FakeRedirectAgent(_FakeAgent):
+    """A 0.20-shaped child: public ``redirect()`` beside ``steer()``."""
+
+    def __init__(
+        self,
+        *,
+        redirect_accepted=True,
+        executing_tools=False,
+        redirect_raises=None,
+        steer_accepted=True,
+    ):
+        super().__init__(accepted=steer_accepted)
+        self.redirect_accepted = redirect_accepted
+        self.redirect_raises = redirect_raises
+        self._executing_tools = executing_tools
+        self.redirected: list[str] = []
+
+    def redirect(self, text: str) -> bool:
+        if self.redirect_raises is not None:
+            raise self.redirect_raises
+        self.redirected.append(text)
+        return self.redirect_accepted
+
+
+def test_redirect_empty_text_is_refused():
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "  ")
+    assert "the correction itself" in out.lower()
+
+
+def test_redirect_run_number_refuses_with_lane_wording():
+    run_id, hung = _running_run(talk_host.LANE_API_SERVER)
+    try:
+        out = talk_host.host().redirect_agent(str(run_id), "wrong repo")
+    finally:
+        hung.set()
+    assert "api server" in out.lower()
+
+
+def test_redirect_without_host_module_refuses(monkeypatch):
+    _install_host(monkeypatch, absent=True)
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "doesn't let me redirect" in out.lower()
+
+
+def test_redirect_accepted_mid_thought_claims_redirected(monkeypatch):
+    agent = _FakeRedirectAgent()
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo, use taskchad-ship")
+    assert "redirect accepted" in out.lower()
+    # The wire text leads with the correlation token — both verbs share it.
+    assert len(agent.redirected) == 1
+    assert re.fullmatch(
+        r"\[tk-[0-9a-f]{8}\] wrong repo, use taskchad-ship", agent.redirected[0]
+    )
+    assert "redirected" in talk_steer.notes_summary()
+
+
+def test_redirect_mid_tool_speaks_queued_not_redirected(monkeypatch):
+    # The host degrades a mid-tool redirect to steer() — the truthful claim
+    # is queued-language, upgraded later by the drain artifacts.
+    agent = _FakeRedirectAgent(executing_tools=True)
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "mid-tool" in out.lower()
+    assert "queued" in talk_steer.notes_summary()
+    assert "redirected" not in talk_steer.notes_summary()
+
+
+def test_redirect_false_falls_back_to_the_steer_queue(monkeypatch):
+    agent = _FakeRedirectAgent(redirect_accepted=False)
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "queued the correction as a note" in out.lower()
+    assert len(agent.steered) == 1  # the fallback reused the SAME wire text
+    assert "queued" in talk_steer.notes_summary()
+
+
+def test_redirect_false_with_a_dead_steer_says_finished(monkeypatch):
+    agent = _FakeRedirectAgent(redirect_accepted=False, steer_accepted=False)
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "may have just finished" in out.lower()
+    assert talk_steer.notes_summary() == ""  # no claim without an artifact
+
+
+def test_redirect_raising_is_spoken(monkeypatch):
+    agent = _FakeRedirectAgent(redirect_raises=RuntimeError("child died"))
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "RuntimeError" in out
+
+
+def test_redirect_unknown_id_lists_the_live_ones(monkeypatch):
+    _install_host(
+        monkeypatch,
+        {"sa-0-aaaa": {"agent": _FakeRedirectAgent()}},
+    )
+    out = talk_host.host().redirect_agent("sa-9-zzzz", "x")
+    assert "sa-0-aaaa" in out
+
+
+def test_redirect_empty_registry_says_nothing_running(monkeypatch):
+    _install_host(monkeypatch, {})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "x")
+    assert "nothing is running" in out.lower()
+
+
+def test_redirect_dead_record_refuses(monkeypatch):
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": None}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "x")
+    assert "no live agent" in out.lower()
+
+
+def test_redirect_wrong_registry_shape_refuses(monkeypatch):
+    module = _install_host(monkeypatch, {})
+    del module._active_subagents
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "x")
+    assert "isn't in the shape" in out.lower()
+
+
+def test_redirect_on_a_pre_020_host_degrades_to_steer(monkeypatch):
+    # A registry child WITHOUT redirect() — the correction still travels,
+    # through the steer queue, and the reply says queued (never redirected).
+    agent = _FakeAgent()
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    assert "queued for their next step" in out.lower()
+    assert len(agent.steered) == 1
+
+
+def test_redirect_tool_layer_requires_agent_id_and_text():
+    assert "list_agents" in talk_tools.execute_talk_tool("redirect_agent", {"text": "x"})
+    assert "correction itself" in talk_tools.execute_talk_tool(
+        "redirect_agent", {"agent_id": "sa-0-aaaa"}
+    )
+
+
+def test_redirect_description_scopes_the_verb():
+    schema = next(
+        t for t in talk_tools.default_talk_tools() if t["name"] == "redirect_agent"
+    )
+    text = schema["description"].lower()
+    assert "stronger than steer_agent" in text
+    assert "never cancels" in text
+
+
 # -- the advertised surface ---------------------------------------------------
 
 
 def test_the_three_tools_are_advertised():
     names = [tool["name"] for tool in talk_tools.default_talk_tools()]
-    for name in ("list_agents", "steer_agent", "stop_work"):
+    for name in ("list_agents", "steer_agent", "redirect_agent", "stop_work"):
         assert name in names
     assert "steer_run" not in names
 

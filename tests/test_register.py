@@ -110,7 +110,11 @@ def test_register_wires_every_surface(plugin, monkeypatch):
     assert ctx.cli_commands["talk"]["handler_fn"] is plugin.talk_cli.cli_entry
     assert "talk" in ctx.commands
     assert callable(ctx.commands["talk"]["handler"])
-    assert [name for name, _ in ctx.hooks] == ["on_session_end"]
+    assert [name for name, _ in ctx.hooks] == [
+        "on_session_end",
+        "subagent_start",
+        "subagent_stop",
+    ]
     assert len(ctx.tts_providers) == 1
     assert len(ctx.stt_providers) == 1
     assert plugin.REGISTRATION_FAILURES == []
@@ -144,7 +148,8 @@ def test_every_surface_failing_is_recorded_separately(plugin, monkeypatch):
 
     plugin.register(ctx)
 
-    assert len(plugin.REGISTRATION_FAILURES) == 5
+    # cli + slash + three hooks + tts + stt, each recorded on its own line.
+    assert len(plugin.REGISTRATION_FAILURES) == 7
     assert plugin.talk_host.get_ctx() is ctx
 
 

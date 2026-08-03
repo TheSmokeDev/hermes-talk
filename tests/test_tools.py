@@ -49,6 +49,7 @@ def test_default_tools_are_fresh_copies():
         "check_work",
         "list_agents",
         "steer_agent",
+        "redirect_agent",
         "stop_work",
         "talk_status",
     ]

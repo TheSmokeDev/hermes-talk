@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import types
 
 import talk_audio
 import talk_cli
@@ -74,6 +75,84 @@ def test_missing_audio_stack_exits_one_before_dialling(monkeypatch, capsys):
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
     assert "hermes-talk[audio]" in capsys.readouterr().err
+
+
+def test_subagent_stop_messages_are_a_user_turn_with_the_summary():
+    messages = talk_cli.subagent_stop_messages(
+        {
+            "subagent_id": "sa-0-aaaa",
+            "role": "researcher",
+            "status": "ok",
+            "summary": "found three issues",
+        }
+    )
+    assert len(messages) == 2
+    item = messages[0]["item"]
+    assert item["role"] == "user"  # new information from OUTSIDE the call
+    text = item["content"][0]["text"]
+    assert "sa-0-aaaa" in text
+    assert "(researcher)" in text
+    assert "finished" in text
+    assert "found three issues" in text
+    assert messages[1] == {"type": "response.create"}
+
+
+def test_subagent_stop_messages_verbs_track_the_host_statuses():
+    def text_for(status):
+        return talk_cli.subagent_stop_messages(
+            {"subagent_id": "sa-0-aaaa", "status": status, "summary": ""}
+        )[0]["item"]["content"][0]["text"]
+
+    assert "failed" in text_for("error")
+    assert "timed out" in text_for("timeout")
+    assert "was stopped" in text_for("interrupted")
+    # An unknown status is spoken raw, never guessed into an outcome.
+    assert "finished (weird)" in text_for("weird")
+    assert "with no summary" in text_for("ok")
+
+
+def test_subagent_stop_messages_without_an_id_say_nothing():
+    assert talk_cli.subagent_stop_messages({}) == []
+
+
+def test_subagent_stop_messages_cap_the_summary_tail():
+    long_summary = "x" * (talk_cli.WATCH_OUTPUT_TAIL_CHARS + 500)
+    text = talk_cli.subagent_stop_messages(
+        {"subagent_id": "sa-0-aaaa", "status": "ok", "summary": long_summary}
+    )[0]["item"]["content"][0]["text"]
+    assert len(text) < talk_cli.WATCH_OUTPUT_TAIL_CHARS + 200
+
+
+def test_session_always_detaches_the_lifecycle_target(monkeypatch, capsys):
+    # A session that dies mid-dial must not leave the hook bus holding a
+    # callback into a dead loop — the outer finally owns the belt.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", lambda _self: None)
+    monkeypatch.setattr(talk_audio.DuplexAudio, "stop", lambda _self: None)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+
+    class _DeadClientSession:
+        def __init__(self, *a, **k):
+            raise RuntimeError("no network in tests")
+
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(ClientSession=_DeadClientSession),
+    )
+    detached: list[bool] = []
+    monkeypatch.setattr(
+        talk_cli.talk_lifecycle, "detach_session", lambda: detached.append(True)
+    )
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+    assert detached  # the belt ran
+    assert "no network in tests" in capsys.readouterr().err
 
 
 def test_keyboard_interrupt_hangs_up_cleanly(monkeypatch, capsys):

@@ -178,6 +178,41 @@ _TOOL_STEER_AGENT: dict = {
     },
 }
 
+_TOOL_REDIRECT_AGENT: dict = {
+    "type": "function",
+    "name": "redirect_agent",
+    "description": (
+        "Interrupt background work's CURRENT step and re-aim it right now — "
+        "stronger than steer_agent, for corrections that can't wait ('stop, "
+        "wrong repo', 'abandon that approach'). The agent keeps everything "
+        "it already finished; only its in-flight thinking is dropped and "
+        "retried with the correction. If it's mid-tool the correction lands "
+        "when the tool finishes. Only subagent ids (from list_agents) can "
+        "be redirected — run numbers cannot. This never cancels the work; "
+        "use stop_work for that."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "agent_id": {
+                "type": "string",
+                "description": (
+                    "The subagent id from list_agents. Not a run number."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": (
+                    "The correction, written to the agent doing the work. It "
+                    "never sees this conversation, so make it stand alone."
+                ),
+            },
+        },
+        "required": ["agent_id", "text"],
+        "additionalProperties": False,
+    },
+}
+
 _TOOL_STOP_WORK: dict = {
     "type": "function",
     "name": "stop_work",
@@ -253,6 +288,7 @@ def default_talk_tools() -> list[dict]:
             _TOOL_CHECK_WORK,
             _TOOL_LIST_AGENTS,
             _TOOL_STEER_AGENT,
+            _TOOL_REDIRECT_AGENT,
             _TOOL_STOP_WORK,
             _TOOL_TALK_STATUS,
         ]
@@ -365,6 +401,16 @@ def _handle_steer_agent(arguments: dict) -> str:
     return talk_host.host().steer_agent(agent_id, text)
 
 
+def _handle_redirect_agent(arguments: dict) -> str:
+    agent_id = str(arguments.get("agent_id") or "").strip()
+    if not agent_id:
+        return "redirect_agent needs the subagent id — call list_agents first."
+    text = str(arguments.get("text") or "").strip()
+    if not text:
+        return "redirect_agent needs the correction itself."
+    return talk_host.host().redirect_agent(agent_id, text)
+
+
 def _handle_stop_work(arguments: dict) -> str:
     target = str(arguments.get("target") or "").strip()
     if not target:
@@ -424,6 +470,7 @@ _HANDLERS = {
     "check_work": _handle_check_work,
     "list_agents": _handle_list_agents,
     "steer_agent": _handle_steer_agent,
+    "redirect_agent": _handle_redirect_agent,
     "stop_work": _handle_stop_work,
     "talk_status": _handle_talk_status,
 }

@@ -586,6 +586,11 @@ class HostAdapter:
         the call-time sentence claims queueing only and the ledger upgrades
         it to "landed" when the artifact fires.
 
+        The wire text carries a correlation token (``[tk-xxxxxxxx] note``,
+        hermes-talk#1): the drain preview quotes the joined wire text, so the
+        ledger matches on the token exactly instead of on free text — two
+        live notes with identical wording can no longer land each other.
+
         The ladder, most sanctioned first:
 
         1. ``delegate_tool.steer_subagent()`` when the host has it — the
@@ -618,13 +623,18 @@ class HostAdapter:
                 "I can stop it instead."
             )
 
+        token = talk_steer.new_token()
+        wire_text = talk_steer.compose_wire_text(token, text)
+
+        # Arm BOTH watchers BEFORE the queue write, whichever rung takes it —
+        # a fast drain must not beat the handlers onto the loggers.
+        talk_steer.ensure_watcher()
+        talk_steer.ensure_pre_api_watcher()
+
         steer = getattr(module, "steer_subagent", None)
         if callable(steer):
-            # Arm the watcher BEFORE the queue write — a fast drain must
-            # not beat the handler onto the logger.
-            talk_steer.ensure_watcher()
             try:
-                accepted = bool(steer(agent_id, text))
+                accepted = bool(steer(agent_id, wire_text))
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
                 return f"I couldn't get that through: {type(exc).__name__}: {exc}"
             if not accepted:
@@ -636,10 +646,126 @@ class HostAdapter:
                     "finished, or the host refused the note. Want me to "
                     "list what's running?"
                 )
-            return _queued_reply(agent_id, text)
+            return _queued_reply(
+                agent_id, wire_text, token=token, agent=_registry_agent(agent_id)
+            )
 
         # The host predates steer_subagent. Same registry, resolved here.
-        return _steer_via_registry(agent_id, text)
+        return _steer_via_registry(agent_id, wire_text, token=token)
+
+    def redirect_agent(self, agent_id: str, text: str) -> str:
+        """Interrupt a RUNNING child's current step and re-aim it now.
+
+        Stronger than :meth:`steer_agent`: ``AIAgent.redirect()`` (public on
+        the 0.20 host, run_agent.py:3257) aborts the in-flight model request
+        and applies the correction on the retry — or hands it to Codex's
+        native turn/steer — instead of waiting for the next tool boundary.
+        Mid-tool it degrades to ``steer()`` inside the host, so the tool
+        finishes at a safe boundary.
+
+        The receipt comes from the RETURN VALUE, not a log line: the
+        model-request path emits no Delivered line, so ``True`` is itself
+        the artifact (request aborted, correction stashed for the retry).
+        The one wording fork is advisory: ``_executing_tools`` peeked before
+        the call decides whether to speak queued-language (the degrade path,
+        drain artifacts still confirm) or redirected-language. The peek can
+        race the host's state; both failure modes UNDER-claim (a delivered
+        correction spoken as queued), never over.
+
+        ``False`` means no live turn — the correction falls back to the
+        steer queue, spoken as exactly that.
+        """
+
+        text = (text or "").strip()
+        if not text:
+            return "I need the correction itself before I can redirect."
+
+        run = _registry_run(agent_id)
+        if run is not None:
+            return _unsteerable_run(run)
+
+        module = _delegation_module()
+        if module is None:
+            return (
+                "This Hermes build doesn't let me redirect running work — "
+                "I can stop it instead."
+            )
+
+        record, live = _registry_record(agent_id)
+        if record is _NO_REGISTRY:
+            return (
+                "I can't redirect running work on this Hermes version — its "
+                "delegation registry isn't in the shape I know how to read."
+            )
+        if record is None:
+            if not live:
+                return "Nothing is running right now, so there's nothing to redirect."
+            return (
+                f"I don't have a running job called {agent_id}. Running now: "
+                f"{', '.join(live[:5])}."
+            )
+        agent = record.get("agent") if isinstance(record, dict) else None
+        if agent is None:
+            return (
+                f"I found {agent_id} but can't reach it to redirect — it has "
+                "no live agent behind it anymore."
+            )
+        if not callable(getattr(agent, "redirect", None)):
+            # Pre-0.20 host: no hard redirect exists. The steer queue is the
+            # honest fallback, and steer_agent's own sentence says queued.
+            return self.steer_agent(agent_id, text)
+
+        token = talk_steer.new_token()
+        wire_text = talk_steer.compose_wire_text(token, text)
+
+        # Advisory peek for WORDING only — the claim itself comes from the
+        # return value either way.
+        executing_tools = bool(getattr(agent, "_executing_tools", False))
+
+        talk_steer.ensure_watcher()
+        talk_steer.ensure_pre_api_watcher()
+
+        try:
+            accepted = bool(agent.redirect(wire_text))
+        except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+            return (
+                f"I couldn't get that through to {agent_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if not accepted:
+            # No live turn to redirect (redirect() rejects between turns and
+            # during teardown). Fall back to the steer queue so the
+            # correction still reaches the next step.
+            try:
+                queued = bool(agent.steer(wire_text)) if hasattr(agent, "steer") else False
+            except Exception:  # noqa: BLE001 — fallback must not raise past the verb
+                queued = False
+            if queued:
+                talk_steer.record_queued(agent_id, wire_text, token=token, agent=agent)
+                return (
+                    f"{agent_id} wasn't mid-thought just then, so I queued the "
+                    "correction as a note for its next step instead."
+                )
+            return (
+                f"That didn't take — {agent_id} may have just finished. "
+                "Want me to list what's running?"
+            )
+
+        if executing_tools:
+            # The host degraded the redirect to a steer at the tool boundary.
+            # Same queue, same drain artifacts, same honest queued claim.
+            talk_steer.record_queued(agent_id, wire_text, token=token, agent=agent)
+            return (
+                f"{agent_id} is mid-tool, so the correction lands the moment "
+                "the tool finishes — I'll confirm when it does."
+            )
+
+        talk_steer.record_redirected(agent_id, wire_text, token=token, agent=agent)
+        return (
+            f"Redirect accepted — {agent_id} drops what it was doing and "
+            "takes the correction now."
+        )
 
     def list_agents(self) -> str:
         """Everything running or recent, tagged with what each can do.
@@ -804,15 +930,23 @@ def degrade_gone_children() -> None:
             talk_steer.mark_child_gone(sid)
 
 
-def _queued_reply(subagent_id: str, text: str) -> str:
+def _queued_reply(
+    subagent_id: str,
+    wire_text: str,
+    *,
+    token: str | None = None,
+    agent: object | None = None,
+) -> str:
     """The call-time sentence for an ACCEPTED steer — claims queueing only.
 
-    Ledgers the receipt and arms the drain watcher; "landed" is spoken later,
-    by check_work, when (and only when) the drain artifact fires.
+    Ledgers the receipt (wire text, so every artifact quotes what was
+    actually queued) and reports whether ANY delivery artifact is watchable;
+    "landed" is spoken later, by check_work, when (and only when) a drain
+    artifact fires.
     """
 
-    talk_steer.record_queued(subagent_id, text)
-    watching = talk_steer.ensure_watcher()
+    talk_steer.record_queued(subagent_id, wire_text, token=token, agent=agent)
+    watching = talk_steer.ensure_watcher() or talk_steer.ensure_pre_api_watcher()
     if watching:
         return (
             f"Passed it along to {subagent_id} — it's queued for their next "
@@ -855,30 +989,27 @@ def _unsteerable_run(run: dict) -> str:
     )
 
 
-def _steer_via_registry(subagent_id: str, text: str) -> str:
-    """Steer a live child by resolving Hermes's own subagent registry.
+#: Sentinel: the delegation registry itself was unreadable — a different
+#: refusal than "this id names nothing".
+_NO_REGISTRY = object()
 
-    The bridge for installs without ``steer_subagent``. Everything it touches
-    is module state inside the SAME process, so this is a lookup rather than
-    an RPC — one private dict read (``_active_subagents``), then the PUBLIC
-    ``AIAgent.steer()``. Every step is guarded and a missing piece degrades
-    to a spoken refusal instead of an exception.
+
+def _registry_record(subagent_id: str) -> tuple[Any, list[str]]:
+    """Resolve one live-child record from the host's delegation registry.
+
+    Returns ``(record, live_ids)``. ``record`` is :data:`_NO_REGISTRY` when
+    the registry is missing or not in a readable shape, ``None`` when the id
+    names nothing. Everything it touches is module state inside the SAME
+    process — one private dict read (``_active_subagents``) under the host's
+    own lock.
     """
 
     delegate_tool = _delegation_module()
     if delegate_tool is None:
-        return (
-            "This Hermes build doesn't let me redirect running work — "
-            "I can stop it instead."
-        )
-
+        return _NO_REGISTRY, []
     registry = getattr(delegate_tool, "_active_subagents", None)
     if not isinstance(registry, dict):
-        return (
-            "I can't redirect running work on this Hermes version — its "
-            "delegation registry isn't in the shape I know how to read."
-        )
-
+        return _NO_REGISTRY, []
     lock = getattr(delegate_tool, "_active_subagents_lock", None)
     if lock is not None:
         with lock:
@@ -887,6 +1018,43 @@ def _steer_via_registry(subagent_id: str, text: str) -> str:
     else:  # pragma: no cover - every shipped Hermes has the lock
         record = registry.get(subagent_id)
         live = sorted(registry)
+    return record, live
+
+
+def _registry_agent(subagent_id: str) -> Any | None:
+    """Best-effort live AIAgent behind an id — receipt ATTRIBUTION only.
+
+    Used on the public-fn rung, where ``steer_subagent()`` resolves the
+    child itself and hands back only a bool. A failure here degrades the
+    pre-API attribution to nothing (the receipt just can't land via that
+    artifact) — it must never break the reply path.
+    """
+
+    try:
+        record, _ = _registry_record(subagent_id)
+    except Exception:  # noqa: BLE001 — attribution is optional, replies are not
+        return None
+    if record is _NO_REGISTRY or not isinstance(record, dict):
+        return None
+    return record.get("agent")
+
+
+def _steer_via_registry(subagent_id: str, wire_text: str, *, token: str | None = None) -> str:
+    """Steer a live child by resolving Hermes's own subagent registry.
+
+    The bridge for installs without ``steer_subagent``. One guarded registry
+    read (:func:`_registry_record`), then the PUBLIC ``AIAgent.steer()``.
+    Every step is guarded and a missing piece degrades to a spoken refusal
+    instead of an exception. ``wire_text`` already carries the correlation
+    token — this rung never composes.
+    """
+
+    record, live = _registry_record(subagent_id)
+    if record is _NO_REGISTRY:
+        return (
+            "I can't redirect running work on this Hermes version — its "
+            "delegation registry isn't in the shape I know how to read."
+        )
 
     if record is None:
         if not live:
@@ -896,7 +1064,7 @@ def _steer_via_registry(subagent_id: str, text: str) -> str:
             f"{', '.join(live[:5])}."
         )
 
-    agent = record.get("agent")
+    agent = record.get("agent") if isinstance(record, dict) else None
     if agent is None or not hasattr(agent, "steer"):
         return (
             f"I found {subagent_id} but can't reach it to redirect — it has no "
@@ -904,20 +1072,20 @@ def _steer_via_registry(subagent_id: str, text: str) -> str:
         )
 
     try:
-        accepted = bool(agent.steer(text))
+        accepted = bool(agent.steer(wire_text))
     except Exception as exc:  # noqa: BLE001 — the model speaks the failure
         return f"I couldn't get that through to {subagent_id}: {type(exc).__name__}: {exc}"
 
     if not accepted:
         # AIAgent.steer() returns False ONLY for empty text (run_agent.py:
-        # 3218-3219) — and empty text was rejected before the ladder. So a
+        # 3242-3243) — and empty text was rejected before the ladder. So a
         # False here is a contract change on the host side, not a state of
         # the child; say that instead of inventing a diagnosis.
         return (
             f"That didn't go through — {subagent_id} refused the note in a "
             "way this Hermes version shouldn't."
         )
-    return _queued_reply(subagent_id, text)
+    return _queued_reply(subagent_id, wire_text, token=token, agent=agent)
 
 
 def host() -> HostAdapter:
