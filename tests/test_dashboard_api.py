@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import talk_apiserver
 import talk_config
 import talk_host
 import talk_runs
@@ -279,11 +280,43 @@ def test_status_never_exposes_a_credential():
     assert body["source"] == "configured"
     assert body["model"] == talk_config.DEFAULT_TALK_MODEL
     assert body["voices"] == list(talk_config.OPENAI_REALTIME_VOICES)
-    # Out of process there is no bound plugin context, and the page says so
-    # rather than implying the agent-loop tools are live.
-    assert body["agentLoop"] is False
+    # Tri-state lane, not a bool. No plugin context is bound here and the
+    # api_server lane is inert under pytest, so the tile reads the exact string
+    # it read before the lane existed.
+    assert body["agentLoop"] == talk_host.LANE_NONE
+    assert body["agentLoop"] == "out of process"
     assert RAW_KEY not in blob
     assert CREDENTIAL_RE.search(blob) is None
+
+
+def test_status_serializes_the_api_server_lane(monkeypatch):
+    """The tile's third state — proven through the ROUTE, not just the helper."""
+
+    monkeypatch.setattr(talk_apiserver, "_lane_enabled", lambda: True)
+    monkeypatch.setattr(
+        talk_apiserver, "probe", lambda: talk_apiserver.ApiServerStatus(True, "ok", "up")
+    )
+    talk_apiserver.reset_for_tests()
+
+    body = call(api.talk_status, FakeRequest())
+
+    assert body["agentLoop"] == talk_host.LANE_API_SERVER
+    assert body["agentLoop"] == "api-server"
+    # A string, so the page must render it verbatim — the old boolean tile
+    # would have read "out of process" as truthy and shown "attached".
+    assert isinstance(body["agentLoop"], str)
+
+
+def test_status_serializes_the_attached_lane():
+    class StubCtx:
+        def dispatch_tool(self, *_args, **_kwargs):
+            return "{}"
+
+    talk_host.bind_ctx(StubCtx())
+
+    body = call(api.talk_status, FakeRequest())
+
+    assert body["agentLoop"] == talk_host.LANE_ATTACHED
 
 
 def test_status_stays_answerable_when_the_voice_is_unusable(monkeypatch):

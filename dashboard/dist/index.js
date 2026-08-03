@@ -530,8 +530,11 @@
           value: active ? "live" : starting ? "connecting" : "idle",
         }),
         h(Metric, {
+          // Tri-state string from the backend: "attached" | "api-server" |
+          // "out of process". Rendered verbatim — it was a bool before, so a
+          // truthiness test here would read "out of process" as attached.
           label: "Agent loop",
-          value: status && status.agentLoop ? "attached" : "out of process",
+          value: (status && status.agentLoop) || "…",
         })
       ),
 

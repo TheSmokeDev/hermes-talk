@@ -29,6 +29,7 @@ fallbacks there; see the README's Dashboard section.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 import sys
@@ -43,6 +44,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
+import talk_apiserver  # noqa: E402
 import talk_auth  # noqa: E402
 import talk_config  # noqa: E402
 import talk_host  # noqa: E402
@@ -174,6 +176,27 @@ async def _json_body(request) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _warm_agent_lane() -> str:
+    """Resolve the agent lane, paying for a cold probe. Worker thread only."""
+
+    talk_apiserver.warm()
+    return talk_host.host().agent_lane()
+
+
+def _mint(auth_token: str, voice: str):
+    """Assemble instructions and mint. Blocking — called on a worker thread."""
+
+    return talk_wire.mint_ephemeral_session(
+        auth_token=auth_token,
+        model=talk_config.talk_model(),
+        voice=voice,
+        instructions=talk_identity.build_instructions(
+            talk_host.host().identity_sections()
+        ),
+        tools=talk_tools.default_talk_tools(),
+    )
+
+
 def _resolve_voice(requested) -> str:
     """The voice for this session — the operator's override, or the configured one."""
 
@@ -223,9 +246,13 @@ async def talk_status(request: Request) -> dict:
         "voice": voice,
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
-        # False in the dashboard process: no plugin context is bound there, so
-        # the agent-loop-only tools take their announced fallbacks.
-        "agentLoop": talk_host.get_ctx() is not None,
+        # Tri-state, not a bool: no plugin context is ever bound in the web
+        # server process, so the only question that matters here is whether the
+        # api_server lane can reach a real agent. This route is the page's
+        # first call, which makes it the right place to PAY for the probe —
+        # off the event loop, so the tile is already right when it first
+        # paints and every later tool call reads a warm verdict.
+        "agentLoop": await asyncio.to_thread(_warm_agent_lane),
     }
 
 
@@ -246,14 +273,13 @@ async def create_session(request: Request) -> dict:
     except talk_auth.TalkAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        descriptor = talk_wire.mint_ephemeral_session(
-            auth_token=auth.token,
-            model=talk_config.talk_model(),
-            voice=voice,
-            instructions=talk_identity.build_instructions(
-                talk_host.host().identity_sections()
-            ),
-            tools=talk_tools.default_talk_tools(),
+        # Off the event loop: the mint is a 30s-timeout HTTP call and identity
+        # assembly reads files and may initialize a memory provider. On the
+        # loop, one slow mint freezes the WHOLE Hermes dashboard.
+        descriptor = await asyncio.to_thread(
+            _mint,
+            auth.token,
+            voice,
         )
     except talk_wire.TalkWireError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -275,7 +301,10 @@ async def run_tool(request: Request) -> dict:
     if not isinstance(arguments, dict):
         arguments = {}
     try:
-        output = talk_tools.execute_talk_tool(name, arguments)
+        # Off the event loop. A tool can probe the api_server, start a run, or
+        # reach a bound agent — none of that may run where the dashboard's own
+        # request loop lives.
+        output = await asyncio.to_thread(talk_tools.execute_talk_tool, name, arguments)
     except talk_tools.TalkToolError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "output": output}
