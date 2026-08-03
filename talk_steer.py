@@ -55,6 +55,12 @@ So a note has exactly these knowable states:
 Everything here is fail-open: a missing host module, a renamed logger, or an
 operator log level above INFO degrades to ``unconfirmed`` — never an
 exception on the voice path, and never a claim without its artifact.
+
+Recorded assumption (Kimi v0.6 gate): the subagent-id-based second sweep in
+:func:`mark_landed_for_agent` assumes one live agent instance per
+``subagent_id`` — true on the 0.20 host, where ids are minted per spawn. A
+host that recycles ids could false-``landed`` a ref-less receipt
+(hermes-talk#7).
 """
 
 from __future__ import annotations
