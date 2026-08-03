@@ -56,6 +56,7 @@ _RECEIPTS: list[dict] = []
 _MAX_RECEIPTS = 50
 
 _WATCHER: _DrainWatcher | None = None
+_WATCHER_LOGGER: logging.Logger | None = None
 
 
 class _DrainWatcher(logging.Handler):
@@ -101,10 +102,18 @@ def ensure_watcher() -> bool:
     logger = getattr(run_agent, "logger", None)
     if not isinstance(logger, logging.Logger):
         return False
+    global _WATCHER_LOGGER
     with _LOCK:
-        if _WATCHER is not None and _WATCHER in logger.handlers:
-            return _watcher_effective(logger)
+        # Class check, not identity: a recycled logger may still carry a
+        # watcher from a previous attach (reset never reaches foreign
+        # loggers), and identity alone would double-attach.
+        for handler in logger.handlers:
+            if isinstance(handler, _DrainWatcher):
+                _WATCHER = handler
+                _WATCHER_LOGGER = logger
+                return _watcher_effective(logger)
         _WATCHER = _DrainWatcher(level=logging.INFO)
+        _WATCHER_LOGGER = logger
         logger.addHandler(_WATCHER)
     return _watcher_effective(logger)
 
@@ -237,10 +246,15 @@ def notes_summary() -> str:
 
 
 def reset_for_tests() -> None:
-    global _WATCHER
+    global _WATCHER, _WATCHER_LOGGER
     with _LOCK:
         _RECEIPTS.clear()
+    if _WATCHER is not None and _WATCHER_LOGGER is not None:
+        # Detach, not just forget — a leaked handler on a long-lived logger
+        # is exactly the double-attach CI caught.
+        _WATCHER_LOGGER.removeHandler(_WATCHER)
     _WATCHER = None
+    _WATCHER_LOGGER = None
 
 
 __all__ = [
