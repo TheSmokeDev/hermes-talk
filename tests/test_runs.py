@@ -224,17 +224,48 @@ def _record(run_id: int, kind: str, status: str, **extra) -> str:
 
 
 def _history_records(path: Path) -> list[dict]:
+    """Read the tail the way the PRODUCT reads it, not more strictly.
+
+    ``talk_runs`` decodes with ``errors="replace"`` and parses line by line,
+    so one torn line costs that line and nothing else. A test reader that
+    decodes strictly would raise on a file the product handles fine — and it
+    did, the moment a helper started polling this file mid-run instead of
+    reading it once after compaction had already swept the bad bytes away.
+    """
+
     file = path / talk_runs._HISTORY_FILENAME
     if not file.exists():
         return []
-    return [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines()]
+    records: list[dict] = []
+    for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
+def _wait_history_terminal(path: Path, run_id: int, timeout: float = 5.0) -> list[dict]:
+    """Wait for the run's TERMINAL record to land on disk, then return its records.
+
+    ``_wait_terminal`` polls the in-memory registry, which flips to a terminal
+    status a moment BEFORE the history tee finishes writing. A test that
+    asserts on the FILE has to wait on the file: waiting on the registry
+    instead passed on one CI runner and failed on the other five.
+    """
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        mine = [r for r in _history_records(path) if r["runId"] == run_id]
+        if mine and mine[-1]["status"] in talk_runs.TERMINAL_STATUSES:
+            return mine
+        time.sleep(0.02)
+    raise AssertionError(f"run {run_id} never reached a terminal status in history")
 
 
 def test_history_tee_on_start_and_finish(history_env: Path):
     run_id = talk_runs.start_run("agent", "audit", lambda _rid: "all good")
-    _wait_terminal(run_id)
-
-    mine = [r for r in _history_records(history_env) if r["runId"] == run_id]
+    mine = _wait_history_terminal(history_env, run_id)
     assert [r["status"] for r in mine] == ["running", "done"]
     assert mine[-1]["output"] == "all good"
     assert mine[-1]["kind"] == "agent"
@@ -331,7 +362,7 @@ def test_history_compaction_keeps_newest(history_env: Path, monkeypatch):
     ids = []
     for i in range(8):
         rid = talk_runs.start_run("skill", f"run {i}", lambda _rid: "out")
-        _wait_terminal(rid)
+        _wait_history_terminal(history_env, rid)
         ids.append(rid)
 
     kept_ids = {r["runId"] for r in _history_records(history_env)}
@@ -418,7 +449,7 @@ def test_compaction_survives_invalid_utf8(history_env: Path, monkeypatch):
     ids = []
     for i in range(8):
         rid = talk_runs.start_run("skill", f"run {i}", lambda _rid: "out")
-        _wait_terminal(rid)
+        _wait_history_terminal(history_env, rid)
         ids.append(rid)
 
     kept_ids = {r["runId"] for r in _history_records(history_env)}
