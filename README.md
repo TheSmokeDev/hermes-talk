@@ -1,28 +1,66 @@
 # hermes-talk
 
-**OpenAI Realtime speech-to-speech voice for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — duplex talk with live tool calling.**
+**Realtime voice as an orchestrator for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
 
 ![hermes-talk demo — a live voice session delegating real background work (8× speed)](docs/demo.gif)
 
-*Real session, 8× speed: voice in, spoken answers, a background agent delegated mid-conversation, and its results spoken back unprompted. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.2.0) — this is a voice demo; the sound is the point.*
+*Real session, 8× speed. 🔊 [Full recording with sound](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.2.0) — this is a voice demo; the sound is the point.*
 
-Hermes has voice mode. This is different: full speech-to-speech duplex over the
-OpenAI Realtime API — you talk, it talks back, you can interrupt it
-mid-sentence — with Realtime function calls relayed live into Hermes's own
-tool surface. Ask what it remembers and you hear a real `memory` lookup.
-Tell it to kick off work and a real background agent runs while you keep
-talking.
+## What this actually is
+
+Not dictation. Not read-my-reply-aloud. A conversation you can hand work to
+while it's still going:
+
+> **You:** go review taskchad.com and report back
+> **Hermes:** starting that now — run one.
+> **You:** cool, while that runs, what did we decide about the pricing page?
+> **Hermes:** *(searches your sessions)* you moved it under /plans on the 14th…
+> **You:** how's that review going?
+> **Hermes:** run one's still working, about two minutes in.
+> *…later, unprompted:*
+> **Hermes:** that review finished — three things: the hero CTA 404s, …
+
+Three properties make that possible, and each one is the part other voice
+integrations don't have:
+
+1. **Duplex.** One bidirectional audio session — turn-taking, interruption,
+   and tool calls happen *inside* the speech layer, not around it. Cut it off
+   mid-sentence and it stops, because it never stopped listening.
+2. **Its tools are Hermes's tools.** Realtime function calls relay straight
+   into the agent's real tool surface. Ask it something it can't know and you
+   hear it go look, then answer from what it found.
+3. **Work outlives the sentence.** Delegation spawns a real background Hermes
+   agent. You keep talking. The result is spoken when it lands — you don't
+   poll, you don't wait, you don't go check a terminal.
+
+**Why this exists:** OpenAI shipped this exact pattern for Codex on 2026-07-23
+— voice as a control layer over concurrent agents. It's excellent, and it's
+closed: paid ChatGPT plans only, and GPT-Live has no developer API. Their own
+docs point builders back at the Realtime API. So that's what this is built on,
+for an agent you actually own.
+
+Hermes's built-in voice mode is good and this doesn't replace it — turn-based
+STT → inference → TTS is the right shape for plenty of work. This is the other
+shape.
 
 ## Install
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice)
+hermes talk
 ```
 
-## Auth — bring a key, or bring your ChatGPT subscription
+Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
+v0.17.0 install. 182 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
-Two lanes, resolved fail-closed in this order:
+## Auth — no API key needed if you have ChatGPT
+
+Signed into the [Codex CLI](https://github.com/openai/codex) (`codex login`)?
+Talk runs on your own ChatGPT subscription's Realtime entitlement — no key, no
+per-minute API bill. Bring a key instead if you'd rather.
+
+Resolved fail-closed in this order:
 
 1. `TALK_OPENAI_API_KEY` — a Talk-scoped API key (set-but-empty refuses, never
    falls through)
@@ -43,7 +81,8 @@ endpoint and never reaches the socket, a log line, or a client.
 hermes talk        # terminal duplex voice session
 ```
 
-or `/talk` inside an interactive Hermes session (full agent-loop tool access).
+or `/talk` inside an interactive Hermes session, which additionally reaches the
+agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
 ## Background work
 
@@ -51,7 +90,8 @@ Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
-The backend is picked in this order, and every fall-through is said out loud:
+The backend is picked in this order, and **every fall-through is said out
+loud** — the plugin never silently does less than you asked:
 
 1. **Hermes's own agent loop** — inside `/talk`, where there's a parent agent
    to delegate into.
@@ -90,10 +130,29 @@ If your model config lives in a **profile** rather than the root
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 
+## Design rules
+
+The three that shaped everything else:
+
+- **Nothing fails quietly.** A degraded backend, a missing tool, a run whose
+  watcher died — each is said out loud in the conversation. A voice surface
+  that silently does less than you asked is worse than one that refuses.
+- **The credential never leaves the process.** Key or OAuth token hits exactly
+  one OpenAI endpoint (the mint) and the socket only ever sees the ephemeral
+  secret it returns.
+- **Hermes owns the tools and the session.** The Realtime layer is ears, mouth,
+  and turn-taking. It never owns the agent loop.
+
 ## Status
 
 v0.2 — under active development. Roadmap: run steering by voice, browser
 dashboard tab, session-end memory debrief, gateway platform adapter.
+
+Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)
+proposes a `RealtimeVoiceProvider` ABC in Hermes core — four open PRs are
+building duplex voice independently, and the category deserves an interface
+rather than a merge queue. This plugin is a working reference implementation
+for that discussion, not a bid to be merged.
 
 ## License
 
