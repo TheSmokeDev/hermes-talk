@@ -23,6 +23,18 @@ from pathlib import Path
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
 DEFAULT_AGENT_TIMEOUT_S = 1_800
+
+#: Where Hermes's api_server gateway platform listens by default
+#: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
+DEFAULT_API_SERVER_URL = "http://127.0.0.1:8642"
+#: Availability probe budget. Tight on purpose: this runs inside a tool call,
+#: and a tool call runs on the same event loop as the microphone.
+DEFAULT_API_SERVER_PROBE_TIMEOUT_S = 1.5
+#: How long a probe verdict is trusted. A stale-but-present verdict is served
+#: immediately and refreshed off the hot path, so only a COLD probe can wait.
+DEFAULT_API_SERVER_PROBE_TTL_S = 30.0
+#: Poll interval while waiting on a /v1/runs run inside a worker thread.
+DEFAULT_API_SERVER_POLL_S = 1.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -245,6 +257,66 @@ def agent_timeout_s() -> int:
     return DEFAULT_AGENT_TIMEOUT_S
 
 
+def _positive_float(name: str, default: float) -> float:
+    """A positive float knob. Junk and non-positive values take the default."""
+
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return default
+        if parsed > 0:
+            return parsed
+    return default
+
+
+def api_server_url() -> str:
+    """Base URL of the Hermes api_server gateway platform, no trailing slash."""
+
+    raw = (os.environ.get("TALK_API_SERVER_URL") or "").strip()
+    return (raw or DEFAULT_API_SERVER_URL).rstrip("/")
+
+
+def api_server_key() -> str | None:
+    """Bearer key for the api_server, or ``None`` to send no Authorization.
+
+    ``TALK_API_SERVER_KEY`` wins; unset falls back to ``API_SERVER_KEY``, the
+    same variable the gateway itself reads (gateway/config.py:1618), so an
+    operator who configured the api_server does not configure it twice.
+
+    Set-but-BLANK is an explicit opt out — send no key, do not fall through —
+    matching ``TALK_AGENT_PROFILE``. The api_server does accept unauthenticated
+    requests when it holds no key of its own (``_check_auth`` returns early),
+    so "no key" is a real, reachable configuration rather than a broken one.
+    """
+
+    scoped = os.environ.get("TALK_API_SERVER_KEY")
+    if scoped is not None:
+        return scoped.strip() or None
+    return (os.environ.get("API_SERVER_KEY") or "").strip() or None
+
+
+def api_server_probe_timeout_s() -> float:
+    """Budget for one availability probe."""
+
+    return _positive_float(
+        "TALK_API_SERVER_PROBE_TIMEOUT_S", DEFAULT_API_SERVER_PROBE_TIMEOUT_S
+    )
+
+
+def api_server_probe_ttl_s() -> float:
+    """How long a probe verdict is trusted before it is refreshed."""
+
+    return _positive_float("TALK_API_SERVER_PROBE_TTL_S", DEFAULT_API_SERVER_PROBE_TTL_S)
+
+
+def api_server_poll_s() -> float:
+    """Poll interval while a worker thread waits on an api_server run."""
+
+    return _positive_float("TALK_API_SERVER_POLL_S", DEFAULT_API_SERVER_POLL_S)
+
+
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
@@ -261,12 +333,21 @@ def audio_output_device() -> str | None:
 
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
+    "DEFAULT_API_SERVER_POLL_S",
+    "DEFAULT_API_SERVER_PROBE_TIMEOUT_S",
+    "DEFAULT_API_SERVER_PROBE_TTL_S",
+    "DEFAULT_API_SERVER_URL",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
     "OPENAI_REALTIME_VOICES",
     "TalkConfigError",
     "agent_profile",
     "agent_timeout_s",
+    "api_server_key",
+    "api_server_poll_s",
+    "api_server_probe_timeout_s",
+    "api_server_probe_ttl_s",
+    "api_server_url",
     "audio_input_device",
     "audio_output_device",
     "detect_agent_profile",

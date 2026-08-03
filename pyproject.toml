@@ -29,6 +29,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
   "talk_config",
   "talk_auth",
+  "talk_apiserver",
   "talk_wire",
   "talk_identity",
   "talk_host",
@@ -57,6 +58,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 
 [tool.ruff.lint.isort]
 known-first-party = [
+  "talk_apiserver",
   "talk_audio",
   "talk_auth",
   "talk_cli",
