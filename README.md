@@ -90,6 +90,45 @@ hermes talk        # terminal duplex voice session
 or `/talk` inside an interactive Hermes session, which additionally reaches the
 agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
+## Dashboard tab
+
+The same session in a browser. Start the dashboard and Talk appears as a tab:
+
+```bash
+hermes plugins enable hermes-talk   # already done by `install --enable`
+hermes dashboard                    # then open the Talk tab
+```
+
+Hit **Start**, allow the microphone, and talk. The page mints an ephemeral
+secret server-side, dials OpenAI directly over WebRTC, relays every function
+call back into the plugin's real tool surface, and shows the transcript plus a
+live list of background runs. Nothing to install — the bundle ships with the
+plugin and the host serves it.
+
+**The honest limitation.** The dashboard runs in the web-server process, which
+has no bound agent context, so the agent-loop-only tools degrade there exactly
+as they do in a standalone `hermes talk`: `search_memory` says it can't reach
+memory, and `delegate_task` falls through to a detached `hermes -z` one-shot
+(which does work, and whose result is still spoken when it lands). Full
+in-loop tools need the session to run where the agent loop is — `/talk`
+today, and the `api_server` gateway platform when the adapter lands.
+
+### `TALK_DASHBOARD_TOKEN` — the tab's own gate
+
+Dashboard routes already sit behind the dashboard's session auth, but this
+plugin's routes mint real credentials, so they carry a second check that never
+fails open:
+
+- **Unset (default): loopback only.** A browser on the same machine works with
+  no configuration. Anything else is refused with a message naming this
+  variable — including a request whose peer address this process cannot read
+  at all, which is treated as remote rather than trusted.
+- **Set: the token is required**, on loopback too, compared with
+  `hmac.compare_digest`. Paste it into the field the tab offers when it gets
+  refused; it's held in `sessionStorage`, so it dies with the tab.
+
+Set it whenever the dashboard is reachable from anywhere but this machine.
+
 ## Background work
 
 Say "go audit the site and tell me what's broken" and it starts a real agent,
@@ -136,6 +175,7 @@ If your model config lives in a **profile** rather than the root
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
+| `TALK_DASHBOARD_TOKEN` | unset | Token for the dashboard tab's routes (unset = loopback only) |
 
 ### `TALK_IDENTITY_INCLUDE` — what the session starts knowing
 
@@ -178,8 +218,8 @@ The three that shaped everything else:
 
 ## Status
 
-v0.3 — under active development. Roadmap: run steering by voice, browser
-dashboard tab, session-end memory debrief, gateway platform adapter.
+v0.3 — under active development. Roadmap: run steering by voice, session-end
+memory debrief, gateway platform adapter.
 
 Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)
 proposes a `RealtimeVoiceProvider` ABC in Hermes core — four open PRs are
