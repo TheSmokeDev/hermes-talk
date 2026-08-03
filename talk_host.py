@@ -11,6 +11,22 @@ method:
   ``register(ctx)``; every lookup reads it through the module so a test (or a
   later rebind) is seen immediately.
 
+Reaching a real agent is a three-tier chain, tried in order, and **every
+fall-through is announced in the returned text**:
+
+1. the bound plugin context's own agent loop (interactive ``/talk``)
+2. a real Hermes agent over the api_server gateway platform
+   (:mod:`talk_apiserver`) — the lane that makes the dashboard tab and a
+   standalone ``hermes talk`` more than a fallback
+3. what is left: a detached ``hermes -z`` for delegation, a spoken refusal
+   naming what is missing for a memory lookup
+
+Tiers 2 and 3 both return the ``WORK_STARTED`` receipt rather than an answer.
+That is not a preference: the relay executes tools synchronously on the event
+loop carrying the microphone, so a tool that waits for an agent is a call
+that goes silent. :mod:`talk_runs` already owns "start it, speak it when it
+lands", and both surfaces already watch for the receipt.
+
 The detached backend spawns ``hermes [--profile <name>] -z <task>``. The
 profile comes from ``TALK_AGENT_PROFILE`` or, unset, from auto-detection in
 :mod:`talk_config` — on an install whose model config lives only in a profile,
@@ -27,8 +43,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import talk_auth, talk_config, talk_runs
+    from . import talk_apiserver, talk_auth, talk_config, talk_runs
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_apiserver
     import talk_auth
     import talk_config
     import talk_runs
@@ -57,6 +74,13 @@ AGENT_LOOP_ABSENT_MARKERS = (
 )
 
 HERMES_BINARY = "hermes"
+
+#: Which tier a real-agent request would take. ``LANE_NONE`` keeps the exact
+#: wording the dashboard tile already shipped, so an install with no agent lane
+#: reads the same as it did before the api_server lane existed.
+LANE_ATTACHED = "attached"
+LANE_API_SERVER = "api-server"
+LANE_NONE = "out of process"
 
 _CTX: Any | None = None
 
@@ -92,13 +116,18 @@ def _speakable(raw: Any, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     return json.dumps(parsed, default=str)[:limit]
 
 
-def _agent_loop_absent(raw: Any) -> bool:
+def _agent_loop_absent(raw: Any, tool_name: str = DELEGATE_TOOL_NAME) -> bool:
     """True when a dispatch result says the AGENT LOOP is missing, not the task.
 
     Read off the registry's universal error envelope (``{"error": ...}``), and
     matched against named markers rather than "any error": falling back on a
     generic failure would route around an operator's paused delegation or a
     depth limit, which is the host's call, not this plugin's.
+
+    ``tool_name`` adds that tool's own "unknown tool" marker, so a host with no
+    ``session_search`` falls through to the api_server lane for the same reason
+    a host with no ``delegate_task`` does. The default reproduces
+    :data:`AGENT_LOOP_ABSENT_MARKERS` exactly.
     """
 
     text = raw if isinstance(raw, str) else json.dumps(raw, default=str)
@@ -112,7 +141,8 @@ def _agent_loop_absent(raw: Any) -> bool:
     if not isinstance(error, str):
         return False
     lowered = error.lower()
-    return any(marker in lowered for marker in AGENT_LOOP_ABSENT_MARKERS)
+    markers = (*AGENT_LOOP_ABSENT_MARKERS, f"unknown tool: {tool_name}")
+    return any(marker in lowered for marker in markers)
 
 
 def hermes_binary() -> str | None:
@@ -175,6 +205,29 @@ def _detached_agent_worker(task: str, binary: str) -> Any:
         return (stdout or "the agent finished without printing anything")[
             : talk_runs.HISTORY_OUTPUT_CAP
         ]
+
+    return worker
+
+
+def _api_server_worker(task: str, *, session_id: str | None) -> Any:
+    """Build the worker that runs one api_server agent run to completion.
+
+    Runs on a :mod:`talk_runs` thread, which is the only place blocking is
+    allowed — see :mod:`talk_apiserver`. Failures are marked failed with
+    speakable text rather than raised, so the registry never puts an exception
+    type in front of a sentence meant to be said out loud.
+    """
+
+    def worker(run_id: int) -> str:
+        talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
+        try:
+            return talk_apiserver.run_to_completion(task, session_id=session_id)[
+                : talk_runs.HISTORY_OUTPUT_CAP
+            ]
+        except talk_apiserver.TalkApiServerError as exc:
+            message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
+            talk_runs.finish_run(run_id, "failed", message)
+            return message
 
     return worker
 
@@ -335,40 +388,98 @@ class HostAdapter:
 
         return talk_config.state_dir()
 
+    def agent_lane(self) -> str:
+        """Which tier a real-agent request would take RIGHT NOW.
+
+        One of :data:`LANE_ATTACHED`, :data:`LANE_API_SERVER`,
+        :data:`LANE_NONE`. Read by ``talk_status`` and by the dashboard's
+        readiness tile, so the surface reports the lane it would actually use
+        instead of a boolean that was true for a different reason.
+        """
+
+        if get_ctx() is not None:
+            return LANE_ATTACHED
+        try:
+            if talk_apiserver.is_available():
+                return LANE_API_SERVER
+        except Exception as exc:  # noqa: BLE001 — a status read is never fatal
+            _log.warning("api server lane check failed: %s: %s", type(exc).__name__, exc)
+        return LANE_NONE
+
     def search_memory(self, query: str, limit: int = 5) -> str:
-        """Search past Hermes sessions for what was said about ``query``."""
+        """Search past Hermes sessions for what was said about ``query``.
+
+        Three tiers, each fall-through said out loud (see the module docstring).
+        Tier 2 answers with a receipt rather than the answer — an agent run is
+        seconds of work and this call is on the loop carrying the microphone.
+        """
 
         ctx = get_ctx()
-        if ctx is None:
+        if ctx is not None:
+            try:
+                raw = ctx.dispatch_tool(
+                    MEMORY_TOOL_NAME, {"query": query, "limit": limit}
+                )
+            except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+                return f"the memory lookup failed: {type(exc).__name__}: {exc}"
+            if not _agent_loop_absent(raw, MEMORY_TOOL_NAME):
+                return _speakable(raw)
+
+        return self._search_memory_via_api_server(query, limit)
+
+    def _search_memory_via_api_server(self, query: str, limit: int) -> str:
+        """Tier 2/3 for a memory lookup."""
+
+        verdict = talk_apiserver.status()
+        if not verdict.available:
+            # Detail LAST: it can itself be a two-clause sentence ("running but
+            # rejected my key — set …"), and anything appended after that reads
+            # as part of the remediation instead of as the refusal.
             return (
-                "memory isn't available in this session — I'm running outside "
-                "a Hermes agent, so I can't look anything up."
+                "memory isn't available in this session — I can't look anything "
+                f"up: I'm running outside a Hermes agent, and {verdict.detail}."
             )
+        label = f"memory: {query.strip()[:50]}"
+        prompt = (
+            "Search this Hermes install's past sessions and saved memory for "
+            f"anything about: {query.strip()}\n\n"
+            f"Report the {max(1, min(limit, 8))} most relevant findings as plain "
+            "spoken prose in a few sentences. No markdown, no bullet lists, no "
+            "file paths. If you find nothing, say so plainly."
+        )
         try:
-            raw = ctx.dispatch_tool(MEMORY_TOOL_NAME, {"query": query, "limit": limit})
+            run_id = talk_runs.start_run(
+                "agent", label, _api_server_worker(prompt, session_id=None)
+            )
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"the memory lookup failed: {type(exc).__name__}: {exc}"
-        return _speakable(raw)
+            return f"I couldn't start that lookup: {type(exc).__name__}: {exc}"
+        return (
+            f"{talk_runs.started_sentinel(run_id, 'agent', label)} — asking a "
+            "Hermes agent through the api server; I'll tell you what it finds."
+        )
 
     def run_agent(self, prompt: str, background: bool = True) -> str:
         """Hand a self-contained task to a background Hermes agent.
 
-        Three backends, tried in order, and every fall-through is ANNOUNCED in
+        Four backends, tried in order, and every fall-through is ANNOUNCED in
         the returned text — a voice surface that quietly downgrades is worse
         than one that refuses:
 
         1. **The host's own agent loop** (``dispatch_tool``) when a plugin
            context is bound and Hermes has a parent agent to delegate into.
            Its result re-enters the conversation through Hermes itself.
-        2. **A detached headless Hermes** (``hermes -z``) on a registry run
-           thread. This is what makes ``delegate_task`` real in a standalone
-           ``hermes talk``, where there IS no agent loop. Returns the
+        2. **A real agent over the api_server** (``POST /v1/runs``) on a
+           registry run thread. Preferred over a spawn: it reuses a warm,
+           fully-tooled agent instead of paying a process start, and it is what
+           makes delegation real in the dashboard tab.
+        3. **A detached headless Hermes** (``hermes -z``) on a registry run
+           thread — the lane that needs nothing enabled. Returns the
            WORK_STARTED sentinel; the session watcher speaks the result.
-        3. Neither available — speakable refusal naming what is missing.
+        4. None available — speakable refusal naming what is missing.
 
         ``background`` is accepted for the caller's mental model but never
         forwarded: Hermes documents the tool's own flag as deprecated and
-        ignored, and both real backends are asynchronous regardless.
+        ignored, and every real backend is asynchronous regardless.
         """
 
         ctx = get_ctx()
@@ -380,17 +491,41 @@ class HostAdapter:
             if not _agent_loop_absent(raw):
                 return f"WORK_STARTED — {_speakable(raw)}"
 
+        via_api_server = self._run_api_server_agent(prompt)
+        if via_api_server is not None:
+            return via_api_server
         return self._run_detached_agent(prompt)
 
+    def _run_api_server_agent(self, prompt: str) -> str | None:
+        """Tier 2: run the task on a real agent over the api_server.
+
+        ``None`` means the lane is unavailable and the caller should fall
+        through — a lane that cannot run must not consume the request.
+        """
+
+        if not talk_apiserver.is_available():
+            return None
+        label = prompt.strip()[:60]
+        try:
+            run_id = talk_runs.start_run(
+                "agent", label, _api_server_worker(prompt, session_id=None)
+            )
+        except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+            return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+        return (
+            f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running on a "
+            "Hermes agent through the api server; I'll tell you when it lands."
+        )
+
     def _run_detached_agent(self, prompt: str) -> str:
-        """Tier 2/3: run the task as a detached ``hermes -z`` one-shot."""
+        """Tier 3/4: run the task as a detached ``hermes -z`` one-shot."""
 
         binary = hermes_binary()
         if binary is None:
             return (
                 "I can't hand off work right now — there's no Hermes agent "
-                "attached to this call and no `hermes` command on the PATH to "
-                "run one."
+                "attached to this call, the api server isn't reachable, and "
+                "there's no `hermes` command on the PATH to run one."
             )
         label = prompt.strip()[:60]
         try:
@@ -418,6 +553,9 @@ __all__ = [
     "AGENT_LOOP_ABSENT_MARKERS",
     "DELEGATE_TOOL_NAME",
     "HERMES_BINARY",
+    "LANE_API_SERVER",
+    "LANE_ATTACHED",
+    "LANE_NONE",
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
     "PROBE_SESSION_ID",

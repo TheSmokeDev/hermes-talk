@@ -31,6 +31,7 @@ import time
 
 try:
     from . import (
+        talk_apiserver,
         talk_audio,
         talk_auth,
         talk_config,
@@ -42,6 +43,7 @@ try:
     )
     from .talk_relay import RealtimeRelay
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_apiserver
     import talk_audio
     import talk_auth
     import talk_config
@@ -186,6 +188,12 @@ async def run_talk_session() -> int:
 
     instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
     tools = talk_tools.default_talk_tools()
+
+    # Find out NOW whether the api_server lane is up. The verdict is needed by
+    # the first tool call, and by then the answer has to be free: that call
+    # runs on the loop carrying the microphone. Fire-and-forget on a daemon
+    # thread — a session must never wait on this, and never fail because of it.
+    talk_apiserver.warm_in_background()
 
     # Local checks before network: a missing microphone must fail here, not
     # after a mint round-trip has already spent an ephemeral secret.

@@ -272,6 +272,10 @@ def _handle_talk_status(arguments: dict) -> str:
         "model": talk_config.talk_model(),
         "voice": voice,
         "attached_to_hermes": talk_host.get_ctx() is not None,
+        # Which tier a real-agent request would actually take: an in-process
+        # agent loop, a real agent over the api_server, or neither. The bool
+        # above answers a narrower question and cannot stand in for this one.
+        "agent_lane": talk_host.host().agent_lane(),
         "audio_available": talk_audio.audio_available(),
         # Which identity sections resolved and how big they are — NEVER the
         # content. This is spoken aloud and lands in transcripts; the whole
