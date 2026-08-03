@@ -161,6 +161,29 @@ def agent_profile() -> str | None:
     return detect_agent_profile()
 
 
+def identity_include() -> tuple[str, ...] | None:
+    """Which identity sections may ride the voice prompt, or ``None`` for all.
+
+    ``TALK_IDENTITY_INCLUDE`` is a comma-separated list of section names
+    (case-insensitive). Unset or blank means every section the host can
+    resolve.
+
+    **The trap:** this list REPLACES the default, it does not extend it.
+    ``TALK_IDENTITY_INCLUDE=MEMORY`` means memory AND NOTHING ELSE — the
+    persona section stops travelling, and the only visible symptom is a voice
+    session that has quietly stopped knowing who it is talking to.
+
+    Unknown names are dropped rather than raising: a typo in a knob must
+    narrow the prompt, never take the voice surface down with it.
+    """
+
+    raw = (os.environ.get("TALK_IDENTITY_INCLUDE") or "").strip()
+    if not raw:
+        return None
+    names = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+    return names or None
+
+
 def talk_model() -> str:
     """Realtime model, resolved at call time."""
 
@@ -248,6 +271,7 @@ __all__ = [
     "audio_output_device",
     "detect_agent_profile",
     "get_hermes_home",
+    "identity_include",
     "resolve_openai_key",
     "state_dir",
     "talk_model",

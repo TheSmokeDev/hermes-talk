@@ -12,9 +12,16 @@ from __future__ import annotations
 
 DEFAULT_SECTION_CAP = 4_000
 
-#: How much of each known host section rides the prompt.
+#: How much of each host section rides the prompt.
+#:
+#: These are a BUDGET, not a nicety. Unlike a chat completion, a Realtime
+#: session's instructions are resident for the whole call and paid for on
+#: every turn — a section that would be a rounding error in a text agent is
+#: charged again each time the operator speaks. PERSONA is capped well below
+#: what a text agent would carry for exactly that reason: the voice preamble
+#: is the behavioural contract here, and SOUL.md is supporting colour.
 IDENTITY_CAPS: dict[str, int] = {
-    "PERSONA": 12_000,
+    "PERSONA": 4_000,
     "USER": 4_000,
     "MEMORY": 6_000,
     "WORKING": 2_000,
