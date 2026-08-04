@@ -169,6 +169,109 @@ def test_landed_note_messages_without_an_id_say_nothing():
     assert talk_cli.landed_note_messages("") == []
 
 
+class _StubRelay:
+    def __init__(self, active: bool = False):
+        self.response_active = active
+
+
+class _YieldingWS:
+    """Records sends and yields between them — the interleaving window."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send_json(self, message: dict) -> None:
+        self.sent.append(message)
+        await asyncio.sleep(0)
+
+
+async def _drain(ws, expected: int, timeout_steps: int = 300) -> None:
+    for _ in range(timeout_steps):
+        if len(ws.sent) >= expected:
+            return
+        await asyncio.sleep(0.01)
+
+
+def test_pump_keeps_concurrent_announcements_contiguous():
+    # Codex v0.6.1 finding 3: two landings announced concurrently must not
+    # interleave create-A, create-B, response-A … — one response would see
+    # both temporary items. The pump serializes whole batches.
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        relay, ws = _StubRelay(), _YieldingWS()
+        pump = asyncio.create_task(talk_cli.pump_announcements(announce_queue, relay, ws))
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-1-bbbb"))
+        await _drain(ws, 6)
+        pump.cancel()
+        return ws.sent
+
+    sent = asyncio.run(scenario())
+    assert [m["type"] for m in sent] == [
+        "conversation.item.create",
+        "response.create",
+        "conversation.item.delete",
+        "conversation.item.create",
+        "response.create",
+        "conversation.item.delete",
+    ]
+    assert "sa-0-aaaa" in sent[0]["item"]["content"][0]["text"]
+    assert "sa-1-bbbb" in sent[3]["item"]["content"][0]["text"]
+    # Each delete targets its OWN batch's item.
+    assert sent[2]["item_id"] == sent[0]["item"]["id"]
+    assert sent[5]["item_id"] == sent[3]["item"]["id"]
+
+
+def test_pump_defers_while_a_response_is_in_flight(monkeypatch):
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        relay, ws = _StubRelay(active=True), _YieldingWS()
+        pump = asyncio.create_task(talk_cli.pump_announcements(announce_queue, relay, ws))
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.05)
+        deferred = list(ws.sent)
+        relay.response_active = False
+        await _drain(ws, 3)
+        pump.cancel()
+        return deferred, ws.sent
+
+    deferred, sent = asyncio.run(scenario())
+    assert deferred == []  # nothing while the model was mid-sentence
+    assert len(sent) == 3  # flowed once the wire went idle
+
+
+def test_pump_survives_a_dying_socket():
+    class _FlakyWS:
+        def __init__(self):
+            self.sent: list[dict] = []
+            self.fail_next = True
+
+        async def send_json(self, message: dict) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("socket closed")
+            self.sent.append(message)
+            await asyncio.sleep(0)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        relay, ws = _StubRelay(), _FlakyWS()
+        pump = asyncio.create_task(talk_cli.pump_announcements(announce_queue, relay, ws))
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-1-bbbb"))
+        await _drain(ws, 3)
+        pump.cancel()
+        return ws.sent
+
+    sent = asyncio.run(scenario())
+    # The first batch died with the socket error; the pump lived and the
+    # second batch flowed intact.
+    assert len(sent) == 3
+    assert "sa-1-bbbb" in sent[0]["item"]["content"][0]["text"]
+
+
 def test_subagent_stop_messages_cap_the_summary_tail():
     long_summary = "x" * (talk_cli.WATCH_OUTPUT_TAIL_CHARS + 500)
     text = talk_cli.subagent_stop_messages(

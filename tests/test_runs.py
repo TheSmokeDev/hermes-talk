@@ -456,3 +456,49 @@ def test_compaction_survives_invalid_utf8(history_env: Path, monkeypatch):
     assert len(kept_ids) <= 4
     assert ids[-1] in kept_ids
     assert ids[0] not in kept_ids
+
+
+def test_stop_receipt_survives_a_process_restart(history_env: Path):
+    # Codex v0.6.1 finding 1: a receipt promised past the courtesy wait used
+    # to live only in memory — hang up and it was gone, history reloads
+    # rebuilt meta={}. tee=True persists it, and the history rebuild carries
+    # it back, so a later session's check_work can still keep the promise.
+    run_id = talk_runs.start_run("agent", "audit", lambda _rid: "all done")
+    _wait_terminal(run_id)
+    talk_runs.annotate_run(run_id, tee=True, stop_result="stop sent, receipt pending")
+
+    # Simulate the restart: registry wiped, JSONL survives.
+    with talk_runs._RUN_LOCK:
+        talk_runs._RUNS.clear()
+
+    runs = talk_runs.list_runs(include_history=True)
+    reloaded = next(r for r in runs if r["runId"] == run_id)
+    assert reloaded["fromHistory"] is True
+    assert reloaded["meta"]["stop_result"] == "stop sent, receipt pending"
+
+
+def test_annotate_without_tee_stays_in_memory(history_env: Path):
+    run_id = talk_runs.start_run("agent", "audit", lambda _rid: "all done")
+    _wait_terminal(run_id)
+    talk_runs.annotate_run(run_id, stop_result="ephemeral")
+
+    with talk_runs._RUN_LOCK:
+        talk_runs._RUNS.clear()
+
+    runs = talk_runs.list_runs(include_history=True)
+    reloaded = next(r for r in runs if r["runId"] == run_id)
+    assert reloaded["meta"] == {}  # default tee-less annotate: telemetry only
+
+
+def test_terminal_tee_carries_meta_so_compaction_cannot_erase_it(history_env: Path):
+    # The compactor keeps the NEWEST record per run — if the terminal tee
+    # dropped meta, a receipt annotated before the finish would be erased.
+    gate = threading.Event()
+    run_id = talk_runs.start_run("agent", "audit", lambda _rid: gate.wait(5) or "all done")
+    talk_runs.annotate_run(run_id, stop_result="accepted")  # while still running
+    gate.set()
+    _wait_terminal(run_id)
+
+    records = _history_records(history_env)
+    terminal = [r for r in records if r["runId"] == run_id and r["status"] == "done"]
+    assert terminal and terminal[-1]["meta"].get("stop_result") == "accepted"

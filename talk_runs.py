@@ -298,7 +298,12 @@ def finish_run(run_id: int, status: str, output: str) -> bool:
 
 
 def _terminal_tee_locked(run_id: int, run: dict) -> dict:
-    """The history record for a terminal transition. Caller holds the lock."""
+    """The history record for a terminal transition. Caller holds the lock.
+
+    Meta rides the tee: compaction keeps the NEWEST record per run, so a
+    terminal record without meta would erase a durable stop receipt written
+    moments earlier (Codex v0.6.1 finding 1).
+    """
 
     return {
         "runId": run_id,
@@ -306,13 +311,21 @@ def _terminal_tee_locked(run_id: int, run: dict) -> dict:
         "label": run["label"],
         "status": run["status"],
         "output": str(run["output"] or "")[:HISTORY_OUTPUT_CAP],
+        "meta": dict(run["meta"]),
         "ts": run["ts"],
         "updated": run["updated"],
     }
 
 
-def annotate_run(run_id: int, **fields: Any) -> None:
-    """Merge worker-observed facts (pid, phase) into the entry."""
+def annotate_run(run_id: int, *, tee: bool = False, **fields: Any) -> None:
+    """Merge worker-observed facts (pid, phase) into the entry.
+
+    ``tee=True`` also persists a full snapshot to the JSONL history — for
+    facts that must SURVIVE this process, like a stop receipt promised to
+    the operator (Codex v0.6.1 finding 1: a daemon thread's receipt
+    otherwise died with the session, and history reloads rebuilt
+    ``meta={}``, leaving the promise unkeepable).
+    """
 
     with _RUN_LOCK:
         run = _RUNS.get(run_id)
@@ -320,6 +333,9 @@ def annotate_run(run_id: int, **fields: Any) -> None:
             return
         run["meta"].update(fields)
         run["updated"] = time.time()
+        record = _terminal_tee_locked(run_id, run) if tee else None
+    if record is not None:
+        _append_history(record)
 
 
 def get_run(run_id: int) -> dict | None:
@@ -367,7 +383,9 @@ def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
             "label": rec.get("label") or "",
             "status": status if status in TERMINAL_STATUSES else "lost",
             "output": str(rec.get("output") or ""),
-            "meta": {},
+            # Persisted meta (a durable stop receipt) survives the reload;
+            # absent in old records, so default to empty.
+            "meta": dict(rec.get("meta") or {}),
             "ts": rec.get("ts"),
             "updated": rec.get("updated"),
             "fromHistory": True,
@@ -417,17 +435,33 @@ def terminate_process(run_id: int) -> bool:
     return True
 
 
-def wait_process(run_id: int, timeout: float) -> int | None:
+def get_process(run_id: int) -> object | None:
+    """Snapshot the retained handle so a confirm can outlive the registry.
+
+    The detached worker releases its registry entry the moment it reaps the
+    child — a confirm that re-looked-up by run id could then mistake a
+    successfully dead child for an unconfirmable one (Codex v0.6.1 finding
+    2). A captured Popen keeps answering ``poll()`` after release.
+    """
+
+    with _PROCESS_LOCK:
+        return _PROCESSES.get(run_id)
+
+
+def wait_process(run_id: int, timeout: float, *, process: object | None = None) -> int | None:
     """Bounded wait for a retained child to actually die (hermes-talk#2).
 
     ``terminate()`` is a signal, not a wait — this is the confirmation half.
     Returns the exit code once the process is gone, or ``None`` if it is
-    still running when the budget runs out (or no handle is held). Polls
-    outside the lock so a wedged child can never wedge the registry.
+    still running when the budget runs out (or no handle is held). Pass the
+    handle captured by :func:`get_process` to stay immune to the worker
+    releasing the registry entry mid-wait. Polls outside the lock so a
+    wedged child can never wedge the registry.
     """
 
-    with _PROCESS_LOCK:
-        process = _PROCESSES.get(run_id)
+    if process is None:
+        with _PROCESS_LOCK:
+            process = _PROCESSES.get(run_id)
     if process is None:
         return None
     deadline = time.monotonic() + max(0.0, timeout)
@@ -460,6 +494,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "annotate_run",
     "finish_run",
+    "get_process",
     "get_run",
     "list_runs",
     "register_process",

@@ -414,10 +414,66 @@ def test_stop_detached_undying_child_promises_the_receipt(monkeypatch):
     talk_runs.register_process(run_id, _Undying())
     try:
         out = talk_host.host().stop_work(str(run_id))
+        assert "death receipt" in out.lower()
+        # The run is STILL running when the late budget expires, so honest
+        # uncertainty is the only truthful receipt (the terminal-record
+        # fallback is covered separately).
+        assert "never confirmed dead" in _poll_stop_receipt(run_id, "never confirmed dead")
     finally:
         hung.set()
-    assert "death receipt" in out.lower()
-    assert "never confirmed dead" in _poll_stop_receipt(run_id, "never confirmed dead")
+
+
+def test_stop_detached_survives_the_worker_reaping_first():
+    # Codex v0.6.1 finding 2 repro: the run worker reaps the child and
+    # RELEASES the registry handle between terminate and confirm. The
+    # captured handle still answers poll(), so the receipt is the truth
+    # ("exited 0"), never "never confirmed dead" for a child that died.
+    run_id, hung = _running_run()
+
+    class _ReapedProc:
+        def __init__(self):
+            self._code = None
+            self._polls = 0
+
+        def terminate(self):
+            self._code = 0
+
+        def poll(self):
+            self._polls += 1
+            if self._polls == 1:
+                talk_runs.release_process(run_id)  # the worker got there first
+            return self._code
+
+    talk_runs.register_process(run_id, _ReapedProc())
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+    finally:
+        hung.set()
+    assert "it's down" in out.lower()
+    assert _poll_stop_receipt(run_id, "exited 0") == "exited 0"
+
+
+def test_stop_confirm_consults_the_run_record_before_claiming_uncertainty(monkeypatch):
+    # The handle never shows an exit code, but the RUN finishes anyway —
+    # the late confirm must report the terminal record, not uncertainty.
+    monkeypatch.setattr(talk_host, "STOP_CONFIRM_WAIT_S", 0.05)
+    monkeypatch.setattr(talk_host, "STOP_LATE_CONFIRM_S", 0.3)
+
+    class _Undying:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    run_id, hung = _running_run()
+    talk_runs.register_process(run_id, _Undying())
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+        assert "death receipt" in out.lower()
+    finally:
+        hung.set()  # the worker finishes; the run flips terminal
+    assert "run finished as done" in _poll_stop_receipt(run_id, "run finished as")
 
 
 def test_check_work_speaks_the_stop_receipt(monkeypatch):

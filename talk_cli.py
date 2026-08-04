@@ -160,6 +160,38 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
     ]
 
 
+#: How the announcement pump waits for the wire to go idle: poll interval and
+#: the bound after which the batch is sent anyway (a stuck response must not
+#: silence announcements forever).
+ANNOUNCE_IDLE_POLL_S = 0.05
+ANNOUNCE_IDLE_MAX_WAIT_S = 5.0
+
+
+async def pump_announcements(announce_queue, relay, ws) -> None:
+    """Serialize every out-of-band announcement (Codex v0.6.1 finding 3).
+
+    One consumer, one batch at a time: concurrent landings each spawning
+    their own send task could interleave as create-A, create-B, response-A —
+    one response seeing two temporary system items, confirmations merged or
+    lost, or the server rejecting a second active response. Each batch also
+    defers (bounded) until no response is in flight, so an announcement
+    never stomps the model mid-sentence. A failed send costs that batch
+    only — the pump never dies of a closing socket.
+    """
+
+    while True:
+        batch = await announce_queue.get()
+        waited = 0.0
+        while relay.response_active and waited < ANNOUNCE_IDLE_MAX_WAIT_S:
+            await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
+            waited += ANNOUNCE_IDLE_POLL_S
+        try:
+            for out in batch:
+                await ws.send_json(out)
+        except Exception:  # noqa: BLE001 — a closing socket costs one batch
+            pass
+
+
 def landed_note_messages(subagent_id: str) -> list[dict]:
     """Spoken the moment a steering note lands (hermes-talk#2).
 
@@ -424,39 +456,23 @@ async def run_talk_session() -> int:
                         if event.get("type") == "response.done":
                             print(flush=True)
 
-                announcements: set[asyncio.Task] = set()
+                announce_queue: asyncio.Queue = asyncio.Queue()
 
                 def on_subagent_event(event: dict) -> None:
-                    """Speak a finished child. Runs ON the loop thread —
-                    :mod:`talk_lifecycle` marshals hook threads here via
-                    ``call_soon_threadsafe``; this only schedules the send."""
+                    """Queue a finished child's announcement. Runs ON the loop
+                    thread — :mod:`talk_lifecycle` marshals hook threads here
+                    via ``call_soon_threadsafe``; the pump owns the sending."""
 
-                    async def _announce() -> None:
-                        try:
-                            for out in subagent_stop_messages(event):
-                                await ws.send_json(out)
-                        except Exception:  # noqa: BLE001 — a closing socket must
-                            # never surface back into the host's hook bus.
-                            pass
-
-                    task = loop.create_task(_announce())
-                    announcements.add(task)
-                    task.add_done_callback(announcements.discard)
+                    messages = subagent_stop_messages(event)
+                    if messages:
+                        announce_queue.put_nowait(messages)
 
                 def on_note_landed(subagent_id: str) -> None:
-                    """Speak a landed steering note. Runs ON the loop thread."""
+                    """Queue a landed steering note. Runs ON the loop thread."""
 
-                    async def _speak() -> None:
-                        try:
-                            for out in landed_note_messages(subagent_id):
-                                await ws.send_json(out)
-                        except Exception:  # noqa: BLE001 — a closing socket must
-                            # never surface back into the drain path.
-                            pass
-
-                    task = loop.create_task(_speak())
-                    announcements.add(task)
-                    task.add_done_callback(announcements.discard)
+                    messages = landed_note_messages(subagent_id)
+                    if messages:
+                        announce_queue.put_nowait(messages)
 
                 loop = asyncio.get_running_loop()
                 talk_lifecycle.attach_session(loop, on_subagent_event)
@@ -467,19 +483,17 @@ async def run_talk_session() -> int:
                 )
 
                 sender = asyncio.create_task(send_microphone())
+                pump = asyncio.create_task(pump_announcements(announce_queue, relay, ws))
                 try:
                     await receive_events()
                 finally:
                     talk_steer.set_landed_notifier(None)
                     talk_lifecycle.detach_session()
                     sender.cancel()
+                    pump.cancel()
                     for watcher in watchers:
                         watcher.cancel()
-                    for announcement in list(announcements):
-                        announcement.cancel()
-                    await asyncio.gather(
-                        sender, *watchers, *announcements, return_exceptions=True
-                    )
+                    await asyncio.gather(sender, pump, *watchers, return_exceptions=True)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
@@ -530,6 +544,7 @@ __all__ = [
     "build_session_update",
     "cli_entry",
     "landed_note_messages",
+    "pump_announcements",
     "run_finished_messages",
     "run_talk_session",
     "setup_cli",

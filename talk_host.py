@@ -886,15 +886,25 @@ class HostAdapter:
                 try:
                     kind, err = outcomes.get(timeout=STOP_CONFIRM_WAIT_S)
                 except queue.Empty:
+                    # Durable BEFORE the promise (Codex v0.6.1 finding 1): a
+                    # daemon receipt dies with the process, so the pending
+                    # state is persisted synchronously — a later session's
+                    # check_work still has SOMETHING truthful to say.
+                    talk_runs.annotate_run(
+                        run_id, tee=True, stop_result="stop sent, receipt pending"
+                    )
 
                     def _receipt(_rid: int = run_id) -> None:
                         try:
                             late_kind, late_err = outcomes.get(timeout=STOP_LATE_CONFIRM_S)
                         except queue.Empty:
-                            talk_runs.annotate_run(_rid, stop_result="no answer from the server")
+                            talk_runs.annotate_run(
+                                _rid, tee=True, stop_result="no answer from the server"
+                            )
                             return
                         talk_runs.annotate_run(
                             _rid,
+                            tee=True,
                             stop_result=(
                                 "accepted" if late_kind == "ok" else f"failed: {late_err}"
                             ),
@@ -910,28 +920,45 @@ class HostAdapter:
                     return f"the stop didn't go through: {err}"
                 # 2xx = the server ACCEPTED the stop ("stopping"), not
                 # that the agent is gone — say the request, not the outcome.
-                talk_runs.annotate_run(run_id, stop_result="accepted")
+                talk_runs.annotate_run(run_id, tee=True, stop_result="accepted")
                 return (
                     f"Sent the stop for run {run.get('runId')} — the "
                     "server is winding it down."
                 )
+            # Capture the handle BEFORE terminating (Codex v0.6.1 finding 2):
+            # the detached worker releases its registry entry the moment it
+            # reaps the child, and a confirm that re-looks-up by run id would
+            # then read a successful death as "never confirmed".
+            proc = talk_runs.get_process(run_id)
             if talk_runs.terminate_process(run_id):
                 # terminate() is a signal, not a wait — confirm within the
                 # bounded budget, and keep confirming off-thread past it
                 # (hermes-talk#2): the death receipt lands in the run's meta
                 # either way, spoken by the next check_work.
-                code = talk_runs.wait_process(run_id, STOP_CONFIRM_WAIT_S)
+                code = talk_runs.wait_process(run_id, STOP_CONFIRM_WAIT_S, process=proc)
                 if code is not None:
-                    talk_runs.annotate_run(run_id, stop_result=f"exited {code}")
+                    talk_runs.annotate_run(run_id, tee=True, stop_result=f"exited {code}")
                     return f"Stopped run {run.get('runId')} — it's down."
+                talk_runs.annotate_run(
+                    run_id, tee=True, stop_result="stop sent, receipt pending"
+                )
 
-                def _confirm(_rid: int = run_id) -> None:
-                    late = talk_runs.wait_process(_rid, STOP_LATE_CONFIRM_S)
+                def _confirm(_rid: int = run_id, _proc: object | None = proc) -> None:
+                    late = talk_runs.wait_process(_rid, STOP_LATE_CONFIRM_S, process=_proc)
+                    if late is not None:
+                        talk_runs.annotate_run(_rid, tee=True, stop_result=f"exited {late}")
+                        return
+                    # No exit code — but the RUN may have finished anyway
+                    # (worker reaped it through a path our handle can't see).
+                    # Consult the record before speaking uncertainty.
+                    current = talk_runs.get_run(_rid)
+                    status = (current or {}).get("status")
                     talk_runs.annotate_run(
                         _rid,
+                        tee=True,
                         stop_result=(
-                            f"exited {late}"
-                            if late is not None
+                            f"run finished as {status}"
+                            if status in talk_runs.TERMINAL_STATUSES
                             else "stop signaled, never confirmed dead"
                         ),
                     )
