@@ -13,6 +13,7 @@ import array
 import math
 import queue
 import sys
+import threading
 import types
 
 import pytest
@@ -65,8 +66,23 @@ def test_bridge_wears_the_audio_device_surface():
 def test_downsample_halves_the_sample_count_and_collapses_channels():
     # 4 stereo frames (8 samples) of 48k -> 2 mono samples of 24k.
     pcm = _tone(4, rate=48_000, stereo=True)
-    out = talk_discord.discord_to_session(pcm)
+    out, remainder = talk_discord.discord_to_session(pcm)
     assert len(out) == len(pcm) // 4
+    assert remainder == b""
+
+
+def test_downsample_carries_a_partial_group_instead_of_dropping_it():
+    # A dropped remainder transposes L/R for every later sample — the
+    # channels stay swapped for the rest of the stream.
+    whole = _tone(8, rate=48_000, stereo=True)
+    joined, tail = talk_discord.discord_to_session(whole)
+    assert tail == b""
+    # Split mid-group (5 samples in, not a multiple of 4).
+    first, carry = talk_discord.discord_to_session(whole[:10])
+    assert carry, "a partial group must be carried, not dropped"
+    second, tail2 = talk_discord.discord_to_session(whole[10:], carry=carry)
+    assert first + second == joined
+    assert tail2 == b""
 
 
 def test_upsample_doubles_and_duplicates_to_stereo():
@@ -82,7 +98,7 @@ def test_a_tone_survives_the_round_trip():
     # noise and not silence.
     original = _tone(480, rate=24_000, freq=440.0)
     up, _ = talk_discord.session_to_discord(original)
-    back = talk_discord.discord_to_session(up)
+    back, _ = talk_discord.discord_to_session(up)
     assert len(back) == len(original)
 
     src = array.array("h")
@@ -106,8 +122,9 @@ def test_carry_makes_chunk_boundaries_continuous():
 
 
 def test_conversions_survive_empty_and_odd_input():
-    assert talk_discord.discord_to_session(b"") == b""
-    assert talk_discord.discord_to_session(b"\x01") == b""
+    assert talk_discord.discord_to_session(b"") == (b"", b"")
+    odd_out, odd_carry = talk_discord.discord_to_session(b"\x01")
+    assert odd_out == b"" and odd_carry == b"\x01"
     assert talk_discord.session_to_discord(b"") == (b"", None)
     out, carry = talk_discord.session_to_discord(b"\x01")
     assert out == b"" and carry is None
@@ -225,3 +242,143 @@ def test_stop_with_no_session_says_so():
 def test_start_outside_a_loop_points_at_the_terminal():
     reply = talk_discord.start_session()
     assert "hermes talk" in reply
+
+
+# -- the host handoff (what offline tests missed the first time) --------------
+
+
+class _FakeConnection:
+    """discord.py stores the CALLBACK OBJECT and calls what it stored."""
+
+    def __init__(self) -> None:
+        self.callbacks: list = []
+
+    def add_socket_listener(self, cb) -> None:
+        self.callbacks.append(cb)
+
+    def remove_socket_listener(self, cb) -> None:
+        self.callbacks.remove(cb)  # raises if it was never registered
+
+    def deliver(self, data: bytes) -> None:
+        for cb in list(self.callbacks):
+            cb(data)
+
+
+class _FakeReceiver:
+    def __init__(self) -> None:
+        self._buffers: dict = {}
+        self._lock = threading.Lock()
+        self.seen: list = []
+
+    def _on_packet(self, data: bytes) -> None:
+        self.seen.append(data)
+        with self._lock:
+            self._buffers.setdefault(1, bytearray()).extend(data)
+
+
+class _FakeVoiceClient:
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self.playing = None
+
+    def is_playing(self) -> bool:
+        return self.playing is not None
+
+    def play(self, source) -> None:
+        self.playing = source
+
+    def stop(self) -> None:
+        self.playing = None
+
+
+def _wired_host(monkeypatch):
+    connection = _FakeConnection()
+    receiver = _FakeReceiver()
+    connection.add_socket_listener(receiver._on_packet)  # as the host does
+    vc = _FakeVoiceClient(connection)
+    adapter = _fake_host(monkeypatch, clients={7: vc}, receivers={7: receiver})
+    adapter._reset_voice_timeout = lambda gid: adapter.__dict__.setdefault(
+        "timer_resets", []
+    ).append(gid)
+    adapter._voice_mode_getter = lambda chat_id: "all"
+    adapter._voice_mixers = {7: "the-host-mixer"}
+    return connection, receiver, vc, adapter
+
+
+def test_tap_is_registered_not_just_assigned(monkeypatch):
+    # THE bug that made the first cut unable to work: discord.py appends the
+    # bound method OBJECT to its listener list and calls what it stored, so
+    # rebinding the attribute alone taps nothing and the call hears silence
+    # with no error anywhere.
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original = connection.callbacks[0]  # the exact object the host registered
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    assert original not in connection.callbacks, "old listener still wired"
+    assert len(connection.callbacks) == 1, "tap must replace, not stack"
+
+    connection.deliver(b"" * 8)
+    assert receiver.seen, "the host's own handler must still run"
+    assert bridge.read_input_chunk() is not None, "the tap never fired"
+
+    bridge.stop()
+    assert connection.callbacks == [original], "original not restored"
+
+
+def test_stop_restores_the_host_exactly(monkeypatch):
+    connection, receiver, _vc, adapter = _wired_host(monkeypatch)
+    original = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    assert adapter._voice_mixers == {}, "host mixer must be parked while we own audio"
+    assert adapter._voice_mode_getter("c") == "off", "host speech must be parked"
+
+    bridge.stop()
+    assert connection.callbacks == [original]
+    # Equality, not identity: Python mints a fresh bound-method object on
+    # every attribute access, so `a.m is a.m` is False even untouched.
+    assert receiver._on_packet == original
+    assert adapter._voice_mixers == {7: "the-host-mixer"}, "mixer not handed back"
+    assert adapter._voice_mode_getter("c") == "all", "host speech not handed back"
+
+
+def test_capture_rearms_the_hosts_inactivity_timer(monkeypatch):
+    # The host auto-leaves the channel when its silence gate sees nothing —
+    # and we drain the very buffers that gate measures. Without re-arming,
+    # it pulls the bot out mid-conversation.
+    connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge._loop = types.SimpleNamespace(
+        call_soon_threadsafe=lambda fn, *a: fn(*a)  # run inline for the test
+    )
+    bridge.start()
+    bridge._loop = types.SimpleNamespace(call_soon_threadsafe=lambda fn, *a: fn(*a))
+    connection.deliver(b"" * 8)
+    assert adapter.__dict__.get("timer_resets") == [7]
+    bridge.stop()
+
+
+def test_played_ms_counts_what_was_heard_not_what_was_queued(monkeypatch):
+    # The model streams far faster than realtime. Counting at queue time
+    # tells a barge-in truncate the operator heard everything generated.
+    _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    bridge.queue_playback(_tone(2400, rate=24_000))  # 100ms of audio, queued
+    assert bridge.played_ms == 0, "nothing has been heard yet"
+
+    vc.playing.read()  # the host's player pulls exactly one 20ms frame
+    assert bridge.played_ms == 20
+    bridge.stop()
+
+
+def test_underrun_never_retires_the_player(monkeypatch):
+    _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    frame = vc.playing.read()  # nothing queued
+    assert frame == talk_discord.SILENCE_FRAME
+    assert frame != b""
+    bridge.stop()

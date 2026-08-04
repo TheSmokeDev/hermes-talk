@@ -37,6 +37,7 @@ import array
 import logging
 import queue
 import threading
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -63,6 +64,26 @@ MAX_INPUT_FRAMES = 100  # 2 s of inbound speech
 MAX_OUTPUT_FRAMES = 250  # 5 s of queued reply
 
 
+#: Distinguishes "never captured" from a legitimately stored ``None``.
+_UNSET = object()
+
+#: How often, at most, we re-arm the host's inactivity timer while audio
+#: is flowing. The host's own timer is minutes wide; this only has to be
+#: comfortably under it.
+KEEPALIVE_INTERVAL_S = 20.0
+
+
+def _running_loop():
+    """The loop to marshal host calls onto, or ``None`` off-loop."""
+
+    import asyncio
+
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
 class TalkDiscordError(Exception):
     """The host's Discord voice surface is unavailable or unrecognized."""
 
@@ -70,24 +91,32 @@ class TalkDiscordError(Exception):
 # -- rate conversion ----------------------------------------------------------
 
 
-def discord_to_session(pcm48_stereo: bytes) -> bytes:
+def discord_to_session(pcm48_stereo: bytes, *, carry: bytes = b"") -> tuple[bytes, bytes]:
     """48 kHz stereo → 24 kHz mono. Both steps average, never drop.
 
     Averaging the channel pair and then the sample pair is a crude two-tap
     low-pass, which is the point: plain decimation would alias the top of
     the band straight back down into speech.
+
+    Returns ``(converted, remainder)``. The remainder is whatever did not
+    fill a whole 4-sample group; feed it back as ``carry`` next call. A
+    dropped remainder would transpose L/R for every subsequent sample in
+    the stream — one partial frame and the channels stay swapped forever.
     """
 
-    if not pcm48_stereo:
-        return b""
+    data = carry + pcm48_stereo
+    if not data:
+        return b"", b""
+    usable = len(data) - (len(data) % 8)  # 4 samples * 2 bytes
+    remainder = data[usable:]
     samples = array.array("h")
-    samples.frombytes(pcm48_stereo[: len(pcm48_stereo) - (len(pcm48_stereo) % 2)])
+    samples.frombytes(data[:usable])
     out = array.array("h")
-    # Two stereo frames (4 samples) collapse to one mono sample.
-    for i in range(0, len(samples) - 3, 4):
+    # Two stereo frames (L,R,L,R) collapse to one mono sample.
+    for i in range(0, len(samples), 4):
         total = samples[i] + samples[i + 1] + samples[i + 2] + samples[i + 3]
-        out.append(int(total / 4))
-    return out.tobytes()
+        out.append(total >> 2)
+    return out.tobytes(), remainder
 
 
 def session_to_discord(pcm24_mono: bytes, *, carry: int | None = None) -> tuple[bytes, int | None]:
@@ -191,19 +220,32 @@ class _RealtimeSource:
     def __init__(self, frames: queue.Queue) -> None:
         self._frames = frames
         self._carry = bytearray()
-        self.frames_served = 0
+        # read() runs on the host's player thread; cleanup() runs on the
+        # event loop during barge-in — which is exactly when both fire at
+        # once. An unguarded bytearray tears there, and an exception inside
+        # read() retires playback for the rest of the call.
+        self._carry_lock = threading.Lock()
+        self._served_lock = threading.Lock()
+        self._frames_served = 0
+
+    @property
+    def frames_served(self) -> int:
+        with self._served_lock:
+            return self._frames_served
 
     def read(self) -> bytes:
-        while len(self._carry) < DISCORD_FRAME_BYTES:
-            try:
-                self._carry += self._frames.get_nowait()
-            except queue.Empty:
-                break
-        if len(self._carry) >= DISCORD_FRAME_BYTES:
-            frame = bytes(self._carry[:DISCORD_FRAME_BYTES])
-            del self._carry[:DISCORD_FRAME_BYTES]
-            self.frames_served += 1
-            return frame
+        with self._carry_lock:
+            while len(self._carry) < DISCORD_FRAME_BYTES:
+                try:
+                    self._carry += self._frames.get_nowait()
+                except queue.Empty:
+                    break
+            if len(self._carry) >= DISCORD_FRAME_BYTES:
+                frame = bytes(self._carry[:DISCORD_FRAME_BYTES])
+                del self._carry[:DISCORD_FRAME_BYTES]
+                with self._served_lock:
+                    self._frames_served += 1
+                return frame
         # Underrun: silence, never b"". An empty read retires the player
         # thread and the call goes permanently mute.
         return SILENCE_FRAME
@@ -212,7 +254,8 @@ class _RealtimeSource:
         return False
 
     def cleanup(self) -> None:
-        self._carry.clear()
+        with self._carry_lock:
+            self._carry.clear()
 
 
 class DiscordAudio:
@@ -225,9 +268,15 @@ class DiscordAudio:
         self._inbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
-        self._played_frames = 0
+        self._played_baseline = 0
         self._carry_sample: int | None = None
+        self._capture_remainder = b""
         self._original_on_packet = None
+        self._tapped = None
+        self._loop = None
+        self._last_keepalive = 0.0
+        self._restore_voice_mode: Any = _UNSET
+        self._parked_mixer: Any = _UNSET
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -252,10 +301,11 @@ class DiscordAudio:
 
         self._bridge = bridge
         self._source = _RealtimeSource(self._outbound)
+        self._loop = _running_loop()
+        voice_client = bridge["voice_client"]
 
         # Tap the host's receive path. We wrap rather than replace so the
-        # host's own transcription keeps working — its silence-gated turn
-        # loop and our continuous stream read the same frames.
+        # host's own bookkeeping keeps working.
         original = receiver._on_packet
 
         def tapped(data: bytes) -> None:
@@ -264,10 +314,41 @@ class DiscordAudio:
             finally:
                 self._drain_receiver(receiver)
 
-        self._original_on_packet = original
+        # The registration is what matters, NOT the attribute. discord.py
+        # appends the BOUND METHOD OBJECT to its listener list and calls the
+        # stored objects; rebinding ``receiver._on_packet`` alone shadows an
+        # attribute nothing reads, so the tap never fires and the session
+        # hears silence with nothing logged. Swap the registration, and keep
+        # the attribute in sync so the host's own stop() still unregisters
+        # the object it will look up.
+        try:
+            connection = voice_client._connection
+            connection.remove_socket_listener(original)
+            connection.add_socket_listener(tapped)
+        except Exception as exc:  # host receive surface, any type
+            self._bridge = None
+            raise talk_audio.TalkAudioError(
+                f"couldn't listen in on the voice channel: {exc}"
+            ) from exc
         receiver._on_packet = tapped
+        self._original_on_packet = original
+        self._tapped = tapped
 
-        voice_client = bridge["voice_client"]
+        # Park the host's own speech while we own the conversation. Its
+        # reply path waits on ``is_playing()`` — which our continuous source
+        # keeps True — for a two-minute timeout, then force-stops us
+        # mid-sentence and never gives the channel back. The mode getter is
+        # read dynamically at reply time, so swapping it actually takes
+        # (unlike the listener above), and the mixer is popped so the host
+        # cannot block on a mixer nobody is draining.
+        adapter = bridge.get("adapter")
+        self._restore_voice_mode = getattr(adapter, "_voice_mode_getter", None)
+        with suppress(Exception):
+            adapter._voice_mode_getter = lambda _chat_id: "off"
+        mixers = getattr(adapter, "_voice_mixers", None)
+        if isinstance(mixers, dict):
+            self._parked_mixer = mixers.pop(bridge["guild_id"], _UNSET)
+
         try:
             if getattr(voice_client, "is_playing", lambda: False)():
                 voice_client.stop()
@@ -283,12 +364,28 @@ class DiscordAudio:
 
         bridge, self._bridge = self._bridge, None
         # Teardown is best-effort at every step: a half-torn-down bridge
-        # must still hand the connection back to the host.
+        # must still hand the connection back to the host, in the reverse
+        # order it was taken.
         if bridge is not None and self._original_on_packet is not None:
+            receiver = bridge.get("receiver")
             with suppress(Exception):
-                bridge.get("receiver")._on_packet = self._original_on_packet
+                connection = bridge["voice_client"]._connection
+                connection.remove_socket_listener(self._tapped)
+                connection.add_socket_listener(self._original_on_packet)
+            with suppress(Exception):
+                receiver._on_packet = self._original_on_packet
         self._original_on_packet = None
+        self._tapped = None
         if bridge is not None:
+            adapter = bridge.get("adapter")
+            if self._restore_voice_mode is not _UNSET:
+                with suppress(Exception):
+                    adapter._voice_mode_getter = self._restore_voice_mode
+            self._restore_voice_mode = _UNSET
+            if self._parked_mixer is not _UNSET:
+                with suppress(Exception):
+                    adapter._voice_mixers[bridge["guild_id"]] = self._parked_mixer
+            self._parked_mixer = _UNSET
             with suppress(Exception):
                 bridge["voice_client"].stop()
         self._source = None
@@ -318,8 +415,12 @@ class DiscordAudio:
                 chunks = [bytes(buf) for buf in buffers.values() if buf]
                 for buf in buffers.values():
                     del buf[:]
+            if chunks:
+                self._touch_host_timer()
             for chunk in chunks:
-                converted = discord_to_session(chunk)
+                converted, self._capture_remainder = discord_to_session(
+                    chunk, carry=self._capture_remainder
+                )
                 if not converted:
                     continue
                 try:
@@ -334,6 +435,34 @@ class DiscordAudio:
                         pass
         except Exception:  # noqa: BLE001 — this runs on the HOST's thread
             _log.debug("discord capture drain failed", exc_info=True)
+
+    def _touch_host_timer(self) -> None:
+        """Tell the host somebody is talking (throttled, loop-marshalled).
+
+        The host auto-leaves the channel after an inactivity window, and it
+        only re-arms that timer on its OWN playback or on a COMPLETED
+        utterance from its silence gate. We drain the buffers that gate
+        measures, so from its side the room looks abandoned and it pulls the
+        bot out mid-conversation. Re-arming keeps that from happening.
+
+        This runs on the host's socket-reader thread and the timer is an
+        asyncio task, so the call is marshalled onto the loop rather than
+        made here.
+        """
+
+        now = time.monotonic()
+        if now - self._last_keepalive < KEEPALIVE_INTERVAL_S:
+            return
+        self._last_keepalive = now
+        bridge, loop = self._bridge, self._loop
+        if bridge is None or loop is None:
+            return
+        adapter = bridge.get("adapter")
+        reset = getattr(adapter, "_reset_voice_timeout", None)
+        if not callable(reset):
+            return
+        with suppress(RuntimeError):  # loop closed mid-teardown
+            loop.call_soon_threadsafe(reset, bridge["guild_id"])
 
     def read_input_chunk(self) -> bytes | None:
         """One chunk of 24 kHz mono for the session, or ``None`` when idle."""
@@ -357,13 +486,13 @@ class DiscordAudio:
             self._outbound.put_nowait(converted)
         except queue.Full:
             _log.debug("discord playback queue full — dropping a chunk")
-            return
-        with self._lock:
-            self._played_frames += len(pcm) // talk_audio.FRAME_BYTES
 
     def drain_playback(self) -> None:
         """Barge-in: drop everything not yet spoken."""
 
+        with self._lock:
+            source = self._source
+            self._played_baseline = source.frames_served if source is not None else 0
         while True:
             try:
                 self._outbound.get_nowait()
@@ -376,14 +505,27 @@ class DiscordAudio:
 
     @property
     def played_ms(self) -> int:
-        """Milliseconds handed to the channel since the last reset."""
+        """Milliseconds the channel has actually HEARD since the last reset.
 
+        Counted from frames the host's player thread pulled — never from
+        what we queued. The model streams far faster than realtime, so
+        queue-time would tell a barge-in truncate that the operator heard
+        everything generated, and the model would carry on as if it had
+        said sentences nobody heard. That desync is the entire reason this
+        number exists.
+        """
+
+        source = self._source
+        if source is None:
+            return 0
         with self._lock:
-            return int(self._played_frames * 1000 / talk_audio.SAMPLE_RATE)
+            served = source.frames_served - self._played_baseline
+        return max(0, served) * 20  # each Discord frame is 20 ms
 
     def reset_played_ms(self) -> None:
+        source = self._source
         with self._lock:
-            self._played_frames = 0
+            self._played_baseline = source.frames_served if source is not None else 0
 
 
 __all__ = [
@@ -437,11 +579,6 @@ def start_session(guild_id: int | None = None) -> str:
     except RuntimeError:
         return "That needs the gateway's event loop — run `hermes talk` in a shell instead."
 
-    with _SESSION_LOCK:
-        existing = _SESSION.get("task")
-        if existing is not None and not existing.done():
-            return "I'm already live in a voice channel — say `talk leave` first."
-
     try:
         bridge = resolve_voice_bridge(guild_id)
     except TalkDiscordError as exc:
@@ -453,7 +590,6 @@ def start_session(guild_id: int | None = None) -> str:
         import talk_cli
 
     audio = DiscordAudio(bridge["guild_id"])
-    task = loop.create_task(talk_cli.run_talk_session(audio=audio))
 
     def _done(finished) -> None:
         with _SESSION_LOCK:
@@ -464,12 +600,24 @@ def start_session(guild_id: int | None = None) -> str:
         except Exception:  # noqa: BLE001 — teardown is best-effort
             _log.debug("discord audio teardown failed", exc_info=True)
 
-    task.add_done_callback(_done)
+    # Claim the slot and publish the task under ONE lock: checking in one
+    # acquisition and publishing in another lets two joins both pass the
+    # check, both tap the receiver, and the second orphan the first.
     with _SESSION_LOCK:
+        existing = _SESSION.get("task")
+        if existing is not None and not existing.done():
+            return "I'm already live in a voice channel — say `talk leave` first."
+        task = loop.create_task(talk_cli.run_talk_session(audio=audio))
+        task.add_done_callback(_done)
         _SESSION.update({"task": task, "guild_id": bridge["guild_id"], "audio": audio})
+
+    # Deliberately not "I'm live": nothing has connected yet. The session
+    # still has to mint, open a socket, and take the channel, and any of
+    # those can refuse. Overclaiming here would be the one thing this
+    # plugin refuses to do anywhere else.
     return (
-        "I'm live in the voice channel — talk to me. I can hear you while I "
-        "speak, and I'll steer your background agents out loud."
+        "Starting up in the voice channel — give me a second, then talk to "
+        "me. Say `talk status` if you want to check, or `talk leave` to stop."
     )
 
 
