@@ -137,8 +137,14 @@ def test_conversions_survive_empty_and_odd_input():
 def _fake_host(monkeypatch, *, clients=None, receivers=None, runner=True, adapter=True):
     """Install a fake gateway/adapter the way the host exposes them."""
 
+    # The host keeps Platform in gateway.config — NOT in `models`, which is a
+    # different project's convention and does not exist here. Pinning the
+    # wrong path made every lookup fail and refuse on a healthy gateway.
     platform = types.SimpleNamespace(DISCORD="discord")
-    monkeypatch.setitem(sys.modules, "models", types.SimpleNamespace(Platform=platform))
+    gateway_config = types.ModuleType("gateway.config")
+    gateway_config.Platform = platform
+    monkeypatch.setitem(sys.modules, "gateway.config", gateway_config)
+    monkeypatch.setitem(sys.modules, "models", None)
 
     fake_adapter = types.SimpleNamespace(
         _voice_clients=clients if clients is not None else {},
@@ -457,3 +463,29 @@ def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):
     assert set(bridge._capture_remainder) == {1, 2}
     assert bridge._capture_remainder[1] != bridge._capture_remainder[2]
     bridge.stop()
+
+
+def test_adapter_is_found_when_only_the_key_name_matches(monkeypatch):
+    # Last-resort lookup: a host that moves or renames the Platform enum
+    # must still resolve, because "I could not import your enum" is
+    # indistinguishable from "Discord is not running" to an operator.
+    monkeypatch.setitem(sys.modules, "gateway.config", None)
+    monkeypatch.setitem(sys.modules, "models", None)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", None)
+
+    class _PlatformKey:  # an enum-like key: hashable, carries .value
+        value = "discord"
+
+    fake_adapter = types.SimpleNamespace(
+        _voice_clients={5: object()}, _voice_receivers={5: object()}
+    )
+    runner = types.SimpleNamespace(adapters={_PlatformKey(): fake_adapter})
+    module = types.ModuleType("gateway.run")
+    module._gateway_runner_ref = lambda: runner
+    package = types.ModuleType("gateway")
+    package.run = module
+    monkeypatch.setitem(sys.modules, "gateway", package)
+    monkeypatch.setitem(sys.modules, "gateway.run", module)
+
+    bridge = talk_discord.resolve_voice_bridge()
+    assert bridge["adapter"] is fake_adapter

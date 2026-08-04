@@ -171,13 +171,28 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     if runner is None:
         raise TalkDiscordError("the Hermes gateway isn't running in this process")
 
+    # Find the Discord adapter without pinning one import path. The enum has
+    # lived in more than one module across host versions, and guessing wrong
+    # is indistinguishable from "Discord isn't running" — which is how this
+    # first shipped, refusing on a gateway that was connected fine.
+    adapters = getattr(runner, "adapters", None) or {}
     adapter = None
-    try:
-        from models import Platform
-
-        adapter = (getattr(runner, "adapters", None) or {}).get(Platform.DISCORD)
-    except Exception:  # noqa: BLE001 — fall through to the refusal below
-        adapter = None
+    for module_name in ("gateway.config", "models", "gateway.platform_registry"):
+        try:
+            module = __import__(module_name, fromlist=["Platform"])
+            adapter = adapters.get(module.Platform.DISCORD)
+        except Exception:  # noqa: BLE001 — try the next candidate
+            continue
+        if adapter is not None:
+            break
+    if adapter is None:
+        # Last resort: match on the key's own name, so a host that moves or
+        # renames the enum entirely still resolves.
+        for key, value in adapters.items():
+            label = getattr(key, "value", None) or getattr(key, "name", None) or key
+            if str(label).strip().lower() == "discord":
+                adapter = value
+                break
     if adapter is None:
         raise TalkDiscordError("the Discord adapter isn't loaded on this gateway")
 
