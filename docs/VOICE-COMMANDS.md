@@ -1,0 +1,40 @@
+# Voice commands — say this, hear this
+
+There are no magic words. The model hears normal speech and picks the
+tool; the phrasings below are just reliable triggers. What IS a contract
+is the receipt that comes back: every reply commits to exactly what the
+substrate can prove, never more. `WORK_STARTED #7` is a commitment to
+watch run 7 and speak its result; "queued" is a queue write, not a
+delivery; "landed" only ever follows a real delivery artifact.
+
+## The card
+
+| Say something like | Tool fired | You hear | What it commits to |
+|---|---|---|---|
+| "what do you remember about the auth refactor?" | `search_memory` | matching excerpts from past Hermes sessions, summarized aloud | a real search ran; "nothing found" means the search was empty, not skipped |
+| "delegate a task: audit the login module and list every route it touches" | `delegate_task` | `WORK_STARTED #N` — "it's running, I'll tell you when it lands" | a watcher polls that run and SPEAKS the result when it finishes, even if you've gone quiet |
+| "how's the work going?" / "check run 7" | `check_work` | per-run status lines, plus the state of every steering note you've sent | the note states come from the receipt ledger — never "they got it" without the artifact |
+| "what's running right now?" | `list_agents` | live subagent ids tagged **can steer**, run numbers tagged **stop only** | ids that exist RIGHT NOW — resolve "the research one" here, never from memory of earlier speech |
+| "tell that audit to focus on the token refresh instead" | `steer_agent` | "queued for their next step — I'll confirm when it lands" | queueing only; "landed" arrives later, pushed, when a delivery artifact fires |
+| "stop — wrong repo, use the ship branch" | `redirect_agent` | "redirect accepted — it takes the correction at its current step, or its very next one" | the stronger verb: interrupts current thinking where the host supports it (0.20+), degrades to the steer queue mid-tool or on older hosts — and says which |
+| "kill the audit" / "stop run 7" | `stop_work` | "sent the stop — winding down" then a death receipt ("it's down", exit code) when confirmed | stopping drops unread steering notes (their receipts flip to `superseded`); every stop offered is real on that lane |
+| "what are you running on?" / "status report" | `talk_status` | version, model, voice, auth lane, agent lane, audio, identity sections | the verification command — field-by-field meaning in [OPERATING.md](OPERATING.md#2-talk_status--the-one-command) |
+
+Things you'll hear without asking (v0.6+): a background agent finishing
+("Background agent sa-… finished…"), and a steering note landing ("the
+note just landed"). Both arrive the moment the host reports them.
+
+## Steer vs redirect vs stop — three sentences
+
+- **Steer** queues a note the agent reads at its next natural step; its
+  current step always finishes.
+- **Redirect** interrupts the current step and re-aims it now — the
+  correction that can't wait.
+- **Stop** cancels the work; anything queued and unread dies with it,
+  and the receipt says so.
+
+The full receipt-state vocabulary (`queued` / `landed` / `redirected` /
+`unconfirmed` / `missed` / `superseded`) and the artifacts behind each
+state live in the README's
+[redirecting-work section](../README.md#redirecting-work-thats-already-running)
+— that prose is canonical; this card doesn't repeat it.
