@@ -4,7 +4,7 @@
 
 ![The Talk tab in the Hermes dashboard — a live voice session, a background agent delegated mid-conversation, its result landing in the runs panel (8× speed)](docs/dashboard.gif)
 
-*Real session, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — 2:27: delegate, keep talking, hear the result land. This is a voice demo; the sound is the point.*
+*Real session, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — 2:27: delegate, keep talking, hear the result land. This is a voice demo; the sound is the point. Recorded at v0.3.0 — the flow is unchanged.*
 
 ## What this actually is
 
@@ -51,6 +51,10 @@ shape.
 
 ## Install
 
+Needs Python ≥ 3.11 and a Hermes host ≥ v0.17 (`redirect_agent`'s
+clean-abort path wants 0.20+ and [degrades honestly below it](#redirecting-work-thats-already-running)
+— details in [docs/OPERATING.md](docs/OPERATING.md#prerequisites)).
+
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice)
@@ -58,7 +62,21 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 314 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 390 offline tests, CI on ubuntu + windows × py3.11–3.13.
+
+**Verify it** (no talking required):
+
+```bash
+hermes plugins list    # → hermes-talk · enabled · current version
+hermes talk --help     # → registration proof: the command only exists if the plugin loaded
+# then, in any session: say "status report" — talk_status answers with
+# version, auth lane, agent lane, and audio state.
+```
+
+**Upgrade** with `hermes plugins update hermes-talk` — not a second
+`install` (it refuses on an existing plugin) — then **restart the
+gateway**: a running process keeps executing the old code until you do.
+Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify--the-receipts).
 
 ## Auth — no API key needed if you have ChatGPT
 
@@ -89,6 +107,9 @@ hermes talk        # terminal duplex voice session
 
 or `/talk` inside an interactive Hermes session, which additionally reaches the
 agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
+
+What can you actually say? The full say-this → hear-this card, with what
+each spoken receipt commits to: [docs/VOICE-COMMANDS.md](docs/VOICE-COMMANDS.md).
 
 ## Dashboard tab
 
@@ -259,6 +280,9 @@ If your model config lives in a **profile** rather than the root
 
 ## Knobs
 
+The common ones. Every variable — api-server probe internals included —
+with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configuration--every-knob).
+
 | Variable | Default | What it does |
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model |
@@ -312,7 +336,8 @@ The three that shaped everything else:
 
 ## Status
 
-v0.6 — under active development. Roadmap: barge-in latch + spoken-text
+v0.6.1 — under active development. Changes, all seven versions with their
+receipts: [CHANGELOG.md](CHANGELOG.md). Roadmap: barge-in latch + spoken-text
 normalizer, Gemini Live backend
 ([#3](https://github.com/TheSmokeDev/hermes-talk/issues/3)), `computer_use`
 relay, session-end memory debrief, gateway platform adapter.
