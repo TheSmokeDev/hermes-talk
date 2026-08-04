@@ -298,8 +298,14 @@ def _mint_session(
         raise
 
 
-async def run_talk_session() -> int:
-    """Run one terminal voice session. Returns a process exit code."""
+async def run_talk_session(audio: object | None = None) -> int:
+    """Run one voice session. Returns a process exit code.
+
+    ``audio`` is any object with :class:`talk_audio.DuplexAudio`'s surface —
+    the terminal's microphone by default, or a Discord voice channel
+    (:class:`talk_discord.DiscordAudio`). Everything above this line is the
+    same session either way: the same tools, ledger, and announcements.
+    """
 
     try:
         auth = talk_host.host().resolve_auth()
@@ -318,9 +324,11 @@ async def run_talk_session() -> int:
     # thread — a session must never wait on this, and never fail because of it.
     talk_apiserver.warm_in_background()
 
-    # Local checks before network: a missing microphone must fail here, not
-    # after a mint round-trip has already spent an ephemeral secret.
-    audio = talk_audio.DuplexAudio()
+    # Local checks before network: a missing microphone (or an unavailable
+    # voice channel) must fail here, not after a mint round-trip has already
+    # spent an ephemeral secret.
+    if audio is None:
+        audio = talk_audio.DuplexAudio()
     try:
         audio.start()
     except talk_audio.TalkAudioError as exc:

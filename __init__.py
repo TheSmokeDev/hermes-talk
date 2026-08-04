@@ -17,9 +17,17 @@ import asyncio
 import logging
 
 try:
-    from . import talk_cli, talk_host, talk_lifecycle, talk_providers, talk_tools
+    from . import (
+        talk_cli,
+        talk_discord,
+        talk_host,
+        talk_lifecycle,
+        talk_providers,
+        talk_tools,
+    )
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
+    import talk_discord
     import talk_host
     import talk_lifecycle
     import talk_providers
@@ -42,18 +50,33 @@ def _record(surface: str, exc: Exception) -> None:
 def _talk_command(raw_args: str = "") -> str:
     """``/talk`` — start a voice session from inside a Hermes session.
 
-    Duplex audio owns a terminal for as long as the call lasts, so it only
-    runs when nothing else owns the loop. Inside an async host (the gateway)
-    it says where to run it instead of blocking the event loop for minutes.
+    Two rooms, one command. Outside an event loop (a terminal session) the
+    call owns the terminal: microphone in, speaker out. Inside the gateway
+    it runs in the Discord voice channel the host is already sitting in —
+    ``join`` / ``leave`` / ``status`` — because a duplex call cannot own a
+    terminal that nobody is looking at, and the gateway has a better room.
     """
 
+    sub = (raw_args or "").strip().lower()
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        if sub in {"join", "leave", "status"}:
+            return (
+                "Those are for the gateway's Discord voice channel. Here in a "
+                "terminal, plain `/talk` starts the call."
+            )
         return "Voice session ended." if talk_cli.cli_entry() == 0 else (
             "Voice session ended with errors — see stderr."
         )
-    return "Voice needs its own terminal: run `hermes talk` in a shell."
+
+    if sub in {"leave", "stop", "hang up"}:
+        return talk_discord.stop_session()
+    if sub == "status":
+        return talk_discord.session_status()
+    if sub in {"", "join"}:
+        return talk_discord.start_session()
+    return talk_discord.JOIN_USAGE
 
 
 def _on_session_end(**kwargs) -> None:
@@ -87,8 +110,8 @@ def register(ctx) -> None:
         ctx.register_command(
             "talk",
             handler=_talk_command,
-            description="Start a Realtime voice session",
-            args_hint="",
+            description="Start a Realtime voice session (gateway: join|leave|status)",
+            args_hint="[join|leave|status]",
         )
     except Exception as exc:  # noqa: BLE001
         _record("slash command", exc)

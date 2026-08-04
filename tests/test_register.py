@@ -171,7 +171,10 @@ def test_session_end_hook_is_a_noop(plugin):
     assert callback(session_id="abc") is None
 
 
-def test_slash_command_points_at_a_terminal_inside_an_event_loop(plugin):
+def test_slash_command_takes_the_discord_room_inside_an_event_loop(plugin):
+    # Inside the gateway the call runs in the host's Discord voice channel,
+    # not a terminal nobody is looking at. With no gateway present it must
+    # refuse in one sentence rather than raise.
     import asyncio
 
     ctx = StubCtx()
@@ -181,7 +184,19 @@ def test_slash_command_points_at_a_terminal_inside_an_event_loop(plugin):
     async def call_from_a_loop():
         return handler("")
 
-    assert "hermes talk" in asyncio.run(call_from_a_loop())
+    reply = asyncio.run(call_from_a_loop())
+    assert "gateway" in reply.lower()
+    assert "traceback" not in reply.lower()
+
+
+def test_slash_command_subcommands_are_gateway_only(plugin):
+    # In a terminal, join/leave/status name a room that isn't there.
+    ctx = StubCtx()
+    plugin.register(ctx)
+    handler = ctx.commands["talk"]["handler"]
+
+    reply = handler("status")
+    assert "terminal" in reply.lower()
 
 
 def test_slash_command_runs_the_session_outside_a_loop(plugin, monkeypatch):
