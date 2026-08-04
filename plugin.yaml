@@ -1,5 +1,5 @@
 name: hermes-talk
-version: 0.6.1
+version: 0.7.0
 manifest_version: 1
 kind: standalone
 description: "OpenAI Realtime speech-to-speech voice for Hermes: duplex talk with live tool calling."

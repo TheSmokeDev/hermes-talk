@@ -11,6 +11,47 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.7.0] — 2026-08-04
+
+Talk to it in the Discord voice channel Hermes is already sitting in.
+`/talk join` turns that channel into a live duplex call — it hears you
+while it speaks, you can cut it off mid-sentence, and you can delegate
+and steer background agents out loud. Verified on a real call: the
+session connected on `gpt-realtime-2.1` over a ChatGPT subscription,
+heard the operator, answered, and spawned a background agent by voice.
+
+### Added
+- **Discord voice** (`talk_discord.py`). The plugin's audio device is
+  seven methods wide, so a voice channel can wear the same shape a
+  microphone does — the session, tool calls, steering ledger and
+  announcements above it are unchanged.
+- `/talk join` / `leave` / `status` inside the gateway. Outside it,
+  `/talk` still means the terminal call.
+
+### Changed
+- **No second Discord connection.** The host already holds one and
+  already decrypts DAVE; the plugin borrows it, so it is one bot, one
+  connection, the host's own E2EE. For the duration of a call it takes
+  over three host surfaces and returns them on stop — with one documented
+  exception: the ambient mixer is dropped rather than handed back,
+  because taking over playback closes it permanently and a closed mixer
+  still reports itself speaking, which would stall every later host reply.
+- Rate conversion is integer 2:1 both ways over `array` — no resampler
+  dependency, and specifically no `audioop`, which left the stdlib in 3.13.
+
+### Fixed
+Four defects that only a real call could surface, each now pinned by a
+regression whose fake models the host's actual behaviour:
+- the receive tap was never registered (discord.py stores the bound
+  method object and calls what it stored, so rebinding the attribute
+  tapped nothing — the call heard silence with nothing logged);
+- the playback source was duck-typed where `VoiceClient.play`
+  isinstance-checks;
+- the adapter lookup imported `Platform` from a module this host does not
+  have, so it refused on a healthy gateway;
+- capture forwarded only what Discord sent, so during a pause the
+  server's turn detection never saw the silence that ends a turn.
+
 ## [0.6.1] — 2026-08-03
 
 The polish release: the stop verbs can no longer dead-air the call, and
@@ -146,6 +187,7 @@ Repo foundation: the plugin manifest, call-time config resolution, and a
 pure Realtime wire layer that knows the OpenAI protocol and nothing about
 the host.
 
+[0.7.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.4.0...v0.5.0

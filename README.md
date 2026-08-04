@@ -62,7 +62,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 390 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 425 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 **Verify it** (no talking required):
 
@@ -107,6 +107,12 @@ hermes talk        # terminal duplex voice session
 
 or `/talk` inside an interactive Hermes session, which additionally reaches the
 agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
+
+**In Discord**, `/talk join` runs the call in the voice channel Hermes is
+already in — same conversation, same tools, same steering, in a room other
+people can hear. It borrows the host's own voice connection rather than
+opening a second one. Details and the one caveat:
+[docs/OPERATING.md](docs/OPERATING.md#discord-voice--talking-in-the-channel-hermes-is-already-in).
 
 What can you actually say? The full say-this → hear-this card, with what
 each spoken receipt commits to: [docs/VOICE-COMMANDS.md](docs/VOICE-COMMANDS.md).
@@ -336,7 +342,7 @@ The three that shaped everything else:
 
 ## Status
 
-v0.6.1 — under active development. Changes, all seven versions with their
+v0.7.0 — under active development. Changes, all seven versions with their
 receipts: [CHANGELOG.md](CHANGELOG.md). Roadmap: barge-in latch + spoken-text
 normalizer, Gemini Live backend
 ([#3](https://github.com/TheSmokeDev/hermes-talk/issues/3)), `computer_use`
