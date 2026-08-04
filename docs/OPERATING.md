@@ -176,6 +176,38 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 (One internal: the presence of `PYTEST_CURRENT_TEST` disables the durable
 run-history tee so test suites can't write into a real Hermes home.)
 
+## Discord voice — talking in the channel Hermes is already in
+
+Inside the gateway, `/talk join` runs the call in the Discord voice
+channel the host is already sitting in. `/talk leave` ends it, `/talk
+status` reports whether a session is live. Outside the gateway (a plain
+terminal) `/talk` still means the terminal session, and those
+subcommands say so.
+
+We do **not** open a second Discord connection. Hermes already has one,
+already decrypts DAVE, and already decodes Opus in this process — we
+borrow it, so it is one bot, one connection, and the host's own E2EE.
+Hermes exposes no plugin hook for voice, so for the duration of a call
+the plugin takes over three host surfaces and hands them back on stop:
+the voice receive listener, `play_in_voice_channel` (so the host does
+not fight us for the speaker), and the inactivity-timer mode getter.
+
+**One asterisk on "hands them back": the ambient mixer is not restored,
+deliberately.** Taking over playback makes Discord close that mixer
+permanently — and a closed mixer still reports itself as speaking, so
+returning it would make every later host voice reply stall for the full
+playback timeout and then vanish. Dropping it instead falls back to the
+host's plain playback path, which works. The practical consequence: if
+you had the ambient bed enabled (`discord.voice_fx`), it is gone until
+the bot next rejoins the channel. That is the smaller permanent loss,
+chosen over the larger one.
+
+Known limitation: if the bot leaves and rejoins the channel (manually,
+or through a voice-server reconnect) while a session is live, the bridge
+is left pointing at the old connection and the call goes quiet — it
+fails to silence, never to a wrong answer. Say `/talk leave` and rejoin.
+Tracked as [#8](https://github.com/TheSmokeDev/hermes-talk/issues/8).
+
 ## Troubleshooting
 
 **"Invalid length for parameter modelId, value: 0"** — the detached agent

@@ -656,6 +656,23 @@ def start_session(guild_id: int | None = None) -> str:
         with _SESSION_LOCK:
             if _SESSION.get("task") is finished:
                 _SESSION.clear()
+        # The weakest receipt in this surface: a session that dies during
+        # mint or connect leaves a Discord operator hearing silence, because
+        # the failure lands on stderr where nobody in the channel is looking.
+        # `talk status` is the detector the join reply already hands them —
+        # this makes sure the reason is on the record when they go looking.
+        try:
+            if not finished.cancelled():
+                error = finished.exception()
+                if error is not None:
+                    _log.warning("discord voice session ended: %r", error)
+                elif finished.result():
+                    _log.warning(
+                        "discord voice session exited %s — say `talk status`",
+                        finished.result(),
+                    )
+        except Exception:  # noqa: BLE001 — a receipt must not raise
+            _log.debug("could not read the session outcome", exc_info=True)
         try:
             audio.stop()
         except Exception:  # noqa: BLE001 — teardown is best-effort
