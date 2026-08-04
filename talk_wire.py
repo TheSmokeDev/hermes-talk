@@ -1,6 +1,6 @@
 """Pure OpenAI Realtime wire layer — session payloads and ephemeral mints.
 
-Ported from the proven Talk Mode slice (second-brain `talk_session.py`).
+Ported from a prior proven Talk Mode implementation.
 This module knows the OpenAI Realtime wire format and NOTHING about the
 host: no Hermes imports, no identity assembly, no tool handlers. Callers
 pass instructions, tools, and an auth token in; only the ephemeral client

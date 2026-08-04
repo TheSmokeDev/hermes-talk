@@ -57,9 +57,10 @@ def _talk_command(raw_args: str = "") -> str:
 
 
 def _on_session_end(**kwargs) -> None:
-    """Session-end hook. v0.1 has no durable state to tear down.
+    """Session-end hook. No durable state to tear down yet.
 
-    TODO(v0.4): flush the call's transcript into Hermes memory here.
+    TODO: flush the call's transcript into Hermes memory here
+    (roadmap: session-end memory debrief).
     """
 
 

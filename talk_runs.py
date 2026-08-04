@@ -1,9 +1,9 @@
 """Async-run registry — voice never blocks.
 
 Anything slower than a couple of seconds starts here, returns a spoken
-receipt immediately, and is polled until it lands. Ported from the proven
-Talk Mode slice (second-brain ``talk_runs.py``), trimmed to the two kinds
-this plugin has: ``agent`` (a detached Hermes one-shot) and ``skill``.
+receipt immediately, and is polled until it lands. Ported from a prior
+proven Talk Mode implementation, trimmed to the two kinds this plugin
+has: ``agent`` (a detached Hermes one-shot) and ``skill``.
 
 The sentinel string is the contract between a tool handler, the Realtime
 model, and the session watcher: a handler returns
