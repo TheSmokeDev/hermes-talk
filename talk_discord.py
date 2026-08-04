@@ -270,13 +270,14 @@ class DiscordAudio:
         self._lock = threading.Lock()
         self._played_baseline = 0
         self._carry_sample: int | None = None
-        self._capture_remainder = b""
+        self._capture_remainder: dict[Any, bytes] = {}
         self._original_on_packet = None
         self._tapped = None
         self._loop = None
         self._last_keepalive = 0.0
         self._restore_voice_mode: Any = _UNSET
-        self._parked_mixer: Any = _UNSET
+        self._restore_play: Any = _UNSET
+        self._final_played = 0
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -302,6 +303,13 @@ class DiscordAudio:
         self._bridge = bridge
         self._source = _RealtimeSource(self._outbound)
         self._loop = _running_loop()
+        if self._loop is None:
+            # Without a loop we cannot marshal the host's inactivity-timer
+            # reset, and the host would evict us mid-conversation with no
+            # signal. Say it once rather than fail silently.
+            _log.warning(
+                "no running loop — the host's voice inactivity timer will not be re-armed"
+            )
         voice_client = bridge["voice_client"]
 
         # Tap the host's receive path. We wrap rather than replace so the
@@ -321,18 +329,32 @@ class DiscordAudio:
         # hears silence with nothing logged. Swap the registration, and keep
         # the attribute in sync so the host's own stop() still unregisters
         # the object it will look up.
+        # Record BEFORE touching the host: if the swap half-completes, stop()
+        # is the only thing that can put the original listener back, and it
+        # is gated on these being set. Losing that leg leaves the host
+        # permanently deaf with no path back.
+        self._original_on_packet = original
+        self._tapped = tapped
         try:
             connection = voice_client._connection
-            connection.remove_socket_listener(original)
+            # Add first, then remove: unregistering the only callback pauses
+            # discord.py's reader thread until something re-registers
+            # (voice_state.py:99-104), and packets in that window are lost.
+            # Overlapping costs one duplicated packet instead of a gap.
             connection.add_socket_listener(tapped)
+            connection.remove_socket_listener(original)
         except Exception as exc:  # host receive surface, any type
+            with suppress(Exception):  # never leave the host deaf
+                connection.remove_socket_listener(tapped)
+            with suppress(Exception):
+                connection.add_socket_listener(original)
+            self._original_on_packet = None
+            self._tapped = None
             self._bridge = None
             raise talk_audio.TalkAudioError(
                 f"couldn't listen in on the voice channel: {exc}"
             ) from exc
         receiver._on_packet = tapped
-        self._original_on_packet = original
-        self._tapped = tapped
 
         # Park the host's own speech while we own the conversation. Its
         # reply path waits on ``is_playing()`` — which our continuous source
@@ -342,12 +364,40 @@ class DiscordAudio:
         # (unlike the listener above), and the mixer is popped so the host
         # cannot block on a mixer nobody is draining.
         adapter = bridge.get("adapter")
+
+        # THE chokepoint. Every route the host uses to speak — the runner's
+        # reply path and the adapter's own auto-TTS — funnels through
+        # play_in_voice_channel, and it waits on is_playing() (which our
+        # continuous source keeps True) for a two-minute timeout before
+        # force-stopping us mid-sentence and never handing back. Parking the
+        # adapter's voice-mode getter does NOT do this: that getter is a
+        # read-only view onto the runner's own dict and is only consulted by
+        # the inactivity timer.
+        self._restore_play = getattr(adapter, "play_in_voice_channel", _UNSET)
+
+        async def _parked_play(*_args: Any, **_kwargs: Any) -> bool:
+            _log.debug("host playback suppressed — the realtime session owns the channel")
+            return False
+
+        with suppress(Exception):
+            adapter.play_in_voice_channel = _parked_play
+
+        # Keep parking the mode getter too: it makes the host's inactivity
+        # handler bail out early, which double-covers the auto-leave.
         self._restore_voice_mode = getattr(adapter, "_voice_mode_getter", None)
         with suppress(Exception):
             adapter._voice_mode_getter = lambda _chat_id: "off"
+
+        # Take the mixer out of the host's reach. It is NOT handed back:
+        # voice_client.stop() below makes discord.py call cleanup() on it,
+        # which sets _closed and drops the ambient bed permanently, and a
+        # closed mixer still reports speech_active forever — so returning it
+        # would make every later host reply stall the full playback timeout
+        # and vanish. Dropping it falls back to the plain playback path,
+        # which works. A fresh bed needs the host's own installer.
         mixers = getattr(adapter, "_voice_mixers", None)
         if isinstance(mixers, dict):
-            self._parked_mixer = mixers.pop(bridge["guild_id"], _UNSET)
+            mixers.pop(bridge["guild_id"], None)
 
         try:
             if getattr(voice_client, "is_playing", lambda: False)():
@@ -371,24 +421,31 @@ class DiscordAudio:
             with suppress(Exception):
                 connection = bridge["voice_client"]._connection
                 connection.remove_socket_listener(self._tapped)
-                connection.add_socket_listener(self._original_on_packet)
+                # Only re-register for a receiver that is still alive. If the
+                # host already tore it down, re-adding an inert callback keeps
+                # its reader thread awake for the life of the connection.
+                if getattr(receiver, "_running", False):
+                    connection.add_socket_listener(self._original_on_packet)
             with suppress(Exception):
                 receiver._on_packet = self._original_on_packet
         self._original_on_packet = None
         self._tapped = None
         if bridge is not None:
             adapter = bridge.get("adapter")
+            if self._restore_play is not _UNSET:
+                with suppress(Exception):
+                    adapter.play_in_voice_channel = self._restore_play
+            self._restore_play = _UNSET
             if self._restore_voice_mode is not _UNSET:
                 with suppress(Exception):
                     adapter._voice_mode_getter = self._restore_voice_mode
             self._restore_voice_mode = _UNSET
-            if self._parked_mixer is not _UNSET:
-                with suppress(Exception):
-                    adapter._voice_mixers[bridge["guild_id"]] = self._parked_mixer
-            self._parked_mixer = _UNSET
             with suppress(Exception):
                 bridge["voice_client"].stop()
-        self._source = None
+        source, self._source = self._source, None
+        if source is not None:
+            with self._lock:
+                self._final_played = max(0, source.frames_served - self._played_baseline) * 20
 
     # -- capture (host socket-reader thread) ----------------------------------
 
@@ -408,19 +465,23 @@ class DiscordAudio:
             lock = getattr(receiver, "_lock", None)
             if lock is not None:
                 with lock:
-                    chunks = [bytes(buf) for buf in buffers.values() if buf]
+                    chunks = [(ssrc, bytes(buf)) for ssrc, buf in buffers.items() if buf]
                     for buf in buffers.values():
                         del buf[:]
             else:  # pragma: no cover - every shipped host has the lock
-                chunks = [bytes(buf) for buf in buffers.values() if buf]
+                chunks = [(ssrc, bytes(buf)) for ssrc, buf in buffers.items() if buf]
                 for buf in buffers.values():
                     del buf[:]
             if chunks:
                 self._touch_host_timer()
-            for chunk in chunks:
-                converted, self._capture_remainder = discord_to_session(
-                    chunk, carry=self._capture_remainder
+            for ssrc, chunk in chunks:
+                # Per speaker: one speaker's partial sample group prepended
+                # to another's audio would shift it and transpose L/R for
+                # that chunk.
+                converted, remainder = discord_to_session(
+                    chunk, carry=self._capture_remainder.get(ssrc, b"")
                 )
+                self._capture_remainder[ssrc] = remainder
                 if not converted:
                     continue
                 try:
@@ -516,9 +577,9 @@ class DiscordAudio:
         """
 
         source = self._source
-        if source is None:
-            return 0
         with self._lock:
+            if source is None:
+                return self._final_played
             served = source.frames_served - self._played_baseline
         return max(0, served) * 20  # each Discord frame is 20 ms
 

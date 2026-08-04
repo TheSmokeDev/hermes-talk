@@ -10,6 +10,7 @@ refusal instead of a traceback.
 from __future__ import annotations
 
 import array
+import asyncio
 import math
 import queue
 import sys
@@ -268,6 +269,7 @@ class _FakeReceiver:
     def __init__(self) -> None:
         self._buffers: dict = {}
         self._lock = threading.Lock()
+        self._running = True  # the host clears this in its own teardown
         self.seen: list = []
 
     def _on_packet(self, data: bytes) -> None:
@@ -302,6 +304,12 @@ def _wired_host(monkeypatch):
     ).append(gid)
     adapter._voice_mode_getter = lambda chat_id: "all"
     adapter._voice_mixers = {7: "the-host-mixer"}
+
+    async def _real_play(guild_id, path):  # the host's speech chokepoint
+        adapter.__dict__.setdefault("host_played", []).append(path)
+        return True
+
+    adapter.play_in_voice_channel = _real_play
     return connection, receiver, vc, adapter
 
 
@@ -339,8 +347,12 @@ def test_stop_restores_the_host_exactly(monkeypatch):
     # Equality, not identity: Python mints a fresh bound-method object on
     # every attribute access, so `a.m is a.m` is False even untouched.
     assert receiver._on_packet == original
-    assert adapter._voice_mixers == {7: "the-host-mixer"}, "mixer not handed back"
-    assert adapter._voice_mode_getter("c") == "all", "host speech not handed back"
+    assert adapter._voice_mode_getter("c") == "all", "mode getter not handed back"
+    # The mixer is deliberately NOT handed back: stopping playback makes
+    # discord.py close it permanently, and a closed mixer still reports
+    # speech_active — so returning it would stall every later host reply
+    # for the full playback timeout and drop it.
+    assert adapter._voice_mixers == {}, "a closed mixer must not be handed back"
 
 
 def test_capture_rearms_the_hosts_inactivity_timer(monkeypatch):
@@ -381,4 +393,67 @@ def test_underrun_never_retires_the_player(monkeypatch):
     frame = vc.playing.read()  # nothing queued
     assert frame == talk_discord.SILENCE_FRAME
     assert frame != b""
+    bridge.stop()
+
+
+def test_host_speech_is_parked_at_the_real_chokepoint(monkeypatch):
+    # Parking the adapter's voice-mode getter does NOT suppress replies —
+    # that getter is a read-only view onto the runner's dict, consulted only
+    # by the inactivity timer. Every route the host speaks through funnels
+    # into play_in_voice_channel, and it blocks on our continuous source
+    # for the full playback timeout before force-stopping us.
+    _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+    original_play = adapter.play_in_voice_channel
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    spoke = asyncio.run(adapter.play_in_voice_channel(7, "reply.mp3"))
+    assert spoke is False, "host speech must be refused while we own the channel"
+    assert "host_played" not in adapter.__dict__, "host still reached the speaker"
+
+    bridge.stop()
+    assert adapter.play_in_voice_channel == original_play, "chokepoint not handed back"
+    assert asyncio.run(adapter.play_in_voice_channel(7, "after.mp3")) is True
+
+
+def test_a_failed_swap_never_leaves_the_host_deaf(monkeypatch):
+    # If the swap half-completes, the original listener must go back — a
+    # host with no receive callback is deaf for the life of the connection
+    # with no path back.
+    connection, _receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original = connection.callbacks[0]
+
+    def explode(cb):
+        raise RuntimeError("listener registry rejected us")
+
+    monkeypatch.setattr(connection, "add_socket_listener", explode)
+    bridge = talk_discord.DiscordAudio(7)
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't listen in"):
+        bridge.start()
+    assert connection.callbacks == [original], "host left without a receive callback"
+
+
+def test_stop_does_not_rewake_a_torn_down_receiver(monkeypatch):
+    # If the host tore the receiver down first, re-registering an inert
+    # callback keeps discord.py's reader thread awake forever.
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    receiver._running = False  # the host's own teardown ran
+    bridge.stop()
+    assert connection.callbacks == [], "re-registered a listener for a dead receiver"
+
+
+def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):
+    # One speaker's partial sample group prepended to another's audio would
+    # shift it and transpose L/R for that chunk.
+    _connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    with receiver._lock:
+        receiver._buffers[1] = bytearray(bytes([1, 0]) * 5)  # 5 samples: 1 group + 1 left
+        receiver._buffers[2] = bytearray(bytes([2, 0]) * 5)
+    bridge._drain_receiver(receiver)
+    assert set(bridge._capture_remainder) == {1, 2}
+    assert bridge._capture_remainder[1] != bridge._capture_remainder[2]
     bridge.stop()
