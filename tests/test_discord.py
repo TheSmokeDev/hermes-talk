@@ -518,3 +518,66 @@ def test_source_satisfies_a_hosts_isinstance_check(monkeypatch):
     assert source.is_opus() is False
     assert source.read() == talk_discord.SILENCE_FRAME
     talk_discord._SOURCE_CLASSES.clear()
+
+
+def test_silence_is_synthesized_when_discord_goes_quiet(monkeypatch):
+    # Discord stops transmitting when nobody speaks. The session's turn
+    # detection measures silence IN THE AUDIO IT RECEIVES, so a bridge that
+    # forwards only what arrives never ends the operator's turn — which
+    # presents as "it takes forever to answer".
+    _connection, _receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    clock = [1000.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    # Already covered for the next frame-duration.
+    bridge._audio_clock = clock[0] + 0.02
+
+    # Nothing queued and the stream is covered: nothing owed yet.
+    assert bridge.read_input_chunk() is None
+
+    # Once wall time catches up, one frame of silence is owed.
+    clock[0] += 0.02
+    frame = bridge.read_input_chunk()
+    assert frame == talk_discord.SESSION_SILENCE
+    assert len(frame) == talk_discord.SESSION_FRAME_BYTES
+
+    # And only one — the clock advanced with it.
+    assert bridge.read_input_chunk() is None
+    bridge.stop()
+
+
+def test_real_audio_pays_down_the_clock_instead_of_earning_silence(monkeypatch):
+    # A burst of buffered speech must not be followed by a burst of
+    # synthesized silence: sending 100ms of audio buys 100ms of the clock.
+    _connection, _receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    clock = [2000.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    bridge._audio_clock = clock[0]
+
+    speech = _tone(2400, rate=24_000)  # 100 ms
+    bridge._inbound.put_nowait(speech)
+    assert bridge.read_input_chunk() == speech
+
+    # 20ms later we are still covered by the audio just sent.
+    clock[0] += 0.02
+    assert bridge.read_input_chunk() is None
+    # Past the end of it, silence resumes.
+    clock[0] += 0.10
+    assert bridge.read_input_chunk() == talk_discord.SESSION_SILENCE
+    bridge.stop()
+
+
+def test_no_silence_before_start_or_after_stop(monkeypatch):
+    # Synthesizing into a session that does not exist would be noise on a
+    # dead socket.
+    bridge = talk_discord.DiscordAudio(7)
+    assert bridge.read_input_chunk() is None
+    _connection, _receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge.start()
+    bridge.stop()
+    assert bridge.read_input_chunk() is None

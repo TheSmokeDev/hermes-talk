@@ -58,10 +58,19 @@ DISCORD_FRAME_BYTES = 3_840
 #: for good with no error anywhere.
 SILENCE_FRAME = b"\x00" * DISCORD_FRAME_BYTES
 
+#: One 20 ms frame of the session's own format (24 kHz mono s16le), and the
+#: silence we synthesize when Discord goes quiet.
+SESSION_FRAME_MS = 20
+SESSION_FRAME_BYTES = 960
+SESSION_SILENCE = bytes(SESSION_FRAME_BYTES)
+
 #: Bounded like the PortAudio path: overflow drops the oldest audio rather
 #: than growing without limit when one side stalls.
 MAX_INPUT_FRAMES = 100  # 2 s of inbound speech
 MAX_OUTPUT_FRAMES = 250  # 5 s of queued reply
+
+#: 24 kHz mono s16le.
+_SESSION_BYTES_PER_SECOND = 24_000 * 2
 
 
 #: Distinguishes "never captured" from a legitimately stored ``None``.
@@ -314,6 +323,9 @@ class DiscordAudio:
         self._played_baseline = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
+        #: Wall-clock instant up to which we have handed the session audio.
+        #: Zero until start(), which is what gates silence synthesis.
+        self._audio_clock = 0.0
         self._original_on_packet = None
         self._tapped = None
         self._loop = None
@@ -345,6 +357,7 @@ class DiscordAudio:
 
         self._bridge = bridge
         self._source = _new_source(self._outbound)
+        self._audio_clock = time.monotonic()
         self._loop = _running_loop()
         if self._loop is None:
             # Without a loop we cannot marshal the host's inactivity-timer
@@ -473,6 +486,7 @@ class DiscordAudio:
                 receiver._on_packet = self._original_on_packet
         self._original_on_packet = None
         self._tapped = None
+        self._audio_clock = 0.0
         if bridge is not None:
             adapter = bridge.get("adapter")
             if self._restore_play is not _UNSET:
@@ -569,12 +583,41 @@ class DiscordAudio:
             loop.call_soon_threadsafe(reset, bridge["guild_id"])
 
     def read_input_chunk(self) -> bytes | None:
-        """One chunk of 24 kHz mono for the session, or ``None`` when idle."""
+        """One chunk of 24 kHz mono for the session, paced to real time.
 
+        A microphone streams continuously — silence included — and the
+        session's turn detection depends on that: the server decides the
+        operator stopped talking by measuring silence IN THE AUDIO IT
+        RECEIVES, not by watching a clock. Discord does the opposite. It
+        stops transmitting when nobody speaks, so a bridge that only
+        forwards what arrives sends nothing during a pause, the server's
+        silence never accumulates, and end-of-turn fires late or not at all
+        — which the operator experiences as "it takes forever to answer".
+
+        So this synthesizes silence to fill the gaps, on a wall clock: one
+        frame per frame-duration, real audio when there is any, zeros when
+        there is not. Pacing is as load-bearing as the silence itself —
+        unpaced zeros would run the stream faster than real time and eat
+        the pauses that separate sentences.
+        """
+
+        now = time.monotonic()
         try:
-            return self._inbound.get_nowait()
+            chunk = self._inbound.get_nowait()
         except queue.Empty:
+            chunk = None
+        if chunk:
+            # Real audio: advance the clock by however much we just sent, so
+            # a burst of buffered speech does not earn extra silence after.
+            duration = len(chunk) / _SESSION_BYTES_PER_SECOND
+            self._audio_clock = max(self._audio_clock, now) + duration
+            return chunk
+        if self._audio_clock <= 0.0:  # not started
             return None
+        if now < self._audio_clock:
+            return None  # already sent audio covering this instant
+        self._audio_clock += SESSION_FRAME_MS / 1000
+        return SESSION_SILENCE
 
     # -- playback -------------------------------------------------------------
 
