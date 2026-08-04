@@ -489,3 +489,32 @@ def test_adapter_is_found_when_only_the_key_name_matches(monkeypatch):
 
     bridge = talk_discord.resolve_voice_bridge()
     assert bridge["adapter"] is fake_adapter
+
+
+def test_source_satisfies_a_hosts_isinstance_check(monkeypatch):
+    # discord.py's VoiceClient.play does `isinstance(source, AudioSource)`
+    # and rejects a duck type outright. The first cut shipped duck-typed and
+    # died on the first real call with "source must be an AudioSource not
+    # _RealtimeSource" — invisible to every offline test, because off-host
+    # there is no base class to fail against. This fakes the host's ABC.
+    class _HostAudioSource:
+        def read(self):  # pragma: no cover - overridden
+            raise NotImplementedError
+
+        def is_opus(self):  # pragma: no cover - overridden
+            return True
+
+        def cleanup(self):  # pragma: no cover - overridden
+            pass
+
+    fake_discord = types.ModuleType("discord")
+    fake_discord.AudioSource = _HostAudioSource
+    monkeypatch.setitem(sys.modules, "discord", fake_discord)
+    talk_discord._SOURCE_CLASSES.clear()
+
+    source = talk_discord._new_source(queue.Queue())
+    assert isinstance(source, _HostAudioSource), "a host would refuse this source"
+    # Our behaviour must still win over the base class's.
+    assert source.is_opus() is False
+    assert source.read() == talk_discord.SILENCE_FRAME
+    talk_discord._SOURCE_CLASSES.clear()

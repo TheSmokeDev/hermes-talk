@@ -226,10 +226,12 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
 class _RealtimeSource:
     """The host's outbound audio, fed live instead of from a finished file.
 
-    Duck-typed rather than subclassed: ``discord.AudioSource`` only requires
-    ``read()``, ``is_opus()``, and ``cleanup()``, and importing the host's
-    discord module at class-definition time would make this module
-    unimportable off-host (where the whole test suite runs).
+    Defined without a base class so this module imports off-host, where the
+    whole test suite runs. That is NOT sufficient on a real call:
+    ``VoiceClient.play`` does ``isinstance(source, AudioSource)`` and
+    rejects a duck type outright ("source must be an AudioSource not
+    _RealtimeSource"). :func:`_new_source` mixes in the host's real base at
+    runtime — the behaviour lives here, the pedigree is added there.
     """
 
     def __init__(self, frames: queue.Queue) -> None:
@@ -271,6 +273,32 @@ class _RealtimeSource:
     def cleanup(self) -> None:
         with self._carry_lock:
             self._carry.clear()
+
+
+#: Concrete source classes, cached per host base class.
+_SOURCE_CLASSES: dict[Any, Any] = {}
+
+
+def _new_source(frames: queue.Queue) -> Any:
+    """A playback source ``discord.VoiceClient.play`` will actually accept.
+
+    On a host, that means a genuine ``discord.AudioSource`` subclass — the
+    play() call isinstance-checks it. Off-host there is nothing to inherit
+    from and the plain implementation is what the tests exercise.
+    """
+
+    try:
+        import discord
+
+        base = discord.AudioSource
+    except Exception:  # noqa: BLE001 — no host discord in this process
+        return _RealtimeSource(frames)
+    cls = _SOURCE_CLASSES.get(base)
+    if cls is None:
+        # _RealtimeSource first in the MRO so its methods win.
+        cls = type("_RealtimeAudioSource", (_RealtimeSource, base), {})
+        _SOURCE_CLASSES[base] = cls
+    return cls(frames)
 
 
 class DiscordAudio:
@@ -316,7 +344,7 @@ class DiscordAudio:
             )
 
         self._bridge = bridge
-        self._source = _RealtimeSource(self._outbound)
+        self._source = _new_source(self._outbound)
         self._loop = _running_loop()
         if self._loop is None:
             # Without a loop we cannot marshal the host's inactivity-timer
