@@ -351,6 +351,11 @@ def _describe_run(run: dict) -> str:
         line += _describe_age(run)
     if run.get("status") == "lost":
         line += " (started before this session — I can't see how it ended)"
+    # A stop verb's detached confirmation lands in meta (hermes-talk#2) —
+    # this is where "ask me in a moment for the receipt" pays off.
+    meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+    if meta.get("stop_result"):
+        line += f" — stop receipt: {meta['stop_result']}"
     return line
 
 

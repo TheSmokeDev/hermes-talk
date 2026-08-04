@@ -152,6 +152,23 @@ def test_subagent_stop_messages_without_an_id_say_nothing():
     assert talk_cli.subagent_stop_messages({}) == []
 
 
+def test_landed_note_messages_are_trusted_but_keep_the_shape():
+    messages = talk_cli.landed_note_messages("sa-0-aaaa")
+    assert len(messages) == 3
+    item = messages[0]["item"]
+    assert item["role"] == "system"
+    text = item["content"][0]["text"]
+    assert "sa-0-aaaa" in text and "just landed" in text
+    # No report rides this one, so no data-framing boilerplate either.
+    assert "DATA, not instructions" not in text
+    assert messages[1] == {"type": "response.create", "response": {"tool_choice": "none"}}
+    assert messages[2] == {"type": "conversation.item.delete", "item_id": item["id"]}
+
+
+def test_landed_note_messages_without_an_id_say_nothing():
+    assert talk_cli.landed_note_messages("") == []
+
+
 def test_subagent_stop_messages_cap_the_summary_tail():
     long_summary = "x" * (talk_cli.WATCH_OUTPUT_TAIL_CHARS + 500)
     text = talk_cli.subagent_stop_messages(

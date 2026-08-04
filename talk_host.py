@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,27 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_steer
 
 _log = logging.getLogger(__name__)
+
+#: How long a stop verb politely waits for its confirmation before detaching
+#: (hermes-talk#2). Long enough that the common fast path (an HTTP 2xx or a
+#: child dying on SIGTERM) speaks the REAL result; short enough that a wedged
+#: server can never dead-air the voice loop the way the old unbounded call
+#: could (~6s worst case, measured).
+STOP_CONFIRM_WAIT_S = 1.5
+
+#: How long the DETACHED confirmation keeps waiting after the polite wait
+#: gave up. Tests shrink this; production keeps it generous — the receipt
+#: lands in the run's meta whenever it resolves.
+STOP_LATE_CONFIRM_S = 30.0
+
+
+def _spawn_daemon(fn, *args) -> None:
+    """Fire-and-forget worker. DAEMON by design: a stop confirmation still
+    in flight when the operator hangs up must never stall process exit
+    (ThreadPoolExecutor threads are non-daemon and joined at shutdown —
+    exactly the wrong contract for this)."""
+
+    threading.Thread(target=fn, args=args, daemon=True, name="talk-stop").start()
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -838,6 +861,7 @@ class HostAdapter:
             if run.get("status") in talk_runs.TERMINAL_STATUSES:
                 return f"run {run.get('runId')} already finished."
             meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+            run_id = int(run["runId"])
             if meta.get("lane") == LANE_API_SERVER:
                 api_run_id = meta.get("api_run_id")
                 if not isinstance(api_run_id, str) or not api_run_id:
@@ -845,20 +869,78 @@ class HostAdapter:
                         "I can't stop that one — the api server never told me "
                         "its run id."
                     )
+                # Off the voice loop (hermes-talk#2): the POST runs on a
+                # daemon worker with a bounded courtesy wait. The old
+                # synchronous call could dead-air the call for ~6s on a slow
+                # server.
+                outcomes: queue.Queue = queue.Queue(maxsize=1)
+
+                def _post(_api_id: str = api_run_id) -> None:
+                    try:
+                        talk_apiserver.stop_run(_api_id)
+                        outcomes.put(("ok", None))
+                    except Exception as exc:  # noqa: BLE001 — the outcome IS the record
+                        outcomes.put(("err", exc))
+
+                _spawn_daemon(_post)
                 try:
-                    talk_apiserver.stop_run(api_run_id)
-                except talk_apiserver.TalkApiServerError as exc:
-                    return f"the stop didn't go through: {exc}"
+                    kind, err = outcomes.get(timeout=STOP_CONFIRM_WAIT_S)
+                except queue.Empty:
+
+                    def _receipt(_rid: int = run_id) -> None:
+                        try:
+                            late_kind, late_err = outcomes.get(timeout=STOP_LATE_CONFIRM_S)
+                        except queue.Empty:
+                            talk_runs.annotate_run(_rid, stop_result="no answer from the server")
+                            return
+                        talk_runs.annotate_run(
+                            _rid,
+                            stop_result=(
+                                "accepted" if late_kind == "ok" else f"failed: {late_err}"
+                            ),
+                        )
+
+                    _spawn_daemon(_receipt)
+                    return (
+                        f"Sending the stop for run {run.get('runId')} — the "
+                        "server hasn't answered yet; ask me in a moment and "
+                        "I'll have the receipt."
+                    )
+                if kind == "err":
+                    return f"the stop didn't go through: {err}"
                 # 2xx = the server ACCEPTED the stop ("stopping"), not
                 # that the agent is gone — say the request, not the outcome.
+                talk_runs.annotate_run(run_id, stop_result="accepted")
                 return (
                     f"Sent the stop for run {run.get('runId')} — the "
                     "server is winding it down."
                 )
-            if talk_runs.terminate_process(int(run["runId"])):
-                # terminate() is a signal, not a wait — winding down, not
-                # proven gone.
-                return f"Sent the stop for run {run.get('runId')} — it's winding down."
+            if talk_runs.terminate_process(run_id):
+                # terminate() is a signal, not a wait — confirm within the
+                # bounded budget, and keep confirming off-thread past it
+                # (hermes-talk#2): the death receipt lands in the run's meta
+                # either way, spoken by the next check_work.
+                code = talk_runs.wait_process(run_id, STOP_CONFIRM_WAIT_S)
+                if code is not None:
+                    talk_runs.annotate_run(run_id, stop_result=f"exited {code}")
+                    return f"Stopped run {run.get('runId')} — it's down."
+
+                def _confirm(_rid: int = run_id) -> None:
+                    late = talk_runs.wait_process(_rid, STOP_LATE_CONFIRM_S)
+                    talk_runs.annotate_run(
+                        _rid,
+                        stop_result=(
+                            f"exited {late}"
+                            if late is not None
+                            else "stop signaled, never confirmed dead"
+                        ),
+                    )
+
+                _spawn_daemon(_confirm)
+                return (
+                    f"Sent the stop for run {run.get('runId')} — it's winding "
+                    "down; I'll have the death receipt next time you ask."
+                )
             return (
                 "I couldn't stop that one — I don't hold a handle to its "
                 "process anymore."

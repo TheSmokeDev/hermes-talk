@@ -417,6 +417,32 @@ def terminate_process(run_id: int) -> bool:
     return True
 
 
+def wait_process(run_id: int, timeout: float) -> int | None:
+    """Bounded wait for a retained child to actually die (hermes-talk#2).
+
+    ``terminate()`` is a signal, not a wait — this is the confirmation half.
+    Returns the exit code once the process is gone, or ``None`` if it is
+    still running when the budget runs out (or no handle is held). Polls
+    outside the lock so a wedged child can never wedge the registry.
+    """
+
+    with _PROCESS_LOCK:
+        process = _PROCESSES.get(run_id)
+    if process is None:
+        return None
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            code = process.poll()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — a foreign handle proves nothing
+            return None
+        if code is not None:
+            return int(code)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
 def reset_for_tests() -> None:
     """Clear registry state between tests (never called in production)."""
 
@@ -442,4 +468,5 @@ __all__ = [
     "start_run",
     "started_sentinel",
     "terminate_process",
+    "wait_process",
 ]

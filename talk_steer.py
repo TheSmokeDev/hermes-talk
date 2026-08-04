@@ -113,6 +113,33 @@ _PRE_API_LOGGER: logging.Logger | None = None
 _PRE_API_GATE: _DebugGate | None = None
 _PRE_API_PREV_LEVEL: int | None = None
 
+#: Optional landing push (hermes-talk#2): called with a subagent id each
+#: time one or more of its queued receipts flip to ``landed``. Set by the
+#: live Talk session so a landing is SPOKEN when it happens instead of
+#: waiting for the next check_work. Invoked on the HOST's drain thread and
+#: NEVER while ``_LOCK`` is held — the callback owns its own marshalling.
+_LANDED_NOTIFIER = None
+
+
+def set_landed_notifier(callback) -> None:
+    """Register (or clear, with ``None``) the landed-push callback."""
+
+    global _LANDED_NOTIFIER
+    _LANDED_NOTIFIER = callback
+
+
+def _push_landed(subagent_ids) -> None:
+    """Fire the notifier per landed agent — outside the lock, fail-open."""
+
+    notifier = _LANDED_NOTIFIER
+    if notifier is None:
+        return
+    for subagent_id in subagent_ids:
+        try:
+            notifier(subagent_id)
+        except Exception:  # noqa: BLE001 — a push must never break the drain path
+            _log.debug("landed notifier failed", exc_info=True)
+
 
 def new_token() -> str:
     """A fresh correlation token for one steered note."""
@@ -289,6 +316,12 @@ def ensure_pre_api_watcher() -> bool:
     lower it ourselves and install :class:`_DebugGate` so only the drain
     line escapes at that level. ``False`` means no host module in this
     process — the pre-API artifact is simply unavailable.
+
+    Every call also RECONCILES the borrow (hermes-talk#5): if the operator
+    has since raised their own config to DEBUG, our gate would wrongly mute
+    this module's other DEBUG lines — so the borrow is handed back and the
+    operator's level governs. Watchers are armed on every steer, so drift
+    is corrected at least that often.
     """
 
     global _PRE_API_WATCHER, _PRE_API_LOGGER, _PRE_API_GATE, _PRE_API_PREV_LEVEL
@@ -300,22 +333,96 @@ def ensure_pre_api_watcher() -> bool:
     if not isinstance(logger, logging.Logger):
         return False
     with _LOCK:
+        _reconcile_borrow_locked(logger)
+        existing = None
         for handler in logger.handlers:
             if isinstance(handler, _PreApiDrainWatcher):
-                _PRE_API_WATCHER = handler
-                _PRE_API_LOGGER = logger
-                return True
+                existing = handler
+                break
+        if existing is not None:
+            _PRE_API_WATCHER = existing
+            _PRE_API_LOGGER = logger
+            # Re-borrow if needed: an operator who toggled verbose ON (borrow
+            # handed back) and OFF again would otherwise leave the watcher
+            # blind while this function still answered True.
+            _ensure_borrow_locked(logger)
+            return True
         watcher = _PreApiDrainWatcher(level=logging.DEBUG)
-        if logger.getEffectiveLevel() > logging.DEBUG:
-            _PRE_API_PREV_LEVEL = logger.level
-            gate = _DebugGate()
-            logger.addFilter(gate)
-            _PRE_API_GATE = gate
-            logger.setLevel(logging.DEBUG)
+        _PRE_API_LOGGER = logger
+        _ensure_borrow_locked(logger)
         logger.addHandler(watcher)
         _PRE_API_WATCHER = watcher
-        _PRE_API_LOGGER = logger
     return True
+
+
+def _ensure_borrow_locked(logger: logging.Logger) -> None:
+    """Take the DEBUG borrow iff needed and not already held. Caller holds
+    ``_LOCK``. Idempotent counterpart of :func:`_release_borrow_locked`."""
+
+    global _PRE_API_GATE, _PRE_API_PREV_LEVEL
+    if _PRE_API_GATE is not None:
+        return
+    if logger.getEffectiveLevel() > logging.DEBUG:
+        _PRE_API_PREV_LEVEL = logger.level
+        gate = _DebugGate()
+        logger.addFilter(gate)
+        _PRE_API_GATE = gate
+        logger.setLevel(logging.DEBUG)
+
+
+def _reconcile_borrow_locked(logger: logging.Logger) -> None:
+    """Hand the borrowed level back when the operator's config catches up.
+
+    Caller holds ``_LOCK``. We only ever borrowed because the effective
+    level was above DEBUG; if the logger's PARENT chain now resolves to
+    DEBUG on its own, the operator turned verbose logging on and our gate
+    is the only thing muting this module — remove it and restore the level
+    we found. The watcher handler stays: it works at any level once records
+    exist.
+    """
+
+    if _PRE_API_GATE is None or _PRE_API_LOGGER is not logger:
+        return
+    parent = logger.parent
+    if parent is None or parent.getEffectiveLevel() > logging.DEBUG:
+        return
+    _release_borrow_locked(logger)
+
+
+def _release_borrow_locked(logger: logging.Logger) -> None:
+    """Remove the gate and restore the found level. Caller holds ``_LOCK``."""
+
+    global _PRE_API_GATE, _PRE_API_PREV_LEVEL
+    if _PRE_API_GATE is not None:
+        logger.removeFilter(_PRE_API_GATE)
+        _PRE_API_GATE = None
+    if _PRE_API_PREV_LEVEL is not None:
+        logger.setLevel(_PRE_API_PREV_LEVEL)
+        _PRE_API_PREV_LEVEL = None
+
+
+def uninstall_watchers() -> None:
+    """Production unhook (hermes-talk#5): detach everything we attached.
+
+    Symmetric with the two ``ensure_*`` calls — removes both handlers,
+    removes the gate filter, and restores the borrowed level. Receipts are
+    NOT cleared; they are history, not wiring. Safe to call at any time; a
+    later ``ensure_*`` re-attaches cleanly. Wire this to a host plugin
+    unload hook if Hermes ever grows one.
+    """
+
+    global _WATCHER, _WATCHER_LOGGER, _PRE_API_WATCHER, _PRE_API_LOGGER
+    with _LOCK:
+        if _WATCHER is not None and _WATCHER_LOGGER is not None:
+            _WATCHER_LOGGER.removeHandler(_WATCHER)
+        _WATCHER = None
+        _WATCHER_LOGGER = None
+        if _PRE_API_LOGGER is not None:
+            if _PRE_API_WATCHER is not None:
+                _PRE_API_LOGGER.removeHandler(_PRE_API_WATCHER)
+            _release_borrow_locked(_PRE_API_LOGGER)
+        _PRE_API_WATCHER = None
+        _PRE_API_LOGGER = None
 
 
 def _watcher_effective(logger: logging.Logger) -> bool:
@@ -462,6 +569,8 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                         continue
                     receipt["state"] = STATE_LANDED
                     flipped += 1
+    if matched_agents:
+        _push_landed(sorted(matched_agents))
     return flipped
 
 
@@ -507,6 +616,8 @@ def mark_landed_for_agent(agent: object) -> int:
                         continue
                     receipt["state"] = STATE_LANDED
                     flipped += 1
+    if matched_agents:
+        _push_landed(sorted(matched_agents))
     return flipped
 
 
@@ -580,28 +691,13 @@ def notes_summary() -> str:
 
 
 def reset_for_tests() -> None:
-    global _WATCHER, _WATCHER_LOGGER
-    global _PRE_API_WATCHER, _PRE_API_LOGGER, _PRE_API_GATE, _PRE_API_PREV_LEVEL
+    # Detach, not just forget — a leaked handler on a long-lived logger is
+    # exactly the double-attach CI caught. uninstall_watchers() owns the
+    # symmetric teardown (including the borrowed-level restore).
+    uninstall_watchers()
+    set_landed_notifier(None)
     with _LOCK:
         _RECEIPTS.clear()
-    if _WATCHER is not None and _WATCHER_LOGGER is not None:
-        # Detach, not just forget — a leaked handler on a long-lived logger
-        # is exactly the double-attach CI caught.
-        _WATCHER_LOGGER.removeHandler(_WATCHER)
-    _WATCHER = None
-    _WATCHER_LOGGER = None
-    if _PRE_API_LOGGER is not None:
-        if _PRE_API_WATCHER is not None:
-            _PRE_API_LOGGER.removeHandler(_PRE_API_WATCHER)
-        if _PRE_API_GATE is not None:
-            _PRE_API_LOGGER.removeFilter(_PRE_API_GATE)
-        if _PRE_API_PREV_LEVEL is not None:
-            # Restore the level we found — including NOTSET(0).
-            _PRE_API_LOGGER.setLevel(_PRE_API_PREV_LEVEL)
-    _PRE_API_WATCHER = None
-    _PRE_API_LOGGER = None
-    _PRE_API_GATE = None
-    _PRE_API_PREV_LEVEL = None
 
 
 __all__ = [
@@ -629,4 +725,6 @@ __all__ = [
     "record_queued",
     "record_redirected",
     "reset_for_tests",
+    "set_landed_notifier",
+    "uninstall_watchers",
 ]

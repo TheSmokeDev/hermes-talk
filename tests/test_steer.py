@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -311,6 +312,123 @@ def test_stop_subagent_interrupts_and_supersedes_its_notes(monkeypatch):
     # A hard interrupt drops pending steer text (clear_interrupt) — the
     # ledger must not keep claiming the note is queued.
     assert "the note may not have been read" in talk_steer.notes_summary()
+
+
+def _poll_stop_receipt(run_id: int, expected_fragment: str, timeout: float = 3.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        run = talk_runs.get_run(run_id)
+        meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+        result = meta.get("stop_result")
+        if result and expected_fragment in result:
+            return result
+        threading.Event().wait(0.05)
+    raise AssertionError(f"stop receipt never carried {expected_fragment!r}")
+
+
+def test_stop_api_run_fast_path_annotates_the_receipt(monkeypatch):
+    monkeypatch.setattr(talk_apiserver, "stop_run", lambda rid: None)
+    run_id, hung = _running_run(talk_host.LANE_API_SERVER, api_run_id="run-777")
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+    finally:
+        hung.set()
+    assert "sent the stop" in out.lower()
+    assert _poll_stop_receipt(run_id, "accepted") == "accepted"
+
+
+def test_stop_api_run_slow_server_detaches_then_receipts(monkeypatch):
+    # hermes-talk#2: the POST must not dead-air the voice loop. A server
+    # slower than the courtesy wait gets honest detached wording, and the
+    # receipt lands in the run's meta when the answer finally arrives.
+    release = threading.Event()
+
+    def slow_stop(_rid):
+        release.wait(5)
+
+    monkeypatch.setattr(talk_apiserver, "stop_run", slow_stop)
+    monkeypatch.setattr(talk_host, "STOP_CONFIRM_WAIT_S", 0.05)
+    run_id, hung = _running_run(talk_host.LANE_API_SERVER, api_run_id="run-777")
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+        assert "hasn't answered yet" in out.lower()
+        release.set()
+        assert _poll_stop_receipt(run_id, "accepted") == "accepted"
+    finally:
+        release.set()
+        hung.set()
+
+
+def test_stop_api_run_error_within_the_window_is_spoken(monkeypatch):
+    def failing(_rid):
+        raise talk_apiserver.TalkApiServerError("boom")
+
+    monkeypatch.setattr(talk_apiserver, "stop_run", failing)
+    run_id, hung = _running_run(talk_host.LANE_API_SERVER, api_run_id="run-777")
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+    finally:
+        hung.set()
+    assert "didn't go through" in out.lower()
+    assert "boom" in out
+
+
+class _DyingProc:
+    """A child that dies (exit 0) as soon as it is terminated."""
+
+    def __init__(self):
+        self._code = None
+
+    def poll(self):
+        return self._code
+
+    def terminate(self):
+        self._code = 0
+
+
+def test_stop_detached_confirms_the_death_within_budget():
+    run_id, hung = _running_run()
+    talk_runs.register_process(run_id, _DyingProc())
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+    finally:
+        hung.set()
+    # terminate() is a signal — but the bounded wait SAW it die, so the
+    # spoken claim is allowed to be the outcome, with the exit code on file.
+    assert "it's down" in out.lower()
+    assert _poll_stop_receipt(run_id, "exited 0") == "exited 0"
+
+
+def test_stop_detached_undying_child_promises_the_receipt(monkeypatch):
+    monkeypatch.setattr(talk_host, "STOP_CONFIRM_WAIT_S", 0.05)
+    monkeypatch.setattr(talk_host, "STOP_LATE_CONFIRM_S", 0.05)
+
+    class _Undying:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    run_id, hung = _running_run()
+    talk_runs.register_process(run_id, _Undying())
+    try:
+        out = talk_host.host().stop_work(str(run_id))
+    finally:
+        hung.set()
+    assert "death receipt" in out.lower()
+    assert "never confirmed dead" in _poll_stop_receipt(run_id, "never confirmed dead")
+
+
+def test_check_work_speaks_the_stop_receipt(monkeypatch):
+    run_id, hung = _running_run()
+    try:
+        talk_runs.annotate_run(run_id, stop_result="accepted")
+        _install_host(monkeypatch, {})
+        out = talk_tools.execute_talk_tool("check_work", {})
+    finally:
+        hung.set()
+    assert "stop receipt: accepted" in out
 
 
 def test_stop_unknown_subagent_says_so(monkeypatch):

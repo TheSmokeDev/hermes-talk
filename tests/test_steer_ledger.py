@@ -421,3 +421,105 @@ def test_reset_restores_the_borrowed_logger_exactly(monkeypatch):
     assert logger.level == logging.INFO
     assert logger.handlers == []
     assert logger.filters == []
+
+
+# -- the borrow lifecycle (hermes-talk#5) -------------------------------------
+
+
+def test_borrow_is_handed_back_when_the_operator_goes_debug(monkeypatch):
+    # The operator's config is the PARENT chain. Borrow while it says INFO;
+    # when the operator turns verbose logging on at runtime, the next ensure
+    # must remove the gate and restore the found level — our filter must not
+    # keep muting a module the operator explicitly asked to hear.
+    parent = logging.getLogger(f"fake-op-{uuid.uuid4().hex[:8]}")
+    parent.setLevel(logging.INFO)
+    child = logging.getLogger(parent.name + ".conversation_loop")
+    child.setLevel(logging.NOTSET)  # inherits the operator's level
+    module = types.ModuleType("agent.conversation_loop")
+    module.logger = child
+    package = types.ModuleType("agent")
+    package.conversation_loop = module
+    monkeypatch.setitem(sys.modules, "agent", package)
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", module)
+
+    recorder = _Recorder()
+    child.addHandler(recorder)
+    assert talk_steer.ensure_pre_api_watcher() is True
+    assert child.level == logging.DEBUG  # borrowed
+    child.debug("operator chatter")
+    assert recorder.messages == []  # gated while borrowed
+
+    parent.setLevel(logging.DEBUG)  # the operator turns verbose on
+    assert talk_steer.ensure_pre_api_watcher() is True  # reconciles
+    assert child.level == logging.NOTSET  # found level restored
+    assert child.filters == []  # gate gone
+    child.debug("operator chatter")
+    assert "operator chatter" in recorder.messages  # operator hears their module
+    # The watcher itself stays attached and functional.
+    assert any(isinstance(h, logging.Handler) and h is not recorder for h in child.handlers)
+    child.removeHandler(recorder)
+
+
+def test_uninstall_watchers_detaches_everything_but_keeps_receipts(monkeypatch):
+    run_logger = _fake_run_agent(monkeypatch)
+    conv_logger = _fake_conversation_loop(monkeypatch, level=logging.INFO)
+    talk_steer.ensure_watcher()
+    talk_steer.ensure_pre_api_watcher()
+    talk_steer.record_queued("sa-0-aaaa", "a note about auth")
+
+    talk_steer.uninstall_watchers()
+
+    assert run_logger.handlers == []
+    assert conv_logger.handlers == []
+    assert conv_logger.filters == []
+    assert conv_logger.level == logging.INFO  # borrow returned
+    assert "queued" in talk_steer.notes_summary()  # history, not wiring
+    # Re-attach is clean — uninstall is a pause, not a poison.
+    assert talk_steer.ensure_watcher() is True
+    assert talk_steer.ensure_pre_api_watcher() is True
+
+
+# -- the landed push (hermes-talk#2) ------------------------------------------
+
+
+def test_landed_push_fires_per_agent_outside_the_lock():
+    seen: list[tuple[str, bool]] = []
+    talk_steer.set_landed_notifier(
+        lambda sid: seen.append((sid, talk_steer._LOCK.locked()))
+    )
+    token = talk_steer.new_token()
+    wire = talk_steer.compose_wire_text(token, "a note about auth")
+    talk_steer.record_queued("sa-0-aaaa", wire, token=token)
+    talk_steer.mark_landed_from_preview(wire)
+    # Fired once, with the ledger lock RELEASED — the callback marshals to
+    # an event loop and must never run under our lock.
+    assert seen == [("sa-0-aaaa", False)]
+
+
+def test_landed_push_covers_the_pre_api_path_too():
+    seen: list[str] = []
+    talk_steer.set_landed_notifier(seen.append)
+    agent = _Steerable()
+    talk_steer.record_queued("sa-0-aaaa", "with a ref", agent=agent)
+    talk_steer.mark_landed_for_agent(agent)
+    assert seen == ["sa-0-aaaa"]
+
+
+def test_landed_push_is_silent_when_nothing_flips():
+    seen: list[str] = []
+    talk_steer.set_landed_notifier(seen.append)
+    talk_steer.record_queued("sa-0-aaaa", "a note about auth")
+    talk_steer.mark_landed_from_preview("completely different text")
+    assert seen == []
+
+
+def test_landed_push_failure_never_breaks_the_drain_path():
+    def boom(_sid: str) -> None:
+        raise RuntimeError("notifier died")
+
+    talk_steer.set_landed_notifier(boom)
+    token = talk_steer.new_token()
+    wire = talk_steer.compose_wire_text(token, "a note about auth")
+    talk_steer.record_queued("sa-0-aaaa", wire, token=token)
+    talk_steer.mark_landed_from_preview(wire)  # no raise is the assertion
+    assert "landed" in talk_steer.notes_summary()
