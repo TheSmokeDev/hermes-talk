@@ -133,7 +133,7 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--which-identity-sections-ride-the-session). Unknown names are dropped silently. |
+| `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--what-the-session-starts-knowing). Unknown names are dropped silently. |
 
 ### Agent lanes
 
