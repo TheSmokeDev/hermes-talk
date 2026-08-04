@@ -1,0 +1,62 @@
+name: Bug report
+description: Something misbehaved — bring the receipts and we can fix it fast.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks — one paste does most of the work here. In a session, say
+        "status report" (the `talk_status` tool), or hit
+        `GET /api/plugins/hermes-talk/status` on the dashboard, and paste
+        the output below. It answers version, auth lane, agent lane, and
+        audio in one go.
+  - type: textarea
+    id: talk_status
+    attributes:
+      label: talk_status output
+      description: Paste the JSON. Identity is reported as section names and sizes only — no content leaves your machine.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: host_version
+    attributes:
+      label: Hermes host version
+      placeholder: "hermes --version"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Windows 11 / Ubuntu 24.04 / macOS 15"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - Terminal (hermes talk)
+        - /talk inside a session
+        - Dashboard tab
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What you said, what you expected to hear, what you heard
+      description: The three-line version is perfect. Include the exact spoken receipt if there was one — the wording is a contract here, and a wrong sentence is a real bug.
+      placeholder: |
+        Said: "tell the audit to focus on pricing"
+        Expected: "queued for their next step — I'll confirm when it lands"
+        Heard: (nothing / error / the wrong claim)
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, tracebacks, relevant knobs you've set (names only — never paste keys).
+    validations:
+      required: false

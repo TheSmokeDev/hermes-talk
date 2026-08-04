@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How the run-control surface works (steer / redirect / receipts)
+    url: https://github.com/TheSmokeDev/hermes-talk#redirecting-work-thats-already-running
+    about: The receipt states and the artifacts behind them — worth a read before filing "it said queued but…"
+  - name: Operating manual — install, upgrade, verify, every knob, troubleshooting
+    url: https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/OPERATING.md
+    about: Most "is this broken?" questions are answered by the verify runbook.
