@@ -19,19 +19,23 @@ import logging
 try:
     from . import (
         talk_cli,
+        talk_config,
         talk_discord,
         talk_host,
         talk_lifecycle,
         talk_providers,
         talk_tools,
+        talk_transcript,
     )
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
+    import talk_config
     import talk_discord
     import talk_host
     import talk_lifecycle
     import talk_providers
     import talk_tools
+    import talk_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +84,13 @@ def _talk_command(raw_args: str = "") -> str:
 
 
 def _on_session_end(**kwargs) -> None:
-    """Session-end hook. No durable state to tear down yet.
+    """Flush completed Talk transcripts without affecting host teardown."""
 
-    TODO: flush the call's transcript into Hermes memory here
-    (roadmap: session-end memory debrief).
-    """
+    del kwargs
+    try:
+        talk_transcript.sweep_transcripts(talk_config.get_hermes_home())
+    except Exception as exc:  # noqa: BLE001 - a memory debrief never breaks teardown
+        logger.warning("Talk transcript session-end sweep failed: %s: %s", type(exc).__name__, exc)
 
 
 def register(ctx) -> None:

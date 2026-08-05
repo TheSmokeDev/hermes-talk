@@ -170,12 +170,14 @@ class RealtimeRelay:
         *,
         on_audio: Callable[[bytes], None] | None = None,
         on_caption: Callable[[str], None] | None = None,
+        on_transcript_turn: Callable[[str, str], None] | None = None,
         on_barge_in: Callable[[], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         tool_executor: Callable[[str, dict], str] | None = None,
     ) -> None:
         self.on_audio = on_audio or _noop
         self.on_caption = on_caption or _noop
+        self.on_transcript_turn = on_transcript_turn or _noop
         self.on_barge_in = on_barge_in or _noop
         self.on_error = on_error or _noop
         self.tool_executor = tool_executor or execute_talk_tool
@@ -188,6 +190,7 @@ class RealtimeRelay:
         #: failed: no active response found" error on EVERY operator turn
         #: (live-session finding).
         self.response_active: bool = False
+        self._assistant_transcript: list[str] = []
 
     def handle_event(self, event: dict) -> list[dict]:
         """Handle one server event; return messages to send back."""
@@ -301,7 +304,26 @@ class RealtimeRelay:
     def _on_transcript_delta(self, event: dict) -> list[dict]:
         delta = event.get("delta")
         if isinstance(delta, str) and delta:
+            self._assistant_transcript.append(delta)
             self.on_caption(delta)
+        return []
+
+    def _on_input_transcript_done(self, event: dict) -> list[dict]:
+        transcript = event.get("transcript")
+        if isinstance(transcript, str) and transcript.strip():
+            self.on_transcript_turn("user", transcript.strip())
+        return []
+
+    def _on_output_transcript_done(self, event: dict) -> list[dict]:
+        completed = event.get("transcript")
+        transcript = (
+            completed
+            if isinstance(completed, str)
+            else "".join(self._assistant_transcript)
+        )
+        self._assistant_transcript.clear()
+        if transcript.strip():
+            self.on_transcript_turn("assistant", transcript.strip())
         return []
 
     def _on_function_call(self, event: dict) -> list[dict]:
@@ -370,6 +392,8 @@ class RealtimeRelay:
         "input_audio_buffer.speech_started": _on_speech_started,
         "response.output_audio.delta": _on_audio_delta,
         "response.output_audio_transcript.delta": _on_transcript_delta,
+        "response.output_audio_transcript.done": _on_output_transcript_done,
+        "conversation.item.input_audio_transcription.completed": _on_input_transcript_done,
         "response.function_call_arguments.done": _on_function_call,
         "response.done": _on_response_done,
         "error": _on_error,
