@@ -38,12 +38,10 @@ So a note has exactly these knowable states:
 - ``landed``      — a drain artifact matched this receipt. Positive-only:
                     absence of a match never proves absence of delivery
                     (the pre-API put-back path is silent by design).
-- ``redirected``  — ``AIAgent.redirect()`` returned True on a live turn.
-                    The artifact is the return value itself: the model
-                    request was aborted (or Codex accepted a native steer),
-                    so the correction applies to the CURRENT step. The
-                    model-request path emits no Delivered line — this state
-                    never waits on one.
+- ``redirected``  — post-call host state held this exact correction in its
+                    active-turn redirect slot (or Codex accepted its native
+                    steer). The model-request path emits no Delivered line —
+                    this state never waits on one.
 - ``unconfirmed`` — the child is gone and no landing was observed.
 - ``missed``      — the host's completion entry carried the note back as
                     undelivered (``missed_steer`` — present only on hosts
@@ -56,11 +54,10 @@ Everything here is fail-open: a missing host module, a renamed logger, or an
 operator log level above INFO degrades to ``unconfirmed`` — never an
 exception on the voice path, and never a claim without its artifact.
 
-Recorded assumption (Kimi v0.6 gate): the subagent-id-based second sweep in
-:func:`mark_landed_for_agent` assumes one live agent instance per
-``subagent_id`` — true on the 0.20 host, where ids are minted per spawn. A
-host that recycles ids could false-``landed`` a ref-less receipt
-(hermes-talk#7).
+Ref-less compatibility receipts can join a pre-API batch only when the nearest
+preceding receipt for that subagent id carries the exact draining agent
+reference.  The public id alone is never a landing artifact: hosts may recycle
+it for another agent instance.
 """
 
 from __future__ import annotations
@@ -492,11 +489,10 @@ def record_redirected(
 ) -> str:
     """Ledger an accepted redirect. Returns the receipt id.
 
-    The artifact is ``AIAgent.redirect()``'s return value — True on a live
-    turn means the in-flight model request was aborted with the correction
-    stashed for the retry (or Codex accepted a native turn/steer). No log
-    line exists on that path, so this state is terminal at call time and
-    never waits on a drain artifact.
+    The caller has already observed the host's post-call redirect artifact:
+    this exact correction in the active-turn redirect slot, or acceptance by
+    Codex's native turn/steer. No drain log exists on that path, so this state
+    is terminal at call time and never waits on a drain artifact.
     """
 
     receipt = _make_receipt(subagent_id, text, STATE_REDIRECTED, token, agent)
@@ -578,11 +574,12 @@ def mark_landed_for_agent(agent: object) -> int:
     """Land queued receipts held against this live agent. Returns count.
 
     The pre-API drain empties the ENTIRE pending queue for one agent, so a
-    hit lands every queued receipt attributed to it — by captured reference
-    first (exact), then by subagent id for receipts recorded without one
-    (same batch, same agent). Receipts whose token is STILL in the agent's
-    pending queue at emit time were queued after the drain and are skipped
-    on both passes.
+    hit lands every queued receipt attributed to it by captured reference
+    (exact). A following ref-less compatibility receipt may join that same
+    identity-anchored generation; a bare subagent-id match never suffices,
+    because hosts may recycle ids. Receipts whose token is STILL in the
+    agent's pending queue at emit time were queued after the drain and are
+    skipped on both passes.
     """
 
     if agent is None:
@@ -606,10 +603,21 @@ def mark_landed_for_agent(agent: object) -> int:
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
         if matched_agents:
+            # Walk in ledger order and anchor each id generation to its most
+            # recent captured reference.  This preserves old/ref-less sibling
+            # receipts recorded AFTER an exact receipt, but never sweeps an
+            # earlier generation merely because a host recycled its public id.
+            generation_targets: dict[str, object | None] = {}
             for receipt in _RECEIPTS:
+                subagent_id = receipt["subagent_id"]
+                ref = receipt.get("agent_ref")
+                if ref is not None:
+                    generation_targets[subagent_id] = ref()
+                    continue
                 if (
                     receipt["state"] == STATE_QUEUED
-                    and receipt["subagent_id"] in matched_agents
+                    and subagent_id in matched_agents
+                    and generation_targets.get(subagent_id) is agent
                 ):
                     token = receipt.get("token")
                     if token is not None and token in still_pending:

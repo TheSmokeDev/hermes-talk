@@ -2,9 +2,9 @@
 
 What is being proved: every state transition rides a REAL artifact — the
 post-tool drain INFO line or the pre-API drain DEBUG line for ``landed``,
-``AIAgent.redirect()``'s return value for ``redirected``, registry
-disappearance for ``unconfirmed``, a patched host's ``missed_steer`` for
-``missed`` — and absence of evidence never upgrades a claim.
+post-call active-turn state (or Codex native acceptance) for ``redirected``,
+registry disappearance for ``unconfirmed``, a patched host's ``missed_steer``
+for ``missed`` — and absence of evidence never upgrades a claim.
 """
 
 from __future__ import annotations
@@ -310,6 +310,20 @@ def test_pre_api_batch_lands_same_agent_receipts_without_a_ref():
     talk_steer.record_queued("sa-0-aaaa", "with a ref", agent=agent)
     talk_steer.record_queued("sa-0-aaaa", "without a ref")
     assert talk_steer.mark_landed_for_agent(agent) == 2
+
+
+def test_pre_api_drain_does_not_land_ref_less_receipt_from_recycled_id():
+    # A host may recycle the public id for a later agent instance.  The old
+    # ref-less receipt has no identity artifact tying it to the new child, so
+    # an exact match on the new receipt must not sweep the old one into landed.
+    talk_steer.record_queued("sa-0-aaaa", "old agent without a ref")
+    replacement = _Steerable()
+    talk_steer.record_queued("sa-0-aaaa", "replacement with a ref", agent=replacement)
+
+    assert talk_steer.mark_landed_for_agent(replacement) == 1
+    summary = talk_steer.notes_summary()
+    assert "note to sa-0-aaaa: queued" in summary
+    assert "note to sa-0-aaaa: landed" in summary
 
 
 def test_pre_api_watcher_forces_debug_but_gates_other_lines(monkeypatch):
