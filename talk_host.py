@@ -323,6 +323,71 @@ _IDENTITY_FILES = {
     "MEMORY": ("memories/MEMORY.md", "memory_char_limit"),
 }
 
+#: How Hermes separates memory entries on disk (``tools/memory_tool.py:59``).
+#: Scanning has to be PER ENTRY like the host's own sanitizer, not per file:
+#: one poisoned entry must cost that entry, not the operator's whole profile.
+IDENTITY_ENTRY_DELIMITER = "\n§\n"
+
+#: The scope Hermes uses for these files. Deliberately BROADER than the
+#: ``context`` scope it applies to SOUL.md — these are written by the model
+#: from conversation content, so they carry the lower trust.
+IDENTITY_SCAN_SCOPE = "strict"
+
+
+def _sanitize_identity_entries(body: str, filename: str) -> str:
+    """Replace threat-matching entries with a placeholder, per entry.
+
+    Mirrors ``MemoryStore._sanitize_entries_for_snapshot``
+    (``tools/memory_tool.py:207-240``). Reading these files directly gets the
+    plugin off the agent-only path, but it must not get it off the SCAN — a
+    memory entry the text prompt would block is strictly more dangerous in a
+    voice prompt, where nobody is reading the screen.
+
+    **Fails CLOSED, unlike every other resolver here.** If the scanner cannot
+    be imported or throws, the section is dropped rather than passed through:
+    everywhere else a failure costs a section, and here passing through IS the
+    failure.
+    """
+
+    try:
+        from tools.threat_patterns import scan_for_threats
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "identity scan unavailable (%s: %s) — dropping %s rather than "
+            "injecting it unscanned",
+            type(exc).__name__,
+            exc,
+            filename,
+        )
+        return ""
+
+    kept: list[str] = []
+    for entry in body.split(IDENTITY_ENTRY_DELIMITER):
+        if not entry.strip() or entry.lstrip().startswith("[BLOCKED:"):
+            kept.append(entry)
+            continue
+        try:
+            findings = scan_for_threats(entry, scope=IDENTITY_SCAN_SCOPE)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "identity scan failed on %s (%s: %s) — dropping the entry",
+                filename,
+                type(exc).__name__,
+                exc,
+            )
+            findings = ["scan_failed"]
+        if findings:
+            _log.warning(
+                "identity entry from %s blocked: %s", filename, ", ".join(findings)
+            )
+            kept.append(
+                f"[BLOCKED: {filename} entry contained threat pattern(s): "
+                f"{', '.join(findings)}. Removed from the voice prompt.]"
+            )
+        else:
+            kept.append(entry)
+    return IDENTITY_ENTRY_DELIMITER.join(kept).strip()
+
 
 def _identity_file(section: str) -> str:
     """One of Hermes's own identity files, capped by the host's own budget.
@@ -336,22 +401,23 @@ def _identity_file(section: str) -> str:
     Read from disk so this works with no agent and no plugin context: the
     lanes that need it most (gateway, dashboard) have neither.
 
-    Two deliberate asymmetries with :func:`_resolve_persona`, both matching
-    what the HOST does rather than what looks safer in isolation:
+    Reading raw does NOT mean reading unscanned. Hermes sanitizes these two
+    per ENTRY at snapshot time (``MemoryStore._sanitize_entries_for_snapshot``,
+    ``tools/memory_tool.py:207-240``) using the ``strict`` threat scope —
+    which is BROADER than the ``context`` scope it applies to SOUL.md, because
+    these files are written by the model from conversation content and then
+    injected into every future turn. Bypassing that would let the voice prompt
+    carry an entry the text prompt blocks, which is a strictly worse place for
+    it to land: a live call has no one reading the screen. So the same scan
+    runs here, per entry, with the same placeholder.
 
-    - **No injection scan.** ``_resolve_persona`` refuses a raw-file fallback
-      because Hermes scans SOUL.md (``_scan_context_content``) and a direct
-      read would drop that check. Hermes does NOT scan these two: they reach
-      the text system prompt through ``_memory_store.format_for_system_prompt``
-      verbatim (``agent/system_prompt.py:428-434``). Scanning here would put
-      the voice prompt out of step with the text prompt over content the host
-      already treats as its own, so it does not.
-    - **The char limits are the host's WRITE budget**, not a read truncation:
-      Hermes renders the whole file and uses these numbers to tell the model
-      when to consolidate (``tools/memory_tool.py:663-676``). Reused here as a
-      cap because a Realtime prompt is resident and re-charged every turn. On
-      a file the host is keeping within budget this trims nothing; it is the
-      floor under a file that has run over.
+    One deliberate asymmetry remains: **the char limits are the host's WRITE
+    budget**, not a read truncation. Hermes renders the whole file and uses
+    these numbers to tell the model when to consolidate
+    (``tools/memory_tool.py:663-676``). Reused here as a cap because a
+    Realtime prompt is resident and re-charged every turn. On a file the host
+    keeps within budget this trims nothing; it is the floor under one that has
+    run over.
     """
 
     entry = _IDENTITY_FILES.get(section.upper())
@@ -366,6 +432,9 @@ def _identity_file(section: str) -> str:
     except Exception as exc:  # noqa: BLE001 — a section, never an outage
         _log.debug("identity file %s unavailable: %s: %s", relative, type(exc).__name__, exc)
         return ""
+    if not body:
+        return ""
+    body = _sanitize_identity_entries(body, relative)
     if not body:
         return ""
     limit = talk_config.identity_char_limit(limit_key)
