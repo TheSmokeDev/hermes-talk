@@ -42,6 +42,7 @@ try:
         talk_runs,
         talk_steer,
         talk_tools,
+        talk_transcript,
         talk_wire,
     )
     from .talk_relay import RealtimeRelay
@@ -56,6 +57,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_runs
     import talk_steer
     import talk_tools
+    import talk_transcript
     import talk_wire
     from talk_relay import RealtimeRelay
 
@@ -390,6 +392,9 @@ async def run_talk_session(audio: object | None = None) -> int:
     same session either way: the same tools, ledger, and announcements.
     """
 
+    hermes_home = talk_config.get_hermes_home()
+    talk_transcript.sweep_transcripts(hermes_home)
+
     try:
         auth = talk_host.host().resolve_auth()
         model = talk_config.talk_model()
@@ -452,9 +457,11 @@ async def run_talk_session(audio: object | None = None) -> int:
     def on_error(text: str) -> None:
         print(f"\n[talk] {text}", file=sys.stderr, flush=True)
 
+    capture = talk_transcript.TranscriptCapture(hermes_home)
     relay = RealtimeRelay(
         on_audio=audio.queue_playback,
         on_caption=on_caption,
+        on_transcript_turn=capture.append_turn,
         on_barge_in=on_barge_in,
         on_error=on_error,
     )
@@ -662,6 +669,8 @@ async def run_talk_session(audio: object | None = None) -> int:
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         audio.stop()
+        capture.finish()
+        talk_transcript.sweep_transcripts(hermes_home)
 
     return 0
 

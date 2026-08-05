@@ -133,6 +133,12 @@ call back into the plugin's real tool surface, and shows the transcript plus a
 live list of background runs. Nothing to install — the bundle ships with the
 plugin and the host serves it.
 
+**Memory writeback currently covers terminal and Discord Talk sessions.** Those
+rooms share the server-side Realtime relay, which durably captures completed
+turns. The dashboard's Realtime events stay in the browser, so matching durable
+capture requires a separate authenticated transcript endpoint; until that lane
+exists, the tab does not claim to write its conversation back to memory.
+
 The tile at the top of the tab reads **attached**, **api-server**, or **out of
 process** — which of the three agent lanes below this session would actually
 use. It is not a guess; it is the lane the next tool call will take.
