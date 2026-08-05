@@ -131,6 +131,35 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 
 ### Identity
 
+What a session knows before you say anything, and where each part comes from:
+
+| Section | Source | Absent when |
+|---|---|---|
+| `PERSONA` | `SOUL.md`, through Hermes's own loader (which injection-scans it) | hermes-agent is not importable, or SOUL.md is empty |
+| `USER` | `<hermes_home>/memories/USER.md`, read directly | the file is missing or blank |
+| `MEMORY` | `<hermes_home>/memories/MEMORY.md`, then a one-line pointer at `search_vault` | no file **and** no usable memory provider |
+| `WORKING` | nothing yet — declared, no producer | always |
+
+`USER` and `MEMORY` are read from disk rather than through an agent, so they
+work on all three lanes. The gateway and the dashboard have no agent and no
+plugin context, and those are the lanes most likely to be asked "what do you
+know about X".
+
+Two budgets apply in order: the host's own `memory.user_char_limit` /
+`memory.memory_char_limit` from `config.yaml` (its WRITE budget, reused here
+as a read cap), then this plugin's per-section cap. A section that resolves
+empty is omitted entirely rather than rendering a header with nothing under
+it. `talk_status` reports character COUNTS per section and never content.
+
+The session instructions also carry the current date and time, built per
+session — a voice assistant that cannot say what day it is fails the first
+obvious question.
+
+**Known gap — speaker identity on Discord.** Every speaker in a voice channel
+is merged into one stream, so anyone in the channel is treated as the
+operator and can fire `delegate_task` or `stop_work`. Only invite Hermes to
+channels whose members you would hand the keyboard to.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--what-the-session-starts-knowing). Unknown names are dropped silently. |

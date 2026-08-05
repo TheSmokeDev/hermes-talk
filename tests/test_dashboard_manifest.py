@@ -96,3 +96,22 @@ def test_styles_stay_namespaced(manifest):
     assert selectors
     for selector in selectors:
         assert selector.startswith(".ht-"), selector
+
+
+def test_every_talk_module_is_packaged():
+    """v0.5 shipped a wheel missing ``talk_steer``: the plugin imported fine
+    from a git checkout and died on a real install, because a flat-module
+    layout needs every module named by hand. A hand-maintained list drifts
+    silently, so it is checked against the files on disk instead of trusted.
+    """
+
+    on_disk = {path.stem for path in PLUGIN_ROOT.glob("talk_*.py")}
+    declared = set(
+        re.findall(
+            r'"(talk_[a-z_]+)"',
+            (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        )
+    )
+
+    assert on_disk - declared == set(), "module on disk is missing from py-modules"
+    assert declared - on_disk == set(), "py-modules names a module that does not exist"

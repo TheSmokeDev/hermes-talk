@@ -11,6 +11,52 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.8.0] — 2026-08-04
+
+The session stops arriving as a stranger. It now knows who it is talking
+to, what it already knows, what day it is, and how to look something up
+in your written notes — and it stopped telling the model to call tools
+it does not have.
+
+### Added
+- **`USER` and `MEMORY` actually ride the session.** Both were declared
+  with headers, caps and an ordering, and had no producer anywhere. The
+  cause was two similarly named host surfaces: `MEMORY.md`/`USER.md`
+  live on the agent's memory STORE, and this plugin read the memory
+  MANAGER, which holds external providers only. They are now read from
+  `<hermes_home>/memories/` directly, so it works on all three lanes —
+  the gateway and the dashboard have no agent at all.
+- **`search_vault`** — look something up in the operator's long-term
+  written notes, as distinct from `search_memory`'s what-was-said.
+  Backed by the memory provider's own index read in process, and
+  advertised **only** when a lookup can really be served.
+- The current date and time, built per session (a module-level clock
+  would freeze at import and a long-running gateway would state the day
+  it booted).
+
+### Changed
+- **The memory pointer stopped lying.** The provider's own
+  `system_prompt_block` used to pass straight through, telling the model
+  to call `homie_memory_search` — a real tool in a text agent's registry
+  and absent from a Realtime session's, so the model called it and got
+  "That tool isn't available" on a live call. Every provider's block has
+  that shape, so this was wrong as a class. One sentence this plugin
+  authors replaces it, naming a tool the session has.
+- The vault provider is resolved once behind a single-flight lock (a
+  rebuild is a full vault walk, ~0.3s measured, on the loop carrying the
+  microphone), and BORROWED from a live agent when one already has it
+  initialized — never shut down in that case, because it is that
+  agent's.
+
+### Fixed
+- A case-variant known section name (`"memory"`) matched neither the
+  ordered list nor the extras, so it vanished from the prompt entirely
+  rather than rendering out of order.
+
+### Known gaps
+- Nothing is written back when a call ends (#9), and every speaker in a
+  Discord channel is still treated as the operator (#10).
+
 ## [0.7.0] — 2026-08-04
 
 Talk to it in the Discord voice channel Hermes is already sitting in.
@@ -187,6 +233,7 @@ Repo foundation: the plugin manifest, call-time config resolution, and a
 pure Realtime wire layer that knows the OpenAI protocol and nothing about
 the host.
 
+[0.8.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/TheSmokeDev/hermes-talk/compare/v0.5.0...v0.6.0

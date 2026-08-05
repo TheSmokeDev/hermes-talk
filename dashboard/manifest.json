@@ -3,7 +3,7 @@
   "label": "Talk",
   "description": "Realtime speech-to-speech voice in the browser — duplex audio over WebRTC, live tool calls, background runs spoken when they land.",
   "icon": "MessageSquare",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "tab": { "path": "/talk", "position": "end" },
   "entry": "dist/index.js",
   "css": "dist/style.css",

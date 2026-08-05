@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.7.0"
+version = "0.8.0"
 description = "OpenAI Realtime speech-to-speech voice for Hermes Agent: duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,6 +42,7 @@ py-modules = [
   "talk_audio",
   "talk_cli",
   "talk_providers",
+  "talk_vault",
 ]
 
 [tool.pytest.ini_options]

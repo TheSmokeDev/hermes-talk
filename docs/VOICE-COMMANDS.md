@@ -12,6 +12,7 @@ delivery; "landed" only ever follows a real delivery artifact.
 | Say something like | Tool fired | You hear | What it commits to |
 |---|---|---|---|
 | "what do you remember about the auth refactor?" | `search_memory` | matching excerpts from past Hermes sessions, summarized aloud | a real search ran; "nothing found" means the search was empty, not skipped |
+| "what do my notes say about the offer ladder?" | `search_vault` | matching excerpts from your long-term written notes | what was WRITTEN DOWN, as opposed to `search_memory`'s what was SAID. Only offered when a memory provider can actually serve it; "nothing in the notes" and "the lookup failed" are deliberately different sentences |
 | "delegate a task: audit the login module and list every route it touches" | `delegate_task` | `WORK_STARTED #N` — "it's running, I'll tell you when it lands" | a watcher polls that run and SPEAKS the result when it finishes, even if you've gone quiet |
 | "how's the work going?" / "check run 7" | `check_work` | per-run status lines, plus the state of every steering note you've sent | the note states come from the receipt ledger — never "they got it" without the artifact |
 | "what's running right now?" | `list_agents` | live subagent ids tagged **can steer**, run numbers tagged **stop only** | ids that exist RIGHT NOW — resolve "the research one" here, never from memory of earlier speech |
