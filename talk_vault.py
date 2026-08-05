@@ -200,14 +200,21 @@ def provider() -> Any | None:
     resolved = borrowed if borrowed is not None else _load_provider()
     owned = borrowed is None
 
+    loser = None
     with _LOCK:
         if _RESOLVED:
             winner = _PROVIDER
             if owned and resolved is not winner:
-                _release(resolved)
-            return winner
-        _PROVIDER, _OWNED, _RESOLVED = resolved, owned, True
-        return _PROVIDER
+                loser = resolved
+        else:
+            _PROVIDER, _OWNED, _RESOLVED = resolved, owned, True
+            winner = _PROVIDER
+
+    # Teardown happens OUTSIDE the lock for the same reason resolution does:
+    # ``shutdown()`` is third-party code, and calling it under a non-reentrant
+    # lock re-opens exactly the deadlock the split above was meant to close.
+    _release(loser)
+    return winner
 
 
 def reset() -> None:

@@ -349,3 +349,44 @@ def test_resolution_does_not_hold_the_lock(monkeypatch):
     # with no error — the worst shape of failure this plugin has.
     assert talk_vault.available() is True
     assert seen == ["reentered"]
+
+
+def test_teardown_does_not_hold_the_lock(monkeypatch):
+    """Round-2 finding: moving the LOAD outside the lock is not enough.
+    ``shutdown()`` is third-party code too, so releasing a losing racer's
+    provider under the lock re-opens the same deadlock the split closed.
+    """
+
+    observed: list[bool] = []
+
+    class Watching(StubProvider):
+        def shutdown(self):
+            observed.append(talk_vault._LOCK.locked())
+            super().shutdown()
+
+    made: list[Watching] = []
+    arrived = threading.Barrier(2)
+
+    def factory(_name):
+        item = Watching("hits")
+        made.append(item)
+        arrived.wait(timeout=5)  # force both racers past the cold check
+        return item
+
+    memory = types.ModuleType("plugins.memory")
+    memory._get_active_memory_provider = lambda: "stub"
+    memory.load_memory_provider = factory
+    plugins_pkg = types.ModuleType("plugins")
+    plugins_pkg.memory = memory
+    monkeypatch.setitem(sys.modules, "plugins", plugins_pkg)
+    monkeypatch.setitem(sys.modules, "plugins.memory", memory)
+
+    threads = [threading.Thread(target=talk_vault.provider) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert not any(t.is_alive() for t in threads)
+    assert len(made) == 2  # the race really happened
+    assert observed == [False], "the loser was torn down under the lock"
