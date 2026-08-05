@@ -236,6 +236,57 @@ def test_failing_handler_answers_200_with_speakable_text(monkeypatch):
     assert "disk on fire" in body["output"]
 
 
+def test_dashboard_tool_wait_is_bounded_and_honest(monkeypatch):
+    def slow_tool(_name, _arguments):
+        # A finite wait keeps a broken implementation's RED run bounded too.
+        import time
+
+        time.sleep(0.2)
+        return "late result"
+
+    monkeypatch.setattr(api.talk_tools, "execute_talk_tool", slow_tool)
+    monkeypatch.setattr(api, "TOOL_EXECUTION_WAIT_S", 0.01)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        body = await api.run_tool(FakeRequest(body={"name": "slow_tool"}))
+        return body, loop.time() - started
+
+    body, elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.1
+    assert body["ok"] is True
+    assert "still running" in body["output"]
+    assert "result won't return" in body["output"]
+
+
+def test_dashboard_worker_saturation_reports_that_tool_was_not_started(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def stuck_tool(_name, _arguments):
+        release.wait()
+        return "late"
+
+    pool = api.talk_relay._DaemonWorkerPool(max_workers=1, max_pending=1)
+    monkeypatch.setattr(api.talk_relay, "_TOOL_POOL", pool)
+    monkeypatch.setattr(api.talk_tools, "execute_talk_tool", stuck_tool)
+    monkeypatch.setattr(api, "TOOL_EXECUTION_WAIT_S", 0.01)
+
+    async def scenario():
+        requests = [FakeRequest(body={"name": f"tool_{i}"}) for i in range(10)]
+        return await asyncio.gather(*(api.run_tool(request) for request in requests))
+
+    bodies = asyncio.run(scenario())
+    release.set()
+
+    refused = [body["output"] for body in bodies if "not started" in body["output"]]
+    assert refused
+    assert all("detached it" not in output for output in refused)
+
+
 def test_tool_arguments_reach_the_handler():
     seen: dict = {}
 
