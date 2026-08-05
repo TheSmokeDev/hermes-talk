@@ -87,11 +87,31 @@ def test_an_erroring_availability_check_costs_only_the_vault_tool(monkeypatch):
     assert [tool["name"] for tool in talk_tools.default_talk_tools()] == _BASE_TOOLS
 
 
-def test_every_advertised_tool_has_a_handler():
+def test_every_advertised_tool_has_a_handler(monkeypatch):
+    """Checked with the CONDITIONAL tool advertised too. With vault
+    availability pinned off (the fixture default) this test would never see
+    search_vault — and a tool advertised with no handler raises TalkToolError
+    at the relay, which the model hears as "that tool isn't available" in the
+    middle of a live call."""
+
+    monkeypatch.setattr(talk_vault, "available", lambda: True)
+    names = {tool["name"] for tool in talk_tools.default_talk_tools()}
+    assert "search_vault" in names
+
     for tool in talk_tools.default_talk_tools():
         assert tool["name"] in talk_tools._HANDLERS
         assert tool["type"] == "function"
         assert tool["parameters"]["type"] == "object"
+
+
+def test_no_handler_is_orphaned():
+    """The other direction: a handler with no schema is dead code the model
+    can never reach."""
+
+    advertised = {tool["name"] for tool in talk_tools.default_talk_tools()}
+    advertised.add("search_vault")  # conditional, absent when unservable
+
+    assert set(talk_tools._HANDLERS) == advertised
 
 
 def test_unknown_tool_raises():
