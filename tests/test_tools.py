@@ -9,6 +9,7 @@ import time
 import pytest
 
 import talk_host
+import talk_operator_auth
 import talk_runs
 import talk_tools
 import talk_vault
@@ -112,6 +113,14 @@ def test_no_handler_is_orphaned():
     advertised.add("search_vault")  # conditional, absent when unservable
 
     assert set(talk_tools._HANDLERS) == advertised
+
+
+def test_every_tool_is_explicitly_classified_read_only_or_mutating():
+    read_only = talk_operator_auth.READ_ONLY_TALK_TOOLS
+    mutating = talk_operator_auth.MUTATING_TALK_TOOLS
+
+    assert read_only.isdisjoint(mutating)
+    assert set(talk_tools._HANDLERS) == read_only | mutating
 
 
 def test_unknown_tool_raises():

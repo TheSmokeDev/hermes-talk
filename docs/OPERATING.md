@@ -161,7 +161,7 @@ The session instructions also carry the current date and time, built per
 session — a voice assistant that cannot say what day it is fails the first
 obvious question.
 
-**Discord speaker attribution is an identity floor, not authorization.** For
+**Discord speaker attribution is the authorization floor.** For
 each decoded audio packet, Talk snapshots the receiver's current SSRC mapping and
 PCM together under the receiver lock, then gives the model the immutable Discord
 user ID plus display name immediately before that exact audio. The display name
@@ -173,17 +173,26 @@ as unresolved and unauthorized and never guesses that it belongs to the
 operator. Attribution changes are deduplicated by immutable user ID even when
 Discord changes SSRC, and stop/rejoin/remap invalidates stale queued callbacks.
 
-That floor **does not grant or enforce permission**. All channel participants
-still reach the same tools, including mutating tools such as `delegate_task`
-and `stop_work`. Issue
-[#10](https://github.com/TheSmokeDev/hermes-talk/issues/10) therefore remains
-open for the policy choice (for example, which immutable user IDs are allowed)
-and default-deny mutating-tool enforcement. Until that policy lands, only use
-channels whose members you would hand the keyboard to.
+Authorization itself is enforced outside the model at tool execution time.
+Discord sessions disable VAD's automatic response creation, resolve the exact
+`audio_start_ms`/`audio_end_ms` interval against the packet ledger, and create
+the response with an opaque binding token. A function call must carry a server
+response ID that resolves through that token to exactly one immutable Discord
+user ID. Tool continuations preserve the same token; bounded item/response
+ledgers are released on completion and cleared on teardown. Display names,
+SSRC alone, model arguments, and "last speaker" state are never authority.
+
+Configured IDs may run the four state-changing tools: `delegate_task`,
+`steer_agent`, `redirect_agent`, and `stop_work`. Other speakers retain normal
+conversation and the read-only tools (`search_memory`, `search_vault`,
+`check_work`, `list_agents`, and `talk_status`). Missing response correlation,
+an unresolved speaker, two speakers in one VAD turn, or a speaker outside the
+allowlist returns a non-sensitive spoken denial without running the handler.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--what-the-session-starts-knowing). Unknown names are dropped silently. |
+| `TALK_DISCORD_OPERATOR_USER_IDS` | nobody | Comma-separated immutable decimal Discord user IDs authorized for mutating tools in Discord voice. Unset/blank = nobody. **Any** blank or malformed entry invalidates the whole list and authorizes nobody; valid entries are never partially accepted. Example: `TALK_DISCORD_OPERATOR_USER_IDS=<your-user-id>,<another-user-id>`. |
 
 ### Agent lanes
 
@@ -233,6 +242,17 @@ channel the host is already sitting in. `/talk leave` ends it, `/talk
 status` reports whether a session is live. Outside the gateway (a plain
 terminal) `/talk` still means the terminal session, and those
 subcommands say so.
+
+Before inviting Talk into a shared voice room, set the operator list in the
+gateway environment and restart the gateway:
+
+```bash
+TALK_DISCORD_OPERATOR_USER_IDS=<your-immutable-discord-user-id>
+```
+
+Use Discord's numeric user ID, not a username or display name. With the variable
+unset, every participant can converse and use read-only tools, while every
+mutating tool is denied.
 
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we

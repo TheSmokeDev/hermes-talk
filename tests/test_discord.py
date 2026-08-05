@@ -1044,6 +1044,21 @@ def test_real_audio_pays_down_the_clock_instead_of_earning_silence(monkeypatch):
     bridge.stop()
 
 
+def test_legacy_raw_bytes_are_explicitly_unresolved_not_synthetic_silence(monkeypatch):
+    _connection, _receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    speech = _tone(480, rate=24_000)
+    bridge._inbound.put_nowait(speech)
+
+    packet = bridge.read_input_packet()
+
+    assert packet.pcm == speech
+    assert packet.speaker["user_id"] is None
+    assert packet.speaker["ssrc"] == 0
+    bridge.stop()
+
+
 def test_no_silence_before_start_or_after_stop(monkeypatch):
     # Synthesizing into a session that does not exist would be noise on a
     # dead socket.

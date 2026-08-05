@@ -48,6 +48,11 @@ OPENAI_REALTIME_VOICES = (
     "cedar",
 )
 
+# Discord snowflakes are unsigned 64-bit decimal integers. Treating the whole
+# list as one configuration unit is intentional: a typo must narrow authority
+# to nobody, never silently leave the other entries active.
+_MAX_DISCORD_USER_ID = (1 << 64) - 1
+
 
 class TalkConfigError(Exception):
     """A Talk configuration value is unusable."""
@@ -374,6 +379,36 @@ def audio_output_device() -> str | None:
     return raw or None
 
 
+def discord_operator_user_ids() -> frozenset[int]:
+    """Immutable Discord user IDs allowed to run state-changing Talk tools.
+
+    Unset, blank, or any malformed comma-separated entry returns an empty set.
+    A partially valid list never partially authorizes.
+    """
+
+    raw = os.environ.get("TALK_DISCORD_OPERATOR_USER_IDS")
+    if raw is None or not raw.strip():
+        return frozenset()
+    resolved: set[int] = set()
+    for part in raw.split(","):
+        candidate = part.strip()
+        if (
+            not candidate
+            or len(candidate) > 20
+            or not candidate.isascii()
+            or not candidate.isdecimal()
+        ):
+            return frozenset()
+        try:
+            user_id = int(candidate)
+        except ValueError:
+            return frozenset()
+        if user_id <= 0 or user_id > _MAX_DISCORD_USER_ID:
+            return frozenset()
+        resolved.add(user_id)
+    return frozenset(resolved)
+
+
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
@@ -394,6 +429,7 @@ __all__ = [
     "audio_input_device",
     "audio_output_device",
     "detect_agent_profile",
+    "discord_operator_user_ids",
     "get_hermes_home",
     "identity_include",
     "resolve_openai_key",
