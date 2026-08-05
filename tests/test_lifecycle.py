@@ -133,7 +133,7 @@ def test_nested_children_still_degrade_the_ledger():
 def test_stop_announces_a_top_level_child_through_the_loop():
     events: list[dict] = []
     loop = _StubLoop()
-    talk_lifecycle.attach_session(loop, events.append)
+    talk_lifecycle.attach_session(loop, events.append, "parent-sess")
     _start()
     _stop()
     assert loop.marshalled == 1
@@ -156,7 +156,7 @@ def test_roster_retains_the_parent_session():
 
 def test_nested_children_stop_silently():
     events: list[dict] = []
-    talk_lifecycle.attach_session(_StubLoop(), events.append)
+    talk_lifecycle.attach_session(_StubLoop(), events.append, "parent-sess")
     _start(csid="sess-nested", sid="sa-1-cccc", parent_subagent_id="sa-0-aaaa")
     _stop(csid="sess-nested")
     assert events == []
@@ -169,7 +169,7 @@ def test_no_attached_session_is_fine():
 
 def test_detach_stops_announcements():
     events: list[dict] = []
-    talk_lifecycle.attach_session(_StubLoop(), events.append)
+    talk_lifecycle.attach_session(_StubLoop(), events.append, "parent-sess")
     talk_lifecycle.detach_session()
     _start()
     _stop()
@@ -179,9 +179,48 @@ def test_detach_stops_announcements():
 def test_a_closed_loop_is_contained():
     # call_soon_threadsafe raises RuntimeError once a loop closes — the hook
     # must swallow it, because it is running on a HOST thread.
-    talk_lifecycle.attach_session(_StubLoop(raises=RuntimeError("loop closed")), lambda e: None)
+    talk_lifecycle.attach_session(
+        _StubLoop(raises=RuntimeError("loop closed")), lambda e: None, "parent-sess"
+    )
     _start()
     _stop()  # no exception is the assertion
+
+
+def test_foreign_parent_stop_is_not_announced_but_still_degrades_the_ledger():
+    events: list[dict] = []
+    talk_lifecycle.attach_session(_StubLoop(), events.append, "other-parent")
+    _start()
+    talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
+
+    _stop()
+
+    assert events == []
+    assert "finished before I could confirm" in talk_steer.notes_summary()
+
+
+def test_missing_event_parent_is_not_announced_but_still_degrades_the_ledger():
+    events: list[dict] = []
+    talk_lifecycle.attach_session(_StubLoop(), events.append, "parent-sess")
+    _start(parent_session_id=None)
+    talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
+
+    _stop()
+
+    assert events == []
+    assert "finished before I could confirm" in talk_steer.notes_summary()
+
+
+@pytest.mark.parametrize("owner_session_id", [None, ""])
+def test_missing_owner_rejects_all_announcements(owner_session_id):
+    events: list[dict] = []
+    talk_lifecycle.attach_session(_StubLoop(), events.append, owner_session_id)
+    _start()
+    talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
+
+    _stop()
+
+    assert events == []
+    assert "finished before I could confirm" in talk_steer.notes_summary()
 
 
 # -- fail-open ----------------------------------------------------------------

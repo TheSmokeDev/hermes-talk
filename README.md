@@ -51,9 +51,13 @@ shape.
 
 ## Install
 
-Needs Python ≥ 3.11 and a Hermes host ≥ v0.17 (`redirect_agent`'s
-clean-abort path wants 0.20+ and [degrades honestly below it](#redirecting-work-thats-already-running)
-— details in [docs/OPERATING.md](docs/OPERATING.md#prerequisites)).
+Needs Python ≥ 3.11 and a Hermes host ≥ v0.17. `redirect_agent`'s
+clean-abort path wants 0.20+ and [degrades honestly below it](#redirecting-work-thats-already-running).
+The plugin remains backward-compatible with older hosts, but session-owned
+subagent completion announcements require Hermes core commit `832b0cb` or a
+release containing it; without that ownership property, announcements are
+suppressed rather than guessed. Details are in
+[docs/OPERATING.md](docs/OPERATING.md#prerequisites).
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable
@@ -235,7 +239,8 @@ operator log output is unchanged) — any DEBUG-guarded computation in that
 one module becomes active, a bounded perf cost traded for killing the
 false-"unconfirmed" class. And you often don't have to ask: the host's
 `subagent_stop` hook announces a finished background agent into the live
-call the moment it lands.
+call the moment it lands. Those hook events are filtered to the parent session
+that owns the call; foreign or ownership-less completions are never spoken.
 
 Four tools carry the surface, discovery-first:
 

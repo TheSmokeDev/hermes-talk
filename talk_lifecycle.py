@@ -50,7 +50,7 @@ _MAX_ROSTER = 100
 
 _LOCK = threading.Lock()
 _ROSTER: dict[str, dict] = {}
-_SESSION: tuple[Any, Callable[[dict], None]] | None = None
+_SESSION: tuple[Any, Callable[[dict], None], str | None] | None = None
 
 
 def on_subagent_start(**kwargs: Any) -> None:
@@ -129,13 +129,21 @@ def on_subagent_stop(**kwargs: Any) -> None:
 
 
 def _notify(event: dict) -> None:
-    """Marshal one lifecycle event onto the live session's loop, if any."""
+    """Marshal an event only to the Talk session that owns its parent.
+
+    Ownership fails closed in both directions: an older host that cannot name
+    the attached parent, and an event that cannot name its parent, are both
+    silent. Ledger degradation happens before this function and remains
+    global regardless of announcement ownership.
+    """
 
     with _LOCK:
         session = _SESSION
     if session is None:
         return
-    loop, callback = session
+    loop, callback, owner_session_id = session
+    if not owner_session_id or event.get("parent_session_id") != owner_session_id:
+        return
     try:
         loop.call_soon_threadsafe(callback, event)
     except RuntimeError:
@@ -146,17 +154,23 @@ def _notify(event: dict) -> None:
         _log.debug("lifecycle notify failed", exc_info=True)
 
 
-def attach_session(loop: Any, callback: Callable[[dict], None]) -> None:
+def attach_session(
+    loop: Any,
+    callback: Callable[[dict], None],
+    owner_session_id: str | None = None,
+) -> None:
     """Register the live Talk session as the announcement target.
 
     ``callback`` runs ON the loop thread (via ``call_soon_threadsafe``) and
-    owns its own scheduling. One session at a time — a new attach replaces
-    the old target, which matches one-terminal-one-call reality.
+    owns its own scheduling. ``owner_session_id`` is the Hermes parent session
+    this Talk call belongs to; absent ownership suppresses announcements
+    rather than guessing. One session at a time — a new attach replaces the
+    old target, which matches one-terminal-one-call reality.
     """
 
     global _SESSION
     with _LOCK:
-        _SESSION = (loop, callback)
+        _SESSION = (loop, callback, owner_session_id)
 
 
 def detach_session() -> None:

@@ -256,6 +256,15 @@ def subagent_stop_messages(event: dict) -> list[dict]:
     return _announcement_messages(headline, tail)
 
 
+def _active_parent_session_id() -> str | None:
+    """Snapshot the bound Hermes session id, or fail closed on older hosts."""
+
+    ctx = talk_host.get_ctx()
+    if ctx is None:
+        return None
+    return getattr(ctx, "active_parent_session_id", None)
+
+
 def _import_aiohttp():
     try:
         import aiohttp
@@ -483,7 +492,12 @@ async def run_talk_session(audio: object | None = None) -> int:
                         announce_queue.put_nowait(messages)
 
                 loop = asyncio.get_running_loop()
-                talk_lifecycle.attach_session(loop, on_subagent_event)
+                # Snapshot ownership once for this socket. Older Hermes builds
+                # do not expose the property; None deliberately suppresses
+                # lifecycle announcements instead of guessing from global
+                # hook traffic.
+                owner_session_id = _active_parent_session_id()
+                talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
                 # The notifier fires on HOST drain threads — marshal onto the
                 # loop; a closed loop raises into talk_steer's own containment.
                 talk_steer.set_landed_notifier(

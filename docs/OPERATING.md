@@ -12,6 +12,11 @@ to **prove** it's running instead of assuming it is.
   host's public `AIAgent.redirect()` (**0.20+**). Below that it degrades
   to the steer queue and the spoken reply says queued — never a fake
   abort. (See the README's [redirect section](../README.md#redirecting-work-thats-already-running).)
+  Subagent completion announcements have a second compatibility boundary:
+  they require Hermes core commit `832b0cb` (or a release containing it),
+  which exposes the active parent session id to plugins. On older Hermes the
+  rest of Talk remains compatible, but those announcements fail closed and
+  stay silent rather than risking a foreign session's result being spoken.
 - **Audio**: the terminal session needs the `[audio]` extra
   (`sounddevice` + PortAudio). The dashboard tab uses the browser's mic
   instead and needs nothing installed locally.
