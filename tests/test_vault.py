@@ -224,3 +224,38 @@ def test_document_count_survives_a_broken_status(monkeypatch):
 
     assert talk_vault.document_count() == 0
     assert talk_vault.available() is True
+
+
+# --- warm before the call ------------------------------------------------------
+
+
+def test_the_index_is_built_during_session_setup_not_mid_call(monkeypatch):
+    """The first resolve costs a full vault walk (~0.9s measured live). On the
+    loop carrying the microphone that is audible dead air, so it MUST be paid
+    while the session is being minted, not on the operator's first question.
+
+    Both mint-time paths warm it: identity_sections builds the pointer, and
+    default_talk_tools asks whether to advertise the tool.
+    """
+
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+
+    talk_host.host().identity_sections()
+
+    assert "initialize" in provider.calls  # warm already, before any tool call
+    provider.calls.clear()
+    talk_vault.search("anything")
+    assert "initialize" not in provider.calls  # the lookup pays only the search
+
+
+def test_an_include_filter_cannot_defer_the_warm_into_the_call(monkeypatch):
+    """TALK_IDENTITY_INCLUDE drops the SECTION, and the filter runs after the
+    sections are built — so excluding MEMORY must not push the index build
+    into the live call instead."""
+
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "PERSONA")
+
+    talk_host.host().identity_sections()
+
+    assert "initialize" in provider.calls

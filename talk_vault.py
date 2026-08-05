@@ -15,9 +15,17 @@ the dashboard do not have — the two lanes most likely to be asked "what do
 you know about X". Loading the provider ourselves works on all three.
 
 Two costs, both measured on a 1,000-document vault and both shaping the
-design: building the index is ~0.3s and a search is ~0.3s. A tool call runs
-on the loop carrying the microphone, so the index is built ONCE behind a
+design: the first resolve is ~0.9s and a search is ~0.3s. A tool call runs on
+the loop carrying the microphone, so the index is built ONCE behind a
 single-flight lock and kept, rather than rebuilt per lookup.
+
+That first resolve is paid while the SESSION IS BEING MINTED, not on the
+operator's first question: ``identity_sections`` builds the vault pointer and
+``default_talk_tools`` asks whether to advertise the tool, and both run before
+the call is live. It matters enough to be pinned by tests
+(``test_the_index_is_built_during_session_setup_not_mid_call``) — if a future
+change made the first resolve lazy, the symptom would be a one-second silence
+on the operator's first lookup and nothing in the logs to explain it.
 """
 
 from __future__ import annotations
@@ -150,6 +158,14 @@ def provider() -> Any | None:
     microphone. The index is therefore a snapshot: a note written mid-call is
     not visible until restart, which is how the host's own provider behaves
     for a text session too.
+
+    A BORROWED provider outlives the agent it came from (a ``/clear`` or
+    ``/resume`` builds a new agent, and nothing here re-resolves). That is
+    safe for the one thing this module does, and the host says so itself: the
+    provider's ``on_session_switch`` documents that "the vault index is
+    session-independent and read-only, so no other state needs to move". We
+    only ever read. If this module ever gains a WRITE path, that assumption
+    stops holding and the cache has to be invalidated on session switch.
     """
 
     global _PROVIDER, _RESOLVED, _OWNED
