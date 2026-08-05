@@ -796,17 +796,14 @@ class HostAdapter:
         Mid-tool it degrades to ``steer()`` inside the host, so the tool
         finishes at a safe boundary.
 
-        The receipt comes from the RETURN VALUE, not a log line: the
-        model-request path emits no Delivered line, so ``True`` is itself
-        the artifact — but ``True`` means ACCEPTED, and only that. The host
-        picks the mechanism internally (abort-and-retry, Codex native
-        steer, or a steer-queue write when a tool is executing), and the
-        ``_executing_tools`` peek below can be stale by the time
-        ``redirect()`` runs. So no spoken sentence may claim the abort:
-        every ``True`` is worded to be true on EITHER path ("current step,
-        or its very next one"). The peek only picks between that sentence
-        and the more specific mid-tool queued-language, where a stale peek
-        under-claims (queued wording for an aborted turn) — never over.
+        ``True`` proves acceptance, but not which mechanism the host chose.
+        The receipt therefore comes from the post-call state artifact: this
+        token in ``_pending_redirect`` proves abort-and-retry, this token in
+        ``_pending_steer`` proves the tool-boundary queue, and a successful
+        Codex native call proves its own redirect. If those transient slots
+        were consumed before inspection, the ledger deliberately degrades to
+        ``queued``. The pre-call ``_executing_tools`` peek is wording-only and
+        never selects the receipt state.
 
         ``False`` means no live turn — the correction falls back to the
         steer queue, spoken as exactly that.
@@ -888,18 +885,32 @@ class HostAdapter:
                 "Want me to list what's running?"
             )
 
-        if executing_tools:
-            # The host degraded the redirect to a steer at the tool boundary.
-            # Same queue, same drain artifacts, same honest queued claim.
+        # Classify the mechanism from a positive host artifact after the call,
+        # never from the advisory pre-call peek.  A raced tool transition puts
+        # this exact token in the steer queue; a hard redirect stashes it in
+        # the redirect slot.  If either slot was consumed before we can see it,
+        # degrade to queued rather than inventing the stronger claim.
+        pending_steer = getattr(agent, "_pending_steer", None)
+        pending_redirect = getattr(agent, "_pending_redirect", None)
+        queued_artifact = isinstance(pending_steer, str) and wire_text in pending_steer
+        redirected_artifact = (
+            isinstance(pending_redirect, str) and wire_text in pending_redirect
+        ) or getattr(agent, "api_mode", None) == "codex_app_server"
+
+        if queued_artifact or not redirected_artifact:
             talk_steer.record_queued(agent_id, wire_text, token=token, agent=agent)
+            if executing_tools or queued_artifact:
+                return (
+                    f"{agent_id} is mid-tool, so the correction is queued for "
+                    "the moment the tool finishes — I'll confirm when it lands."
+                )
             return (
-                f"{agent_id} is mid-tool, so the correction lands the moment "
-                "the tool finishes — I'll confirm when it does."
+                f"Redirect accepted by {agent_id}; I couldn't prove which path "
+                "the host took, so I'm tracking it as queued and will only "
+                "confirm if a delivery artifact appears."
             )
 
         talk_steer.record_redirected(agent_id, wire_text, token=token, agent=agent)
-        # True on this branch is abort-and-retry OR a steer-queue write that
-        # raced the peek — the sentence must hold on both.
         return (
             f"Redirect accepted — {agent_id} takes the correction at its "
             "current step, or its very next one if a tool was mid-flight."
