@@ -13,8 +13,9 @@ to **prove** it's running instead of assuming it is.
   to the steer queue and the spoken reply says queued — never a fake
   abort. (See the README's [redirect section](../README.md#redirecting-work-thats-already-running).)
   Subagent completion announcements have a second compatibility boundary:
-  they require Hermes core commit `832b0cb` (or a release containing it),
-  which exposes the active parent session id to plugins. On older Hermes the
+  they require a Hermes release exposing
+  `PluginContext.active_parent_session_id` (upstream
+  [PR #79716](https://github.com/NousResearch/hermes-agent/pull/79716)). On older Hermes the
   rest of Talk remains compatible, but those announcements fail closed and
   stay silent rather than risking a foreign session's result being spoken.
 - **Audio**: the terminal session needs the `[audio]` extra

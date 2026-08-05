@@ -54,9 +54,10 @@ shape.
 Needs Python ≥ 3.11 and a Hermes host ≥ v0.17. `redirect_agent`'s
 clean-abort path wants 0.20+ and [degrades honestly below it](#redirecting-work-thats-already-running).
 The plugin remains backward-compatible with older hosts, but session-owned
-subagent completion announcements require Hermes core commit `832b0cb` or a
-release containing it; without that ownership property, announcements are
-suppressed rather than guessed. Details are in
+subagent completion announcements require a Hermes release exposing
+`PluginContext.active_parent_session_id` (upstream
+[PR #79716](https://github.com/NousResearch/hermes-agent/pull/79716)); without
+that property, announcements are suppressed rather than guessed. Details are in
 [docs/OPERATING.md](docs/OPERATING.md#prerequisites).
 
 ```bash
