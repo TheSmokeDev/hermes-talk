@@ -50,6 +50,10 @@ VAULT_SESSION_ID = "hermes-talk-vault"
 #: never be spoken.
 MAX_VAULT_CHARS = 2_000
 
+class VaultSearchError(Exception):
+    """A vault lookup failed — distinct from a lookup that found nothing."""
+
+
 _LOCK = threading.Lock()
 _PROVIDER: Any | None = None
 #: Distinct from ``_PROVIDER is None``: a failed load must not be retried on
@@ -117,12 +121,14 @@ def _load_provider() -> Any | None:
         _log.debug("memory provider plugins unavailable: %s: %s", type(exc).__name__, exc)
         return None
 
+    provider = None
     try:
         active = _get_active_memory_provider()
         if not active:
             return None
         provider = load_memory_provider(active)
         if provider is None or not provider.is_available():
+            _release(provider)  # constructed but unusable — still ours to close
             return None
         provider.initialize(
             VAULT_SESSION_ID,
@@ -134,6 +140,9 @@ def _load_provider() -> Any | None:
         )
     except Exception as exc:  # noqa: BLE001 — a missing capability, never an outage
         _log.debug("vault provider unavailable: %s: %s", type(exc).__name__, exc)
+        # Abandoning a provider we CONSTRUCTED without closing it leaks it
+        # past any reset(), because the cache only remembers what it kept.
+        _release(provider)
         return None
     if getattr(provider, "_index", None) is None:
         # Loadable is not usable. A provider whose initialize left no index
@@ -142,12 +151,20 @@ def _load_provider() -> Any | None:
         # refusal we give when there is no provider at all, so this counts as
         # unavailable and the tool is never advertised.
         _log.debug("vault provider initialized without an index; treating as absent")
-        try:
-            provider.shutdown()
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-            _log.debug("vault provider shutdown failed: %s: %s", type(exc).__name__, exc)
+        _release(provider)
         return None
     return provider
+
+
+def _release(provider: Any | None) -> None:
+    """Shut down a provider WE own. Never called on a borrowed one."""
+
+    if provider is None:
+        return
+    try:
+        provider.shutdown()
+    except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+        _log.debug("vault provider shutdown failed: %s: %s", type(exc).__name__, exc)
 
 
 def provider() -> Any | None:
@@ -170,13 +187,26 @@ def provider() -> Any | None:
 
     global _PROVIDER, _RESOLVED, _OWNED
     with _LOCK:
-        if not _RESOLVED:
-            borrowed = _provider_from_agent()
-            if borrowed is not None:
-                _PROVIDER, _OWNED = borrowed, False
-            else:
-                _PROVIDER, _OWNED = _load_provider(), True
-            _RESOLVED = True
+        if _RESOLVED:
+            return _PROVIDER
+
+    # Resolve OUTSIDE the lock. `initialize()` is arbitrary third-party
+    # provider code plus filesystem work; running it under a non-reentrant
+    # lock means any provider that reached back into this module would
+    # deadlock the call rather than degrade. The cost is that two threads
+    # racing a cold cache can both build one — settled below, where the
+    # loser's copy is closed rather than leaked.
+    borrowed = _provider_from_agent()
+    resolved = borrowed if borrowed is not None else _load_provider()
+    owned = borrowed is None
+
+    with _LOCK:
+        if _RESOLVED:
+            winner = _PROVIDER
+            if owned and resolved is not winner:
+                _release(resolved)
+            return winner
+        _PROVIDER, _OWNED, _RESOLVED = resolved, owned, True
         return _PROVIDER
 
 
@@ -237,7 +267,11 @@ def search(query: str, *, max_chars: int = MAX_VAULT_CHARS) -> str:
         return ""
     active = provider()
     if active is None:
-        return ""
+        # NOT "" — that is the sentence "nothing is written down about that",
+        # and we do not know it. We know we could not look. Collapsing the two
+        # would have the session tell the operator, in a confident voice, that
+        # they never wrote something down.
+        raise VaultSearchError("no memory provider is available in this process")
     try:
         # ``prefetch`` is the ABC's own read entrypoint, so this works for any
         # provider rather than only the one that ships with this box.
@@ -246,10 +280,6 @@ def search(query: str, *, max_chars: int = MAX_VAULT_CHARS) -> str:
         _log.warning("vault search failed: %s: %s", type(exc).__name__, exc)
         raise VaultSearchError(f"{type(exc).__name__}: {exc}") from exc
     return found[:max_chars]
-
-
-class VaultSearchError(Exception):
-    """A vault lookup failed — distinct from a lookup that found nothing."""
 
 
 __all__ = [

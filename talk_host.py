@@ -363,7 +363,14 @@ def _sanitize_identity_entries(body: str, filename: str) -> str:
 
     kept: list[str] = []
     for entry in body.split(IDENTITY_ENTRY_DELIMITER):
-        if not entry.strip() or entry.lstrip().startswith("[BLOCKED:"):
+        # Only genuinely EMPTY entries skip the scan. An entry that merely
+        # LOOKS already-blocked does not: the marker is unauthenticated text
+        # inside the very file this scan treats as untrusted, so exempting it
+        # hands the bypass to exactly the attacker the scan exists to stop —
+        # prefix a payload with "[BLOCKED:" and it rides into the prompt
+        # verbatim. The placeholder emitted below contains no threat
+        # patterns, so a real one survives a re-scan and needs no exemption.
+        if not entry.strip():
             kept.append(entry)
             continue
         try:

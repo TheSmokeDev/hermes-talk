@@ -37,8 +37,11 @@ def _hermetic(monkeypatch):
 
 def test_no_hermes_means_no_vault():
     assert talk_vault.available() is False
-    assert talk_vault.search("anything") == ""
     assert talk_vault.document_count() == 0
+    # NOT "" — that string means "nothing is written down about that", which
+    # we do not know. We know we could not look.
+    with pytest.raises(talk_vault.VaultSearchError):
+        talk_vault.search("anything")
 
 
 def test_an_unavailable_provider_is_never_initialized(monkeypatch):
@@ -99,12 +102,32 @@ def test_a_failed_load_is_not_retried_per_lookup(monkeypatch):
     assert len(calls) == 1
 
 
-def test_concurrent_first_lookups_load_exactly_one_provider(monkeypatch):
+def test_concurrent_first_lookups_keep_exactly_one_provider(monkeypatch):
     """Two tool calls can land together (a retry, or the dashboard and the
-    gateway in one process); the single-flight lock is what stops that from
-    building two indexes."""
+    gateway in one process). Exactly one provider is KEPT, and every loser is
+    closed rather than leaked.
 
-    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    Note what this deliberately does NOT promise: that only one is BUILT.
+    Resolution runs outside the lock so that a provider's ``initialize`` —
+    arbitrary third-party code — can never deadlock the call by reaching back
+    into this module. A cold-cache race can therefore build more than one; the
+    contract is that at most one survives.
+    """
+
+    made: list[StubProvider] = []
+
+    def factory(_name):
+        made.append(StubProvider("hits"))
+        return made[-1]
+
+    memory = types.ModuleType("plugins.memory")
+    memory._get_active_memory_provider = lambda: "stub"
+    memory.load_memory_provider = factory
+    plugins_pkg = types.ModuleType("plugins")
+    plugins_pkg.memory = memory
+    monkeypatch.setitem(sys.modules, "plugins", plugins_pkg)
+    monkeypatch.setitem(sys.modules, "plugins.memory", memory)
+
     start = threading.Barrier(4)
 
     def worker():
@@ -117,7 +140,12 @@ def test_concurrent_first_lookups_load_exactly_one_provider(monkeypatch):
     for thread in threads:
         thread.join(5)
 
-    assert provider.calls.count("initialize") == 1
+    kept = talk_vault.provider()
+    assert kept in made
+    for extra in made:
+        if extra is not kept:
+            assert "shutdown" in extra.calls, "a losing provider was leaked"
+    assert "shutdown" not in kept.calls
 
 
 # --- ownership ----------------------------------------------------------------
@@ -259,3 +287,65 @@ def test_an_include_filter_cannot_defer_the_warm_into_the_call(monkeypatch):
     talk_host.host().identity_sections()
 
     assert "initialize" in provider.calls
+
+
+# --- ownership on the failure paths -------------------------------------------
+
+
+def test_a_provider_that_fails_is_available_is_closed_not_leaked(monkeypatch):
+    """It was CONSTRUCTED, so it is ours. Abandoning it without closing leaks
+    it past every reset(), because the cache only remembers what it kept."""
+
+    provider = _install_provider(monkeypatch, StubProvider(available=False))
+
+    assert talk_vault.available() is False
+    assert "shutdown" in provider.calls
+
+
+def test_a_provider_that_throws_in_initialize_is_closed_not_leaked(monkeypatch):
+    class BadInit(StubProvider):
+        def initialize(self, session_id, **kwargs):
+            self.calls.append("initialize")
+            raise RuntimeError("initialize exploded")
+
+    provider = _install_provider(monkeypatch, BadInit())
+
+    assert talk_vault.available() is False
+    assert "shutdown" in provider.calls
+
+
+def test_a_provider_with_no_index_is_closed_not_leaked(monkeypatch):
+    class NoIndex(StubProvider):
+        def initialize(self, session_id, **kwargs):
+            self.calls.append("initialize")
+
+    provider = _install_provider(monkeypatch, NoIndex())
+
+    assert talk_vault.available() is False
+    assert "shutdown" in provider.calls
+
+
+def test_resolution_does_not_hold_the_lock(monkeypatch):
+    """`initialize` is arbitrary third-party code. Under a non-reentrant lock,
+    a provider that reached back into this module would DEADLOCK the voice
+    call rather than degrade — so resolution runs outside it."""
+
+    seen = []
+
+    class Reentrant(StubProvider):
+        def initialize(self, session_id, **kwargs):
+            # The hazard, exercised directly: a provider reaching back into
+            # this module from inside its own initialize. Guarded to fire once
+            # so the test measures the LOCK, not stub recursion.
+            if not seen:
+                seen.append("reentered")
+                talk_vault.provider()
+            super().initialize(session_id, **kwargs)
+
+    _install_provider(monkeypatch, Reentrant("hits"))
+
+    # The assertion is that this RETURNS AT ALL. Under a held non-reentrant
+    # lock the re-entrant call blocks forever and the voice call goes silent
+    # with no error — the worst shape of failure this plugin has.
+    assert talk_vault.available() is True
+    assert seen == ["reentered"]
