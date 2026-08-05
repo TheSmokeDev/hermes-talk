@@ -164,11 +164,16 @@ def test_providers_skipped_when_the_host_abcs_are_absent(plugin, monkeypatch):
     assert plugin.REGISTRATION_FAILURES == []
 
 
-def test_session_end_hook_is_a_noop(plugin):
+def test_session_end_hook_sweeps_transcripts_fail_open(plugin, monkeypatch, tmp_path):
+    swept = []
+    monkeypatch.setattr(plugin.talk_config, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(plugin.talk_transcript, "sweep_transcripts", swept.append)
     ctx = StubCtx()
     plugin.register(ctx)
     _, callback = ctx.hooks[0]
+
     assert callback(session_id="abc") is None
+    assert swept == [tmp_path]
 
 
 def test_slash_command_takes_the_discord_room_inside_an_event_loop(plugin):

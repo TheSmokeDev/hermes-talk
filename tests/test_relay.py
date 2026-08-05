@@ -262,6 +262,53 @@ def test_response_done_clears_the_spoken_item():
     assert relay.last_audio_item_id is None
 
 
+def test_completed_input_transcription_fires_turn_callback():
+    turns = []
+    relay = talk_relay.RealtimeRelay(
+        on_transcript_turn=lambda role, text: turns.append((role, text))
+    )
+
+    relay.handle_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "  remember that the deploy is Friday  ",
+        }
+    )
+
+    assert turns == [("user", "remember that the deploy is Friday")]
+
+
+def test_assistant_deltas_are_emitted_once_at_done_boundary():
+    turns = []
+    relay = talk_relay.RealtimeRelay(
+        on_transcript_turn=lambda role, text: turns.append((role, text))
+    )
+
+    relay.handle_event(fr.transcript_delta("The deploy "))
+    relay.handle_event(fr.transcript_delta("is Friday."))
+    assert turns == []
+
+    relay.handle_event({"type": "response.output_audio_transcript.done"})
+
+    assert turns == [("assistant", "The deploy is Friday.")]
+
+
+def test_assistant_done_payload_wins_over_incomplete_deltas_and_resets_buffer():
+    turns = []
+    relay = talk_relay.RealtimeRelay(
+        on_transcript_turn=lambda role, text: turns.append((role, text))
+    )
+
+    relay.handle_event(fr.transcript_delta("partial"))
+    relay.handle_event(
+        {"type": "response.output_audio_transcript.done", "transcript": "complete answer"}
+    )
+    relay.handle_event(fr.transcript_delta("next"))
+    relay.handle_event({"type": "response.output_audio_transcript.done"})
+
+    assert turns == [("assistant", "complete answer"), ("assistant", "next")]
+
+
 def test_undecodable_audio_delta_is_reported_not_raised():
     recorder = fr.run_transcript(
         [{"type": "response.output_audio.delta", "item_id": "i", "delta": "!!!not-base64!!!"}]

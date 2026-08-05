@@ -14,6 +14,7 @@ import pytest
 
 import talk_audio
 import talk_cli
+import talk_host
 import talk_relay
 
 
@@ -48,6 +49,9 @@ def test_missing_credentials_exit_one_without_opening_audio(monkeypatch, tmp_pat
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     # Hermetic OAuth lane: a dev box's real ~/.codex login must not leak in.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    swept = []
+    monkeypatch.setattr(talk_cli.talk_transcript, "sweep_transcripts", swept.append)
 
     def never(_self):  # pragma: no cover - must not be reached
         raise AssertionError("audio opened before auth was resolved")
@@ -55,6 +59,7 @@ def test_missing_credentials_exit_one_without_opening_audio(monkeypatch, tmp_pat
     monkeypatch.setattr(talk_audio.DuplexAudio, "start", never)
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
+    assert swept == [tmp_path / "home"]
     assert "codex login" in capsys.readouterr().err
 
 
@@ -737,6 +742,22 @@ def test_subagent_stop_messages_without_an_id_say_nothing():
     assert talk_cli.subagent_stop_messages({}) == []
 
 
+def test_active_parent_session_id_comes_from_the_bound_context():
+    talk_host.bind_ctx(types.SimpleNamespace(active_parent_session_id="parent-sess"))
+    try:
+        assert talk_cli._active_parent_session_id() == "parent-sess"
+    finally:
+        talk_host.bind_ctx(None)
+
+
+def test_old_host_without_active_parent_session_id_fails_closed():
+    talk_host.bind_ctx(types.SimpleNamespace())
+    try:
+        assert talk_cli._active_parent_session_id() is None
+    finally:
+        talk_host.bind_ctx(None)
+
+
 def test_landed_note_messages_are_trusted_but_keep_the_shape():
     messages = talk_cli.landed_note_messages("sa-0-aaaa")
     assert len(messages) == 3
@@ -985,9 +1006,28 @@ def test_session_always_detaches_the_lifecycle_target(monkeypatch, capsys):
     monkeypatch.setattr(
         talk_cli.talk_lifecycle, "detach_session", lambda: detached.append(True)
     )
+    ordering = []
+
+    class _Capture:
+        def __init__(self, _home):
+            ordering.append("capture")
+
+        def append_turn(self, _role, _text):
+            return None
+
+        def finish(self):
+            ordering.append("finish")
+
+    monkeypatch.setattr(talk_cli.talk_transcript, "TranscriptCapture", _Capture)
+    monkeypatch.setattr(
+        talk_cli.talk_transcript,
+        "sweep_transcripts",
+        lambda _home: ordering.append("sweep"),
+    )
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
     assert detached  # the belt ran
+    assert ordering[-2:] == ["finish", "sweep"]
     assert "no network in tests" in capsys.readouterr().err
 
 

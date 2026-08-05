@@ -42,6 +42,7 @@ try:
         talk_runs,
         talk_steer,
         talk_tools,
+        talk_transcript,
         talk_wire,
     )
     from .talk_relay import RealtimeRelay
@@ -56,6 +57,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_runs
     import talk_steer
     import talk_tools
+    import talk_transcript
     import talk_wire
     from talk_relay import RealtimeRelay
 
@@ -422,6 +424,15 @@ def subagent_stop_messages(event: dict) -> list[dict]:
     return _announcement_messages(headline, tail)
 
 
+def _active_parent_session_id() -> str | None:
+    """Snapshot the bound Hermes session id, or fail closed on older hosts."""
+
+    ctx = talk_host.get_ctx()
+    if ctx is None:
+        return None
+    return getattr(ctx, "active_parent_session_id", None)
+
+
 def _import_aiohttp():
     try:
         import aiohttp
@@ -472,6 +483,9 @@ async def run_talk_session(audio: object | None = None) -> int:
     (:class:`talk_discord.DiscordAudio`). Everything above this line is the
     same session either way: the same tools, ledger, and announcements.
     """
+
+    hermes_home = talk_config.get_hermes_home()
+    talk_transcript.sweep_transcripts(hermes_home)
 
     try:
         auth = talk_host.host().resolve_auth()
@@ -535,9 +549,11 @@ async def run_talk_session(audio: object | None = None) -> int:
     def on_error(text: str) -> None:
         print(f"\n[talk] {text}", file=sys.stderr, flush=True)
 
+    capture = talk_transcript.TranscriptCapture(hermes_home)
     relay = RealtimeRelay(
         on_audio=audio.queue_playback,
         on_caption=on_caption,
+        on_transcript_turn=capture.append_turn,
         on_barge_in=on_barge_in,
         on_error=on_error,
     )
@@ -674,7 +690,12 @@ async def run_talk_session(audio: object | None = None) -> int:
                         announce_queue.put_nowait(messages)
 
                 loop = asyncio.get_running_loop()
-                talk_lifecycle.attach_session(loop, on_subagent_event)
+                # Snapshot ownership once for this socket. Older Hermes builds
+                # do not expose the property; None deliberately suppresses
+                # lifecycle announcements instead of guessing from global
+                # hook traffic.
+                owner_session_id = _active_parent_session_id()
+                talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
                 # The notifier fires on HOST drain threads — marshal onto the
                 # loop; a closed loop raises into talk_steer's own containment.
                 talk_steer.set_landed_notifier(
@@ -748,6 +769,8 @@ async def run_talk_session(audio: object | None = None) -> int:
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         audio.stop()
+        capture.finish()
+        talk_transcript.sweep_transcripts(hermes_home)
 
     return 0
 
