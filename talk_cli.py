@@ -491,17 +491,29 @@ async def run_talk_session(audio: object | None = None) -> int:
                 )
 
                 sender = asyncio.create_task(send_microphone())
+                receiver = asyncio.create_task(receive_events())
                 pump = asyncio.create_task(pump_announcements(announce_queue, relay, ws))
                 try:
-                    await receive_events()
+                    # Sender and receiver are one failure domain. In particular,
+                    # an audio bridge exception must not disappear inside a
+                    # detached task while receive_events waits forever on a
+                    # socket that can no longer receive useful input.
+                    done, _pending = await asyncio.wait(
+                        {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for finished in done:
+                        finished.result()
                 finally:
                     talk_steer.set_landed_notifier(None)
                     talk_lifecycle.detach_session()
                     sender.cancel()
+                    receiver.cancel()
                     pump.cancel()
                     for watcher in watchers:
                         watcher.cancel()
-                    await asyncio.gather(sender, pump, *watchers, return_exceptions=True)
+                    await asyncio.gather(
+                        sender, receiver, pump, *watchers, return_exceptions=True
+                    )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
