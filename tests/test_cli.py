@@ -13,6 +13,7 @@ import pytest
 
 import talk_audio
 import talk_cli
+import talk_host
 import talk_relay
 
 
@@ -536,6 +537,22 @@ def test_subagent_stop_messages_verbs_track_the_host_statuses():
 
 def test_subagent_stop_messages_without_an_id_say_nothing():
     assert talk_cli.subagent_stop_messages({}) == []
+
+
+def test_active_parent_session_id_comes_from_the_bound_context():
+    talk_host.bind_ctx(types.SimpleNamespace(active_parent_session_id="parent-sess"))
+    try:
+        assert talk_cli._active_parent_session_id() == "parent-sess"
+    finally:
+        talk_host.bind_ctx(None)
+
+
+def test_old_host_without_active_parent_session_id_fails_closed():
+    talk_host.bind_ctx(types.SimpleNamespace())
+    try:
+        assert talk_cli._active_parent_session_id() is None
+    finally:
+        talk_host.bind_ctx(None)
 
 
 def test_landed_note_messages_are_trusted_but_keep_the_shape():
