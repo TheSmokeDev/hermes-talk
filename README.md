@@ -112,8 +112,8 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 already in — same conversation, same tools, same steering, in a room other
 people can hear. Talk now reports speaker transitions to the model using the
 member's immutable Discord user ID; display names are quoted as untrusted data,
-and an unknown SSRC stays unresolved. **This is attribution only, not
-authorization:** every participant still reaches the same tool surface. Issue
+and an unknown SSRC stays unresolved and unauthorized. **This is attribution only,
+not authorization:** every participant still reaches the same tool surface. Issue
 [#10](https://github.com/TheSmokeDev/hermes-talk/issues/10) remains open for
 the policy choice and default-deny enforcement for mutating tools. Until that
 lands, invite Hermes only to channels whose members you would hand those tools

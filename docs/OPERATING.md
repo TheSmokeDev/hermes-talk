@@ -156,15 +156,16 @@ session — a voice assistant that cannot say what day it is fails the first
 obvious question.
 
 **Discord speaker attribution is an identity floor, not authorization.** For
-each speaker transition, Talk resolves the SSRC through the host's current
-mapping and gives the model the immutable Discord user ID plus display name.
-The display name is quoted JSON inside a self-deleting system announcement,
-explicitly marked untrusted data; it is never a `role=user` turn and that
-announcement's response has `tool_choice: none`. If an SSRC is unknown, Talk
-reports it as unresolved and never guesses that it belongs to the operator.
-Mappings are re-read for every audio chunk, attribution changes are deduplicated
-by immutable user ID even when Discord changes SSRC, and stop/rejoin/remap
-invalidates stale queued callbacks.
+each decoded audio packet, Talk snapshots the receiver's current SSRC mapping and
+PCM together under the receiver lock, then gives the model the immutable Discord
+user ID plus display name immediately before that exact audio. The display name
+is JSON-quoted, bounded, and explicitly marked as untrusted profile data inside
+a persistent `role=system` context item; it is never a `role=user` turn. Speaker
+transitions replace the previous context in the same serialized outgoing batch
+as the PCM, without creating a response. If an SSRC is unknown, Talk reports it
+as unresolved and unauthorized and never guesses that it belongs to the
+operator. Attribution changes are deduplicated by immutable user ID even when
+Discord changes SSRC, and stop/rejoin/remap invalidates stale queued callbacks.
 
 That floor **does not grant or enforce permission**. All channel participants
 still reach the same tools, including mutating tools such as `delegate_task`
