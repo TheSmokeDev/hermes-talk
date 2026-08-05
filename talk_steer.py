@@ -54,10 +54,9 @@ Everything here is fail-open: a missing host module, a renamed logger, or an
 operator log level above INFO degrades to ``unconfirmed`` — never an
 exception on the voice path, and never a claim without its artifact.
 
-Ref-less compatibility receipts can join a drained batch only when the nearest
-preceding receipt for that subagent id carries the exact draining agent
-reference. The public id alone is never a landing artifact: hosts may recycle
-it for another agent instance.
+Ref-less receipts land only from their own positive token/text drain artifact.
+They never inherit a sibling's exact agent reference: ledger order cannot prove
+generation membership when hosts may recycle a public subagent id.
 """
 
 from __future__ import annotations
@@ -509,9 +508,9 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
     oracle: the host drains before it logs, so a note whose token is still
     pending at emit time was queued after this drain and stays ``queued``
     instead of being swept into ``landed`` with the batch.
-    Batch expansion is generation-aware: it requires either this exact agent
-    or a live reference on a directly matched receipt. A public id alone can
-    land only the directly matched receipt, never truncated siblings.
+    Batch expansion requires an exact live agent reference on each expanded
+    receipt. A ref-less receipt can land only by its own token/text match and
+    stays queued when the preview truncates it.
     """
 
     preview = (preview or "").strip()
@@ -573,19 +572,14 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                             target
                         )
 
-            generation_targets: dict[str, object | None] = {}
             for receipt in _RECEIPTS:
                 subagent_id = receipt["subagent_id"]
                 ref = receipt.get("agent_ref")
-                if ref is not None:
-                    generation_targets[subagent_id] = ref()
                 targets = batch_targets.get(subagent_id, ())
                 if (
                     receipt["state"] != STATE_QUEUED
-                    or not any(
-                        generation_targets.get(subagent_id) is target
-                        for target in targets
-                    )
+                    or ref is None
+                    or not any(ref() is target for target in targets)
                 ):
                     continue
                 token = receipt.get("token")
@@ -603,11 +597,9 @@ def mark_landed_for_agent(agent: object) -> int:
 
     The pre-API drain empties the ENTIRE pending queue for one agent, so a
     hit lands every queued receipt attributed to it by captured reference
-    (exact). A following ref-less compatibility receipt may join that same
-    identity-anchored generation; a bare subagent-id match never suffices,
-    because hosts may recycle ids. Receipts whose token is STILL in the
-    agent's pending queue at emit time were queued after the drain and are
-    skipped on both passes.
+    (exact). Ref-less receipts never inherit that identity from ledger order,
+    because hosts may recycle ids. Receipts whose token is STILL in the agent's
+    pending queue at emit time were queued after the drain and are skipped.
     """
 
     if agent is None:
@@ -630,28 +622,7 @@ def mark_landed_for_agent(agent: object) -> int:
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
-        if matched_agents:
-            # Walk in ledger order and anchor each id generation to its most
-            # recent captured reference.  This preserves old/ref-less sibling
-            # receipts recorded AFTER an exact receipt, but never sweeps an
-            # earlier generation merely because a host recycled its public id.
-            generation_targets: dict[str, object | None] = {}
-            for receipt in _RECEIPTS:
-                subagent_id = receipt["subagent_id"]
-                ref = receipt.get("agent_ref")
-                if ref is not None:
-                    generation_targets[subagent_id] = ref()
-                    continue
-                if (
-                    receipt["state"] == STATE_QUEUED
-                    and subagent_id in matched_agents
-                    and generation_targets.get(subagent_id) is agent
-                ):
-                    token = receipt.get("token")
-                    if token is not None and token in still_pending:
-                        continue
-                    receipt["state"] = STATE_LANDED
-                    flipped += 1
+
     if matched_agents:
         _push_landed(sorted(matched_agents))
     return flipped

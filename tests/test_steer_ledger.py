@@ -184,11 +184,11 @@ def test_identical_notes_on_two_agents_land_only_by_token():
     assert "note to sa-1-bbbb: queued" in summary
 
 
-def test_token_match_still_batch_lands_the_same_agents_later_notes():
+def test_token_match_leaves_truncated_ref_less_sibling_queued():
     # One agent, two notes queued before one drain: the joined preview only
     # shows the FIRST token, but the whole batch drained together. The second
-    # receipt deliberately lacks a ref: the first exact ref anchors it to this
-    # generation for compatibility with callers that cannot always resolve it.
+    # receipt deliberately lacks a ref, so ledger order cannot prove it belongs
+    # to this generation and the truncated sibling must remain unconfirmed.
     agent = _Steerable()
     token_a = talk_steer.new_token()
     token_b = talk_steer.new_token()
@@ -206,17 +206,18 @@ def test_token_match_still_batch_lands_the_same_agents_later_notes():
     preview = talk_steer.compose_wire_text(token_a, "first note about auth")[
         : talk_steer.DRAIN_PREVIEW_CHARS
     ]
-    assert talk_steer.mark_landed_from_preview(preview, agent=agent) == 2
+    assert talk_steer.mark_landed_from_preview(preview, agent=agent) == 1
+    assert "queued" in talk_steer.notes_summary()
 
 
-def test_post_tool_batch_uses_matched_receipt_ref_when_stack_identity_is_absent():
+def test_post_tool_batch_uses_each_receipts_ref_when_stack_identity_is_absent():
     agent = _Steerable()
     token_a = talk_steer.new_token()
     token_b = talk_steer.new_token()
     wire_a = talk_steer.compose_wire_text(token_a, "first note about auth")
     wire_b = talk_steer.compose_wire_text(token_b, "truncated compatibility sibling")
     talk_steer.record_queued("sa-0-aaaa", wire_a, token=token_a, agent=agent)
-    talk_steer.record_queued("sa-0-aaaa", wire_b, token=token_b)
+    talk_steer.record_queued("sa-0-aaaa", wire_b, token=token_b, agent=agent)
 
     assert talk_steer.mark_landed_from_preview(wire_a) == 2
 
@@ -323,14 +324,14 @@ def test_pre_api_drain_for_another_agent_flips_nothing(monkeypatch):
     assert "queued" in talk_steer.notes_summary()
 
 
-def test_pre_api_batch_lands_same_agent_receipts_without_a_ref():
-    # The pre-API drain empties the agent's WHOLE queue — receipts recorded
-    # without an agent ref still flip when a sibling receipt attributes the
-    # drain to their subagent id.
+def test_pre_api_batch_leaves_ref_less_sibling_queued():
+    # The drain empties one agent's whole queue, but ledger order cannot prove
+    # that a ref-less sibling belongs to that agent rather than a recycled id.
     agent = _Steerable()
     talk_steer.record_queued("sa-0-aaaa", "with a ref", agent=agent)
     talk_steer.record_queued("sa-0-aaaa", "without a ref")
-    assert talk_steer.mark_landed_for_agent(agent) == 2
+    assert talk_steer.mark_landed_for_agent(agent) == 1
+    assert "queued" in talk_steer.notes_summary()
 
 
 def test_pre_api_drain_does_not_land_ref_less_receipt_from_recycled_id():
@@ -345,6 +346,20 @@ def test_pre_api_drain_does_not_land_ref_less_receipt_from_recycled_id():
     summary = talk_steer.notes_summary()
     assert "note to sa-0-aaaa: queued" in summary
     assert "note to sa-0-aaaa: landed" in summary
+
+
+def test_pre_api_old_agent_drain_does_not_inherit_replacement_ref_less_receipt():
+    # Reverse recycled-id ordering: the old generation has the exact ref, then
+    # a replacement generation reuses the id but its receipt has no ref. The
+    # old agent's later drain cannot prove anything about that replacement.
+    old_agent = _Steerable()
+    talk_steer.record_queued("sa-0-aaaa", "old agent with a ref", agent=old_agent)
+    talk_steer.record_queued("sa-0-aaaa", "replacement without a ref")
+
+    assert talk_steer.mark_landed_for_agent(old_agent) == 1
+    summary = talk_steer.notes_summary()
+    assert summary.count("landed") == 1
+    assert summary.count("queued") == 1
 
 
 def test_pre_api_watcher_forces_debug_but_gates_other_lines(monkeypatch):
@@ -392,18 +407,16 @@ class _PendingAgent(_Steerable):
         self._pending_steer = pending
 
 
-def test_post_tool_drain_does_not_land_receipt_from_recycled_id():
+def test_post_tool_drain_does_not_land_ref_less_receipt_from_recycled_id():
     # The public id was reused for a replacement child. A token match from
-    # the replacement's drain must not batch-expand into the old generation.
-    old_agent = _PendingAgent()
+    # the replacement's drain must not batch-expand into the old ref-less
+    # generation.
     replacement = _PendingAgent()
     old_token = talk_steer.new_token()
     new_token = talk_steer.new_token()
     old_wire = talk_steer.compose_wire_text(old_token, "old agent note")
     new_wire = talk_steer.compose_wire_text(new_token, "replacement agent note")
-    talk_steer.record_queued(
-        "sa-0-aaaa", old_wire, token=old_token, agent=old_agent
-    )
+    talk_steer.record_queued("sa-0-aaaa", old_wire, token=old_token)
     talk_steer.record_queued(
         "sa-0-aaaa", new_wire, token=new_token, agent=replacement
     )
@@ -411,6 +424,29 @@ def test_post_tool_drain_does_not_land_receipt_from_recycled_id():
     flipped = talk_steer.mark_landed_from_preview(new_wire, agent=replacement)
 
     assert flipped == 1
+    summary = talk_steer.notes_summary()
+    assert summary.count("landed") == 1
+    assert summary.count("queued") == 1
+
+
+def test_post_tool_old_agent_drain_does_not_inherit_replacement_ref_less_receipt():
+    # Same reverse recycled-id ordering on the preview drain path. Only the old
+    # receipt has a positive token/text artifact in this drain preview.
+    old_agent = _PendingAgent()
+    old_token = talk_steer.new_token()
+    replacement_token = talk_steer.new_token()
+    old_wire = talk_steer.compose_wire_text(old_token, "old agent note")
+    replacement_wire = talk_steer.compose_wire_text(
+        replacement_token, "replacement agent note"
+    )
+    talk_steer.record_queued(
+        "sa-0-aaaa", old_wire, token=old_token, agent=old_agent
+    )
+    talk_steer.record_queued(
+        "sa-0-aaaa", replacement_wire, token=replacement_token
+    )
+
+    assert talk_steer.mark_landed_from_preview(old_wire, agent=old_agent) == 1
     summary = talk_steer.notes_summary()
     assert summary.count("landed") == 1
     assert summary.count("queued") == 1
