@@ -553,6 +553,8 @@ class _FakeRedirectAgent(_FakeAgent):
         if self.redirect_raises is not None:
             raise self.redirect_raises
         self.redirected.append(text)
+        if self.redirect_accepted and not self._executing_tools:
+            self._pending_redirect = text
         return self.redirect_accepted
 
 
@@ -581,9 +583,8 @@ def test_redirect_accepted_mid_thought_claims_accepted_never_the_abort(monkeypat
     _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
     out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo, use taskchad-ship")
     assert "redirect accepted" in out.lower()
-    # The peek can be stale (redirect() may have degraded to a steer-queue
-    # write and still returned True) — so the sentence must hold on either
-    # path and may NEVER claim the current work was dropped.
+    # The fake exposes the same post-call redirect-slot artifact as the host;
+    # even then the sentence never claims that already completed work vanished.
     assert "current step, or its very next one" in out.lower()
     assert "drops what it was doing" not in out.lower()
     # The wire text leads with the correlation token — both verbs share it.
@@ -603,6 +604,28 @@ def test_redirect_mid_tool_speaks_queued_not_redirected(monkeypatch):
     assert "mid-tool" in out.lower()
     assert "queued" in talk_steer.notes_summary()
     assert "redirect accepted" not in talk_steer.notes_summary()
+
+
+def test_redirect_that_races_into_tools_is_queued_and_can_be_superseded(monkeypatch):
+    class _RacingToolAgent(_FakeRedirectAgent):
+        def redirect(self, text: str) -> bool:
+            # The adapter's pre-call peek saw False; the host crosses into a
+            # tool before redirect() chooses its mechanism and queues instead.
+            self._executing_tools = True
+            self._pending_steer = text
+            self.redirected.append(text)
+            return True
+
+    agent = _RacingToolAgent()
+    _install_host(monkeypatch, {"sa-0-aaaa": {"agent": agent}})
+
+    out = talk_host.host().redirect_agent("sa-0-aaaa", "wrong repo")
+    talk_steer.mark_superseded("sa-0-aaaa")
+
+    assert "queued" in out.lower()
+    summary = talk_steer.notes_summary()
+    assert "stopped — the note may not have been read" in summary
+    assert "redirect accepted" not in summary
 
 
 def test_redirect_false_falls_back_to_the_steer_queue(monkeypatch):
