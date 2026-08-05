@@ -820,23 +820,22 @@ def test_same_discord_speaker_chunks_and_ssrc_reorder_do_not_flood(monkeypatch):
     bridge.stop()
 
 
-def test_speaker_mapping_is_resolved_again_after_stale_ssrc_reuse(monkeypatch):
-    _connection, receiver, vc, adapter = _wired_host(monkeypatch)
+def test_speaker_mapping_is_resolved_again_after_ssrc_reuse(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
     vc.channel = types.SimpleNamespace(
         members=[
             types.SimpleNamespace(id=101, display_name="Alice"),
             types.SimpleNamespace(id=202, display_name="Bob"),
         ]
     )
-    adapter._ssrc_to_user = {11: 101}
     bridge = talk_discord.DiscordAudio(7)
     events: list[dict] = []
     bridge.start()
     bridge.set_speaker_notifier(events.append)
 
     for user_id in (101, 202):
-        adapter._ssrc_to_user[11] = user_id
         with receiver._lock:
+            receiver._ssrc_to_user[11] = user_id
             receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
         bridge._drain_receiver(receiver)
 
@@ -1054,3 +1053,46 @@ def test_no_silence_before_start_or_after_stop(monkeypatch):
     bridge.start()
     bridge.stop()
     assert bridge.read_input_chunk() is None
+
+
+def test_receiver_mapping_and_pcm_are_snapshotted_atomically(monkeypatch):
+    _connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[
+            types.SimpleNamespace(id=101, display_name="Alice"),
+            types.SimpleNamespace(id=202, display_name="Bob"),
+        ]
+    )
+    # The adapter copy is stale. The receiver owns both the decoded buffers
+    # and the mapping that identifies them.
+    adapter._ssrc_to_user = {11: 101}
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    pcm48 = b"\x02\x00" * 8
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 202
+        receiver._buffers[11] = bytearray(pcm48)
+    bridge._drain_receiver(receiver)
+
+    # A remap after drain must not relabel already-queued audio.
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+    packet = bridge.read_input_packet()
+
+    assert packet.speaker == {"ssrc": 11, "user_id": 202, "display_name": "Bob"}
+    assert packet.pcm == talk_discord.discord_to_session(pcm48)[0]
+    bridge.stop()
+
+
+def test_generic_chunk_reader_unwraps_the_atomic_packet(monkeypatch):
+    _connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    pcm48 = b"\x03\x00" * 8
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(pcm48)
+    bridge._drain_receiver(receiver)
+
+    assert bridge.read_input_chunk() == talk_discord.discord_to_session(pcm48)[0]
+    bridge.stop()
