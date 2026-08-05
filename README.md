@@ -67,7 +67,7 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 425 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 593 offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 **Verify it** (no talking required):
 
@@ -117,13 +117,16 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 already in — same conversation, same tools, same steering, in a room other
 people can hear. Talk now reports speaker transitions to the model using the
 member's immutable Discord user ID; display names are quoted as untrusted data,
-and an unknown SSRC stays unresolved and unauthorized. **This is attribution only,
-not authorization:** every participant still reaches the same tool surface. Issue
-[#10](https://github.com/TheSmokeDev/hermes-talk/issues/10) remains open for
-the policy choice and default-deny enforcement for mutating tools. Until that
-lands, invite Hermes only to channels whose members you would hand those tools
-to. It borrows the host's own voice connection rather than opening a second
-one. Details:
+and an unknown SSRC stays unresolved and unauthorized. Configure immutable IDs
+with `TALK_DISCORD_OPERATOR_USER_IDS=<id>[,<id>...]`. Only those speakers may
+run `delegate_task`, `steer_agent`, `redirect_agent`, or `stop_work`; everyone
+may still converse and use read-only tools. Unset, blank, or any malformed list
+authorizes nobody. Talk binds permission to the exact Discord PCM, VAD input
+item, and opaque Realtime response metadata — never a display name, SSRC,
+model argument, or whichever person spoke most recently. Mixed, missing, or
+unresolved attribution fails closed with a spoken denial. Terminal microphone
+and dashboard sessions retain their existing behavior. Talk borrows the host's
+own voice connection rather than opening a second one. Details:
 [docs/OPERATING.md](docs/OPERATING.md#discord-voice--talking-in-the-channel-hermes-is-already-in).
 
 What can you actually say? The full say-this → hear-this card, with what
@@ -321,6 +324,7 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
 | `TALK_DASHBOARD_TOKEN` | unset | Token for the dashboard tab's routes (unset = loopback only) |
+| `TALK_DISCORD_OPERATOR_USER_IDS` | none | Comma-separated immutable Discord IDs allowed to run mutating tools; malformed = nobody |
 
 ### `TALK_IDENTITY_INCLUDE` — what the session starts knowing
 

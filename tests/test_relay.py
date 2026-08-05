@@ -29,6 +29,45 @@ def test_function_call_round_trip():
     assert item["output"] == "You shipped it Tuesday."
 
 
+def test_authorization_denial_is_returned_without_executing_the_tool():
+    executed = []
+    authorized = []
+
+    def executor(name, arguments):  # pragma: no cover - denial must stop here
+        executed.append((name, arguments))
+        return "mutated"
+
+    def authorizer(name, event):
+        authorized.append((name, event["response_id"]))
+        return "That state-changing tool was not run."
+
+    relay = talk_relay.RealtimeRelay(
+        tool_executor=executor,
+        tool_authorizer=authorizer,
+    )
+    messages = relay.handle_event(
+        {
+            **fr.function_call("delegate_task", '{"task": "ship it"}'),
+            "response_id": "resp_operator_turn",
+        }
+    )
+
+    assert executed == []
+    assert authorized == [("delegate_task", "resp_operator_turn")]
+    assert messages[0]["item"]["output"] == "That state-changing tool was not run."
+
+
+def test_authorizer_allow_reaches_the_tool_executor():
+    relay = talk_relay.RealtimeRelay(
+        tool_executor=lambda name, _arguments: f"ran {name}",
+        tool_authorizer=lambda _name, _event: None,
+    )
+
+    messages = relay.handle_event(fr.function_call("search_memory", '{}'))
+
+    assert messages[0]["item"]["output"] == "ran search_memory"
+
+
 def test_async_tool_wait_is_bounded_and_answers_honestly(monkeypatch):
     release = threading.Event()
 

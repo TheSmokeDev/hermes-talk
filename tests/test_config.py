@@ -88,6 +88,46 @@ def test_audio_device_overrides(monkeypatch):
     assert talk_config.audio_output_device() == "Speakers (Realtek)"
 
 
+def test_discord_operator_ids_are_immutable_numeric_ids(monkeypatch):
+    monkeypatch.setenv(
+        "TALK_DISCORD_OPERATOR_USER_IDS",
+        " 586638048133906576, 123456789012345678 ",
+    )
+
+    assert talk_config.discord_operator_user_ids() == frozenset(
+        {586638048133906576, 123456789012345678}
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "586638048133906576,",
+        ",586638048133906576",
+        "586638048133906576,,123456789012345678",
+        "586638048133906576,not-an-id",
+        "-1",
+        "+586638048133906576",
+        "18446744073709551616",
+        "9" * 5_000,
+    ],
+)
+def test_blank_or_malformed_discord_operator_config_authorizes_nobody(
+    monkeypatch, raw
+):
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", raw)
+
+    assert talk_config.discord_operator_user_ids() == frozenset()
+
+
+def test_unset_discord_operator_config_authorizes_nobody(monkeypatch):
+    monkeypatch.delenv("TALK_DISCORD_OPERATOR_USER_IDS", raising=False)
+
+    assert talk_config.discord_operator_user_ids() == frozenset()
+
+
 # --- identity_char_limit ------------------------------------------------------
 
 

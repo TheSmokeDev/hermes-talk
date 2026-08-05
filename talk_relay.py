@@ -174,6 +174,7 @@ class RealtimeRelay:
         on_barge_in: Callable[[], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         tool_executor: Callable[[str, dict], str] | None = None,
+        tool_authorizer: Callable[[str, dict], str | None] | None = None,
     ) -> None:
         self.on_audio = on_audio or _noop
         self.on_caption = on_caption or _noop
@@ -181,6 +182,7 @@ class RealtimeRelay:
         self.on_barge_in = on_barge_in or _noop
         self.on_error = on_error or _noop
         self.tool_executor = tool_executor or execute_talk_tool
+        self.tool_authorizer = tool_authorizer
         self.session_id: str | None = None
         #: Item the model is currently speaking — the CLI needs it to truncate
         #: the server-side transcript at the point playback actually reached.
@@ -229,6 +231,7 @@ class RealtimeRelay:
             except ToolWorkerBusy:
                 call_id = str(event.get("call_id") or "")
                 name = str(event.get("name") or "tool")
+                self._consume_tool_attempt(event)
                 return self._function_output(
                     call_id,
                     f"Earlier tools are still running, so the {name} tool was not "
@@ -238,6 +241,7 @@ class RealtimeRelay:
             except ToolExecutionTimeout as exc:
                 call_id = str(event.get("call_id") or "")
                 name = str(event.get("name") or "tool")
+                self._consume_tool_attempt(event)
                 if exc.started:
                     output = (
                         f"The {name} tool is still running after "
@@ -259,12 +263,27 @@ class RealtimeRelay:
 
         call_id = str(event.get("call_id") or "")
         name = str(event.get("name") or "tool")
+        # Rejection is a terminal execution attempt. Consume any trusted
+        # single-use mutating permit so the same bound event cannot execute
+        # later when queue capacity becomes available.
+        self._consume_tool_attempt(event)
         return self._function_output(
             call_id,
             f"Earlier tools are still running, so the {name} tool was not started. "
             "Wait for them to finish, then ask me to try again.",
             continue_response=False,
         )
+
+    def _consume_tool_attempt(self, event: dict) -> None:
+        """Consume a bound call permit on any terminal non-execution path."""
+
+        if self.tool_authorizer is not None:
+            self.tool_authorizer(str(event.get("name") or "tool"), event)
+
+    def discard_tool_event(self, event: dict) -> None:
+        """Revoke a queued tool event that session teardown will never execute."""
+
+        self._consume_tool_attempt(event)
 
     # -- event handlers -------------------------------------------------------
 
@@ -329,6 +348,10 @@ class RealtimeRelay:
     def _on_function_call(self, event: dict) -> list[dict]:
         call_id = str(event.get("call_id") or "")
         name = str(event.get("name") or "")
+        if self.tool_authorizer is not None:
+            denial = self.tool_authorizer(name, event)
+            if denial is not None:
+                return self._function_output(call_id, denial)
         raw = event.get("arguments")
         try:
             arguments = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}

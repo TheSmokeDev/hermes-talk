@@ -15,6 +15,7 @@ import pytest
 import talk_audio
 import talk_cli
 import talk_host
+import talk_operator_auth
 import talk_relay
 
 
@@ -429,6 +430,186 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
     assert audio.stopped
 
 
+@pytest.mark.parametrize(
+    ("speaker_id", "should_execute"),
+    [(586638048133906576, True), (123456789012345678, False)],
+)
+def test_discord_response_is_bound_to_exact_speaker_for_mutating_tools(
+    monkeypatch, speaker_id, should_execute
+):
+    operator_id = 586638048133906576
+    executed: list[tuple[str, dict]] = []
+
+    class _Audio:
+        discord_speaker_authorization = True
+        played_ms = 0
+
+        def __init__(self):
+            self.packet_sent = False
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+        def read_input_packet(self):
+            if self.packet_sent:
+                return None
+            self.packet_sent = True
+            return types.SimpleNamespace(
+                speaker={"ssrc": 11, "user_id": speaker_id, "display_name": "voice user"},
+                pcm=bytes(20 * 24 * 2),
+            )
+
+        def queue_playback(self, _pcm):
+            pass
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _Message:
+        type = "text"
+
+        def __init__(self, event):
+            self.data = json.dumps(event)
+
+    class _WS:
+        def __init__(self):
+            self.sent: list[dict] = []
+            self.audio_sent = asyncio.Event()
+            self.initial_metadata = None
+            self.index = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+            if message.get("type") == "input_audio_buffer.append":
+                self.audio_sent.set()
+            if message.get("type") == "response.create" and self.initial_metadata is None:
+                self.initial_metadata = message.get("response", {}).get("metadata")
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.index == 0:
+                await self.audio_sent.wait()
+                event = {
+                    "type": "input_audio_buffer.speech_started",
+                    "item_id": "input_1",
+                    "audio_start_ms": 0,
+                }
+            elif self.index == 1:
+                event = {
+                    "type": "input_audio_buffer.speech_stopped",
+                    "item_id": "input_1",
+                    "audio_end_ms": 20,
+                }
+            elif self.index == 2:
+                event = {"type": "input_audio_buffer.committed", "item_id": "input_1"}
+            elif self.index == 3:
+                assert self.initial_metadata is not None
+                event = {
+                    "type": "response.created",
+                    "response": {"id": "resp_1", "metadata": self.initial_metadata},
+                }
+            elif self.index == 4:
+                event = {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call_1",
+                    "name": "delegate_task",
+                    "arguments": '{"task": "ship it"}',
+                    "response_id": "resp_1",
+                }
+            elif self.index == 5:
+                event = {"type": "response.done", "response": {"id": "resp_1"}}
+            else:
+                raise StopAsyncIteration
+            self.index += 1
+            return _Message(event)
+
+    ws = _WS()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    host = types.SimpleNamespace(
+        resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
+        identity_sections=lambda: {},
+    )
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(operator_id))
+    monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
+    monkeypatch.setattr(talk_cli.talk_apiserver, "warm_in_background", lambda: None)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT="text"),
+        ),
+    )
+
+    def executor(name, arguments):
+        executed.append((name, arguments))
+        return "mutation completed"
+
+    monkeypatch.setattr(talk_relay, "execute_talk_tool", executor)
+    audio = _Audio()
+
+    assert asyncio.run(asyncio.wait_for(talk_cli.run_talk_session(audio=audio), 3.0)) == 0
+    expected = [("delegate_task", {"task": "ship it"})] if should_execute else []
+    assert executed == expected
+    session_update = ws.sent[0]
+    assert session_update["session"]["audio"]["input"]["turn_detection"][
+        "create_response"
+    ] is False
+    response_creates = [
+        message for message in ws.sent if message.get("type") == "response.create"
+    ]
+    assert len(response_creates) == 2
+    assert response_creates[0]["response"]["metadata"] != response_creates[1][
+        "response"
+    ]["metadata"]
+    assert all(
+        create["response"]["metadata"][talk_operator_auth.BINDING_METADATA_KEY]
+        for create in response_creates
+    )
+    outputs = [
+        message["item"]["output"]
+        for message in ws.sent
+        if message.get("item", {}).get("type") == "function_call_output"
+    ]
+    if should_execute:
+        assert outputs == ["mutation completed"]
+    else:
+        assert len(outputs) == 1
+        assert "configured Discord operator" in outputs[0]
+        assert "not run" in outputs[0]
+    assert audio.stopped
+
+
 def test_tool_batch_orders_two_outputs_and_continues_once_after_response_done():
     async def scenario():
         sent: list[dict] = []
@@ -470,6 +651,55 @@ def test_tool_batch_orders_two_outputs_and_continues_once_after_response_done():
     assert [m["item"]["call_id"] for m in sent[:-1]] == ["call_1", "call_2"]
     assert sent[-1] == {"type": "response.create"}
     assert sum(m["type"] == "response.create" for m in sent) == 1
+
+
+def test_tool_continuation_keeps_the_trusted_speaker_binding_metadata():
+    async def scenario():
+        sent: list[dict] = []
+        continuation = {
+            "type": "response.create",
+            "response": {
+                "metadata": {
+                    talk_operator_auth.BINDING_METADATA_KEY: "opaque-binding-token"
+                }
+            },
+        }
+
+        class Relay:
+            async def handle_event_async(self, event):
+                return [{"type": "conversation.item.create", "item": {"output": "ok"}}]
+
+            def tool_queue_full_output(self, _event):
+                raise AssertionError("queue should admit the call")
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=1)
+        worker = asyncio.create_task(coordinator.run())
+        coordinator.admit(
+            {
+                "call_id": "call_1",
+                talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY: continuation,
+            }
+        )
+        await coordinator.response_done()
+        await asyncio.wait_for(coordinator.join(), 0.2)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return sent
+
+    sent = asyncio.run(scenario())
+
+    assert sent[-1] == {
+        "type": "response.create",
+        "response": {
+            "metadata": {
+                talk_operator_auth.BINDING_METADATA_KEY: "opaque-binding-token"
+            }
+        },
+    }
+    assert sum(message["type"] == "response.create" for message in sent) == 1
 
 
 def test_tool_batch_strips_production_relays_per_call_continuations():

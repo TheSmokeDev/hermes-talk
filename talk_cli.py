@@ -39,6 +39,7 @@ try:
         talk_host,
         talk_identity,
         talk_lifecycle,
+        talk_operator_auth,
         talk_runs,
         talk_steer,
         talk_tools,
@@ -54,6 +55,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_host
     import talk_identity
     import talk_lifecycle
+    import talk_operator_auth
     import talk_runs
     import talk_steer
     import talk_tools
@@ -268,6 +270,7 @@ class ToolResponseCoordinator:
         self.outputs: list[list[dict] | None] = []
         self.closed = False
         self.failed = False
+        self._continuation: dict = {"type": "response.create"}
         self._flush_lock = asyncio.Lock()
 
     def admit(self, event: dict) -> bool:
@@ -275,6 +278,14 @@ class ToolResponseCoordinator:
             raise RuntimeError("tool call arrived after response.done")
         position = len(self.outputs)
         self.outputs.append(None)
+        candidate = event.get(talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY)
+        candidate = candidate if isinstance(candidate, dict) else {"type": "response.create"}
+        if position == 0:
+            self._continuation = candidate
+        elif candidate != self._continuation:
+            # Mixed/missing attribution in one response can continue talking,
+            # but its continuation must carry no authorization binding.
+            self._continuation = {"type": "response.create"}
         try:
             self.queue.put_nowait((position, event))
         except asyncio.QueueFull:
@@ -297,7 +308,7 @@ class ToolResponseCoordinator:
             ):
                 return
             batch = [message for result in self.outputs for message in result or []]
-            batch.append({"type": "response.create"})
+            batch.append(self._continuation)
             try:
                 await self.send_batch(batch)
             except Exception:
@@ -305,6 +316,7 @@ class ToolResponseCoordinator:
                 raise
             self.outputs = []
             self.closed = False
+            self._continuation = {"type": "response.create"}
 
     async def run(self) -> None:
         while True:
@@ -325,10 +337,13 @@ class ToolResponseCoordinator:
 
         while True:
             try:
-                self.queue.get_nowait()
+                _position, event = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             else:
+                discard = getattr(self.relay, "discard_tool_event", None)
+                if callable(discard):
+                    discard(event)
                 self.queue.task_done()
 
 
@@ -509,6 +524,14 @@ async def run_talk_session(audio: object | None = None) -> int:
     # spent an ephemeral secret.
     if audio is None:
         audio = talk_audio.DuplexAudio()
+    discord_authorization = bool(
+        getattr(audio, "discord_speaker_authorization", False)
+    )
+    authorization_ledger = (
+        talk_operator_auth.DiscordToolAuthorizationLedger()
+        if discord_authorization
+        else None
+    )
     try:
         audio.start()
     except talk_audio.TalkAudioError as exc:
@@ -556,11 +579,23 @@ async def run_talk_session(audio: object | None = None) -> int:
         on_transcript_turn=capture.append_turn,
         on_barge_in=on_barge_in,
         on_error=on_error,
+        tool_authorizer=(
+            authorization_ledger.authorize_tool
+            if authorization_ledger is not None
+            else None
+        ),
     )
 
     session_update = build_session_update(
         model=model, voice=voice, instructions=instructions, tools=tools
     )
+    if authorization_ledger is not None:
+        # Automatic server responses carry no client metadata that can bind
+        # them to a speaker. Discord therefore creates one response itself at
+        # the committed VAD boundary, with an opaque trusted binding token.
+        session_update["session"]["audio"]["input"]["turn_detection"][
+            "create_response"
+        ] = False
 
     try:
         async with aiohttp.ClientSession() as http:  # noqa: SIM117 - flattening buries the socket args
@@ -617,6 +652,8 @@ async def run_talk_session(audio: object | None = None) -> int:
                         if chunk is None:
                             await asyncio.sleep(IDLE_POLL_S)
                             continue
+                        if authorization_ledger is not None:
+                            authorization_ledger.record_packet(speaker, chunk)
                         await send_outgoing(packet_lane.outgoing(speaker, chunk))
 
                 async def watch_run(run_id: int) -> None:
@@ -653,14 +690,40 @@ async def run_talk_session(audio: object | None = None) -> int:
                             continue
                         if not isinstance(event, dict):
                             continue
+                        event_type = event.get("type")
+                        if authorization_ledger is not None:
+                            if event_type == "input_audio_buffer.speech_started":
+                                authorization_ledger.note_speech_started(event)
+                            elif event_type == "input_audio_buffer.speech_stopped":
+                                authorization_ledger.note_speech_stopped(event)
+                            elif event_type == "response.created":
+                                authorization_ledger.note_response_created(event)
+                            elif event_type == "response.function_call_arguments.done":
+                                event = authorization_ledger.bind_tool_event(event)
                         if event.get("type") == "response.created":
                             continuation_pending = False
                         if event.get("type") == "response.function_call_arguments.done":
                             tool_coordinator.admit(event)
                             continue
                         outgoing = relay.handle_event(event)
+                        if (
+                            authorization_ledger is not None
+                            and event_type == "input_audio_buffer.committed"
+                        ):
+                            response_create = authorization_ledger.response_for_commit(event)
+                            if response_create is not None:
+                                outgoing.append(response_create)
                         if event.get("type") == "response.done":
+                            continued = bool(tool_coordinator.outputs)
                             await tool_coordinator.response_done()
+                            response = event.get("response")
+                            response_id = (
+                                response.get("id") if isinstance(response, dict) else None
+                            )
+                            if authorization_ledger is not None:
+                                authorization_ledger.complete_response(
+                                    response_id, continued=continued
+                                )
                         if pending:
                             outgoing = [*outgoing, *pending]
                             pending.clear()
@@ -768,6 +831,8 @@ async def run_talk_session(audio: object | None = None) -> int:
         # hook bus or ledger holding a callback into a dead session.
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
+        if authorization_ledger is not None:
+            authorization_ledger.clear()
         audio.stop()
         capture.finish()
         talk_transcript.sweep_transcripts(hermes_home)

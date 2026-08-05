@@ -326,6 +326,10 @@ def _new_source(frames: queue.Queue) -> Any:
 class DiscordAudio:
     """A voice channel wearing :class:`talk_audio.DuplexAudio`'s interface."""
 
+    # Opt-in capability consumed by run_talk_session. Generic microphones and
+    # dashboard sessions deliberately keep their existing authorization path.
+    discord_speaker_authorization = True
+
     def __init__(self, guild_id: int | None = None) -> None:
         self._guild_id = guild_id
         self._bridge: dict[str, Any] | None = None
@@ -802,9 +806,14 @@ class DiscordAudio:
             packet = None
         if packet:
             # Accept raw bytes placed by older embedders while the public
-            # read_input_chunk compatibility seam remains supported.
+            # read_input_chunk compatibility seam remains supported. Raw bytes
+            # carry no immutable identity and must never look like synthesized
+            # silence to the authorization ledger.
             if isinstance(packet, bytes):
-                packet = InputAudioPacket(speaker=None, pcm=packet)
+                packet = InputAudioPacket(
+                    speaker={"user_id": None, "ssrc": 0, "display_name": ""},
+                    pcm=packet,
+                )
             # Real audio: advance the clock by however much we just sent, so
             # a burst of buffered speech does not earn extra silence after.
             duration = len(packet.pcm) / _SESSION_BYTES_PER_SECOND
