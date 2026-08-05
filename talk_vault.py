@@ -15,9 +15,9 @@ the dashboard do not have — the two lanes most likely to be asked "what do
 you know about X". Loading the provider ourselves works on all three.
 
 Two costs, both measured on a 1,000-document vault and both shaping the
-design: the first resolve is ~0.9s and a search is ~0.3s. A tool call runs on
-the loop carrying the microphone, so the index is built ONCE behind a
-single-flight lock and kept, rather than rebuilt per lookup.
+design: the first resolve is ~0.9s and a search is ~0.3s. Tool waits are
+bounded, so the index is built ONCE behind a single-flight lock and kept,
+rather than rebuilt per lookup.
 
 That first resolve is paid while the SESSION IS BEING MINTED, not on the
 operator's first question: ``identity_sections`` builds the vault pointer and

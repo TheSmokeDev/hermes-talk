@@ -81,6 +81,10 @@ _UNSET = object()
 #: comfortably under it.
 KEEPALIVE_INTERVAL_S = 20.0
 
+#: Allow a brief discord.py reconnect transition, but never synthesize
+#: healthy-looking silence forever on a client that is no longer connected.
+BRIDGE_DISCONNECT_GRACE_S = 1.0
+
 
 def _running_loop():
     """The loop to marshal host calls onto, or ``None`` off-loop."""
@@ -333,6 +337,8 @@ class DiscordAudio:
         self._restore_voice_mode: Any = _UNSET
         self._restore_play: Any = _UNSET
         self._final_played = 0
+        self._bridge_failure: str | None = None
+        self._disconnected_since: float | None = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -356,6 +362,8 @@ class DiscordAudio:
             )
 
         self._bridge = bridge
+        self._bridge_failure = None
+        self._disconnected_since = None
         self._source = _new_source(self._outbound)
         self._audio_clock = time.monotonic()
         self._loop = _running_loop()
@@ -468,6 +476,7 @@ class DiscordAudio:
     def stop(self) -> None:
         """Hand the connection back. Safe twice, and after a failed start."""
 
+        bridge_is_current = self._bridge_identity_is_current()
         bridge, self._bridge = self._bridge, None
         # Teardown is best-effort at every step: a half-torn-down bridge
         # must still hand the connection back to the host, in the reverse
@@ -480,7 +489,7 @@ class DiscordAudio:
                 # Only re-register for a receiver that is still alive. If the
                 # host already tore it down, re-adding an inert callback keeps
                 # its reader thread awake for the life of the connection.
-                if getattr(receiver, "_running", False):
+                if bridge_is_current and getattr(receiver, "_running", False):
                     connection.add_socket_listener(self._original_on_packet)
             with suppress(Exception):
                 receiver._on_packet = self._original_on_packet
@@ -514,6 +523,12 @@ class DiscordAudio:
         so we take the buffers continuously and leave the host's own gate
         to its own bookkeeping.
         """
+
+        if not self._bridge_identity_is_current(receiver):
+            self._mark_bridge_failure(
+                "the Discord voice connection changed while I was listening"
+            )
+            return
 
         try:
             buffers = getattr(receiver, "_buffers", None)
@@ -553,6 +568,83 @@ class DiscordAudio:
                         pass
         except Exception:  # noqa: BLE001 — this runs on the HOST's thread
             _log.debug("discord capture drain failed", exc_info=True)
+
+    def _bridge_identity_is_current(self, receiver: Any | None = None) -> bool:
+        """Whether the adapter still publishes the exact bridge we borrowed."""
+
+        bridge = self._bridge
+        if bridge is None:
+            return True
+        try:
+            adapter = bridge["adapter"]
+            guild_id = bridge["guild_id"]
+            clients = getattr(adapter, "_voice_clients", None)
+            receivers = getattr(adapter, "_voice_receivers", None)
+            if not isinstance(clients, dict) or not isinstance(receivers, dict):
+                return False
+            return (
+                clients.get(guild_id) is bridge["voice_client"]
+                and receivers.get(guild_id) is bridge["receiver"]
+                and (receiver is None or receiver is bridge["receiver"])
+            )
+        except Exception:  # noqa: BLE001 — host internals are an untrusted boundary
+            return False
+
+    def _mark_bridge_failure(self, message: str) -> None:
+        if self._bridge_failure is None:
+            self._bridge_failure = message
+            _log.error("discord voice bridge lost: %s", message)
+
+    def _bridge_credentials_are_current(self) -> bool:
+        """Whether the receiver decrypts with the live connection generation."""
+
+        bridge = self._bridge
+        if bridge is None:
+            return True
+        try:
+            receiver = bridge["receiver"]
+            voice_client = bridge["voice_client"]
+            connection = voice_client._connection
+            return (
+                receiver._vc is voice_client
+                and bytes(receiver._secret_key) == bytes(connection.secret_key)
+                and receiver._dave_session is connection.dave_session
+            )
+        except Exception:  # noqa: BLE001 — unverifiable credentials are not healthy
+            return False
+
+    def _fail_if_bridge_lost(self) -> None:
+        if not self._bridge_identity_is_current():
+            self._mark_bridge_failure(
+                "the Discord voice connection changed while I was listening"
+            )
+        elif not self._bridge_credentials_are_current():
+            self._mark_bridge_failure(
+                "the Discord voice credentials changed while I was listening"
+            )
+        bridge = self._bridge
+        if bridge is not None and self._bridge_failure is None:
+            try:
+                connected = bool(bridge["voice_client"].is_connected())
+            except Exception:  # noqa: BLE001 — host liveness is an untrusted boundary
+                self._mark_bridge_failure(
+                    "the Discord voice connection liveness could not be verified"
+                )
+            else:
+                now = time.monotonic()
+                if connected:
+                    self._disconnected_since = None
+                elif self._disconnected_since is None:
+                    self._disconnected_since = now
+                elif now - self._disconnected_since >= BRIDGE_DISCONNECT_GRACE_S:
+                    self._mark_bridge_failure(
+                        "the Discord voice connection disconnected while I was listening"
+                    )
+        failure = self._bridge_failure
+        if failure is None:
+            return
+        self.stop()
+        raise talk_audio.TalkAudioError(failure)
 
     def _touch_host_timer(self) -> None:
         """Tell the host somebody is talking (throttled, loop-marshalled).
@@ -601,6 +693,7 @@ class DiscordAudio:
         the pauses that separate sentences.
         """
 
+        self._fail_if_bridge_lost()
         now = time.monotonic()
         try:
             chunk = self._inbound.get_nowait()
@@ -697,6 +790,8 @@ __all__ = [
 #: conversation; a second would fight the first for the same connection.
 _SESSION: dict[str, Any] = {}
 _SESSION_LOCK = threading.Lock()
+_LAST_FAILURE: str | None = None
+_NOTIFICATION_TASKS: set[Any] = set()
 
 JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
 
@@ -707,9 +802,53 @@ def session_status() -> str:
     with _SESSION_LOCK:
         task = _SESSION.get("task")
         guild_id = _SESSION.get("guild_id")
+        last_failure = _LAST_FAILURE
     if task is None or task.done():
+        if last_failure:
+            return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
     return f"Live in the voice channel on server {guild_id} — say `talk leave` to stop."
+
+
+async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) -> bool:
+    """Put a failed-closed receipt in the voice channel's linked text room."""
+
+    try:
+        text_channels = getattr(adapter, "_voice_text_channels", None)
+        channel_id = text_channels.get(guild_id) if isinstance(text_channels, dict) else None
+        if channel_id is None:
+            return False
+
+        client = getattr(adapter, "_client", None)
+        channel = None
+        if client is not None:
+            get_channel = getattr(client, "get_channel", None)
+            if callable(get_channel):
+                channel = get_channel(int(channel_id))
+            if channel is None:
+                fetch_channel = getattr(client, "fetch_channel", None)
+                if callable(fetch_channel):
+                    channel = await fetch_channel(int(channel_id))
+        send_to_channel = getattr(channel, "send", None)
+        if callable(send_to_channel):
+            try:
+                await send_to_channel(receipt)
+                return True
+            except Exception:  # noqa: BLE001 — try the adapter's guarded path
+                _log.warning(
+                    "direct Discord voice failure receipt failed; trying adapter send",
+                    exc_info=True,
+                )
+
+        # Older/minimal adapters may expose only their public send path. It is
+        # also the guarded fallback when a cached channel object has gone stale.
+        adapter_send = getattr(adapter, "send", None)
+        if callable(adapter_send):
+            result = await adapter_send(str(channel_id), receipt)
+            return getattr(result, "success", True) is not False
+    except Exception:  # noqa: BLE001 — status remains the durable fallback
+        _log.warning("could not deliver Discord voice failure receipt", exc_info=True)
+    return False
 
 
 def start_session(guild_id: int | None = None) -> str:
@@ -718,6 +857,8 @@ def start_session(guild_id: int | None = None) -> str:
     Returns the sentence to speak back. Requires a running event loop —
     this is the gateway path; the terminal path is ``hermes talk``.
     """
+
+    global _LAST_FAILURE
 
     try:
         import asyncio as _asyncio
@@ -739,26 +880,49 @@ def start_session(guild_id: int | None = None) -> str:
     audio = DiscordAudio(bridge["guild_id"])
 
     def _done(finished) -> None:
-        with _SESSION_LOCK:
-            if _SESSION.get("task") is finished:
-                _SESSION.clear()
-        # The weakest receipt in this surface: a session that dies during
-        # mint or connect leaves a Discord operator hearing silence, because
-        # the failure lands on stderr where nobody in the channel is looking.
-        # `talk status` is the detector the join reply already hands them —
-        # this makes sure the reason is on the record when they go looking.
+        global _LAST_FAILURE
+
+        failure = None
         try:
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None:
-                    _log.warning("discord voice session ended: %r", error)
-                elif finished.result():
-                    _log.warning(
-                        "discord voice session exited %s — say `talk status`",
-                        finished.result(),
-                    )
-        except Exception:  # noqa: BLE001 — a receipt must not raise
-            _log.debug("could not read the session outcome", exc_info=True)
+                    failure = f"{type(error).__name__}: {error}"
+                else:
+                    status = finished.result()
+                    if status:
+                        failure = audio._bridge_failure or f"session exited with status {status}"
+        except Exception as exc:  # noqa: BLE001 — a receipt must not raise
+            failure = f"session outcome could not be read: {exc}"
+
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is finished:
+                _SESSION.clear()
+            if failure:
+                _LAST_FAILURE = failure
+
+        if failure:
+            _log.warning("discord voice session failed: %s", failure)
+            receipt = (
+                f"Voice session failed closed: {failure}. The voice channel was handed "
+                "back; say `talk join` when you want to start a new session."
+            )
+
+            async def _notify() -> None:
+                global _LAST_FAILURE
+
+                delivered = await _deliver_failure_receipt(
+                    bridge["adapter"], bridge["guild_id"], receipt
+                )
+                if delivered:
+                    with _SESSION_LOCK:
+                        if failure == _LAST_FAILURE:
+                            _LAST_FAILURE = None
+
+            notification = loop.create_task(_notify())
+            _NOTIFICATION_TASKS.add(notification)
+            notification.add_done_callback(_NOTIFICATION_TASKS.discard)
+
         try:
             audio.stop()
         except Exception:  # noqa: BLE001 — teardown is best-effort
@@ -771,6 +935,7 @@ def start_session(guild_id: int | None = None) -> str:
         existing = _SESSION.get("task")
         if existing is not None and not existing.done():
             return "I'm already live in a voice channel — say `talk leave` first."
+        _LAST_FAILURE = None
         task = loop.create_task(talk_cli.run_talk_session(audio=audio))
         task.add_done_callback(_done)
         _SESSION.update({"task": task, "guild_id": bridge["guild_id"], "audio": audio})
@@ -803,5 +968,11 @@ def stop_session() -> str:
 
 
 def reset_for_tests() -> None:
+    global _LAST_FAILURE
+
     with _SESSION_LOCK:
         _SESSION.clear()
+        _LAST_FAILURE = None
+        for notification in _NOTIFICATION_TASKS:
+            notification.cancel()
+        _NOTIFICATION_TASKS.clear()

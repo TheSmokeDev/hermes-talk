@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import fake_realtime as fr
 
 import talk_relay
@@ -24,6 +27,110 @@ def test_function_call_round_trip():
     assert item["type"] == "function_call_output"
     assert item["call_id"] == "call_1"
     assert item["output"] == "You shipped it Tuesday."
+
+
+def test_async_tool_wait_is_bounded_and_answers_honestly(monkeypatch):
+    release = threading.Event()
+
+    def stuck_tool(_name, _arguments):
+        release.wait()
+        return "late result"
+
+    async def scenario():
+        relay = talk_relay.RealtimeRelay(tool_executor=stuck_tool)
+        messages = await relay.handle_event_async(fr.function_call("slow_tool", "{}"))
+        release.set()
+        return messages
+
+    monkeypatch.setattr(talk_relay, "TOOL_EXECUTION_WAIT_S", 0.01)
+    messages = asyncio.run(scenario())
+
+    assert "still running" in messages[0]["item"]["output"]
+    assert "result won't return" in messages[0]["item"]["output"]
+    assert len(messages) == 1
+
+
+def test_async_tool_worker_cannot_hold_process_exit_open():
+    worker_was_daemon: list[bool] = []
+
+    def inspect_worker(_name, _arguments):
+        worker_was_daemon.append(threading.current_thread().daemon)
+        return "done"
+
+    async def scenario():
+        relay = talk_relay.RealtimeRelay(tool_executor=inspect_worker)
+        await relay.handle_event_async(fr.function_call("inspect", "{}"))
+
+    asyncio.run(scenario())
+
+    assert worker_was_daemon == [True]
+
+
+def test_timed_out_tools_have_bounded_worker_admission(monkeypatch):
+    release = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+
+    def stuck_tool(_name, _arguments):
+        nonlocal started
+        with started_lock:
+            started += 1
+        release.wait()
+        return "late"
+
+    pool = talk_relay._DaemonWorkerPool(max_workers=1, max_pending=1)
+    monkeypatch.setattr(talk_relay, "_TOOL_POOL", pool)
+    monkeypatch.setattr(talk_relay, "TOOL_EXECUTION_WAIT_S", 0.01)
+
+    async def scenario():
+        relays = [talk_relay.RealtimeRelay(tool_executor=stuck_tool) for _ in range(20)]
+        return await asyncio.gather(
+            *(relay.handle_event_async(fr.function_call("stuck", "{}")) for relay in relays)
+        )
+
+    messages = asyncio.run(scenario())
+    release.set()
+
+    assert pool.worker_count == 1
+    assert started <= 1
+    outputs = [result[0]["item"]["output"] for result in messages]
+    running = sum(
+        output.startswith("The stuck tool is still running") for output in outputs
+    )
+    assert running == started
+    assert all(
+        "still running" in output or "not started" in output or "did not start" in output
+        for output in outputs
+    )
+
+
+def test_pending_tool_timeout_says_it_never_started(monkeypatch):
+    release = threading.Event()
+    pool = talk_relay._DaemonWorkerPool(max_workers=1, max_pending=2)
+    monkeypatch.setattr(talk_relay, "_TOOL_POOL", pool)
+    monkeypatch.setattr(talk_relay, "TOOL_EXECUTION_WAIT_S", 0.02)
+
+    def blocked(_name, _arguments):
+        release.wait()
+        return "late"
+
+    async def scenario():
+        relay = talk_relay.RealtimeRelay(tool_executor=blocked)
+        first = asyncio.create_task(
+            relay.handle_event_async(fr.function_call("first", "{}", "call_first"))
+        )
+        await asyncio.sleep(0.005)
+        second = await relay.handle_event_async(
+            fr.function_call("second", "{}", "call_second")
+        )
+        release.set()
+        await first
+        return second
+
+    messages = asyncio.run(scenario())
+    output = messages[0]["item"]["output"]
+    assert "did not start" in output
+    assert "still running" not in output
 
 
 def test_barge_in_cancels_and_drains():

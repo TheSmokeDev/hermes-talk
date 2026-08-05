@@ -160,14 +160,96 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
     ]
 
 
-#: How the announcement pump waits for the wire to go idle: poll interval and
-#: the bound after which the batch is sent anyway (a stuck response must not
-#: silence announcements forever).
+#: How the announcement pump waits for the wire to go idle. Session teardown
+#: cancels the pump; an active response is never overlapped just to meet a timer.
 ANNOUNCE_IDLE_POLL_S = 0.05
-ANNOUNCE_IDLE_MAX_WAIT_S = 5.0
+TOOL_SESSION_QUEUE_SIZE = 1
+TOOL_CLEANUP_WAIT_S = 6.0
 
 
-async def pump_announcements(announce_queue, relay, ws) -> None:
+class ToolResponseCoordinator:
+    """Collect one response's tool outputs and continue it exactly once.
+
+    Calls are admitted and executed in wire order. Queue saturation produces an
+    output in that same position, but never sends early. Only ``response.done``
+    closes the batch; once every position is resolved, all outputs and one
+    continuation are sent as a single socket batch.
+    """
+
+    def __init__(self, relay, send_batch, *, max_pending: int) -> None:
+        self.relay = relay
+        self.send_batch = send_batch
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_pending)
+        self.outputs: list[list[dict] | None] = []
+        self.closed = False
+        self.failed = False
+        self._flush_lock = asyncio.Lock()
+
+    def admit(self, event: dict) -> bool:
+        if self.closed:
+            raise RuntimeError("tool call arrived after response.done")
+        position = len(self.outputs)
+        self.outputs.append(None)
+        try:
+            self.queue.put_nowait((position, event))
+        except asyncio.QueueFull:
+            self.outputs[position] = self.relay.tool_queue_full_output(event)
+            return False
+        return True
+
+    async def response_done(self) -> None:
+        if not self.outputs:
+            return
+        self.closed = True
+        await self._flush_if_ready()
+
+    async def _flush_if_ready(self) -> None:
+        if not self.closed or not self.outputs or any(item is None for item in self.outputs):
+            return
+        async with self._flush_lock:
+            if not self.closed or not self.outputs or any(
+                item is None for item in self.outputs
+            ):
+                return
+            batch = [message for result in self.outputs for message in result or []]
+            batch.append({"type": "response.create"})
+            try:
+                await self.send_batch(batch)
+            except Exception:
+                self.failed = True
+                raise
+            self.outputs = []
+            self.closed = False
+
+    async def run(self) -> None:
+        while True:
+            position, event = await self.queue.get()
+            try:
+                self.outputs[position] = await self.relay.handle_event_async(event)
+                await self._flush_if_ready()
+            finally:
+                self.queue.task_done()
+
+    async def join(self) -> None:
+        await self.queue.join()
+        if not self.failed:
+            await self._flush_if_ready()
+
+    def discard_pending(self) -> None:
+        """Balance queue accounting during failed-send/session teardown."""
+
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            else:
+                self.queue.task_done()
+
+
+async def pump_announcements(
+    announce_queue, relay, ws, send_batch=None, response_busy=None
+) -> None:
     """Serialize every out-of-band announcement (Codex v0.6.1 finding 3).
 
     One consumer, one batch at a time: concurrent landings each spawning
@@ -181,13 +263,14 @@ async def pump_announcements(announce_queue, relay, ws) -> None:
 
     while True:
         batch = await announce_queue.get()
-        waited = 0.0
-        while relay.response_active and waited < ANNOUNCE_IDLE_MAX_WAIT_S:
+        while response_busy() if response_busy is not None else relay.response_active:
             await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
-            waited += ANNOUNCE_IDLE_POLL_S
         try:
-            for out in batch:
-                await ws.send_json(out)
+            if send_batch is not None:
+                await send_batch(batch)
+            else:
+                for out in batch:
+                    await ws.send_json(out)
         except Exception:  # noqa: BLE001 — a closing socket costs one batch
             pass
 
@@ -328,9 +411,9 @@ async def run_talk_session(audio: object | None = None) -> int:
     tools = talk_tools.default_talk_tools()
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
-    # the first tool call, and by then the answer has to be free: that call
-    # runs on the loop carrying the microphone. Fire-and-forget on a daemon
-    # thread — a session must never wait on this, and never fail because of it.
+    # the first tool call; warming it before then avoids spending that tool's
+    # bounded courtesy wait on a cold network probe. Fire-and-forget on a daemon
+    # thread — session startup must never wait on or fail because of it.
     talk_apiserver.warm_in_background()
 
     # Local checks before network: a missing microphone (or an unavailable
@@ -403,7 +486,28 @@ async def run_talk_session(audio: object | None = None) -> int:
                 timeout=CONNECT_TIMEOUT_S,
                 heartbeat=20.0,
             ) as ws:
-                await ws.send_json(session_update)
+                send_lock = asyncio.Lock()
+                continuation_pending = False
+
+                def start_watchers(messages: list[dict]) -> None:
+                    for run_id in started_run_ids(messages):
+                        if run_id in watched:
+                            continue
+                        watched.add(run_id)
+                        watchers.append(asyncio.create_task(watch_run(run_id)))
+
+                async def send_outgoing(outgoing: list[dict]) -> None:
+                    """Serialize every socket write; keep multi-message batches contiguous."""
+
+                    nonlocal continuation_pending
+                    async with send_lock:
+                        for out in outgoing:
+                            if out.get("type") == "response.create":
+                                continuation_pending = True
+                            await ws.send_json(out)
+                    start_watchers(outgoing)
+
+                await send_outgoing([session_update])
                 print(
                     f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
                     "Ctrl+C to hang up.\n"
@@ -415,11 +519,11 @@ async def run_talk_session(audio: object | None = None) -> int:
                         if chunk is None:
                             await asyncio.sleep(IDLE_POLL_S)
                             continue
-                        await ws.send_json(
-                            {
+                        await send_outgoing(
+                            [{
                                 "type": "input_audio_buffer.append",
                                 "audio": base64.b64encode(chunk).decode("ascii"),
-                            }
+                            }]
                         )
 
                 async def watch_run(run_id: int) -> None:
@@ -438,19 +542,15 @@ async def run_talk_session(audio: object | None = None) -> int:
                         if run is None:
                             return
                         if run["status"] in talk_runs.TERMINAL_STATUSES:
-                            for out in run_finished_messages(run):
-                                await ws.send_json(out)
+                            await announce_queue.put(run_finished_messages(run))
                             return
 
-                def start_watchers(messages: list[dict]) -> None:
-                    for run_id in started_run_ids(messages):
-                        if run_id in watched:
-                            continue
-                        watched.add(run_id)
-                        watchers.append(asyncio.create_task(watch_run(run_id)))
+                tool_coordinator = ToolResponseCoordinator(
+                    relay, send_outgoing, max_pending=TOOL_SESSION_QUEUE_SIZE
+                )
 
                 async def receive_events() -> None:
-                    nonlocal spoken_item
+                    nonlocal continuation_pending, spoken_item
                     async for message in ws:
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             continue
@@ -460,13 +560,18 @@ async def run_talk_session(audio: object | None = None) -> int:
                             continue
                         if not isinstance(event, dict):
                             continue
+                        if event.get("type") == "response.created":
+                            continuation_pending = False
+                        if event.get("type") == "response.function_call_arguments.done":
+                            tool_coordinator.admit(event)
+                            continue
                         outgoing = relay.handle_event(event)
+                        if event.get("type") == "response.done":
+                            await tool_coordinator.response_done()
                         if pending:
                             outgoing = [*outgoing, *pending]
                             pending.clear()
-                        for out in outgoing:
-                            await ws.send_json(out)
-                        start_watchers(outgoing)
+                        await send_outgoing(outgoing)
                         if relay.last_audio_item_id != spoken_item:
                             spoken_item = relay.last_audio_item_id
                             audio.reset_played_ms()
@@ -505,17 +610,61 @@ async def run_talk_session(audio: object | None = None) -> int:
                 )
 
                 sender = asyncio.create_task(send_microphone())
-                pump = asyncio.create_task(pump_announcements(announce_queue, relay, ws))
+                pump = asyncio.create_task(
+                    pump_announcements(
+                        announce_queue,
+                        relay,
+                        ws,
+                        send_outgoing,
+                        lambda: (
+                            relay.response_active
+                            or continuation_pending
+                            or bool(tool_coordinator.outputs)
+                        ),
+                    )
+                )
+                tool_worker = asyncio.create_task(tool_coordinator.run())
+                receiver = asyncio.create_task(receive_events())
+                drain = None
                 try:
-                    await receive_events()
+                    done, _pending_tasks = await asyncio.wait(
+                        {sender, receiver, tool_worker},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if sender in done:
+                        await sender
+                        raise RuntimeError("microphone sender stopped unexpectedly")
+                    if tool_worker in done:
+                        await tool_worker
+                    await receiver
+                    drain = asyncio.create_task(tool_coordinator.join())
+                    done, _pending_tasks = await asyncio.wait(
+                        {drain, tool_worker},
+                        timeout=TOOL_CLEANUP_WAIT_S,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if tool_worker in done:
+                        await tool_worker
+                    if drain not in done:
+                        raise TimeoutError("tool cleanup exceeded its bound")
+                    await drain
                 finally:
                     talk_steer.set_landed_notifier(None)
                     talk_lifecycle.detach_session()
                     sender.cancel()
                     pump.cancel()
+                    receiver.cancel()
+                    tool_worker.cancel()
+                    if drain is not None:
+                        drain.cancel()
+                    tool_coordinator.discard_pending()
                     for watcher in watchers:
                         watcher.cancel()
-                    await asyncio.gather(sender, pump, *watchers, return_exceptions=True)
+                    await asyncio.gather(
+                        sender, pump, receiver, tool_worker,
+                        *([drain] if drain is not None else []), *watchers,
+                        return_exceptions=True
+                    )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback

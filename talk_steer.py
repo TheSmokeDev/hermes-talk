@@ -38,12 +38,10 @@ So a note has exactly these knowable states:
 - ``landed``      — a drain artifact matched this receipt. Positive-only:
                     absence of a match never proves absence of delivery
                     (the pre-API put-back path is silent by design).
-- ``redirected``  — ``AIAgent.redirect()`` returned True on a live turn.
-                    The artifact is the return value itself: the model
-                    request was aborted (or Codex accepted a native steer),
-                    so the correction applies to the CURRENT step. The
-                    model-request path emits no Delivered line — this state
-                    never waits on one.
+- ``redirected``  — post-call host state held this exact correction in its
+                    active-turn redirect slot (or Codex accepted its native
+                    steer). The model-request path emits no Delivered line —
+                    this state never waits on one.
 - ``unconfirmed`` — the child is gone and no landing was observed.
 - ``missed``      — the host's completion entry carried the note back as
                     undelivered (``missed_steer`` — present only on hosts
@@ -56,11 +54,9 @@ Everything here is fail-open: a missing host module, a renamed logger, or an
 operator log level above INFO degrades to ``unconfirmed`` — never an
 exception on the voice path, and never a claim without its artifact.
 
-Recorded assumption (Kimi v0.6 gate): the subagent-id-based second sweep in
-:func:`mark_landed_for_agent` assumes one live agent instance per
-``subagent_id`` — true on the 0.20 host, where ids are minted per spawn. A
-host that recycles ids could false-``landed`` a ref-less receipt
-(hermes-talk#7).
+Ref-less receipts land only from their own positive token/text drain artifact.
+They never inherit a sibling's exact agent reference: ledger order cannot prove
+generation membership when hosts may recycle a public subagent id.
 """
 
 from __future__ import annotations
@@ -158,12 +154,11 @@ class _DrainWatcher(logging.Handler):
     """Flips queued receipts to ``landed`` when the post-tool drain line fires.
 
     The line does not name WHICH agent drained, so matching is token-first:
-    a receipt lands when its correlation token appears in the drained
-    preview (exact). The v0.5 text match stays as the tokenless fallback —
-    prefix matches stay exact, loose containment only for substantial text.
-    Steers queued before one drain concatenate with newlines, so a match on
-    any receipt lands every queued receipt for that same agent (the whole
-    batch drained together).
+    a receipt lands when its correlation token appears in the drained preview
+    (exact). The synchronous host frame still carries ``agent``, grounding
+    expansion to the same identity/generation. The v0.5 text match stays as
+    the tokenless fallback — prefix matches stay exact, loose containment only
+    for substantial text.
     """
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no branch
@@ -492,11 +487,10 @@ def record_redirected(
 ) -> str:
     """Ledger an accepted redirect. Returns the receipt id.
 
-    The artifact is ``AIAgent.redirect()``'s return value — True on a live
-    turn means the in-flight model request was aborted with the correction
-    stashed for the retry (or Codex accepted a native turn/steer). No log
-    line exists on that path, so this state is terminal at call time and
-    never waits on a drain artifact.
+    The caller has already observed the host's post-call redirect artifact:
+    this exact correction in the active-turn redirect slot, or acceptance by
+    Codex's native turn/steer. No drain log exists on that path, so this state
+    is terminal at call time and never waits on a drain artifact.
     """
 
     receipt = _make_receipt(subagent_id, text, STATE_REDIRECTED, token, agent)
@@ -514,6 +508,9 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
     oracle: the host drains before it logs, so a note whose token is still
     pending at emit time was queued after this drain and stays ``queued``
     instead of being swept into ``landed`` with the batch.
+    Batch expansion requires an exact live agent reference on each expanded
+    receipt. A ref-less receipt can land only by its own token/text match and
+    stays queued when the preview truncates it.
     """
 
     preview = (preview or "").strip()
@@ -530,6 +527,7 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
         # reopened exactly the race the exclusion exists to close.
         still_pending = _still_pending_text(agent)
         matched_agents: set[str] = set()
+        matched_receipts: list[dict] = []
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:
                 continue
@@ -540,6 +538,7 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
+                matched_receipts.append(receipt)
                 continue
             own = receipt["preview"].strip()
             head = own[: len(preview)] or own
@@ -553,22 +552,41 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
+                matched_receipts.append(receipt)
         if matched_agents:
             # Steers concatenate WITHIN one agent's pending queue and drain
             # as a single batch — so a match on any receipt lands every
-            # queued receipt for that same agent, even ones whose text (and
-            # token) the 120-char preview truncated away. Except, again,
-            # anything provably still sitting in the pending queue.
+            # queued receipt in that same identity-anchored generation, even
+            # ones whose text (and token) the 120-char preview truncated away.
+            # A bare public id never anchors expansion because hosts recycle it.
+            batch_targets: dict[str, list[object]] = {}
+            if agent is not None:
+                for subagent_id in matched_agents:
+                    batch_targets[subagent_id] = [agent]
+            else:
+                for receipt in matched_receipts:
+                    ref = receipt.get("agent_ref")
+                    target = ref() if ref is not None else None
+                    if target is not None:
+                        batch_targets.setdefault(receipt["subagent_id"], []).append(
+                            target
+                        )
+
             for receipt in _RECEIPTS:
+                subagent_id = receipt["subagent_id"]
+                ref = receipt.get("agent_ref")
+                targets = batch_targets.get(subagent_id, ())
                 if (
-                    receipt["state"] == STATE_QUEUED
-                    and receipt["subagent_id"] in matched_agents
+                    receipt["state"] != STATE_QUEUED
+                    or ref is None
+                    or not any(ref() is target for target in targets)
                 ):
-                    token = receipt.get("token")
-                    if token is not None and token in still_pending:
-                        continue
-                    receipt["state"] = STATE_LANDED
-                    flipped += 1
+                    continue
+                token = receipt.get("token")
+                if token is not None and token in still_pending:
+                    continue
+                receipt["state"] = STATE_LANDED
+                flipped += 1
     if matched_agents:
         _push_landed(sorted(matched_agents))
     return flipped
@@ -578,11 +596,10 @@ def mark_landed_for_agent(agent: object) -> int:
     """Land queued receipts held against this live agent. Returns count.
 
     The pre-API drain empties the ENTIRE pending queue for one agent, so a
-    hit lands every queued receipt attributed to it — by captured reference
-    first (exact), then by subagent id for receipts recorded without one
-    (same batch, same agent). Receipts whose token is STILL in the agent's
-    pending queue at emit time were queued after the drain and are skipped
-    on both passes.
+    hit lands every queued receipt attributed to it by captured reference
+    (exact). Ref-less receipts never inherit that identity from ledger order,
+    because hosts may recycle ids. Receipts whose token is STILL in the agent's
+    pending queue at emit time were queued after the drain and are skipped.
     """
 
     if agent is None:
@@ -605,17 +622,7 @@ def mark_landed_for_agent(agent: object) -> int:
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
-        if matched_agents:
-            for receipt in _RECEIPTS:
-                if (
-                    receipt["state"] == STATE_QUEUED
-                    and receipt["subagent_id"] in matched_agents
-                ):
-                    token = receipt.get("token")
-                    if token is not None and token in still_pending:
-                        continue
-                    receipt["state"] = STATE_LANDED
-                    flipped += 1
+
     if matched_agents:
         _push_landed(sorted(matched_agents))
     return flipped
