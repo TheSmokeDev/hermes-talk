@@ -20,6 +20,7 @@ import types
 import pytest
 
 import talk_audio
+import talk_cli
 import talk_discord
 
 
@@ -238,6 +239,182 @@ def test_source_is_not_opus():
 # -- session lifecycle --------------------------------------------------------
 
 
+def test_bridge_loss_exits_session_cancels_socket_clears_slot_and_notifies(monkeypatch):
+    async def scenario():
+        _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+        delivered: list[str] = []
+
+        class _Channel:
+            async def send(self, content):
+                delivered.append(content)
+
+        adapter._voice_text_channels = {7: 123}
+        adapter._client = types.SimpleNamespace(get_channel=lambda channel_id: _Channel())
+
+        class _FailingAudio:
+            played_ms = 0
+
+            def __init__(self):
+                self._bridge_failure = None
+                self.stopped = False
+
+            def start(self):
+                pass
+
+            def stop(self):
+                self.stopped = True
+
+            def read_input_chunk(self):
+                self._bridge_failure = "the Discord voice connection changed"
+                raise talk_audio.TalkAudioError(self._bridge_failure)
+
+            def queue_playback(self, _pcm):  # pragma: no cover - no server audio
+                raise AssertionError("playback reached a dead bridge")
+
+            def drain_playback(self):
+                pass
+
+            def reset_played_ms(self):
+                pass
+
+        audio = _FailingAudio()
+        monkeypatch.setattr(talk_discord, "DiscordAudio", lambda _guild_id: audio)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("TALK_VOICE", raising=False)
+        monkeypatch.setattr(talk_cli.talk_apiserver, "warm_in_background", lambda: None)
+        monkeypatch.setattr(
+            talk_cli,
+            "_mint_session",
+            lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+        )
+
+        class _BlockingWebSocket:
+            def __init__(self):
+                self.receive_started = False
+                self.receive_cancelled = False
+                self.exited = False
+                self._forever = asyncio.Event()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                self.exited = True
+
+            async def send_json(self, _message):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.receive_started = True
+                try:
+                    await self._forever.wait()
+                except asyncio.CancelledError:
+                    self.receive_cancelled = True
+                    raise
+                raise StopAsyncIteration  # pragma: no cover - event is never set
+
+        ws = _BlockingWebSocket()
+
+        class _ClientSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                pass
+
+            def ws_connect(self, *_args, **_kwargs):
+                return ws
+
+        monkeypatch.setattr(
+            talk_cli,
+            "_import_aiohttp",
+            lambda: types.SimpleNamespace(
+                ClientSession=_ClientSession,
+                WSMsgType=types.SimpleNamespace(TEXT=object()),
+            ),
+        )
+
+        reply = talk_discord.start_session(7)
+        assert "Starting up" in reply
+        task = talk_discord._SESSION["task"]
+        for _ in range(20):
+            if task.done() and not talk_discord._SESSION:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):  # let the done callback's notification task run
+            await asyncio.sleep(0)
+
+        assert task.result() == 1
+        assert ws.receive_started
+        assert ws.receive_cancelled, "bridge loss left socket receive activity running"
+        assert ws.exited
+        assert audio.stopped
+        assert talk_discord._SESSION == {}, "failed session still owns the slot"
+        assert len(delivered) == 1
+        assert "voice session failed" in delivered[0].lower()
+        assert "connection changed" in delivered[0]
+
+    asyncio.run(scenario())
+
+
+def test_failure_receipt_falls_back_to_the_adapter_send_path(monkeypatch):
+    async def scenario():
+        _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+        delivered: list[tuple[str, str]] = []
+
+        class _BrokenChannel:
+            async def send(self, _content):
+                raise RuntimeError("stale cached channel")
+
+        adapter._voice_text_channels = {7: 123}
+        adapter._client = types.SimpleNamespace(get_channel=lambda channel_id: _BrokenChannel())
+
+        async def adapter_send(chat_id, content):
+            delivered.append((chat_id, content))
+            return types.SimpleNamespace(success=True)
+
+        adapter.send = adapter_send
+
+        async def fail_from_bridge(audio):
+            audio._bridge_failure = "the Discord voice connection changed"
+            return 1
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", fail_from_bridge)
+        talk_discord.start_session(7)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert delivered and delivered[0][0] == "123"
+        assert "connection changed" in delivered[0][1]
+
+    asyncio.run(scenario())
+
+
+def test_undeliverable_failure_receipt_is_preserved_for_status(monkeypatch):
+    async def scenario():
+        _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+        adapter._voice_text_channels = {}  # no linked text room is available
+
+        async def fail_from_bridge(audio):
+            audio._bridge_failure = "the Discord voice credentials changed"
+            return 1
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", fail_from_bridge)
+        talk_discord.start_session(7)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert talk_discord._SESSION == {}
+        status = talk_discord.session_status()
+        assert "last voice session failed" in status.lower()
+        assert "credentials changed" in status
+
+    asyncio.run(scenario())
+
+
 def test_status_with_no_session():
     assert "No live voice session" in talk_discord.session_status()
 
@@ -272,7 +449,10 @@ class _FakeConnection:
 
 
 class _FakeReceiver:
-    def __init__(self) -> None:
+    def __init__(self, voice_client=None) -> None:
+        self._vc = voice_client
+        self._secret_key = b"test-secret"
+        self._dave_session = None
         self._buffers: dict = {}
         self._lock = threading.Lock()
         self._running = True  # the host clears this in its own teardown
@@ -287,10 +467,16 @@ class _FakeReceiver:
 class _FakeVoiceClient:
     def __init__(self, connection) -> None:
         self._connection = connection
+        connection.secret_key = b"test-secret"
+        connection.dave_session = None
         self.playing = None
+        self.connected = True
 
     def is_playing(self) -> bool:
         return self.playing is not None
+
+    def is_connected(self) -> bool:
+        return self.connected
 
     def play(self, source) -> None:
         self.playing = source
@@ -301,9 +487,9 @@ class _FakeVoiceClient:
 
 def _wired_host(monkeypatch):
     connection = _FakeConnection()
-    receiver = _FakeReceiver()
-    connection.add_socket_listener(receiver._on_packet)  # as the host does
     vc = _FakeVoiceClient(connection)
+    receiver = _FakeReceiver(vc)
+    connection.add_socket_listener(receiver._on_packet)  # as the host does
     adapter = _fake_host(monkeypatch, clients={7: vc}, receivers={7: receiver})
     adapter._reset_voice_timeout = lambda gid: adapter.__dict__.setdefault(
         "timer_resets", []
@@ -448,6 +634,134 @@ def test_stop_does_not_rewake_a_torn_down_receiver(monkeypatch):
     receiver._running = False  # the host's own teardown ran
     bridge.stop()
     assert connection.callbacks == [], "re-registered a listener for a dead receiver"
+
+
+def test_receiver_replacement_fails_closed_on_the_next_old_packet(monkeypatch):
+    old_connection, old_receiver, old_vc, adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_receiver = _FakeReceiver(new_vc)
+    new_connection.add_socket_listener(new_receiver._on_packet)
+    old_receiver._running = False
+    adapter._voice_clients[7] = new_vc
+    adapter._voice_receivers[7] = new_receiver
+
+    # A final packet can race with the host's replacement. It must detect
+    # that this callback is no longer the live bridge, not drain stale PCM.
+    old_connection.deliver(b"\x01\x02" * 8)
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection changed"):
+        bridge.read_input_chunk()
+
+    assert bridge._bridge is None
+    assert old_vc.playing is None
+    assert old_connection.callbacks == [], "a dead receiver was re-awakened"
+    assert new_connection.callbacks == [new_receiver._on_packet]
+
+
+def test_receiver_replacement_is_detected_even_when_the_old_socket_goes_silent(monkeypatch):
+    old_connection, _old_receiver, _old_vc, adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_receiver = _FakeReceiver(new_vc)
+    new_connection.add_socket_listener(new_receiver._on_packet)
+    adapter._voice_clients[7] = new_vc
+    adapter._voice_receivers[7] = new_receiver
+
+    # A discarded socket normally delivers no final packet, so the session's
+    # polling path must independently validate the published bridge identity.
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection changed"):
+        bridge.read_input_chunk()
+    assert old_connection.callbacks == [], "the obsolete listener was re-registered"
+
+
+def test_sustained_disconnection_fails_closed_after_a_short_grace(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    clock = [1000.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    vc.connected = False
+
+    # A single false sample can happen during a reconnect; do not tear down
+    # immediately, but do not call the bridge healthy indefinitely either.
+    bridge.read_input_chunk()
+    clock[0] += 0.9
+    bridge.read_input_chunk()
+    clock[0] += 0.2
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection disconnected"):
+        bridge.read_input_chunk()
+
+    assert bridge._bridge is None
+    assert vc.playing is None
+    assert connection.callbacks == [original]
+    assert receiver._on_packet == original
+    assert adapter._voice_mode_getter("c") == "all"
+
+
+def test_a_verified_reconnect_resets_the_disconnect_grace(monkeypatch):
+    _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    clock = [2000.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    vc.connected = False
+    bridge.read_input_chunk()
+
+    clock[0] += 0.8
+    vc.connected = True
+    bridge.read_input_chunk()
+
+    # A later outage gets its own full grace period; the first outage's
+    # timestamp must not poison a successfully verified reconnect.
+    clock[0] += 0.4
+    vc.connected = False
+    bridge.read_input_chunk()
+    clock[0] += 0.9
+    bridge.read_input_chunk()
+    clock[0] += 0.2
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection disconnected"):
+        bridge.read_input_chunk()
+
+
+def test_transport_rekey_fails_closed_instead_of_streaming_false_silence(monkeypatch):
+    connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    # The legacy host receiver copied this value at start. Discord rotates
+    # the connection's key on a reconnect, leaving the receiver permanently
+    # unable to decrypt while the client can still report connected.
+    connection.secret_key = b"rotated-secret"
+    with pytest.raises(talk_audio.TalkAudioError, match="voice credentials changed"):
+        bridge.read_input_chunk()
+
+    assert bridge._bridge is None
+    assert vc.playing is None
+
+
+def test_dave_session_replacement_fails_closed_before_corrupt_audio_flows(monkeypatch):
+    connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    # DAVE negotiation can replace the live session object while a legacy
+    # receiver retains its start-time None/object. Feeding that ciphertext
+    # to Opus can sound like speech, so silence-only detection is insufficient.
+    connection.dave_session = object()
+    with pytest.raises(talk_audio.TalkAudioError, match="voice credentials changed"):
+        bridge.read_input_chunk()
+
+    assert bridge._bridge is None
+    assert vc.playing is None
 
 
 def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):

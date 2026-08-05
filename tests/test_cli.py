@@ -662,6 +662,100 @@ def test_subagent_stop_messages_cap_the_summary_tail():
     assert len(text) < talk_cli.WATCH_OUTPUT_TAIL_CHARS + 400
 
 
+def test_audio_bridge_failure_tears_down_the_live_session(monkeypatch, capsys):
+    """A detached microphone failure must stop the receiver and fail the call."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+
+    class _FailingAudio:
+        played_ms = 0
+
+        def __init__(self):
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+        def read_input_chunk(self):
+            raise talk_audio.TalkAudioError("Discord voice bridge lost")
+
+        def queue_playback(self, _pcm):  # pragma: no cover - no server audio
+            raise AssertionError("playback reached a dead bridge")
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _BlockingWebSocket:
+        def __init__(self):
+            self.receive_started = False
+            self.receive_cancelled = False
+            self.exited = False
+            self.sent: list[dict] = []
+            self._forever = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            self.exited = True
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.receive_started = True
+            try:
+                await self._forever.wait()
+            except asyncio.CancelledError:
+                self.receive_cancelled = True
+                raise
+            raise StopAsyncIteration  # pragma: no cover - event is never set
+
+    ws = _BlockingWebSocket()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            pass
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT=object()),
+        ),
+    )
+    audio = _FailingAudio()
+
+    assert asyncio.run(talk_cli.run_talk_session(audio=audio)) == 1
+    assert ws.receive_started, "the live receiver was never exercised"
+    assert ws.receive_cancelled, "sender failure left socket receive activity running"
+    assert ws.exited, "the websocket context was not closed"
+    assert audio.stopped
+    assert "Discord voice bridge lost" in capsys.readouterr().err
+
+
 def test_session_always_detaches_the_lifecycle_target(monkeypatch, capsys):
     # A session that dies mid-dial must not leave the hook bus holding a
     # callback into a dead loop — the outer finally owns the belt.
