@@ -68,6 +68,14 @@ def test_entry_registers_under_the_manifest_name(manifest):
     assert f'__HERMES_PLUGINS__.register("{manifest["name"]}"' in entry
 
 
+def test_dashboard_tool_request_has_a_client_abort_bound(manifest):
+    entry = (DASHBOARD_DIR / manifest["entry"]).read_text(encoding="utf-8")
+
+    assert "const TOOL_TIMEOUT_MS" in entry
+    assert "new AbortController()" in entry
+    assert re.search(r'apiPost\(\s*"/tool",[\s\S]*?TOOL_TIMEOUT_MS\s*\)', entry)
+
+
 def test_tab_declares_a_route(manifest):
     assert manifest["tab"]["path"].startswith("/")
     assert manifest["tab"]["position"]

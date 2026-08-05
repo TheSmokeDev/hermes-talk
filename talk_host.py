@@ -22,10 +22,10 @@ fall-through is announced in the returned text**:
    naming what is missing for a memory lookup
 
 Tiers 2 and 3 both return the ``WORK_STARTED`` receipt rather than an answer.
-That is not a preference: the relay executes tools synchronously on the event
-loop carrying the microphone, so a tool that waits for an agent is a call
-that goes silent. :mod:`talk_runs` already owns "start it, speak it when it
-lands", and both surfaces already watch for the receipt.
+That is not a preference: relay tool waits are bounded, so work that takes an
+agent turn cannot return its answer through the original function call.
+:mod:`talk_runs` already owns "start it, speak it when it lands", and both
+surfaces already watch for the receipt.
 
 The detached backend spawns ``hermes [--profile <name>] -z <task>``. The
 profile comes from ``TALK_AGENT_PROFILE`` or, unset, from auto-detection in
@@ -576,7 +576,7 @@ class HostAdapter:
 
         Three tiers, each fall-through said out loud (see the module docstring).
         Tier 2 answers with a receipt rather than the answer — an agent run is
-        seconds of work and this call is on the loop carrying the microphone.
+        seconds of work and outlives the relay's bounded tool courtesy wait.
         """
 
         ctx = get_ctx()
