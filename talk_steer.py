@@ -54,9 +54,9 @@ Everything here is fail-open: a missing host module, a renamed logger, or an
 operator log level above INFO degrades to ``unconfirmed`` — never an
 exception on the voice path, and never a claim without its artifact.
 
-Ref-less compatibility receipts can join a pre-API batch only when the nearest
+Ref-less compatibility receipts can join a drained batch only when the nearest
 preceding receipt for that subagent id carries the exact draining agent
-reference.  The public id alone is never a landing artifact: hosts may recycle
+reference. The public id alone is never a landing artifact: hosts may recycle
 it for another agent instance.
 """
 
@@ -155,12 +155,11 @@ class _DrainWatcher(logging.Handler):
     """Flips queued receipts to ``landed`` when the post-tool drain line fires.
 
     The line does not name WHICH agent drained, so matching is token-first:
-    a receipt lands when its correlation token appears in the drained
-    preview (exact). The v0.5 text match stays as the tokenless fallback —
-    prefix matches stay exact, loose containment only for substantial text.
-    Steers queued before one drain concatenate with newlines, so a match on
-    any receipt lands every queued receipt for that same agent (the whole
-    batch drained together).
+    a receipt lands when its correlation token appears in the drained preview
+    (exact). The synchronous host frame still carries ``agent``, grounding
+    expansion to the same identity/generation. The v0.5 text match stays as
+    the tokenless fallback — prefix matches stay exact, loose containment only
+    for substantial text.
     """
 
     def emit(self, record: logging.LogRecord) -> None:  # pragma: no branch
@@ -510,6 +509,9 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
     oracle: the host drains before it logs, so a note whose token is still
     pending at emit time was queued after this drain and stays ``queued``
     instead of being swept into ``landed`` with the batch.
+    Batch expansion is generation-aware: it requires either this exact agent
+    or a live reference on a directly matched receipt. A public id alone can
+    land only the directly matched receipt, never truncated siblings.
     """
 
     preview = (preview or "").strip()
@@ -526,6 +528,7 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
         # reopened exactly the race the exclusion exists to close.
         still_pending = _still_pending_text(agent)
         matched_agents: set[str] = set()
+        matched_receipts: list[dict] = []
         for receipt in _RECEIPTS:
             if receipt["state"] != STATE_QUEUED:
                 continue
@@ -536,6 +539,7 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
+                matched_receipts.append(receipt)
                 continue
             own = receipt["preview"].strip()
             head = own[: len(preview)] or own
@@ -549,22 +553,46 @@ def mark_landed_from_preview(preview: str, *, agent: object | None = None) -> in
                 receipt["state"] = STATE_LANDED
                 flipped += 1
                 matched_agents.add(receipt["subagent_id"])
+                matched_receipts.append(receipt)
         if matched_agents:
             # Steers concatenate WITHIN one agent's pending queue and drain
             # as a single batch — so a match on any receipt lands every
-            # queued receipt for that same agent, even ones whose text (and
-            # token) the 120-char preview truncated away. Except, again,
-            # anything provably still sitting in the pending queue.
+            # queued receipt in that same identity-anchored generation, even
+            # ones whose text (and token) the 120-char preview truncated away.
+            # A bare public id never anchors expansion because hosts recycle it.
+            batch_targets: dict[str, list[object]] = {}
+            if agent is not None:
+                for subagent_id in matched_agents:
+                    batch_targets[subagent_id] = [agent]
+            else:
+                for receipt in matched_receipts:
+                    ref = receipt.get("agent_ref")
+                    target = ref() if ref is not None else None
+                    if target is not None:
+                        batch_targets.setdefault(receipt["subagent_id"], []).append(
+                            target
+                        )
+
+            generation_targets: dict[str, object | None] = {}
             for receipt in _RECEIPTS:
+                subagent_id = receipt["subagent_id"]
+                ref = receipt.get("agent_ref")
+                if ref is not None:
+                    generation_targets[subagent_id] = ref()
+                targets = batch_targets.get(subagent_id, ())
                 if (
-                    receipt["state"] == STATE_QUEUED
-                    and receipt["subagent_id"] in matched_agents
+                    receipt["state"] != STATE_QUEUED
+                    or not any(
+                        generation_targets.get(subagent_id) is target
+                        for target in targets
+                    )
                 ):
-                    token = receipt.get("token")
-                    if token is not None and token in still_pending:
-                        continue
-                    receipt["state"] = STATE_LANDED
-                    flipped += 1
+                    continue
+                token = receipt.get("token")
+                if token is not None and token in still_pending:
+                    continue
+                receipt["state"] = STATE_LANDED
+                flipped += 1
     if matched_agents:
         _push_landed(sorted(matched_agents))
     return flipped

@@ -51,9 +51,14 @@ def test_drain_preview_is_truncated_at_120_chars_and_still_matches():
 def test_concatenated_drain_lands_the_whole_batch():
     # Two steers queued before one drain concatenate with newlines; the
     # preview only shows the head. The earlier receipt must land too.
-    talk_steer.record_queued("sa-0-aaaa", "first note about auth")
-    talk_steer.record_queued("sa-0-aaaa", "second note far past the preview window")
-    flipped = talk_steer.mark_landed_from_preview("first note about auth\nsecond")
+    agent = _Steerable()
+    talk_steer.record_queued("sa-0-aaaa", "first note about auth", agent=agent)
+    talk_steer.record_queued(
+        "sa-0-aaaa", "second note far past the preview window", agent=agent
+    )
+    flipped = talk_steer.mark_landed_from_preview(
+        "first note about auth\nsecond", agent=agent
+    )
     assert flipped == 2
 
 
@@ -181,13 +186,17 @@ def test_identical_notes_on_two_agents_land_only_by_token():
 
 def test_token_match_still_batch_lands_the_same_agents_later_notes():
     # One agent, two notes queued before one drain: the joined preview only
-    # shows the FIRST token, but the whole batch drained together.
+    # shows the FIRST token, but the whole batch drained together. The second
+    # receipt deliberately lacks a ref: the first exact ref anchors it to this
+    # generation for compatibility with callers that cannot always resolve it.
+    agent = _Steerable()
     token_a = talk_steer.new_token()
     token_b = talk_steer.new_token()
     talk_steer.record_queued(
         "sa-0-aaaa",
         talk_steer.compose_wire_text(token_a, "first note about auth"),
         token=token_a,
+        agent=agent,
     )
     talk_steer.record_queued(
         "sa-0-aaaa",
@@ -197,7 +206,19 @@ def test_token_match_still_batch_lands_the_same_agents_later_notes():
     preview = talk_steer.compose_wire_text(token_a, "first note about auth")[
         : talk_steer.DRAIN_PREVIEW_CHARS
     ]
-    assert talk_steer.mark_landed_from_preview(preview) == 2
+    assert talk_steer.mark_landed_from_preview(preview, agent=agent) == 2
+
+
+def test_post_tool_batch_uses_matched_receipt_ref_when_stack_identity_is_absent():
+    agent = _Steerable()
+    token_a = talk_steer.new_token()
+    token_b = talk_steer.new_token()
+    wire_a = talk_steer.compose_wire_text(token_a, "first note about auth")
+    wire_b = talk_steer.compose_wire_text(token_b, "truncated compatibility sibling")
+    talk_steer.record_queued("sa-0-aaaa", wire_a, token=token_a, agent=agent)
+    talk_steer.record_queued("sa-0-aaaa", wire_b, token=token_b)
+
+    assert talk_steer.mark_landed_from_preview(wire_a) == 2
 
 
 # -- the redirected state (return-value artifact) -----------------------------
@@ -369,6 +390,30 @@ class _PendingAgent(_Steerable):
 
     def __init__(self, pending: str = ""):
         self._pending_steer = pending
+
+
+def test_post_tool_drain_does_not_land_receipt_from_recycled_id():
+    # The public id was reused for a replacement child. A token match from
+    # the replacement's drain must not batch-expand into the old generation.
+    old_agent = _PendingAgent()
+    replacement = _PendingAgent()
+    old_token = talk_steer.new_token()
+    new_token = talk_steer.new_token()
+    old_wire = talk_steer.compose_wire_text(old_token, "old agent note")
+    new_wire = talk_steer.compose_wire_text(new_token, "replacement agent note")
+    talk_steer.record_queued(
+        "sa-0-aaaa", old_wire, token=old_token, agent=old_agent
+    )
+    talk_steer.record_queued(
+        "sa-0-aaaa", new_wire, token=new_token, agent=replacement
+    )
+
+    flipped = talk_steer.mark_landed_from_preview(new_wire, agent=replacement)
+
+    assert flipped == 1
+    summary = talk_steer.notes_summary()
+    assert summary.count("landed") == 1
+    assert summary.count("queued") == 1
 
 
 def test_drain_sweep_spares_a_note_queued_after_the_drain():
