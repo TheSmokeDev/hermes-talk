@@ -229,12 +229,14 @@ Ask `check_work` and you hear the note's state in those words — never "they
 got it" unless the artifact that proves it exists. Since v0.6 every note
 travels as `[tk-xxxxxxxx] note` — the token is what the drain preview is
 matched on, so two agents holding identical text can never land each
-other's receipts. One substrate note: watching the pre-API drain lowers the
-host's `agent.conversation_loop` logger to DEBUG (with a gate filter so
-operator log output is unchanged) — any DEBUG-guarded computation in that
-one module becomes active, a bounded perf cost traded for killing the
-false-"unconfirmed" class. And you often don't have to ask: the host's
-`subagent_stop` hook announces a finished background agent into the live
+other's receipts. If a truncated sibling receipt has no exact agent reference,
+it stays queued/unconfirmed: receipt order and a reused public subagent id never
+let it inherit another receipt's generation. One substrate note: watching the
+pre-API drain lowers the host's `agent.conversation_loop` logger to DEBUG (with
+a gate filter so operator log output is unchanged) — any DEBUG-guarded
+computation in that one module becomes active, a bounded perf cost traded for
+killing the false-"unconfirmed" class. And you often don't have to ask: the
+host's `subagent_stop` hook announces a finished background agent into the live
 call the moment it lands.
 
 Four tools carry the surface, discovery-first:

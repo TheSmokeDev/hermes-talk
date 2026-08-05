@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
+import json
+import threading
 import types
+
+import pytest
 
 import talk_audio
 import talk_cli
+import talk_relay
 
 
 def test_session_update_keeps_type_drops_model():
@@ -75,6 +81,382 @@ def test_missing_audio_stack_exits_one_before_dialling(monkeypatch, capsys):
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
     assert "hermes-talk[audio]" in capsys.readouterr().err
+
+
+def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
+    """Receive and cancel keep moving while the serialized tool worker is busy."""
+
+    events: list[str] = []
+    tool_started = threading.Event()
+    barge_in_processed = threading.Event()
+
+    def slow_tool(_name, _arguments):
+        events.append("tool_started")
+        tool_started.set()
+        barge_in_processed.wait(timeout=0.5)
+        events.append("tool_finished")
+        return "done"
+
+    class _Audio:
+        played_ms = 0
+
+        def __init__(self):
+            self.sent = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def read_input_chunk(self):
+            return None
+
+        def queue_playback(self, _pcm):
+            pass
+
+        def drain_playback(self):
+            events.append("barge_in_processed")
+            barge_in_processed.set()
+
+        def reset_played_ms(self):
+            pass
+
+    class _Message:
+        type = "text"
+
+        def __init__(self, event):
+            self.data = json.dumps(event)
+
+    class _WS:
+        def __init__(self):
+            self.events = iter(
+                [
+                    {"type": "response.created"},
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "call_id": "call_slow_1",
+                        "name": "slow_tool",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "call_id": "call_slow_2",
+                        "name": "slow_tool",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "call_id": "call_slow_3",
+                        "name": "slow_tool",
+                        "arguments": "{}",
+                    },
+                    {"type": "input_audio_buffer.speech_started"},
+                ]
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                event = next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+            return _Message(event)
+
+        async def send_json(self, message):
+            events.append(message.get("type", ""))
+
+    ws = _WS()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    host = types.SimpleNamespace(
+        resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
+        identity_sections=lambda: {},
+    )
+    monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT="text"),
+        ),
+    )
+    monkeypatch.setattr(talk_relay, "execute_talk_tool", slow_tool)
+
+    assert asyncio.run(talk_cli.run_talk_session(audio=_Audio())) == 0
+    assert events.index("barge_in_processed") < events.index("tool_finished")
+    assert events.index("response.cancel") < events.index("tool_finished")
+
+
+def test_microphone_and_tool_batches_share_the_only_socket_writer():
+    source = inspect.getsource(talk_cli.run_talk_session)
+    start = source.index("async def send_microphone")
+    end = source.index("async def watch_run")
+    microphone = source[start:end]
+
+    assert "await send_outgoing(" in microphone
+    assert source.count("ws.send_json(") == 1
+
+
+def test_tool_batch_orders_two_outputs_and_continues_once_after_response_done():
+    async def scenario():
+        sent: list[dict] = []
+        release_first = asyncio.Event()
+
+        class Relay:
+            async def handle_event_async(self, event):
+                if event["call_id"] == "call_1":
+                    await release_first.wait()
+                return [{
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": event["call_id"],
+                        "output": event["call_id"],
+                    },
+                }]
+
+            def tool_queue_full_output(self, _event):
+                raise AssertionError("queue should admit both calls")
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=2)
+        worker = asyncio.create_task(coordinator.run())
+        coordinator.admit({"call_id": "call_1"})
+        coordinator.admit({"call_id": "call_2"})
+        await coordinator.response_done()
+        await asyncio.sleep(0)
+        assert sent == []
+        release_first.set()
+        await asyncio.wait_for(coordinator.join(), 0.2)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return sent
+
+    sent = asyncio.run(scenario())
+    assert [m["item"]["call_id"] for m in sent[:-1]] == ["call_1", "call_2"]
+    assert sent[-1] == {"type": "response.create"}
+    assert sum(m["type"] == "response.create" for m in sent) == 1
+
+
+def test_tool_batch_strips_production_relays_per_call_continuations():
+    """The real relay must not leak one response.create per successful call."""
+
+    async def scenario():
+        sent: list[dict] = []
+        relay = talk_relay.RealtimeRelay(tool_executor=lambda name, _args: name)
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(relay, send, max_pending=2)
+        worker = asyncio.create_task(coordinator.run())
+        for index in (1, 2):
+            coordinator.admit(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": f"call_{index}",
+                    "name": f"tool_{index}",
+                    "arguments": "{}",
+                }
+            )
+        await coordinator.response_done()
+        await asyncio.wait_for(coordinator.join(), 0.5)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return sent
+
+    sent = asyncio.run(scenario())
+    assert [
+        message["item"]["call_id"]
+        for message in sent
+        if message.get("type") == "conversation.item.create"
+    ] == ["call_1", "call_2"]
+    assert sum(message.get("type") == "response.create" for message in sent) == 1
+
+
+def test_queue_full_output_waits_for_active_tool_and_response_done():
+    async def scenario():
+        sent: list[dict] = []
+        release = asyncio.Event()
+
+        class Relay:
+            async def handle_event_async(self, event):
+                await release.wait()
+                return [{"type": "output", "call_id": event["call_id"]}]
+
+            def tool_queue_full_output(self, event):
+                return [{"type": "output", "call_id": event["call_id"], "busy": True}]
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=1)
+        coordinator.admit({"call_id": "active"})
+        worker = asyncio.create_task(coordinator.run())
+        await asyncio.sleep(0)
+        coordinator.admit({"call_id": "queued"})
+        coordinator.admit({"call_id": "full"})
+        await coordinator.response_done()
+        await asyncio.sleep(0)
+        assert sent == []
+        release.set()
+        await asyncio.wait_for(coordinator.join(), 0.2)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return sent
+
+    sent = asyncio.run(scenario())
+    assert [m.get("call_id") for m in sent[:-1]] == ["active", "queued", "full"]
+    assert sent[-1] == {"type": "response.create"}
+
+
+def test_tool_coordinator_send_failure_does_not_deadlock_queued_cleanup():
+    async def scenario():
+        async def send(_batch):
+            raise RuntimeError("socket failed")
+
+        class Relay:
+            async def handle_event_async(self, event):
+                return [{"type": "output", "call_id": event["call_id"]}]
+
+            def tool_queue_full_output(self, event):
+                return [{"type": "output", "call_id": event["call_id"]}]
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=2)
+        coordinator.admit({"call_id": "first"})
+        coordinator.admit({"call_id": "second"})
+        await coordinator.response_done()
+        worker = asyncio.create_task(coordinator.run())
+        with pytest.raises(RuntimeError, match="socket failed"):
+            await asyncio.wait_for(worker, 0.2)
+        coordinator.discard_pending()
+        await asyncio.wait_for(coordinator.join(), 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_microphone_send_failure_terminates_a_blocked_receiver(monkeypatch, capsys):
+    """A failed audio append must not leave the socket receiver live forever."""
+
+    class _Audio:
+        played_ms = 0
+
+        def __init__(self):
+            self.sent = False
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+        def read_input_chunk(self):
+            if not self.sent:
+                self.sent = True
+                return b"microphone"
+            return None
+
+        def queue_playback(self, _pcm):
+            pass
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _WS:
+        def __init__(self):
+            self.receive_cancelled = False
+            self._forever = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, message):
+            if message.get("type") == "input_audio_buffer.append":
+                raise RuntimeError("microphone socket write failed")
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                await self._forever.wait()
+            except asyncio.CancelledError:
+                self.receive_cancelled = True
+                raise
+            raise StopAsyncIteration
+
+    ws = _WS()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    host = types.SimpleNamespace(
+        resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
+        identity_sections=lambda: {},
+    )
+    monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT="text"),
+        ),
+    )
+    audio = _Audio()
+
+    result = asyncio.run(
+        asyncio.wait_for(talk_cli.run_talk_session(audio=audio), timeout=0.5)
+    )
+    assert result == 1
+    assert ws.receive_cancelled
+    assert audio.stopped
+    assert "microphone socket write failed" in capsys.readouterr().err
 
 
 def test_subagent_stop_messages_are_a_contained_announcement():

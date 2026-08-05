@@ -49,6 +49,7 @@ import talk_auth  # noqa: E402
 import talk_config  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
+import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
@@ -100,6 +101,7 @@ LOOPBACK_ONLY_MESSAGE = (
 #: How many runs the panel asks for. Fixed rather than caller-supplied: the
 #: registry is a status board, not a query surface.
 RUNS_LIMIT = 20
+TOOL_EXECUTION_WAIT_S = talk_relay.TOOL_EXECUTION_WAIT_S
 
 
 # -- auth ---------------------------------------------------------------------
@@ -304,7 +306,31 @@ async def run_tool(request: Request) -> dict:
         # Off the event loop. A tool can probe the api_server, start a run, or
         # reach a bound agent — none of that may run where the dashboard's own
         # request loop lives.
-        output = await asyncio.to_thread(talk_tools.execute_talk_tool, name, arguments)
+        output = await talk_relay.run_bounded_on_daemon(
+            talk_tools.execute_talk_tool,
+            name,
+            arguments,
+            timeout=TOOL_EXECUTION_WAIT_S,
+        )
+    except talk_relay.ToolWorkerBusy:
+        output = (
+            f"Earlier tools are still running, so the {name or 'tool'} tool was not "
+            "started. Wait for them to finish, then ask me to try again."
+        )
+    except talk_relay.ToolExecutionTimeout as exc:
+        if exc.started:
+            output = (
+                f"The {name or 'tool'} tool is still running after "
+                f"{TOOL_EXECUTION_WAIT_S:g} seconds. I detached it so the call can "
+                "continue, but its eventual result won't return to this conversation. "
+                "Ask me to check again if you still need it."
+            )
+        else:
+            output = (
+                f"The {name or 'tool'} tool did not start within "
+                f"{TOOL_EXECUTION_WAIT_S:g} seconds because earlier tools were still "
+                "using the workers. Ask me to try again."
+            )
     except talk_tools.TalkToolError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "output": output}

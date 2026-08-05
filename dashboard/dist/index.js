@@ -29,6 +29,7 @@
   /** Tab-scoped, not localStorage: the token dies with the tab, like a session. */
   const TOKEN_KEY = "hermes-talk-dashboard-token";
   const OFFER_TIMEOUT_MS = 30000;
+  const TOOL_TIMEOUT_MS = 6500;
   const RUN_POLL_MS = 5000;
   const IDLE_POLL_MS = 20000;
   /** How long to watch each run kind before letting go. The work continues. */
@@ -61,18 +62,26 @@
    * auth; the x-talk-token header carries hermes-talk's second gate, which is
    * what TALK_DASHBOARD_TOKEN checks.
    */
-  function apiCall(path, init) {
+  async function apiCall(path, init, timeoutMs) {
     const opts = Object.assign({}, init || {});
     const headers = Object.assign({}, opts.headers || {});
     const token = readToken();
     if (token) headers["x-talk-token"] = token;
     if (opts.body) headers["content-type"] = "application/json";
     opts.headers = headers;
-    return SDK.fetchJSON(API + path, opts);
+    if (!timeoutMs) return SDK.fetchJSON(API + path, opts);
+    const controller = new AbortController();
+    opts.signal = controller.signal;
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await SDK.fetchJSON(API + path, opts);
+    } finally {
+      window.clearTimeout(timer);
+    }
   }
 
-  function apiPost(path, body) {
-    return apiCall(path, { method: "POST", body: JSON.stringify(body || {}) });
+  function apiPost(path, body, timeoutMs) {
+    return apiCall(path, { method: "POST", body: JSON.stringify(body || {}) }, timeoutMs);
   }
 
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
@@ -112,6 +121,9 @@
       this.offerAbort = null;
       this.closed = false;
       this.responseActive = false;
+      this.continuationPending = false;
+      this.toolBatch = null;
+      this.toolTail = Promise.resolve();
     }
 
     async start() {
@@ -198,6 +210,7 @@
 
     send(payload) {
       if (this.channel && this.channel.readyState === "open") {
+        if (payload && payload.type === "response.create") this.continuationPending = true;
         this.channel.send(JSON.stringify(payload));
       }
     }
@@ -221,11 +234,13 @@
           if (event.transcript) this.cb.onTranscript("assistant", event.transcript, true);
           return;
         case "response.created":
+          this.continuationPending = false;
           this.responseActive = true;
           this.cb.onStatus("Thinking…");
           return;
         case "response.done":
           this.responseActive = false;
+          this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
         case "input_audio_buffer.speech_started":
@@ -238,7 +253,7 @@
           this.cb.onStatus("Processing…");
           return;
         case "response.function_call_arguments.done":
-          void this.handleFunctionCall(event);
+          this.enqueueFunctionCall(event);
           return;
         case "error":
           this.handleError(event.error);
@@ -266,6 +281,33 @@
      * back. The session survives a tool failure — the model speaks the error
      * text instead of the call dying.
      */
+    enqueueFunctionCall(event) {
+      if (typeof event.call_id !== "string" || typeof event.name !== "string" ||
+          !event.call_id || !event.name) return;
+      if (!this.toolBatch) this.toolBatch = { done: false, results: [] };
+      const batch = this.toolBatch;
+      const position = batch.results.length;
+      batch.results.push(null);
+      this.toolTail = this.toolTail.then(async () => {
+        batch.results[position] = await this.handleFunctionCall(event);
+        this.flushToolResponse(batch);
+      });
+    }
+
+    finishToolResponse() {
+      if (!this.toolBatch) return;
+      this.toolBatch.done = true;
+      this.flushToolResponse(this.toolBatch);
+    }
+
+    flushToolResponse(batch) {
+      if (this.toolBatch !== batch || !batch.done || batch.results.some((item) => !item)) return;
+      for (let i = 0; i < batch.results.length; i++) this.send(batch.results[i].message);
+      this.send({ type: "response.create" });
+      for (let i = 0; i < batch.results.length; i++) this.watchForRun(batch.results[i].output);
+      this.toolBatch = null;
+    }
+
     async handleFunctionCall(event) {
       const callId = typeof event.call_id === "string" ? event.call_id : "";
       const name = typeof event.name === "string" ? event.name : "";
@@ -280,17 +322,22 @@
       this.cb.onStatus("Using " + name + "…");
       let output;
       try {
-        const res = await apiPost("/tool", { name: name, arguments: args });
+        const res = await apiPost(
+          "/tool",
+          { name: name, arguments: args },
+          TOOL_TIMEOUT_MS
+        );
         output = res && res.output ? String(res.output) : "(no output)";
       } catch (err) {
         output = name + " failed: " + errorText(err);
       }
-      this.send({
-        type: "conversation.item.create",
-        item: { type: "function_call_output", call_id: callId, output: output },
-      });
-      this.send({ type: "response.create" });
-      this.watchForRun(output);
+      return {
+        output: output,
+        message: {
+          type: "conversation.item.create",
+          item: { type: "function_call_output", call_id: callId, output: output },
+        },
+      };
     }
 
     /** Start polling if this text announced background work. */
@@ -324,6 +371,10 @@
           return;
         }
         if (!run || run.status === "running") {
+          window.setTimeout(tick, RUN_POLL_MS);
+          return;
+        }
+        if (this.responseActive || this.continuationPending || this.toolBatch) {
           window.setTimeout(tick, RUN_POLL_MS);
           return;
         }
@@ -584,5 +635,8 @@
       h("div", { className: "ht-metric-value" }, props.value));
   }
 
+  if (window.__HERMES_TALK_TEST_HOOK__) {
+    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport };
+  }
   window.__HERMES_PLUGINS__.register("hermes-talk", TalkPage);
 })();
