@@ -454,6 +454,7 @@ class _FakeReceiver:
         self._secret_key = b"test-secret"
         self._dave_session = None
         self._buffers: dict = {}
+        self._ssrc_to_user: dict[int, int] = {}
         self._lock = threading.Lock()
         self._running = True  # the host clears this in its own teardown
         self.seen: list = []
@@ -779,6 +780,163 @@ def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):
     bridge.stop()
 
 
+def test_drain_resolves_the_discord_speaker_for_each_audio_chunk(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(events.append)
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
+    assert bridge.read_input_chunk() is not None
+    bridge.stop()
+
+
+def test_same_discord_speaker_chunks_and_ssrc_reorder_do_not_flood(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(events.append)
+
+    for ssrc in (11, 11, 12):
+        with receiver._lock:
+            receiver._ssrc_to_user[ssrc] = 101
+            receiver._buffers[ssrc] = bytearray(b"\x01\x00" * 8)
+        bridge._drain_receiver(receiver)
+
+    assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
+    bridge.stop()
+
+
+def test_speaker_mapping_is_resolved_again_after_ssrc_reuse(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[
+            types.SimpleNamespace(id=101, display_name="Alice"),
+            types.SimpleNamespace(id=202, display_name="Bob"),
+        ]
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(events.append)
+
+    for user_id in (101, 202):
+        with receiver._lock:
+            receiver._ssrc_to_user[11] = user_id
+            receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+        bridge._drain_receiver(receiver)
+
+    assert [(event["user_id"], event["display_name"]) for event in events] == [
+        (101, "Alice"),
+        (202, "Bob"),
+    ]
+    bridge.stop()
+
+
+def test_speaker_callback_is_marshaled_from_receiver_thread_to_session_loop(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    scheduled: list[tuple] = []
+    loop = types.SimpleNamespace(
+        call_soon_threadsafe=lambda callback, *args: scheduled.append((callback, args))
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge._loop = loop
+    bridge.set_speaker_notifier(events.append)
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    worker = threading.Thread(target=bridge._drain_receiver, args=(receiver,))
+    worker.start()
+    worker.join()
+
+    assert events == []
+    assert len(scheduled) == 2  # attribution plus the host timer keepalive
+    for callback, args in scheduled:
+        callback(*args)
+    assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
+    bridge.stop()
+
+
+def test_teardown_discards_a_speaker_callback_already_queued_on_the_loop(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    scheduled: list[tuple] = []
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge._loop = types.SimpleNamespace(
+        call_soon_threadsafe=lambda callback, *args: scheduled.append((callback, args))
+    )
+    bridge.set_speaker_notifier(events.append)
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+    bridge.stop()
+    for callback, args in scheduled:
+        callback(*args)
+
+    assert events == []
+
+
+def test_speaker_notifier_reset_discards_old_delivery_and_accepts_current_one():
+    bridge = talk_discord.DiscordAudio(7)
+    old_events: list[dict] = []
+    current_events: list[dict] = []
+    speaker = {"ssrc": 11, "user_id": 101, "display_name": "Alice"}
+
+    bridge.set_speaker_notifier(old_events.append)
+    old_generation = bridge._speaker_notifier_generation
+    old_notifier = bridge._speaker_notifier
+    bridge.set_speaker_notifier(None)
+    bridge.set_speaker_notifier(current_events.append)
+
+    bridge._deliver_speaker(old_generation, old_notifier, speaker)
+    bridge._notify_speaker(speaker)
+
+    assert old_events == []
+    assert current_events == [speaker]
+
+
+def test_failed_start_detaches_a_previously_registered_speaker_notifier(monkeypatch):
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.set_speaker_notifier(lambda _speaker: None)
+    generation = bridge._speaker_notifier_generation
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda _guild_id: (_ for _ in ()).throw(talk_discord.TalkDiscordError("gone")),
+    )
+
+    with pytest.raises(talk_audio.TalkAudioError, match="gone"):
+        bridge.start()
+
+    assert bridge._speaker_notifier is None
+    assert bridge._speaker_notifier_generation > generation
+
+
 def test_adapter_is_found_when_only_the_key_name_matches(monkeypatch):
     # Last-resort lookup: a host that moves or renames the Platform enum
     # must still resolve, because "I could not import your enum" is
@@ -895,3 +1053,46 @@ def test_no_silence_before_start_or_after_stop(monkeypatch):
     bridge.start()
     bridge.stop()
     assert bridge.read_input_chunk() is None
+
+
+def test_receiver_mapping_and_pcm_are_snapshotted_atomically(monkeypatch):
+    _connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[
+            types.SimpleNamespace(id=101, display_name="Alice"),
+            types.SimpleNamespace(id=202, display_name="Bob"),
+        ]
+    )
+    # The adapter copy is stale. The receiver owns both the decoded buffers
+    # and the mapping that identifies them.
+    adapter._ssrc_to_user = {11: 101}
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    pcm48 = b"\x02\x00" * 8
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 202
+        receiver._buffers[11] = bytearray(pcm48)
+    bridge._drain_receiver(receiver)
+
+    # A remap after drain must not relabel already-queued audio.
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+    packet = bridge.read_input_packet()
+
+    assert packet.speaker == {"ssrc": 11, "user_id": 202, "display_name": "Bob"}
+    assert packet.pcm == talk_discord.discord_to_session(pcm48)[0]
+    bridge.stop()
+
+
+def test_generic_chunk_reader_unwraps_the_atomic_packet(monkeypatch):
+    _connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    pcm48 = b"\x03\x00" * 8
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(pcm48)
+    bridge._drain_receiver(receiver)
+
+    assert bridge.read_input_chunk() == talk_discord.discord_to_session(pcm48)[0]
+    bridge.stop()

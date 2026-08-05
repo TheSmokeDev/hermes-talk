@@ -39,6 +39,7 @@ import queue
 import threading
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -71,6 +72,14 @@ MAX_OUTPUT_FRAMES = 250  # 5 s of queued reply
 
 #: 24 kHz mono s16le.
 _SESSION_BYTES_PER_SECOND = 24_000 * 2
+
+
+@dataclass(frozen=True)
+class InputAudioPacket:
+    """One speaker snapshot attached to the exact PCM decoded with it."""
+
+    speaker: dict[str, Any] | None
+    pcm: bytes
 
 
 #: Distinguishes "never captured" from a legitimately stored ``None``.
@@ -321,7 +330,7 @@ class DiscordAudio:
         self._guild_id = guild_id
         self._bridge: dict[str, Any] | None = None
         self._source: _RealtimeSource | None = None
-        self._inbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
+        self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
         self._played_baseline = 0
@@ -339,6 +348,9 @@ class DiscordAudio:
         self._final_played = 0
         self._bridge_failure: str | None = None
         self._disconnected_since: float | None = None
+        self._speaker_notifier = None
+        self._speaker_notifier_generation = 0
+        self._last_speaker_key: Any = _UNSET
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -350,6 +362,10 @@ class DiscordAudio:
         surface should fail the same way whichever room it's in.
         """
 
+        # A reused bridge must never carry a callback from an earlier session.
+        # Do this before any operation that can fail so every failed-start path
+        # also invalidates deliveries already queued on the old loop.
+        self._detach_speaker_notifier()
         try:
             bridge = resolve_voice_bridge(self._guild_id)
         except TalkDiscordError as exc:
@@ -476,6 +492,7 @@ class DiscordAudio:
     def stop(self) -> None:
         """Hand the connection back. Safe twice, and after a failed start."""
 
+        self._detach_speaker_notifier()
         bridge_is_current = self._bridge_identity_is_current()
         bridge, self._bridge = self._bridge, None
         # Teardown is best-effort at every step: a half-torn-down bridge
@@ -515,6 +532,66 @@ class DiscordAudio:
 
     # -- capture (host socket-reader thread) ----------------------------------
 
+    def set_speaker_notifier(self, notifier) -> None:
+        """Receive attribution transitions; ``None`` detaches the consumer."""
+
+        self._speaker_notifier_generation += 1
+        self._speaker_notifier = notifier
+        self._last_speaker_key = _UNSET
+
+    def _detach_speaker_notifier(self) -> None:
+        self.set_speaker_notifier(None)
+
+    def _deliver_speaker(
+        self, generation: int, notifier: Any, speaker: dict[str, Any]
+    ) -> None:
+        if (
+            generation == self._speaker_notifier_generation
+            and notifier is self._speaker_notifier
+            and notifier is not None
+        ):
+            notifier(speaker)
+
+    def _speaker_for_ssrc(self, ssrc: Any, raw_user_id: Any) -> dict[str, Any]:
+        """Resolve display metadata from the receiver's already-captured mapping."""
+
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            user_id = 0
+        display_name = ""
+        if user_id > 0 and self._bridge is not None:
+            voice_client = self._bridge.get("voice_client")
+            channel = getattr(voice_client, "channel", None)
+            for member in getattr(channel, "members", ()) or ():
+                if getattr(member, "id", None) == user_id:
+                    display_name = str(getattr(member, "display_name", "") or "")
+                    break
+        return {
+            "ssrc": int(ssrc),
+            "user_id": user_id or None,
+            "display_name": display_name,
+        }
+
+    def _notify_speaker(self, speaker: dict[str, Any]) -> None:
+        notifier = self._speaker_notifier
+        if notifier is None:
+            return
+        user_id = speaker["user_id"]
+        key = ("user", user_id) if user_id is not None else ("ssrc", speaker["ssrc"])
+        if key == self._last_speaker_key:
+            return
+        self._last_speaker_key = key
+        generation = self._speaker_notifier_generation
+        loop = self._loop
+        if loop is None:
+            self._deliver_speaker(generation, notifier, speaker)
+            return
+        with suppress(RuntimeError):  # loop closed while the receiver thread drains
+            loop.call_soon_threadsafe(
+                self._deliver_speaker, generation, notifier, speaker
+            )
+
     def _drain_receiver(self, receiver: Any) -> None:
         """Move whatever the host just decoded into our queue, at our rate.
 
@@ -537,16 +614,38 @@ class DiscordAudio:
             lock = getattr(receiver, "_lock", None)
             if lock is not None:
                 with lock:
-                    chunks = [(ssrc, bytes(buf)) for ssrc, buf in buffers.items() if buf]
+                    receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
+                    chunks = [
+                        (
+                            ssrc,
+                            receiver_mapping.get(ssrc)
+                            if isinstance(receiver_mapping, dict)
+                            else None,
+                            bytes(buf),
+                        )
+                        for ssrc, buf in buffers.items()
+                        if buf
+                    ]
                     for buf in buffers.values():
                         del buf[:]
             else:  # pragma: no cover - every shipped host has the lock
-                chunks = [(ssrc, bytes(buf)) for ssrc, buf in buffers.items() if buf]
+                receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
+                chunks = [
+                    (
+                        ssrc,
+                        receiver_mapping.get(ssrc)
+                        if isinstance(receiver_mapping, dict)
+                        else None,
+                        bytes(buf),
+                    )
+                    for ssrc, buf in buffers.items()
+                    if buf
+                ]
                 for buf in buffers.values():
                     del buf[:]
             if chunks:
                 self._touch_host_timer()
-            for ssrc, chunk in chunks:
+            for ssrc, raw_user_id, chunk in chunks:
                 # Per speaker: one speaker's partial sample group prepended
                 # to another's audio would shift it and transpose L/R for
                 # that chunk.
@@ -556,14 +655,16 @@ class DiscordAudio:
                 self._capture_remainder[ssrc] = remainder
                 if not converted:
                     continue
+                speaker = self._speaker_for_ssrc(ssrc, raw_user_id)
+                self._notify_speaker(speaker)
                 try:
-                    self._inbound.put_nowait(converted)
+                    self._inbound.put_nowait(InputAudioPacket(speaker=speaker, pcm=converted))
                 except queue.Full:
                     # Drop the oldest: a stalled consumer must not grow this
                     # without bound, and stale speech is worse than none.
                     try:
                         self._inbound.get_nowait()
-                        self._inbound.put_nowait(converted)
+                        self._inbound.put_nowait(InputAudioPacket(speaker=speaker, pcm=converted))
                     except queue.Empty:  # pragma: no cover - racy but harmless
                         pass
         except Exception:  # noqa: BLE001 — this runs on the HOST's thread
@@ -674,8 +775,8 @@ class DiscordAudio:
         with suppress(RuntimeError):  # loop closed mid-teardown
             loop.call_soon_threadsafe(reset, bridge["guild_id"])
 
-    def read_input_chunk(self) -> bytes | None:
-        """One chunk of 24 kHz mono for the session, paced to real time.
+    def read_input_packet(self) -> InputAudioPacket | None:
+        """One atomic metadata+PCM packet for the session, paced to real time.
 
         A microphone streams continuously — silence included — and the
         session's turn detection depends on that: the server decides the
@@ -696,21 +797,31 @@ class DiscordAudio:
         self._fail_if_bridge_lost()
         now = time.monotonic()
         try:
-            chunk = self._inbound.get_nowait()
+            packet = self._inbound.get_nowait()
         except queue.Empty:
-            chunk = None
-        if chunk:
+            packet = None
+        if packet:
+            # Accept raw bytes placed by older embedders while the public
+            # read_input_chunk compatibility seam remains supported.
+            if isinstance(packet, bytes):
+                packet = InputAudioPacket(speaker=None, pcm=packet)
             # Real audio: advance the clock by however much we just sent, so
             # a burst of buffered speech does not earn extra silence after.
-            duration = len(chunk) / _SESSION_BYTES_PER_SECOND
+            duration = len(packet.pcm) / _SESSION_BYTES_PER_SECOND
             self._audio_clock = max(self._audio_clock, now) + duration
-            return chunk
+            return packet
         if self._audio_clock <= 0.0:  # not started
             return None
         if now < self._audio_clock:
             return None  # already sent audio covering this instant
         self._audio_clock += SESSION_FRAME_MS / 1000
-        return SESSION_SILENCE
+        return InputAudioPacket(speaker=None, pcm=SESSION_SILENCE)
+
+    def read_input_chunk(self) -> bytes | None:
+        """Generic audio-device seam; unwrap metadata for legacy consumers."""
+
+        packet = self.read_input_packet()
+        return packet.pcm if packet is not None else None
 
     # -- playback -------------------------------------------------------------
 
@@ -773,6 +884,7 @@ __all__ = [
     "JOIN_USAGE",
     "SILENCE_FRAME",
     "DiscordAudio",
+    "InputAudioPacket",
     "TalkDiscordError",
     "discord_to_session",
     "reset_for_tests",
