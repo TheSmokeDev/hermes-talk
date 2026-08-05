@@ -46,13 +46,21 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import talk_apiserver, talk_auth, talk_config, talk_runs, talk_steer
+    from . import (
+        talk_apiserver,
+        talk_auth,
+        talk_config,
+        talk_runs,
+        talk_steer,
+        talk_vault,
+    )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
     import talk_auth
     import talk_config
     import talk_runs
     import talk_steer
+    import talk_vault
 
 _log = logging.getLogger(__name__)
 
@@ -287,12 +295,6 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
     return worker
 
 
-#: Session id handed to a provider we initialize ourselves. Marked so a
-#: provider that scopes storage by session cannot mistake a read-only probe
-#: for a real conversation.
-PROBE_SESSION_ID = "hermes-talk-identity-probe"
-
-
 def _resolve_persona() -> str:
     """The operator's SOUL.md, via Hermes's own loader.
 
@@ -312,81 +314,103 @@ def _resolve_persona() -> str:
         return ""
 
 
-def _memory_block_from_agent() -> str:
-    """The LIVE agent's already-assembled memory block, when there is one.
+#: Where Hermes keeps the two identity files the text agent already reads.
+#: The voice session read them directly rather than through an agent, because
+#: the gateway and the dashboard both run without one — the path that needs
+#: this most is the one that has no ``_cli_ref``.
+_IDENTITY_FILES = {
+    "USER": ("memories/USER.md", "user_char_limit"),
+    "MEMORY": ("memories/MEMORY.md", "memory_char_limit"),
+}
 
-    Preferred over loading a provider ourselves: this instance is already
-    initialized, so reading it costs nothing and has no lifecycle side
-    effects. The traversal mirrors ``PluginContext.dispatch_tool``'s own
-    route to the parent agent (plugins.py:604-608) and is guarded at every
-    hop — these are framework internals and may simply not be there.
+
+def _identity_file(section: str) -> str:
+    """One of Hermes's own identity files, capped by the host's own budget.
+
+    Hermes puts ``MEMORY.md`` and ``USER.md`` on the agent's memory STORE and
+    injects them into the text agent's system prompt; the memory MANAGER this
+    module reads elsewhere holds external providers only. So a voice session
+    could never see them, on any lane, no matter what was configured — the
+    files were structurally out of reach rather than absent.
+
+    Read from disk so this works with no agent and no plugin context: the
+    lanes that need it most (gateway, dashboard) have neither.
+
+    Two deliberate asymmetries with :func:`_resolve_persona`, both matching
+    what the HOST does rather than what looks safer in isolation:
+
+    - **No injection scan.** ``_resolve_persona`` refuses a raw-file fallback
+      because Hermes scans SOUL.md (``_scan_context_content``) and a direct
+      read would drop that check. Hermes does NOT scan these two: they reach
+      the text system prompt through ``_memory_store.format_for_system_prompt``
+      verbatim (``agent/system_prompt.py:428-434``). Scanning here would put
+      the voice prompt out of step with the text prompt over content the host
+      already treats as its own, so it does not.
+    - **The char limits are the host's WRITE budget**, not a read truncation:
+      Hermes renders the whole file and uses these numbers to tell the model
+      when to consolidate (``tools/memory_tool.py:663-676``). Reused here as a
+      cap because a Realtime prompt is resident and re-charged every turn. On
+      a file the host is keeping within budget this trims nothing; it is the
+      floor under a file that has run over.
     """
 
-    ctx = get_ctx()
-    if ctx is None:
+    entry = _IDENTITY_FILES.get(section.upper())
+    if entry is None:
         return ""
+    relative, limit_key = entry
     try:
-        cli = getattr(getattr(ctx, "_manager", None), "_cli_ref", None)
-        manager = getattr(getattr(cli, "agent", None), "_memory_manager", None)
-        if manager is None:
-            return ""
-        return (manager.build_system_prompt() or "").strip()
-    except Exception as exc:  # noqa: BLE001 — a missing section, never an outage
-        _log.debug("agent memory block unavailable: %s: %s", type(exc).__name__, exc)
+        path = talk_config.get_hermes_home() / relative
+        body = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""  # absent is a missing section, never an error
+    except Exception as exc:  # noqa: BLE001 — a section, never an outage
+        _log.debug("identity file %s unavailable: %s: %s", relative, type(exc).__name__, exc)
         return ""
+    if not body:
+        return ""
+    limit = talk_config.identity_char_limit(limit_key)
+    return body[:limit] if limit else body
 
 
-def _memory_block_from_provider() -> str:
-    """Load the configured memory provider ourselves and ask it for its block.
+def _vault_pointer() -> str:
+    """The one true sentence about vault recall, authored here.
 
-    The standalone path, where no agent exists to borrow one from. The
-    lifecycle is deliberate: ``system_prompt_block()`` is empty before
-    ``initialize()`` for a real provider (hermes-homie-memory returns "" until
-    its index exists), so initializing is required — and every provider we
-    initialize we also shut down, because we own this instance. It is safe to
-    do so: ``load_memory_provider`` builds a FRESH instance per call, so a
-    running agent's own provider is untouched.
+    NOT the provider's own ``system_prompt_block``. That block exists to tell
+    a TEXT agent which tools to call (``homie_memory_search``,
+    ``homie_memory_context``, …) — tool names that are real in that registry
+    and absent from a Realtime session's. Passing it through spent identity
+    budget instructing the model to call things it does not have, and every
+    provider's block has that shape by construction, so the passthrough was
+    wrong as a class rather than for one provider.
+
+    This says the same thing about a capability the session actually has, and
+    only when it has it (:func:`talk_vault.available`).
     """
 
     try:
-        from plugins.memory import _get_active_memory_provider, load_memory_provider
-    except Exception as exc:  # noqa: BLE001 — no Hermes, no provider section
-        _log.debug("memory provider plugins unavailable: %s: %s", type(exc).__name__, exc)
-        return ""
-
-    provider = None
-    try:
-        active = _get_active_memory_provider()
-        if not active:
+        if not talk_vault.available():
             return ""
-        provider = load_memory_provider(active)
-        if provider is None or not provider.is_available():
-            return ""
-        provider.initialize(
-            PROBE_SESSION_ID,
-            platform="cli",
-            hermes_home=str(talk_config.get_hermes_home()),
-            # Non-primary: the ABC's contract is that providers skip writes
-            # outside a primary agent context, and a voice prompt probe must
-            # never write to the operator's memory store.
-            agent_context="flush",
-        )
-        return (provider.system_prompt_block() or "").strip()
-    except Exception as exc:  # noqa: BLE001 — a missing section, never an outage
-        _log.debug("memory provider block unavailable: %s: %s", type(exc).__name__, exc)
+        count = talk_vault.document_count()
+    except Exception as exc:  # noqa: BLE001 — a missing pointer, never an outage
+        _log.debug("vault pointer unavailable: %s: %s", type(exc).__name__, exc)
         return ""
-    finally:
-        if provider is not None:
-            try:
-                provider.shutdown()
-            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-                _log.debug("provider shutdown failed: %s: %s", type(exc).__name__, exc)
+    scope = f" ({count:,} documents indexed)" if count else ""
+    return (
+        f"Long-term written notes{scope} are searchable with the search_vault "
+        "tool — use it for anything the operator would have written down "
+        "rather than said."
+    )
 
 
 def _resolve_memory_block() -> str:
-    """The memory section: the live agent's block, else the configured one."""
+    """The trailing half of the memory section: what can be LOOKED UP.
 
-    return _memory_block_from_agent() or _memory_block_from_provider()
+    Ordered after the durable files in :meth:`HostAdapter.identity_sections`
+    on purpose — what the session already knows outranks what it could go
+    fetch, and the cap trims from the tail.
+    """
+
+    return _vault_pointer()
 
 
 class HostAdapter:
@@ -408,9 +432,19 @@ class HostAdapter:
         persona = _resolve_persona()
         if persona:
             sections["PERSONA"] = persona
-        memory = _resolve_memory_block()
-        if memory:
-            sections["MEMORY"] = memory
+        user = _identity_file("USER")
+        if user:
+            sections["USER"] = user
+        # Real memory first, the provider's capability pointer after it: one
+        # is what the session knows, the other is what it can go look up, and
+        # the budget should go to the former.
+        memory_parts = [
+            part
+            for part in (_identity_file("MEMORY"), _resolve_memory_block())
+            if part
+        ]
+        if memory_parts:
+            sections["MEMORY"] = "\n\n".join(memory_parts)
 
         include = talk_config.identity_include()
         if include is None:
@@ -1217,7 +1251,6 @@ __all__ = [
     "LANE_NONE",
     "MAX_TOOL_OUTPUT_CHARS",
     "MEMORY_TOOL_NAME",
-    "PROBE_SESSION_ID",
     "STEER_TOOL_NAME",
     "HostAdapter",
     "agent_argv",

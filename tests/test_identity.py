@@ -5,10 +5,31 @@ from __future__ import annotations
 import talk_identity
 
 
-def test_preamble_alone_when_the_host_has_nothing():
-    assert talk_identity.build_instructions(None) == talk_identity.VOICE_PREAMBLE
-    assert talk_identity.build_instructions({}) == talk_identity.VOICE_PREAMBLE
-    assert talk_identity.build_instructions({"PERSONA": "   "}) == talk_identity.VOICE_PREAMBLE
+def test_preamble_plus_the_clock_when_the_host_has_nothing():
+    """A host with nothing to say still yields preamble + the one line the
+    session cannot answer without: what day it is."""
+
+    for empty in (None, {}, {"PERSONA": "   "}):
+        built = talk_identity.build_instructions(empty)
+        assert built.startswith(talk_identity.VOICE_PREAMBLE)
+        remainder = built[len(talk_identity.VOICE_PREAMBLE) :]
+        assert remainder.strip() == talk_identity.current_moment()
+
+
+def test_the_clock_is_built_per_call_not_at_import():
+    """A module-level timestamp would freeze at import, so a gateway running
+    for a week would confidently state the day it booted."""
+
+    import time as _time
+
+    frozen = talk_identity.current_moment()
+    real = _time.localtime
+    try:
+        talk_identity.time.localtime = lambda *a: real(1_000_000_000)
+        assert talk_identity.current_moment() != frozen
+        assert "2001" in talk_identity.build_instructions(None)
+    finally:
+        talk_identity.time.localtime = real
 
 
 def test_preamble_states_the_load_bearing_rules():
@@ -40,8 +61,21 @@ def test_sections_render_in_priority_order():
 def test_sections_are_capped_per_name():
     body = "x" * 50_000
     instructions = talk_identity.build_instructions({"WORKING": body})
-    rendered = instructions.split("\n\n")[-1]
+    # -1 is the clock line now; the section body is the block before it.
+    rendered = instructions.split("\n\n")[-2]
     assert len(rendered) == talk_identity.IDENTITY_CAPS["WORKING"]
+
+
+def test_a_case_variant_known_section_is_not_dropped():
+    """The obvious spelling of the render loop (exact match for known names,
+    ``.upper() not in`` for unknown) drops a lowercase known key from BOTH
+    lists — losing the entire section rather than misordering it."""
+
+    instructions = talk_identity.build_instructions(
+        {"memory": "the vault says X", "PERSONA": "be terse"}
+    )
+    assert "the vault says X" in instructions
+    assert instructions.index("be terse") < instructions.index("the vault says X")
 
 
 def test_unknown_sections_are_kept_but_ranked_last():

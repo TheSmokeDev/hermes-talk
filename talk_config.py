@@ -84,6 +84,49 @@ _MODEL_DEFAULT_RE = re.compile(r"^\s+default:\s*(\S.*)$")
 _CONFIG_SCAN_MAX_BYTES = 256_000
 
 
+#: Hermes's own per-section identity budgets, read from the SAME keys the text
+#: agent honors (``memory.memory_char_limit`` / ``memory.user_char_limit``).
+#: Matched at column 0 then inside the indented block, exactly like
+#: :data:`_MODEL_KEY_RE` — a ``memory_char_limit`` nested under some other key
+#: is not this key.
+_MEMORY_SECTION_RE = re.compile(r"^memory:\s*$")
+_TOP_LEVEL_KEY_RE = re.compile(r"^\S")
+
+
+def identity_char_limit(key: str) -> int:
+    """The host's own budget for one identity section, or ``0`` for unset.
+
+    ``0`` means "no host opinion" and the caller applies its own cap; it never
+    means "emit nothing". A text scan rather than a YAML parse for the reason
+    :func:`_has_model_default` gives — PyYAML is not a dependency of this
+    plugin, and being wrong here costs a section trimmed at the plugin's own
+    cap instead of the host's, which :mod:`talk_identity` enforces anyway.
+    """
+
+    pattern = re.compile(r"^\s+" + re.escape(key) + r":\s*(\d+)\s*$")
+    try:
+        text = (get_hermes_home() / "config.yaml").read_text(
+            encoding="utf-8", errors="replace"
+        )[:_CONFIG_SCAN_MAX_BYTES]
+    except OSError:
+        return 0
+
+    in_block = False
+    for line in text.splitlines():
+        if in_block:
+            match = pattern.match(line)
+            if match:
+                try:
+                    return max(0, int(match.group(1)))
+                except ValueError:  # pragma: no cover - the regex proves digits
+                    return 0
+            if _TOP_LEVEL_KEY_RE.match(line):
+                break  # left the memory block without finding the key
+        elif _MEMORY_SECTION_RE.match(line):
+            in_block = True
+    return 0
+
+
 def _has_model_default(config_path: Path) -> bool:
     """True when ``config_path`` names ``model.default``.
 

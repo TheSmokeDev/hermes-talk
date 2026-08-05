@@ -25,6 +25,7 @@ import talk_config
 import talk_host
 import talk_runs
 import talk_tools
+import talk_vault
 import talk_wire
 
 DASHBOARD_DIR = Path(__file__).resolve().parents[1] / "dashboard"
@@ -143,7 +144,10 @@ def test_mint_response_contains_no_raw_credential(minted):
     assert all(not str(value).startswith("sk-") for value in body.values())
 
 
-def test_mint_advertises_the_full_tool_surface(minted):
+def test_mint_advertises_the_full_tool_surface(minted, monkeypatch):
+    # Pinned OFF: vault availability is a property of the box, and the
+    # browser lane must advertise the same surface everywhere.
+    monkeypatch.setattr(talk_vault, "available", lambda: False)
     call(api.create_session, FakeRequest(body={}))
     names = [tool["name"] for tool in minted["session"]["tools"]]
 

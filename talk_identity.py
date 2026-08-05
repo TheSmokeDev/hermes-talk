@@ -10,6 +10,8 @@ cannot answer at all still yields a usable voice prompt.
 
 from __future__ import annotations
 
+import time
+
 DEFAULT_SECTION_CAP = 4_000
 
 #: How much of each host section rides the prompt.
@@ -79,6 +81,20 @@ def cap_section(name: str, body: str) -> str:
     return body.strip()[: IDENTITY_CAPS.get(name.upper(), DEFAULT_SECTION_CAP)]
 
 
+def current_moment() -> str:
+    """The line that lets the session answer "what day is it".
+
+    Built per call, never a module constant: these instructions are assembled
+    once per session but a module-level timestamp would freeze at IMPORT, so a
+    long-lived gateway would confidently state the day it booted.
+    """
+
+    now = time.localtime()
+    zone = time.strftime("%Z", now).strip()
+    stamp = time.strftime("%A, %B %d, %Y, %I:%M %p", now).replace(" 0", " ")
+    return f"Right now it is {stamp}{' ' + zone if zone else ''}."
+
+
 def build_instructions(host_sections: dict[str, str] | None) -> str:
     """Assemble the Realtime session prompt.
 
@@ -89,7 +105,12 @@ def build_instructions(host_sections: dict[str, str] | None) -> str:
 
     sections: list[str] = []
     if host_sections:
-        known = [name for name in IDENTITY_ORDER if name in host_sections]
+        # Match known names case-INSENSITIVELY. The obvious spelling of this
+        # loop (exact `in` for known, `.upper() not in` for extra) drops a
+        # case-variant known key from BOTH lists, silently losing the whole
+        # section rather than misordering it.
+        by_upper = {name.upper(): name for name in host_sections}
+        known = [by_upper[name] for name in IDENTITY_ORDER if name in by_upper]
         extra = sorted(k for k in host_sections if k.upper() not in IDENTITY_ORDER)
         for name in [*known, *extra]:
             body = cap_section(name, str(host_sections.get(name) or ""))
@@ -98,8 +119,10 @@ def build_instructions(host_sections: dict[str, str] | None) -> str:
             header = IDENTITY_HEADERS.get(name.upper(), name.replace("_", " ").title())
             sections.append(f"{header}:\n\n{body}")
 
-    if not sections:
-        return VOICE_PREAMBLE
+    # The clock rides last and unconditionally: it is one line, it is the most
+    # perishable thing in the prompt, and a session with no host sections at
+    # all should still be able to say what day it is.
+    sections.append(current_moment())
     return VOICE_PREAMBLE + "\n\n" + "\n\n".join(sections)
 
 
@@ -111,4 +134,5 @@ __all__ = [
     "VOICE_PREAMBLE",
     "build_instructions",
     "cap_section",
+    "current_moment",
 ]

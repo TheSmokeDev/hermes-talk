@@ -1,0 +1,226 @@
+"""Vault recall — the lookup a voice session can actually make.
+
+Hermetic like the identity suite: ``plugins.memory`` is injected as a fake, so
+the real resolution code runs without hermes-agent installed and without ever
+touching the operator's vault.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import types
+
+import pytest
+
+# Flat module import: the suite runs with `tests/` on sys.path, matching the
+# flat-module layout the plugin itself uses.
+from test_identity_injection import StubProvider, _Ctx, _install_provider
+
+import talk_host
+import talk_vault
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(monkeypatch):
+    talk_host.bind_ctx(None)
+    monkeypatch.setitem(sys.modules, "plugins", None)
+    monkeypatch.setitem(sys.modules, "plugins.memory", None)
+    talk_vault.reset()
+    yield
+    talk_vault.reset()
+    talk_host.bind_ctx(None)
+
+
+# --- availability -------------------------------------------------------------
+
+
+def test_no_hermes_means_no_vault():
+    assert talk_vault.available() is False
+    assert talk_vault.search("anything") == ""
+    assert talk_vault.document_count() == 0
+
+
+def test_an_unavailable_provider_is_never_initialized(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider(available=False))
+
+    assert talk_vault.available() is False
+    assert "initialize" not in provider.calls
+
+
+def test_a_provider_that_raises_is_simply_absent(monkeypatch):
+    _install_provider(monkeypatch, StubProvider(raises=True))
+
+    assert talk_vault.available() is False
+
+
+def test_no_configured_provider_is_absent(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("hits"), active="")
+
+    assert talk_vault.available() is False
+
+
+# --- the cache ----------------------------------------------------------------
+
+
+def test_the_provider_is_resolved_once_not_per_lookup(monkeypatch):
+    """A rebuild is a full vault walk (~0.3s measured) on the loop carrying
+    the microphone, so a per-lookup rebuild would be audible."""
+
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+
+    for _ in range(5):
+        talk_vault.search("anything")
+
+    assert provider.calls.count("initialize") == 1
+
+
+def test_a_failed_load_is_not_retried_per_lookup(monkeypatch):
+    """The failure path includes the filesystem walk too — retrying it on
+    every lookup is the same stall as rebuilding on every lookup."""
+
+    calls: list[str] = []
+
+    def counting_active():
+        calls.append("probe")
+        return ""
+
+    memory = types.ModuleType("plugins.memory")
+    memory._get_active_memory_provider = counting_active
+    memory.load_memory_provider = lambda name: None
+    plugins_pkg = types.ModuleType("plugins")
+    plugins_pkg.memory = memory
+    monkeypatch.setitem(sys.modules, "plugins", plugins_pkg)
+    monkeypatch.setitem(sys.modules, "plugins.memory", memory)
+
+    for _ in range(5):
+        talk_vault.available()
+
+    assert len(calls) == 1
+
+
+def test_concurrent_first_lookups_load_exactly_one_provider(monkeypatch):
+    """Two tool calls can land together (a retry, or the dashboard and the
+    gateway in one process); the single-flight lock is what stops that from
+    building two indexes."""
+
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    start = threading.Barrier(4)
+
+    def worker():
+        start.wait(5)
+        talk_vault.available()
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert provider.calls.count("initialize") == 1
+
+
+# --- ownership ----------------------------------------------------------------
+
+
+def test_a_provider_we_loaded_is_shut_down_on_reset(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    talk_vault.provider()
+
+    talk_vault.reset()
+
+    assert provider.calls[-1] == "shutdown"
+
+
+def test_a_borrowed_provider_survives_reset(monkeypatch):
+    """The sharpest edge in the borrow optimization: this instance belongs to
+    a running agent, and shutting it down would take that agent's memory with
+    it — a plugin teardown silently breaking the host."""
+
+    live = StubProvider("hits")
+    live.initialize("agent-session")
+    live.calls.clear()
+    talk_host.bind_ctx(_Ctx(provider=live))
+    assert talk_vault.provider() is live
+
+    talk_vault.reset()
+
+    assert "shutdown" not in live.calls
+
+
+def test_a_shutdown_that_raises_still_clears_the_cache(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    talk_vault.provider()
+    provider._raises = True
+
+    talk_vault.reset()
+
+    # The next call resolves fresh rather than serving a provider we already
+    # decided to drop.
+    provider._raises = False
+    assert talk_vault.provider() is provider
+    assert provider.calls.count("initialize") == 2
+
+
+# --- search -------------------------------------------------------------------
+
+
+def test_search_returns_what_the_provider_found(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("## Recall\nthe offer ladder is locked"))
+
+    assert "the offer ladder is locked" in talk_vault.search("offer ladder")
+
+
+def test_search_is_bounded(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("x" * 99_999))
+
+    assert len(talk_vault.search("anything")) == talk_vault.MAX_VAULT_CHARS
+
+
+def test_an_empty_query_never_reaches_the_provider(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+
+    assert talk_vault.search("   ") == ""
+    assert "prefetch" not in provider.calls
+
+
+def test_nothing_found_is_empty_not_an_error(monkeypatch):
+    _install_provider(monkeypatch, StubProvider(""))
+
+    assert talk_vault.search("kites") == ""
+
+
+def test_a_failing_lookup_raises_rather_than_reading_as_empty(monkeypatch):
+    """"Nothing written down" and "the lookup broke" must stay
+    distinguishable all the way up — collapsing them would have the session
+    confidently tell the operator they never wrote something down."""
+
+    class Broken(StubProvider):
+        def prefetch(self, query, *, session_id=""):
+            raise OSError("index file vanished")
+
+    _install_provider(monkeypatch, Broken("hits"))
+
+    with pytest.raises(talk_vault.VaultSearchError, match="OSError"):
+        talk_vault.search("anything")
+
+
+def test_the_lookup_never_claims_a_primary_session(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+
+    talk_vault.search("anything")
+
+    assert provider.init_kwargs["agent_context"] != "primary"
+    assert provider.init_kwargs["session_id"] == talk_vault.VAULT_SESSION_ID
+
+
+def test_document_count_survives_a_broken_status(monkeypatch):
+    class NoStatus(StubProvider):
+        def initialize(self, session_id, **kwargs):
+            super().initialize(session_id, **kwargs)
+            self._index = types.SimpleNamespace(status=lambda: 1 / 0)
+
+    _install_provider(monkeypatch, NoStatus("hits"))
+
+    assert talk_vault.document_count() == 0
+    assert talk_vault.available() is True

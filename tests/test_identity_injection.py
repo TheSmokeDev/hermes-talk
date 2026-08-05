@@ -5,7 +5,9 @@ and ``plugins.memory``) are INJECTED as fakes into ``sys.modules``, so the
 suite exercises the real resolution code without hermes-agent installed and
 without ever touching the operator's SOUL.md or memory store. The autouse
 fixture also blocks the real modules, so a box that HAS hermes-agent on the
-path still runs the same test.
+path still runs the same test — and points Hermes home at an empty tmp dir,
+because two of these sections are read from FILES and would otherwise be the
+operator's own.
 """
 
 from __future__ import annotations
@@ -16,23 +18,41 @@ import types
 
 import pytest
 
+import talk_config
 import talk_host
 import talk_identity
 import talk_tools
+import talk_vault
 
 _BLOCKED = ("agent", "agent.prompt_builder", "plugins", "plugins.memory")
 
 
 @pytest.fixture(autouse=True)
-def _hermetic(monkeypatch):
+def _hermetic(monkeypatch, tmp_path):
     talk_host.bind_ctx(None)
     monkeypatch.delenv("TALK_IDENTITY_INCLUDE", raising=False)
     # None in sys.modules makes `import x` raise ImportError — the default
     # state for every test here is "no Hermes at all".
     for name in _BLOCKED:
         monkeypatch.setitem(sys.modules, name, None)
-    yield
+    # An EMPTY Hermes home, so the file-backed sections start absent. Patched
+    # on the module rather than via HERMES_HOME because `get_hermes_home`
+    # prefers the host's own resolver when hermes-agent is importable, and a
+    # box that has it would otherwise read the operator's real USER.md.
+    home = tmp_path / "hermes-home"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setattr(talk_config, "get_hermes_home", lambda: home)
+    # The vault provider is cached for the life of the PROCESS, so without
+    # this every test after the first would silently reuse the previous
+    # test's stub — the classic module-cache test leak.
+    talk_vault.reset()
+    yield home
+    talk_vault.reset()
     talk_host.bind_ctx(None)
+
+
+def _write_identity_file(home, name: str, body: str) -> None:
+    (home / "memories" / name).write_text(body, encoding="utf-8")
 
 
 def _install_persona(monkeypatch, soul: str | None):
@@ -49,12 +69,17 @@ def _install_persona(monkeypatch, soul: str | None):
 class StubProvider:
     """A MemoryProvider shaped like the real ABC, with a call log."""
 
-    def __init__(self, block="", *, available=True, raises=False):
+    def __init__(self, block="", *, available=True, raises=False, documents=412):
         self._block = block
         self._available = available
         self._raises = raises
         self.calls: list[str] = []
         self.init_kwargs: dict = {}
+        # A provider only serves lookups once initialize() has built its
+        # index; before that it is loadable but not usable.
+        self._index = None
+        self._documents = documents
+        self.prefetched: list[str] = []
 
     @property
     def name(self):
@@ -71,6 +96,16 @@ class StubProvider:
         self.init_kwargs = {"session_id": session_id, **kwargs}
         if self._raises:
             raise RuntimeError("provider is broken")
+        self._index = types.SimpleNamespace(
+            status=lambda: {"documents": self._documents}
+        )
+
+    def prefetch(self, query, *, session_id=""):
+        self.calls.append("prefetch")
+        self.prefetched.append(query)
+        if self._raises:
+            raise RuntimeError("provider is broken")
+        return self._block
 
     def system_prompt_block(self):
         self.calls.append("system_prompt_block")
@@ -100,16 +135,17 @@ def _install_provider(monkeypatch, provider, *, active="stub"):
 class _Ctx:
     """A plugin context whose private chain leads to a live memory manager."""
 
-    def __init__(self, block="", *, raises=False):
+    def __init__(self, block="", *, raises=False, provider=None):
         manager = types.SimpleNamespace()
         if raises:
 
-            def boom():
-                raise RuntimeError("manager exploded")
+            class _Boom:
+                def __iter__(self):
+                    raise RuntimeError("manager exploded")
 
-            manager.build_system_prompt = boom
+            manager.providers = _Boom()
         else:
-            manager.build_system_prompt = lambda: block
+            manager.providers = [provider] if provider is not None else []
         agent = types.SimpleNamespace(_memory_manager=manager)
         self._manager = types.SimpleNamespace(_cli_ref=types.SimpleNamespace(agent=agent))
 
@@ -134,91 +170,154 @@ def test_unavailable_provider_is_never_initialized(monkeypatch):
     assert "initialize" not in provider.calls
 
 
-def test_provider_that_raises_on_everything_costs_only_its_section(monkeypatch):
+def test_a_provider_with_no_index_yields_no_pointer(monkeypatch):
+    """``initialize`` that leaves no index means lookups cannot be served, so
+    there is no capability to point at."""
+
+    class NoIndex(StubProvider):
+        def initialize(self, session_id, **kwargs):
+            self.calls.append("initialize")
+            self.init_kwargs = {"session_id": session_id, **kwargs}
+
+    _install_provider(monkeypatch, NoIndex())
+
+    assert talk_host.host().identity_sections() == {}
+
+
+# --- the vault pointer -------------------------------------------------------
+#
+# The MEMORY section's trailing half used to be the provider's own
+# ``system_prompt_block`` pasted through. That block tells a TEXT agent to
+# call homie_memory_search / homie_memory_context — tool names that do not
+# exist in a Realtime session, so the prompt spent budget instructing the
+# model to call things it did not have, and the model got "That tool isn't
+# available" on a live call. Every provider's block has that shape, so the
+# passthrough was wrong as a class. What ships now is one sentence this
+# plugin authors, naming the tool the session ACTUALLY has, emitted only
+# when that tool can really be served.
+
+
+def test_the_pointer_names_the_tool_the_session_actually_has(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits", documents=412))
+
+    memory = talk_host.host().identity_sections()["MEMORY"]
+
+    assert "search_vault" in memory
+    assert "412 documents" in memory
+    # The provider's own advertisement never reaches the model.
+    assert "homie_memory_search" not in memory
+    assert "is_available" in provider.calls and "initialize" in provider.calls
+
+
+def test_no_pointer_when_no_lookup_can_be_served(monkeypatch):
+    """The whole point: a capability sentence is only true if the capability
+    is there. No provider means no sentence, not a sentence about nothing."""
+
+    _install_provider(monkeypatch, StubProvider("hits"), active="")
+
+    assert talk_host.host().identity_sections() == {}
+
+
+def test_an_unknown_document_count_still_yields_a_usable_pointer(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("hits", documents=0))
+
+    memory = talk_host.host().identity_sections()["MEMORY"]
+
+    assert "search_vault" in memory
+    assert "documents indexed" not in memory
+
+
+def test_the_vault_provider_is_a_non_primary_reader(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+
+    talk_host.host().identity_sections()
+
+    # Non-primary context => the ABC's contract is that providers skip writes.
+    # This instance exists to READ; it must never be able to write memory.
+    assert provider.init_kwargs["agent_context"] != "primary"
+    assert provider.init_kwargs["session_id"] == talk_vault.VAULT_SESSION_ID
+    assert "hermes_home" in provider.init_kwargs
+
+
+def test_a_provider_we_loaded_is_shut_down_on_reset(monkeypatch):
+    provider = _install_provider(monkeypatch, StubProvider("hits"))
+    talk_vault.provider()
+
+    talk_vault.reset()
+
+    # We own this instance, so we are the ones who must release it.
+    assert provider.calls[-1] == "shutdown"
+
+
+def test_a_provider_that_raises_costs_only_its_section(monkeypatch):
     _install_persona(monkeypatch, "I am the operator's soul.")
     _install_provider(monkeypatch, StubProvider(raises=True))
 
     sections = talk_host.host().identity_sections()
 
-    # The session still starts, and the section that DID resolve survives.
     assert "MEMORY" not in sections
     assert sections["PERSONA"] == "I am the operator's soul."
-
-
-def test_empty_block_is_not_a_section(monkeypatch):
-    _install_provider(monkeypatch, StubProvider("   \n  "))
-
-    assert talk_host.host().identity_sections() == {}
-
-
-# --- the provider path -------------------------------------------------------
-
-
-def test_provider_block_becomes_the_memory_section(monkeypatch):
-    provider = _install_provider(monkeypatch, StubProvider("# Memory\nIndexed: 412 docs."))
-
-    sections = talk_host.host().identity_sections()
-
-    assert sections == {"MEMORY": "# Memory\nIndexed: 412 docs."}
-    # initialize before the block: a real provider returns "" until it has one.
-    assert provider.calls == [
-        "is_available",
-        "initialize",
-        "system_prompt_block",
-        "shutdown",
-    ]
-
-
-def test_a_provider_we_initialize_is_always_shut_down(monkeypatch):
-    class HalfBroken(StubProvider):
-        def system_prompt_block(self):
-            self.calls.append("system_prompt_block")
-            raise RuntimeError("block failed")
-
-    provider = _install_provider(monkeypatch, HalfBroken())
-
-    assert talk_host.host().identity_sections() == {}
-    # We own this instance; failing to read it does not excuse leaking it.
-    assert provider.calls[-1] == "shutdown"
-
-
-def test_probe_never_claims_to_be_a_primary_session(monkeypatch):
-    provider = _install_provider(monkeypatch, StubProvider("block"))
-
-    talk_host.host().identity_sections()
-
-    # Non-primary context => the ABC's contract is that providers skip writes.
-    assert provider.init_kwargs["agent_context"] != "primary"
-    assert provider.init_kwargs["session_id"] == talk_host.PROBE_SESSION_ID
-    assert "hermes_home" in provider.init_kwargs
 
 
 # --- the live-agent path -----------------------------------------------------
 
 
-def test_the_live_agents_block_is_preferred_over_loading_a_provider(monkeypatch):
-    provider = _install_provider(monkeypatch, StubProvider("from a fresh provider"))
-    talk_host.bind_ctx(_Ctx("from the live agent"))
+def test_the_live_agents_provider_is_borrowed_not_reloaded(monkeypatch):
+    """A second index would be a second full vault walk (~0.3s) and a second
+    copy in memory, for the same content the agent already holds."""
 
-    sections = talk_host.host().identity_sections()
+    live = StubProvider("hits", documents=99)
+    live.initialize("agent-session")
+    live.calls.clear()
+    fresh = _install_provider(monkeypatch, StubProvider("hits", documents=1))
+    talk_host.bind_ctx(_Ctx(provider=live))
 
-    assert sections == {"MEMORY": "from the live agent"}
-    # Already initialized in-process — nothing was loaded or torn down.
-    assert provider.calls == []
+    memory = talk_host.host().identity_sections()["MEMORY"]
+
+    assert "99 documents" in memory
+    assert fresh.calls == []  # nothing loaded, nothing torn down
 
 
-def test_a_ctx_without_an_agent_falls_through_to_the_provider(monkeypatch):
-    _install_provider(monkeypatch, StubProvider("from a fresh provider"))
+def test_a_borrowed_provider_is_never_shut_down(monkeypatch):
+    """It belongs to a running agent. Tearing it down would take that agent's
+    memory with it — the sharpest edge in the borrow optimization."""
+
+    live = StubProvider("hits")
+    live.initialize("agent-session")
+    live.calls.clear()
+    talk_host.bind_ctx(_Ctx(provider=live))
+    talk_vault.provider()
+
+    talk_vault.reset()
+
+    assert "shutdown" not in live.calls
+
+
+def test_an_uninitialized_agent_provider_is_not_borrowed(monkeypatch):
+    """Loadable is not usable: a provider with no index yet answers nothing,
+    so borrowing it would silently disable vault recall for the session."""
+
+    fresh = _install_provider(monkeypatch, StubProvider("hits", documents=7))
+    talk_host.bind_ctx(_Ctx(provider=StubProvider("hits")))  # never initialized
+
+    memory = talk_host.host().identity_sections()["MEMORY"]
+
+    assert "7 documents" in memory
+    assert "initialize" in fresh.calls
+
+
+def test_a_ctx_without_an_agent_falls_through_to_loading_one(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("hits", documents=5))
     talk_host.bind_ctx(types.SimpleNamespace())  # no _manager at all
 
-    assert talk_host.host().identity_sections() == {"MEMORY": "from a fresh provider"}
+    assert "5 documents" in talk_host.host().identity_sections()["MEMORY"]
 
 
-def test_a_raising_agent_manager_falls_through_to_the_provider(monkeypatch):
-    _install_provider(monkeypatch, StubProvider("from a fresh provider"))
+def test_a_raising_agent_manager_falls_through_to_loading_one(monkeypatch):
+    _install_provider(monkeypatch, StubProvider("hits", documents=5))
     talk_host.bind_ctx(_Ctx(raises=True))
 
-    assert talk_host.host().identity_sections() == {"MEMORY": "from a fresh provider"}
+    assert "5 documents" in talk_host.host().identity_sections()["MEMORY"]
 
 
 # --- persona -----------------------------------------------------------------
@@ -236,6 +335,80 @@ def test_absent_soul_is_simply_no_persona(monkeypatch):
     _install_persona(monkeypatch, None)
 
     assert talk_host.host().identity_sections() == {}
+
+
+# --- file-backed sections (USER.md / MEMORY.md) ------------------------------
+
+
+def test_user_and_memory_files_ride_the_session(_hermetic):
+    """The load-bearing fix. Hermes puts these two on the memory STORE, while
+    this module reads the memory MANAGER (external providers only) — so a
+    voice session could never see them on ANY lane, configured or not."""
+
+    _write_identity_file(_hermetic, "USER.md", "User is Pedro, ships at night.")
+    _write_identity_file(_hermetic, "MEMORY.md", "TaskChad runs on Dograh.")
+
+    sections = talk_host.host().identity_sections()
+
+    assert sections["USER"] == "User is Pedro, ships at night."
+    assert sections["MEMORY"] == "TaskChad runs on Dograh."
+
+
+def test_absent_files_are_an_absent_key_not_an_empty_header(_hermetic):
+    """An empty section would render its header with nothing under it — a
+    prompt that claims to describe the operator and then says nothing."""
+
+    assert talk_host.host().identity_sections() == {}
+    assert "USER" not in talk_identity.build_instructions({})
+
+
+def test_a_blank_file_is_also_absent(_hermetic):
+    _write_identity_file(_hermetic, "USER.md", "   \n\n  ")
+
+    assert "USER" not in talk_host.host().identity_sections()
+
+
+def test_an_unreadable_file_degrades_to_no_section(_hermetic, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("disk said no")
+
+    monkeypatch.setattr(talk_host.Path, "read_text", boom)
+
+    assert talk_host.host().identity_sections() == {}
+
+
+def test_real_memory_outranks_the_lookup_pointer(_hermetic, monkeypatch):
+    """The pointer says what CAN be fetched; the file IS what is known.
+    Knowledge the session already has must come first, because the cap trims
+    from the tail."""
+
+    _write_identity_file(_hermetic, "MEMORY.md", "the durable fact")
+    _install_provider(monkeypatch, StubProvider("hits"))
+
+    memory = talk_host.host().identity_sections()["MEMORY"]
+
+    assert memory.index("the durable fact") < memory.index("search_vault")
+
+
+def test_the_host_char_budget_is_honored(_hermetic, monkeypatch):
+    monkeypatch.setattr(
+        talk_config, "identity_char_limit", lambda key: 5 if key == "user_char_limit" else 0
+    )
+    _write_identity_file(_hermetic, "USER.md", "x" * 500)
+
+    assert talk_host.host().identity_sections()["USER"] == "xxxxx"
+
+
+def test_no_host_budget_falls_back_to_the_plugin_cap(_hermetic, monkeypatch):
+    """``0`` from the config scan means "no host opinion", NOT "emit nothing" —
+    the inverted reading would silently blank the section on any install whose
+    config omits the key."""
+
+    monkeypatch.setattr(talk_config, "identity_char_limit", lambda key: 0)
+    _write_identity_file(_hermetic, "USER.md", "y" * 50_000)
+
+    rendered = talk_identity.cap_section("USER", talk_host.host().identity_sections()["USER"])
+    assert len(rendered) == talk_identity.IDENTITY_CAPS["USER"]
 
 
 # --- TALK_IDENTITY_INCLUDE ---------------------------------------------------
@@ -294,13 +467,16 @@ def test_cap_is_exact_at_the_boundary(name):
     assert len(talk_identity.cap_section(name, "x" * (cap + 1))) == cap
 
 
-def test_an_oversized_provider_block_is_capped_in_the_prompt(monkeypatch):
-    _install_provider(monkeypatch, StubProvider("m" * 99_999))
+def test_an_oversized_memory_section_is_capped_in_the_prompt(_hermetic, monkeypatch):
+    monkeypatch.setattr(talk_config, "identity_char_limit", lambda key: 0)
+    _write_identity_file(_hermetic, "MEMORY.md", "m" * 99_999)
 
     instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
 
-    # Measure the rendered body only — the preamble has its own "m"s.
+    # Measure the rendered body only — the preamble has its own "m"s, and the
+    # clock line trails every prompt.
     body = instructions.split(talk_identity.IDENTITY_HEADERS["MEMORY"] + ":\n\n", 1)[1]
+    body = body.split("\n\n" + talk_identity.current_moment())[0]
     assert len(body) == talk_identity.IDENTITY_CAPS["MEMORY"]
 
 
@@ -318,33 +494,38 @@ def test_build_instructions_renders_header_and_body_for_each_section():
         assert body in instructions
 
 
-def test_no_sections_still_yields_the_bare_preamble():
-    assert talk_identity.build_instructions(None) == talk_identity.VOICE_PREAMBLE
-    assert talk_identity.build_instructions({}) == talk_identity.VOICE_PREAMBLE
+def test_no_sections_still_yields_the_preamble_and_the_clock():
+    for empty in (None, {}):
+        built = talk_identity.build_instructions(empty)
+        assert built.startswith(talk_identity.VOICE_PREAMBLE)
+        assert built[len(talk_identity.VOICE_PREAMBLE) :].strip() == (
+            talk_identity.current_moment()
+        )
 
 
 # --- talk_status -------------------------------------------------------------
 
 
-def test_status_reports_counts_and_never_the_content(monkeypatch):
+def test_status_reports_counts_and_never_the_content(_hermetic, monkeypatch):
     secret = "the operator's private soul, which must not be spoken back"
-    block = "indexed 412 documents"
+    private = "the operator's private durable memory"
     _install_persona(monkeypatch, secret)
-    _install_provider(monkeypatch, StubProvider(block))
+    _write_identity_file(_hermetic, "MEMORY.md", private)
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
 
     payload = talk_tools.execute_talk_tool("talk_status", {})
     status = json.loads(payload)
 
-    assert status["identity"] == {"PERSONA": len(secret), "MEMORY": len(block)}
+    assert status["identity"] == {"PERSONA": len(secret), "MEMORY": len(private)}
     # The whole point of the sections is that they hold things about the
     # operator; status is spoken aloud and lands in transcripts.
     assert secret not in payload
-    assert block not in payload
+    assert private not in payload
 
 
-def test_status_counts_are_post_cap(monkeypatch):
-    _install_provider(monkeypatch, StubProvider("m" * 99_999))
+def test_status_counts_are_post_cap(_hermetic, monkeypatch):
+    monkeypatch.setattr(talk_config, "identity_char_limit", lambda key: 0)
+    _write_identity_file(_hermetic, "MEMORY.md", "m" * 99_999)
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
 
     status = json.loads(talk_tools.execute_talk_tool("talk_status", {}))

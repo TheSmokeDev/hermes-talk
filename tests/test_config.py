@@ -86,3 +86,60 @@ def test_audio_device_overrides(monkeypatch):
     monkeypatch.setenv("TALK_OUTPUT_DEVICE", "Speakers (Realtek)")
     assert talk_config.audio_input_device() == "3"
     assert talk_config.audio_output_device() == "Speakers (Realtek)"
+
+
+# --- identity_char_limit ------------------------------------------------------
+
+
+def _home_with_config(monkeypatch, tmp_path, body: str):
+    """An isolated Hermes home holding one config.yaml."""
+
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def test_identity_char_limit_reads_the_memory_block(monkeypatch, tmp_path):
+    _home_with_config(
+        monkeypatch,
+        tmp_path,
+        "model:\n  default: gpt-5.5\nmemory:\n  memory_char_limit: 2200\n"
+        "  user_char_limit: 1375\n",
+    )
+
+    assert talk_config.identity_char_limit("memory_char_limit") == 2200
+    assert talk_config.identity_char_limit("user_char_limit") == 1375
+
+
+def test_identity_char_limit_is_zero_when_unset(monkeypatch, tmp_path):
+    """Zero means "no host opinion" — the caller applies its own cap. Callers
+    must never read it as "emit nothing"."""
+
+    _home_with_config(monkeypatch, tmp_path, "memory:\n  memory_enabled: true\n")
+
+    assert talk_config.identity_char_limit("user_char_limit") == 0
+
+
+def test_identity_char_limit_ignores_the_key_outside_the_memory_block(
+    monkeypatch, tmp_path
+):
+    """Same discipline as the model scan: a matching key nested under some
+    OTHER top-level section is not this key."""
+
+    _home_with_config(
+        monkeypatch,
+        tmp_path,
+        "voice:\n  user_char_limit: 99\nmemory:\n  memory_enabled: true\n",
+    )
+
+    assert talk_config.identity_char_limit("user_char_limit") == 0
+
+
+def test_identity_char_limit_survives_a_missing_config(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nowhere"))
+
+    assert talk_config.identity_char_limit("memory_char_limit") == 0

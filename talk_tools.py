@@ -30,6 +30,7 @@ try:
         talk_identity,
         talk_runs,
         talk_steer,
+        talk_vault,
     )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_identity
     import talk_runs
     import talk_steer
+    import talk_vault
 
 _log = logging.getLogger(__name__)
 
@@ -70,6 +72,29 @@ _TOOL_SEARCH_MEMORY: dict = {
                 "minimum": 1,
                 "maximum": 8,
                 "description": "How many matches to bring back (default 5).",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+_TOOL_SEARCH_VAULT: dict = {
+    "type": "function",
+    "name": "search_vault",
+    "description": (
+        "Look something up in the operator's long-term notes — the durable "
+        "vault of projects, decisions, people and standing rules. Use this "
+        "for what is WRITTEN DOWN, as opposed to search_memory, which is "
+        "what was SAID in past sessions. Returns matching excerpts to "
+        "summarize aloud."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to look for, in plain words.",
             },
         },
         "required": ["query"],
@@ -279,20 +304,30 @@ def plugin_version() -> str:
 
 
 def default_talk_tools() -> list[dict]:
-    """The tool set advertised to a new Talk session (fresh copies per call)."""
+    """The tool set advertised to a new Talk session (fresh copies per call).
 
-    return copy.deepcopy(
-        [
-            _TOOL_SEARCH_MEMORY,
-            _TOOL_DELEGATE_TASK,
-            _TOOL_CHECK_WORK,
-            _TOOL_LIST_AGENTS,
-            _TOOL_STEER_AGENT,
-            _TOOL_REDIRECT_AGENT,
-            _TOOL_STOP_WORK,
-            _TOOL_TALK_STATUS,
-        ]
-    )
+    The base set is unconditional. ``search_vault`` is CONDITIONAL: it is
+    advertised only when a memory provider is actually loadable in this
+    process, because advertising a lookup that cannot be served is the same
+    defect as the provider block this plugin stopped passing through.
+    """
+
+    tools = [
+        _TOOL_SEARCH_MEMORY,
+        _TOOL_DELEGATE_TASK,
+        _TOOL_CHECK_WORK,
+        _TOOL_LIST_AGENTS,
+        _TOOL_STEER_AGENT,
+        _TOOL_REDIRECT_AGENT,
+        _TOOL_STOP_WORK,
+        _TOOL_TALK_STATUS,
+    ]
+    try:
+        if talk_vault.available():
+            tools.insert(1, _TOOL_SEARCH_VAULT)
+    except Exception as exc:  # noqa: BLE001 — a missing tool, never a dead session
+        _log.debug("vault availability unknown: %s: %s", type(exc).__name__, exc)
+    return copy.deepcopy(tools)
 
 
 def execute_talk_tool(name: str, arguments: dict | None) -> str:
@@ -321,6 +356,21 @@ def _handle_search_memory(arguments: dict) -> str:
     except (TypeError, ValueError):
         limit = 5
     return talk_host.host().search_memory(query, max(1, min(limit, 8)))
+
+
+def _handle_search_vault(arguments: dict) -> str:
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return "search_vault needs something to look for."
+    try:
+        found = talk_vault.search(query)
+    except talk_vault.VaultSearchError as exc:
+        return f"the vault lookup failed: {exc}"
+    if not found:
+        # Distinct sentence from the failure above, deliberately: "nothing
+        # written down" and "the lookup broke" must never sound the same.
+        return f"nothing in the notes about {query}."
+    return found
 
 
 def _handle_delegate_task(arguments: dict) -> str:
@@ -471,6 +521,7 @@ def _handle_talk_status(arguments: dict) -> str:
 
 _HANDLERS = {
     "search_memory": _handle_search_memory,
+    "search_vault": _handle_search_vault,
     "delegate_task": _handle_delegate_task,
     "check_work": _handle_check_work,
     "list_agents": _handle_list_agents,

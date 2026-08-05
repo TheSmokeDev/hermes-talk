@@ -11,6 +11,7 @@ import pytest
 import talk_host
 import talk_runs
 import talk_tools
+import talk_vault
 
 
 def _wait_terminal(run_id: int, timeout: float = 3.0) -> dict:
@@ -35,24 +36,55 @@ def unbound_ctx(monkeypatch):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
+    # Vault availability is a property of the BOX, so leaving it unpinned
+    # would make the advertised tool list depend on whether the machine
+    # running the suite happens to have a memory provider installed.
+    monkeypatch.setattr(talk_vault, "available", lambda: False)
+    talk_vault.reset()
     yield
+    talk_vault.reset()
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
+
+
+_BASE_TOOLS = [
+    "search_memory",
+    "delegate_task",
+    "check_work",
+    "list_agents",
+    "steer_agent",
+    "redirect_agent",
+    "stop_work",
+    "talk_status",
+]
 
 
 def test_default_tools_are_fresh_copies():
     first = talk_tools.default_talk_tools()
     first[0]["name"] = "mutated"
-    assert [tool["name"] for tool in talk_tools.default_talk_tools()] == [
-        "search_memory",
-        "delegate_task",
-        "check_work",
-        "list_agents",
-        "steer_agent",
-        "redirect_agent",
-        "stop_work",
-        "talk_status",
-    ]
+    assert [tool["name"] for tool in talk_tools.default_talk_tools()] == _BASE_TOOLS
+
+
+def test_the_vault_tool_is_advertised_only_when_it_can_be_served(monkeypatch):
+    """Advertising a lookup that cannot run is the same defect as the
+    provider block this plugin stopped passing through — the model calls it,
+    the relay says the tool does not exist, and the call stalls on nothing."""
+
+    monkeypatch.setattr(talk_vault, "available", lambda: True)
+    names = [tool["name"] for tool in talk_tools.default_talk_tools()]
+
+    assert names == [*_BASE_TOOLS[:1], "search_vault", *_BASE_TOOLS[1:]]
+
+
+def test_an_erroring_availability_check_costs_only_the_vault_tool(monkeypatch):
+    def boom():
+        raise RuntimeError("provider import exploded")
+
+    monkeypatch.setattr(talk_vault, "available", boom)
+
+    # A session that starts without one tool beats a session that never
+    # starts, so this degrades rather than raising into the mint path.
+    assert [tool["name"] for tool in talk_tools.default_talk_tools()] == _BASE_TOOLS
 
 
 def test_every_advertised_tool_has_a_handler():
@@ -263,3 +295,36 @@ def test_non_json_host_result_passes_through_bounded():
     result = talk_tools.execute_talk_tool("search_memory", {"query": "anything"})
 
     assert len(result) == talk_host.MAX_TOOL_OUTPUT_CHARS
+
+
+# --- search_vault -------------------------------------------------------------
+
+
+def test_search_vault_speaks_what_the_vault_returned(monkeypatch):
+    monkeypatch.setattr(talk_vault, "search", lambda q, **k: f"notes about {q}")
+
+    assert talk_tools.execute_talk_tool("search_vault", {"query": "the offer ladder"}) == (
+        "notes about the offer ladder"
+    )
+
+
+def test_search_vault_needs_something_to_look_for():
+    assert "needs something" in talk_tools.execute_talk_tool("search_vault", {"query": "  "})
+
+
+def test_nothing_found_is_a_different_sentence_from_a_failure(monkeypatch):
+    """A live call must be able to tell "you never wrote that down" apart from
+    "the lookup broke" — they lead to completely different next moves."""
+
+    monkeypatch.setattr(talk_vault, "search", lambda q, **k: "")
+    empty = talk_tools.execute_talk_tool("search_vault", {"query": "kites"})
+
+    def boom(q, **k):
+        raise talk_vault.VaultSearchError("OSError: index gone")
+
+    monkeypatch.setattr(talk_vault, "search", boom)
+    broken = talk_tools.execute_talk_tool("search_vault", {"query": "kites"})
+
+    assert "nothing in the notes" in empty
+    assert "failed" in broken
+    assert empty != broken
