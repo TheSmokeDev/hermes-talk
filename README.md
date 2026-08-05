@@ -110,8 +110,15 @@ agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
 
 **In Discord**, `/talk join` runs the call in the voice channel Hermes is
 already in — same conversation, same tools, same steering, in a room other
-people can hear. It borrows the host's own voice connection rather than
-opening a second one. Details and the one caveat:
+people can hear. Talk now reports speaker transitions to the model using the
+member's immutable Discord user ID; display names are quoted as untrusted data,
+and an unknown SSRC stays unresolved. **This is attribution only, not
+authorization:** every participant still reaches the same tool surface. Issue
+[#10](https://github.com/TheSmokeDev/hermes-talk/issues/10) remains open for
+the policy choice and default-deny enforcement for mutating tools. Until that
+lands, invite Hermes only to channels whose members you would hand those tools
+to. It borrows the host's own voice connection rather than opening a second
+one. Details:
 [docs/OPERATING.md](docs/OPERATING.md#discord-voice--talking-in-the-channel-hermes-is-already-in).
 
 What can you actually say? The full say-this → hear-this card, with what

@@ -155,9 +155,23 @@ The session instructions also carry the current date and time, built per
 session — a voice assistant that cannot say what day it is fails the first
 obvious question.
 
-**Known gap — speaker identity on Discord.** Every speaker in a voice channel
-is merged into one stream, so anyone in the channel is treated as the
-operator and can fire `delegate_task` or `stop_work`. Only invite Hermes to
+**Discord speaker attribution is an identity floor, not authorization.** For
+each speaker transition, Talk resolves the SSRC through the host's current
+mapping and gives the model the immutable Discord user ID plus display name.
+The display name is quoted JSON inside a self-deleting system announcement,
+explicitly marked untrusted data; it is never a `role=user` turn and that
+announcement's response has `tool_choice: none`. If an SSRC is unknown, Talk
+reports it as unresolved and never guesses that it belongs to the operator.
+Mappings are re-read for every audio chunk, attribution changes are deduplicated
+by immutable user ID even when Discord changes SSRC, and stop/rejoin/remap
+invalidates stale queued callbacks.
+
+That floor **does not grant or enforce permission**. All channel participants
+still reach the same tools, including mutating tools such as `delegate_task`
+and `stop_work`. Issue
+[#10](https://github.com/TheSmokeDev/hermes-talk/issues/10) therefore remains
+open for the policy choice (for example, which immutable user IDs are allowed)
+and default-deny mutating-tool enforcement. Until that policy lands, only use
 channels whose members you would hand the keyboard to.
 
 | Variable | Default | Effect / failure mode |

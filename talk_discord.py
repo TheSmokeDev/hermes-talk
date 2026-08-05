@@ -339,6 +339,9 @@ class DiscordAudio:
         self._final_played = 0
         self._bridge_failure: str | None = None
         self._disconnected_since: float | None = None
+        self._speaker_notifier = None
+        self._speaker_notifier_generation = 0
+        self._last_speaker_key: Any = _UNSET
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -350,6 +353,10 @@ class DiscordAudio:
         surface should fail the same way whichever room it's in.
         """
 
+        # A reused bridge must never carry a callback from an earlier session.
+        # Do this before any operation that can fail so every failed-start path
+        # also invalidates deliveries already queued on the old loop.
+        self._detach_speaker_notifier()
         try:
             bridge = resolve_voice_bridge(self._guild_id)
         except TalkDiscordError as exc:
@@ -476,6 +483,7 @@ class DiscordAudio:
     def stop(self) -> None:
         """Hand the connection back. Safe twice, and after a failed start."""
 
+        self._detach_speaker_notifier()
         bridge_is_current = self._bridge_identity_is_current()
         bridge, self._bridge = self._bridge, None
         # Teardown is best-effort at every step: a half-torn-down bridge
@@ -514,6 +522,73 @@ class DiscordAudio:
                 self._final_played = max(0, source.frames_served - self._played_baseline) * 20
 
     # -- capture (host socket-reader thread) ----------------------------------
+
+    def set_speaker_notifier(self, notifier) -> None:
+        """Receive attribution transitions; ``None`` detaches the consumer."""
+
+        self._speaker_notifier_generation += 1
+        self._speaker_notifier = notifier
+        self._last_speaker_key = _UNSET
+
+    def _detach_speaker_notifier(self) -> None:
+        self.set_speaker_notifier(None)
+
+    def _deliver_speaker(
+        self, generation: int, notifier: Any, speaker: dict[str, Any]
+    ) -> None:
+        if (
+            generation == self._speaker_notifier_generation
+            and notifier is self._speaker_notifier
+            and notifier is not None
+        ):
+            notifier(speaker)
+
+    def _speaker_for_ssrc(self, receiver: Any, ssrc: Any) -> dict[str, Any]:
+        bridge = self._bridge or {}
+        adapter_mapping = getattr(bridge.get("adapter"), "_ssrc_to_user", None)
+        receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
+        if isinstance(adapter_mapping, dict) and ssrc in adapter_mapping:
+            raw_user_id = adapter_mapping.get(ssrc)
+        else:
+            raw_user_id = (
+                receiver_mapping.get(ssrc) if isinstance(receiver_mapping, dict) else None
+            )
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            user_id = 0
+        display_name = ""
+        if user_id > 0 and self._bridge is not None:
+            voice_client = self._bridge.get("voice_client")
+            channel = getattr(voice_client, "channel", None)
+            for member in getattr(channel, "members", ()) or ():
+                if getattr(member, "id", None) == user_id:
+                    display_name = str(getattr(member, "display_name", "") or "")
+                    break
+        return {
+            "ssrc": int(ssrc),
+            "user_id": user_id or None,
+            "display_name": display_name,
+        }
+
+    def _notify_speaker(self, speaker: dict[str, Any]) -> None:
+        notifier = self._speaker_notifier
+        if notifier is None:
+            return
+        user_id = speaker["user_id"]
+        key = ("user", user_id) if user_id is not None else ("ssrc", speaker["ssrc"])
+        if key == self._last_speaker_key:
+            return
+        self._last_speaker_key = key
+        generation = self._speaker_notifier_generation
+        loop = self._loop
+        if loop is None:
+            self._deliver_speaker(generation, notifier, speaker)
+            return
+        with suppress(RuntimeError):  # loop closed while the receiver thread drains
+            loop.call_soon_threadsafe(
+                self._deliver_speaker, generation, notifier, speaker
+            )
 
     def _drain_receiver(self, receiver: Any) -> None:
         """Move whatever the host just decoded into our queue, at our rate.
@@ -556,6 +631,7 @@ class DiscordAudio:
                 self._capture_remainder[ssrc] = remainder
                 if not converted:
                     continue
+                self._notify_speaker(self._speaker_for_ssrc(receiver, ssrc))
                 try:
                     self._inbound.put_nowait(converted)
                 except queue.Full:
