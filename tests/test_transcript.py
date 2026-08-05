@@ -137,18 +137,43 @@ def test_live_capture_is_not_swept_until_finish(tmp_path):
     assert not capture.path.exists()
 
 
-def test_next_process_recovers_force_killed_active_capture(tmp_path, monkeypatch):
-    capture = talk_transcript.TranscriptCapture(tmp_path)
-    capture.append_turn("user", _long_turn("killed user"))
-    capture.append_turn("assistant", _long_turn("killed assistant"))
-    prompts = []
-    # A new process starts with an empty in-process writer registry.
-    monkeypatch.setattr(talk_transcript, "_ACTIVE_TRANSCRIPTS", set())
+def test_other_process_skips_live_capture_then_recovers_it_after_force_kill(tmp_path):
+    code = "\n".join(
+        [
+            "import time",
+            "from pathlib import Path",
+            "import talk_transcript",
+            f"capture = talk_transcript.TranscriptCapture(Path({str(tmp_path)!r}))",
+            f"capture.append_turn('user', {_long_turn('live child user')!r})",
+            f"capture.append_turn('assistant', {_long_turn('live child assistant')!r})",
+            "print(capture.path, flush=True)",
+            "time.sleep(60)",
+        ]
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        capture_path = Path(child.stdout.readline().strip())
+        assert capture_path.exists()
+        prompts = []
+
+        talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+
+        assert prompts == []
+        assert capture_path.exists()
+    finally:
+        child.kill()
+        child.wait(timeout=5)
 
     talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
 
     assert len(prompts) == 1
-    assert not capture.path.exists()
+    assert not capture_path.exists()
 
 
 def test_sweep_claims_and_flushes_a_qualifying_orphan(tmp_path):
@@ -170,6 +195,7 @@ def test_next_start_recovers_a_claim_left_by_a_killed_sweeper(tmp_path):
     capture = talk_transcript.TranscriptCapture(tmp_path)
     capture.append_turn("user", _long_turn("orphan user"))
     capture.append_turn("assistant", _long_turn("orphan assistant"))
+    capture.finish()
     orphaned_claim = capture.path.with_name(capture.path.name + ".claimed-deadgateway")
     os.rename(capture.path, orphaned_claim)
     prompts = []
@@ -197,6 +223,52 @@ def test_sweep_drops_a_symlink_that_escapes_the_transcript_directory(tmp_path):
 
     assert outside.exists()
     assert not link.exists()
+
+
+def test_path_swap_between_validation_and_claim_never_reads_outside_root(
+    tmp_path, monkeypatch
+):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("safe user"))
+    capture.append_turn("assistant", _long_turn("safe assistant"))
+    capture.finish()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text(
+        "\n".join(
+            [
+                json.dumps({"role": "user", "text": _long_turn("OUTSIDE SECRET user")}),
+                json.dumps(
+                    {"role": "assistant", "text": _long_turn("OUTSIDE SECRET assistant")}
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original_rename = os.rename
+    swapped = False
+
+    def swap_then_rename(source, destination):
+        nonlocal swapped
+        if Path(source) == capture.path and not swapped:
+            swapped = True
+            capture.path.unlink()
+            try:
+                capture.path.symlink_to(outside)
+            except OSError:
+                import pytest
+
+                pytest.skip("symlink creation is unavailable")
+        return original_rename(source, destination)
+
+    monkeypatch.setattr(os, "rename", swap_then_rename)
+    prompts = []
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+
+    assert swapped
+    assert all("OUTSIDE SECRET" not in prompt for prompt in prompts)
+    assert outside.exists()
 
 
 def test_noise_below_turn_or_character_gate_is_dropped(tmp_path):
@@ -305,6 +377,80 @@ def test_default_handoff_never_blocks_sweep_startup(tmp_path, monkeypatch):
     release.set()
 
 
+def test_detached_handoff_lease_blocks_another_process_until_done(tmp_path, monkeypatch):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("detached user"))
+    capture.append_turn("assistant", _long_turn("detached assistant"))
+    capture.finish()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(_prompt):
+        entered.set()
+        release.wait(timeout=5)
+        return "WORK_STARTED — accepted"
+
+    monkeypatch.setattr(talk_transcript, "_default_run_agent", blocked)
+    talk_transcript.sweep_transcripts(tmp_path)
+    assert entered.wait(timeout=1)
+    code = (
+        "from pathlib import Path; import talk_transcript; "
+        f"talk_transcript.sweep_transcripts(Path({str(tmp_path)!r}), "
+        "lambda _prompt: print('OTHER_FLUSHED'))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout == ""
+    release.set()
+    root = tmp_path / "state" / "talk-transcripts"
+    deadline = time.monotonic() + 2
+    while any(root.glob("*.claimed-*")) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not list(root.glob("*.claimed-*"))
+
+
+def test_force_killed_sweeper_claim_is_recovered_by_next_process(tmp_path):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("crashed sweep user"))
+    capture.append_turn("assistant", _long_turn("crashed sweep assistant"))
+    capture.finish()
+    code = "\n".join(
+        [
+            "import time",
+            "from pathlib import Path",
+            "import talk_transcript",
+            "def block(_prompt):",
+            "    print('CLAIMED', flush=True)",
+            "    time.sleep(60)",
+            f"talk_transcript.sweep_transcripts(Path({str(tmp_path)!r}), block)",
+        ]
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "CLAIMED"
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    prompts = []
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+
+    assert len(prompts) == 1
+
+
 def test_failed_claimed_flush_is_logged_dropped_and_does_not_block_next_file(
     tmp_path, caplog
 ):
@@ -379,3 +525,32 @@ def test_child_process_does_not_reclaim_parent_process_live_claim(tmp_path):
     talk_transcript.sweep_transcripts(tmp_path, run_agent=flush_while_child_sweeps)
 
     assert child_outputs == [""]
+
+
+def test_dead_claim_is_recovered_when_pid_now_belongs_to_unrelated_live_process(tmp_path):
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        root = tmp_path / "state" / "talk-transcripts"
+        root.mkdir(parents=True)
+        claimed = root / f"orphan.jsonl.claimed-{sleeper.pid}-reused"
+        claimed.write_text(
+            "\n".join(
+                [
+                    json.dumps({"role": "user", "text": _long_turn("reused pid user")}),
+                    json.dumps(
+                        {"role": "assistant", "text": _long_turn("reused pid assistant")}
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        prompts = []
+
+        talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+
+        assert len(prompts) == 1
+        assert not claimed.exists()
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=5)

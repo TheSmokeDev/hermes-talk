@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import threading
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -27,28 +29,116 @@ def _safe_root(home: Path, root: Path) -> Path | None:
     return resolved if resolved.is_relative_to(home) else None
 
 
-def _claim_owner_is_live(path: Path) -> bool:
-    """Whether a PID-bearing claim belongs to another still-live process."""
+def _lease_path(path: Path) -> Path:
+    """Return the stable lease name shared by an original and all its claims."""
 
-    marker = path.name.rsplit(".claimed-", 1)
-    if len(marker) != 2:
-        return False
+    original_name = path.name.split(".claimed-", 1)[0]
+    return path.with_name(f"{original_name}.lease")
+
+
+class _Lease:
+    """An OS-owned one-byte lock, released by the kernel when a process dies."""
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self.fd = fd
+
+    @classmethod
+    def try_acquire(cls, path: Path) -> _Lease | None:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return cls(path, fd)
+
+    def close(self) -> None:
+        if self.fd < 0:
+            return
+        fd, self.fd = self.fd, -1
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_windows_read_shared(path: Path) -> int:
+    """Open without following reparse points and permit the subsequent rename."""
+
+    import ctypes
+    import msvcrt
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002 | 0x00000004,  # FILE_SHARE_READ | WRITE | DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        owner_pid = int(marker[1].split("-", 1)[0])
-    except (TypeError, ValueError):
-        return False
-    if owner_pid == os.getpid():
-        # Same-process claims are protected by _ACTIVE_TRANSCRIPTS. If the
-        # registry no longer owns one, its worker failed before handoff and a
-        # later sweep in this process may recover it.
-        return path in _ACTIVE_TRANSCRIPTS
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        raise
+
+
+def _open_verified_regular(path: Path) -> int:
+    """Open first, then prove the directory entry names that regular file."""
+
+    if os.name == "nt":
+        fd = _open_windows_read_shared(path)
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
     try:
-        os.kill(owner_pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        opened = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode):
+            raise OSError("transcript is not a regular file")
+        if not _same_file(opened, named):
+            raise OSError("transcript changed while it was opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class TranscriptCapture:
@@ -59,6 +149,7 @@ class TranscriptCapture:
         self._home, self._root = _roots(hermes_home)
         self.path = self._root / f"{uuid.uuid4().hex}.jsonl"
         self._finished = False
+        self._lease: _Lease | None = None
         with _ACTIVE_LOCK:
             _ACTIVE_TRANSCRIPTS.add(self.path)
 
@@ -83,6 +174,11 @@ class TranscriptCapture:
                     _log.warning("unsafe Talk transcript root was refused: %s", self._root)
                     return
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                if self._lease is None:
+                    self._lease = _Lease.try_acquire(_lease_path(self.path))
+                    if self._lease is None:
+                        _log.warning("Talk transcript writer lease could not be acquired")
+                        return
                 with self.path.open("a", encoding="utf-8", newline="\n") as stream:
                     stream.write(row + "\n")
             except Exception as exc:  # noqa: BLE001 - capture cannot break a live call
@@ -94,11 +190,24 @@ class TranscriptCapture:
         with _ACTIVE_LOCK:
             self._finished = True
             _ACTIVE_TRANSCRIPTS.discard(self.path)
+            if self._lease is not None:
+                try:
+                    self._lease.close()
+                except OSError as exc:
+                    _log.warning("Talk transcript writer lease could not be released: %s", exc)
+                self._lease = None
+
+    def __del__(self) -> None:
+        lease = getattr(self, "_lease", None)
+        if lease is not None:
+            with suppress(OSError):
+                lease.close()
 
 
-def _read_turns(path: Path) -> list[dict[str, str]]:
+def _read_turns(fd: int) -> list[dict[str, str]]:
     turns = []
-    with path.open(encoding="utf-8", errors="replace") as stream:
+    os.lseek(fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(fd), encoding="utf-8", errors="replace") as stream:
         for line in stream:
             try:
                 row = json.loads(line)
@@ -141,11 +250,16 @@ def _default_run_agent(prompt: str) -> str:
     return talk_host.host().run_agent(prompt, background=False)
 
 
-def _finish_claim(claimed: Path, flush: Callable[[str], object]) -> None:
-    """Process one claimed file, then drop it regardless of handoff outcome."""
+def _finish_claim(
+    claimed: Path,
+    transcript_fd: int,
+    lease: _Lease,
+    flush: Callable[[str], object],
+) -> None:
+    """Process one descriptor-bound claim, then drop it regardless of outcome."""
 
     try:
-        turns = _read_turns(claimed)
+        turns = _read_turns(transcript_fd)
         chars = sum(len(turn["text"]) for turn in turns)
         if len(turns) < MIN_TURNS or chars < MIN_CHARS:
             return
@@ -160,26 +274,37 @@ def _finish_claim(claimed: Path, flush: Callable[[str], object]) -> None:
         )
     finally:
         try:
+            with suppress(OSError):
+                os.close(transcript_fd)
             claimed.unlink(missing_ok=True)
         except OSError as exc:
             _log.warning("claimed Talk transcript could not be deleted: %s", exc)
         finally:
             with _ACTIVE_LOCK:
                 _ACTIVE_TRANSCRIPTS.discard(claimed)
+            try:
+                lease.close()
+            finally:
+                with suppress(OSError):
+                    lease.path.unlink(missing_ok=True)
 
 
-def _start_default_handoff(claimed: Path) -> None:
-    """Detach the host handoff so a slow agent lane cannot delay call startup."""
+def _start_default_handoff(claimed: Path, transcript_fd: int, lease: _Lease) -> None:
+    """Detach the host handoff while retaining its descriptor and OS lease."""
 
     worker = threading.Thread(
         target=_finish_claim,
-        args=(claimed, _default_run_agent),
+        args=(claimed, transcript_fd, lease, _default_run_agent),
         daemon=True,
         name="talk-memory-handoff",
     )
     try:
         worker.start()
     except Exception as exc:  # noqa: BLE001 - startup remains fail-open
+        with suppress(OSError):
+            os.close(transcript_fd)
+        with suppress(OSError):
+            lease.close()
         with _ACTIVE_LOCK:
             _ACTIVE_TRANSCRIPTS.discard(claimed)
         _log.warning(
@@ -202,34 +327,59 @@ def _sweep_transcripts(
     if root_resolved is None:
         _log.warning("unsafe Talk transcript root was refused: %s", root)
         return
-    # Claimed rows only survive a force-kill during a prior sweep. Snapshot
-    # before claiming so racing sweepers never mistake a live claim for stale.
+    # Claimed rows only survive a force-kill during a prior sweep. Their stable
+    # sidecar lease, not a PID marker, proves whether any writer/handoff owns them.
     candidates = [*root.glob("*.jsonl"), *root.glob("*.claimed-*")]
     for source in candidates:
+        lease: _Lease | None = None
+        transcript_fd: int | None = None
+        claimed: Path | None = None
+        handed_off = False
         try:
             if source.is_symlink() or source.resolve().parent != root_resolved:
                 _log.warning("dropping unsafe Talk transcript path: %s", source)
                 source.unlink(missing_ok=True)
                 continue
             with _ACTIVE_LOCK:
-                if source in _ACTIVE_TRANSCRIPTS or _claim_owner_is_live(source):
+                if source in _ACTIVE_TRANSCRIPTS:
                     continue
-                claimed = source.with_name(
-                    f"{source.name}.claimed-{os.getpid()}-{uuid.uuid4().hex}"
-                )
-                try:
-                    # Deliberately not os.replace: only one racing sweeper can move
-                    # the source, and the unique destination can never be replaced.
-                    os.rename(source, claimed)
-                except FileNotFoundError:
-                    continue
+            lease = _Lease.try_acquire(_lease_path(source))
+            if lease is None:
+                continue
+            transcript_fd = _open_verified_regular(source)
+            claimed = source.with_name(
+                f"{source.name}.claimed-{os.getpid()}-{uuid.uuid4().hex}"
+            )
+            # Only one lease holder may claim this identity. The post-rename
+            # lstat comparison catches a path swap injected after validation.
+            os.rename(source, claimed)
+            claimed_stat = os.stat(claimed, follow_symlinks=False)
+            opened_stat = os.fstat(transcript_fd)
+            if not stat.S_ISREG(claimed_stat.st_mode) or not _same_file(
+                opened_stat, claimed_stat
+            ):
+                _log.warning("dropping Talk transcript path swapped during claim: %s", claimed)
+                claimed.unlink(missing_ok=True)
+                continue
+            with _ACTIVE_LOCK:
                 _ACTIVE_TRANSCRIPTS.add(claimed)
             if run_agent is None:
-                _start_default_handoff(claimed)
+                _start_default_handoff(claimed, transcript_fd, lease)
             else:
-                _finish_claim(claimed, run_agent)
+                _finish_claim(claimed, transcript_fd, lease, run_agent)
+            handed_off = True
+        except FileNotFoundError:
+            continue
         except Exception as exc:  # noqa: BLE001 - sweeps must never affect a call/session
             _log.warning("Talk transcript sweep skipped a file: %s: %s", type(exc).__name__, exc)
+        finally:
+            if not handed_off:
+                if transcript_fd is not None:
+                    with suppress(OSError):
+                        os.close(transcript_fd)
+                if lease is not None:
+                    with suppress(OSError):
+                        lease.close()
 
 
 def sweep_transcripts(
