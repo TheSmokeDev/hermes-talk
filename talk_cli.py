@@ -23,12 +23,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import re
 import sys
 import time
 import uuid
+from contextlib import suppress
 
 try:
     from . import (
@@ -39,7 +39,9 @@ try:
         talk_host,
         talk_identity,
         talk_lifecycle,
+        talk_openai_realtime,
         talk_operator_auth,
+        talk_realtime,
         talk_runs,
         talk_steer,
         talk_tools,
@@ -55,7 +57,9 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_host
     import talk_identity
     import talk_lifecycle
+    import talk_openai_realtime
     import talk_operator_auth
+    import talk_realtime
     import talk_runs
     import talk_steer
     import talk_tools
@@ -100,11 +104,36 @@ def build_session_update(
     }
 
 
-def started_run_ids(messages: list[dict]) -> list[int]:
+def _tool_definitions(tools: list[dict]) -> tuple[talk_realtime.ToolDefinition, ...]:
+    """Lift Hermes' provider-independent function schemas into the contract."""
+
+    return tuple(
+        talk_realtime.ToolDefinition(
+            name=str(tool.get("name") or ""),
+            description=str(tool.get("description") or ""),
+            parameters=(
+                tool.get("parameters")
+                if isinstance(tool.get("parameters"), dict)
+                else {}
+            ),
+        )
+        for tool in tools
+        if tool.get("type") == "function"
+    )
+
+
+def started_run_ids(messages) -> list[int]:
     """Run ids announced by WORK_STARTED sentinels in outgoing tool results."""
 
     found: list[int] = []
     for message in messages:
+        if isinstance(message, talk_realtime.SubmitToolResult):
+            output = message.output
+            for match in WORK_STARTED_RE.finditer(output):
+                found.append(int(match.group(1)))
+            continue
+        if not isinstance(message, dict):
+            continue
         item = message.get("item")
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
             continue
@@ -113,8 +142,10 @@ def started_run_ids(messages: list[dict]) -> list[int]:
     return found
 
 
-def _announcement_messages(headline: str, report: str) -> list[dict]:
-    """Wire messages that make the model SPEAK a background result safely.
+def _announcement_commands(
+    headline: str, report: str
+) -> list[talk_realtime.RealtimeCommand]:
+    """Neutral commands that make the model speak a background result safely.
 
     Background output is UNTRUSTED data — a child that read a hostile
     repository or web page can carry injected instructions in its summary.
@@ -145,22 +176,21 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
         else ""
     )
     return [
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "id": item_id,
-                "type": "message",
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"{headline} Tell the operator briefly.{framing}",
-                    }
-                ],
-            },
-        },
-        {"type": "response.create", "response": {"tool_choice": "none"}},
-        {"type": "conversation.item.delete", "item_id": item_id},
+        talk_realtime.AddContext(
+            item_id=item_id,
+            text=f"{headline} Tell the operator briefly.{framing}",
+        ),
+        talk_realtime.StartResponse(allow_tools=False),
+        talk_realtime.RemoveContext(item_id=item_id),
+    ]
+
+
+def _announcement_messages(headline: str, report: str) -> list[dict]:
+    """Compatibility view of :func:`_announcement_commands` for callers/tests."""
+
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in _announcement_commands(headline, report)
     ]
 
 
@@ -213,45 +243,40 @@ class SpeakerPacketLane:
         )
 
     def outgoing(self, speaker: dict | None, pcm: bytes) -> list[dict]:
+        """Compatibility wire view of :meth:`commands`."""
+
+        return [
+            talk_openai_realtime.encode_command(command)
+            for command in self.commands(speaker, pcm)
+        ]
+
+    def commands(
+        self, speaker: dict | None, pcm: bytes
+    ) -> list[talk_realtime.RealtimeCommand]:
         """Build one indivisible context-transition plus audio append batch."""
 
-        messages: list[dict] = []
+        commands: list[talk_realtime.RealtimeCommand] = []
         if speaker is not None:
             key, payload, policy = self._identity(speaker)
             if key != self._speaker_key:
                 if self._context_item_id is not None:
-                    messages.append(
-                        {"type": "conversation.item.delete", "item_id": self._context_item_id}
+                    commands.append(
+                        talk_realtime.RemoveContext(item_id=self._context_item_id)
                     )
                 item_id = f"talkspk{uuid.uuid4().hex[:20]}"
-                messages.append(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "id": item_id,
-                            "type": "message",
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": (
-                                        f"{policy}\nSpeaker metadata, JSON-quoted untrusted data:\n"
-                                        f"{json.dumps(payload, ensure_ascii=False)}"
-                                    ),
-                                }
-                            ],
-                        },
-                    }
+                commands.append(
+                    talk_realtime.AddContext(
+                        item_id=item_id,
+                        text=(
+                            f"{policy}\nSpeaker metadata, JSON-quoted untrusted data:\n"
+                            f"{json.dumps(payload, ensure_ascii=False)}"
+                        ),
+                    )
                 )
                 self._speaker_key = key
                 self._context_item_id = item_id
-        messages.append(
-            {
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(pcm).decode("ascii"),
-            }
-        )
-        return messages
+        commands.append(talk_realtime.AppendInputAudio(data=pcm))
+        return commands
 
 
 class ToolResponseCoordinator:
@@ -263,15 +288,33 @@ class ToolResponseCoordinator:
     continuation are sent as a single socket batch.
     """
 
-    def __init__(self, relay, send_batch, *, max_pending: int) -> None:
+    def __init__(
+        self, relay, send_batch, *, max_pending: int, provider_neutral: bool = False
+    ) -> None:
         self.relay = relay
         self.send_batch = send_batch
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_pending)
-        self.outputs: list[list[dict] | None] = []
+        self.outputs: list[list | None] = []
         self.closed = False
         self.failed = False
-        self._continuation: dict = {"type": "response.create"}
+        self.provider_neutral = provider_neutral
+        self._continuation = self._default_continuation()
         self._flush_lock = asyncio.Lock()
+
+    def _default_continuation(self):
+        return (
+            talk_realtime.StartResponse()
+            if self.provider_neutral
+            else {"type": "response.create"}
+        )
+
+    @staticmethod
+    def _neutral_continuation(candidate):
+        response = candidate.get("response") if isinstance(candidate, dict) else None
+        metadata = response.get("metadata") if isinstance(response, dict) else None
+        return talk_realtime.StartResponse(
+            metadata=metadata if isinstance(metadata, dict) else {}
+        )
 
     def admit(self, event: dict) -> bool:
         if self.closed:
@@ -280,16 +323,22 @@ class ToolResponseCoordinator:
         self.outputs.append(None)
         candidate = event.get(talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY)
         candidate = candidate if isinstance(candidate, dict) else {"type": "response.create"}
+        if self.provider_neutral:
+            candidate = self._neutral_continuation(candidate)
         if position == 0:
             self._continuation = candidate
         elif candidate != self._continuation:
             # Mixed/missing attribution in one response can continue talking,
             # but its continuation must carry no authorization binding.
-            self._continuation = {"type": "response.create"}
+            self._continuation = self._default_continuation()
         try:
             self.queue.put_nowait((position, event))
         except asyncio.QueueFull:
-            self.outputs[position] = self.relay.tool_queue_full_output(event)
+            self.outputs[position] = (
+                self.relay.tool_queue_full_commands(event)
+                if self.provider_neutral
+                else self.relay.tool_queue_full_output(event)
+            )
             return False
         return True
 
@@ -316,13 +365,17 @@ class ToolResponseCoordinator:
                 raise
             self.outputs = []
             self.closed = False
-            self._continuation = {"type": "response.create"}
+            self._continuation = self._default_continuation()
 
     async def run(self) -> None:
         while True:
             position, event = await self.queue.get()
             try:
-                self.outputs[position] = await self.relay.handle_event_async(event)
+                self.outputs[position] = await (
+                    self.relay.handle_tool_call_async(event)
+                    if self.provider_neutral
+                    else self.relay.handle_event_async(event)
+                )
                 await self._flush_if_ready()
             finally:
                 self.queue.task_done()
@@ -357,8 +410,8 @@ async def pump_announcements(
     one response seeing two temporary system items, confirmations merged or
     lost, or the server rejecting a second active response. Each batch also
     defers (bounded) until no response is in flight, so an announcement
-    never stomps the model mid-sentence. A failed send costs that batch
-    only — the pump never dies of a closing socket.
+    never stomps the model mid-sentence. Legacy direct-socket callers drop a
+    failed batch; provider-session sends surface failure to the supervisor.
     """
 
     while True:
@@ -371,8 +424,11 @@ async def pump_announcements(
             else:
                 for out in batch:
                     await ws.send_json(out)
-        except Exception:  # noqa: BLE001 — a closing socket costs one batch
-            pass
+        except Exception:
+            if send_batch is not None:
+                # Provider-session sends are terminal once rejected. Let the
+                # monitored pump fail so the supervisor tears down the call.
+                raise
 
 
 def landed_note_messages(subagent_id: str) -> list[dict]:
@@ -383,10 +439,17 @@ def landed_note_messages(subagent_id: str) -> list[dict]:
     every out-of-band injection into the conversation obeys one contract.
     """
 
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in landed_note_commands(subagent_id)
+    ]
+
+
+def landed_note_commands(subagent_id: str) -> list[talk_realtime.RealtimeCommand]:
     subagent_id = str(subagent_id or "")
     if not subagent_id:
         return []
-    return _announcement_messages(
+    return _announcement_commands(
         f"The steering note to {subagent_id} just landed — the agent has it.", ""
     )
 
@@ -394,12 +457,21 @@ def landed_note_messages(subagent_id: str) -> list[dict]:
 def run_finished_messages(run: dict) -> list[dict]:
     """The wire messages that make the model SPEAK a finished run's result."""
 
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in run_finished_commands(run)
+    ]
+
+
+def run_finished_commands(run: dict) -> list[talk_realtime.RealtimeCommand]:
+    """Provider-neutral commands that make the model speak a finished run."""
+
     tail = str(run.get("output") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
     verb = "finished" if run.get("status") == "done" else "failed"
     headline = f"Background run #{run.get('runId')} {verb}" + (
         "." if tail else " with no output."
     )
-    return _announcement_messages(headline, tail)
+    return _announcement_commands(headline, tail)
 
 
 #: ``child_status`` → the verb the model is prompted with. Values from
@@ -423,6 +495,15 @@ def subagent_stop_messages(event: dict) -> list[dict]:
     filtered to top-level children.
     """
 
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in subagent_stop_commands(event)
+    ]
+
+
+def subagent_stop_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """Provider-neutral contained announcement for a finished child."""
+
     subagent_id = str(event.get("subagent_id") or "")
     if not subagent_id:
         return []
@@ -436,7 +517,7 @@ def subagent_stop_messages(event: dict) -> list[dict]:
     headline = f"Background agent {subagent_id}{role_part} {verb}" + (
         "." if tail else " with no summary."
     )
-    return _announcement_messages(headline, tail)
+    return _announcement_commands(headline, tail)
 
 
 def _active_parent_session_id() -> str | None:
@@ -490,7 +571,48 @@ def _mint_session(
         raise
 
 
-async def run_talk_session(audio: object | None = None) -> int:
+def _openai_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
+    """Build the current provider adapter behind the neutral session contract."""
+
+    return talk_openai_realtime.OpenAIRealtimeSession(
+        auth_token=auth.token,
+        auth_source=auth.source,
+        aiohttp_module=_import_aiohttp(),
+        # Keep the established 401 remediation and this module's test seam.
+        mint_session=lambda setup: _mint_session(
+            auth,
+            model=setup.model,
+            voice=setup.voice,
+            instructions=setup.instructions,
+            tools=[
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": dict(tool.parameters),
+                }
+                for tool in setup.tools
+            ],
+        ),
+    )
+
+
+def _neutral_response_command(message: dict) -> talk_realtime.StartResponse:
+    response = message.get("response") if isinstance(message, dict) else None
+    metadata = response.get("metadata") if isinstance(response, dict) else None
+    return talk_realtime.StartResponse(
+        metadata=metadata if isinstance(metadata, dict) else {},
+        allow_tools=(
+            False
+            if isinstance(response, dict) and response.get("tool_choice") == "none"
+            else None
+        ),
+    )
+
+
+async def run_talk_session(
+    audio: object | None = None, *, session_factory=None
+) -> int:
     """Run one voice session. Returns a process exit code.
 
     ``audio`` is any object with :class:`talk_audio.DuplexAudio`'s surface —
@@ -538,17 +660,14 @@ async def run_talk_session(audio: object | None = None) -> int:
         print(f"talk: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        descriptor = _mint_session(
-            auth, model=model, voice=voice, instructions=instructions, tools=tools
-        )
-    except talk_wire.TalkWireError as exc:
-        print(f"talk: {exc}", file=sys.stderr)
-        audio.stop()
-        return 1
-
-    aiohttp = _import_aiohttp()
-    pending: list[dict] = []
+    setup = talk_realtime.SessionSetup(
+        model=model,
+        voice=voice,
+        instructions=instructions,
+        tools=_tool_definitions(tools),
+        automatic_response=authorization_ledger is None,
+    )
+    pending: list[talk_realtime.RealtimeCommand] = []
     watchers: list[asyncio.Task] = []
     watched: set[int] = set()
     spoken_item: str | None = None
@@ -558,12 +677,9 @@ async def run_talk_session(audio: object | None = None) -> int:
         audio.drain_playback()
         if relay.last_audio_item_id and played > 0:
             pending.append(
-                {
-                    "type": "conversation.item.truncate",
-                    "item_id": relay.last_audio_item_id,
-                    "content_index": 0,
-                    "audio_end_ms": played,
-                }
+                talk_realtime.TruncateOutput(
+                    item_id=relay.last_audio_item_id, audio_end_ms=played
+                )
             )
 
     def on_caption(text: str) -> None:
@@ -585,250 +701,15 @@ async def run_talk_session(audio: object | None = None) -> int:
             else None
         ),
     )
-
-    session_update = build_session_update(
-        model=model, voice=voice, instructions=instructions, tools=tools
-    )
-    if authorization_ledger is not None:
-        # Automatic server responses carry no client metadata that can bind
-        # them to a speaker. Discord therefore creates one response itself at
-        # the committed VAD boundary, with an opaque trusted binding token.
-        session_update["session"]["audio"]["input"]["turn_detection"][
-            "create_response"
-        ] = False
-
+    session = None
+    result = 0
     try:
-        async with aiohttp.ClientSession() as http:  # noqa: SIM117 - flattening buries the socket args
-            async with http.ws_connect(
-                f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={model}",
-                headers={
-                    # The ephemeral secret from the mint — the raw key/OAuth
-                    # token never touches the socket. No OpenAI-Beta header:
-                    # that opts into the RETIRED beta protocol and the GA
-                    # endpoint refuses the call (live-canary finding).
-                    "Authorization": f"Bearer {descriptor.client_secret}",
-                },
-                timeout=CONNECT_TIMEOUT_S,
-                heartbeat=20.0,
-            ) as ws:
-                send_lock = asyncio.Lock()
-                continuation_pending = False
-                packet_lane = SpeakerPacketLane()
-
-                def start_watchers(messages: list[dict]) -> None:
-                    for run_id in started_run_ids(messages):
-                        if run_id in watched:
-                            continue
-                        watched.add(run_id)
-                        watchers.append(asyncio.create_task(watch_run(run_id)))
-
-                async def send_outgoing(outgoing: list[dict]) -> None:
-                    """Serialize every socket write; keep multi-message batches contiguous."""
-
-                    nonlocal continuation_pending
-                    async with send_lock:
-                        for out in outgoing:
-                            if out.get("type") == "response.create":
-                                continuation_pending = True
-                            await ws.send_json(out)
-                    start_watchers(outgoing)
-
-                await send_outgoing([session_update])
-                print(
-                    f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
-                    "Ctrl+C to hang up.\n"
-                )
-
-                async def send_microphone() -> None:
-                    read_packet = getattr(audio, "read_input_packet", None)
-                    while True:
-                        if callable(read_packet):
-                            packet = read_packet()
-                            speaker = packet.speaker if packet is not None else None
-                            chunk = packet.pcm if packet is not None else None
-                        else:
-                            speaker = None
-                            chunk = audio.read_input_chunk()
-                        if chunk is None:
-                            await asyncio.sleep(IDLE_POLL_S)
-                            continue
-                        if authorization_ledger is not None:
-                            authorization_ledger.record_packet(speaker, chunk)
-                        await send_outgoing(packet_lane.outgoing(speaker, chunk))
-
-                async def watch_run(run_id: int) -> None:
-                    """Poll one background run and speak its result when it lands.
-
-                    Sends on the socket directly rather than queueing: if the
-                    operator has gone quiet, no inbound event will arrive to
-                    flush a queue, and the result would sit unspoken until the
-                    next thing they said.
-                    """
-
-                    deadline = time.monotonic() + talk_config.agent_timeout_s()
-                    while time.monotonic() < deadline:
-                        await asyncio.sleep(WATCH_POLL_S)
-                        run = talk_runs.get_run(run_id)
-                        if run is None:
-                            return
-                        if run["status"] in talk_runs.TERMINAL_STATUSES:
-                            await announce_queue.put(run_finished_messages(run))
-                            return
-
-                tool_coordinator = ToolResponseCoordinator(
-                    relay, send_outgoing, max_pending=TOOL_SESSION_QUEUE_SIZE
-                )
-
-                async def receive_events() -> None:
-                    nonlocal continuation_pending, spoken_item
-                    async for message in ws:
-                        if message.type is not aiohttp.WSMsgType.TEXT:
-                            continue
-                        try:
-                            event = json.loads(message.data)
-                        except ValueError:
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-                        event_type = event.get("type")
-                        if authorization_ledger is not None:
-                            if event_type == "input_audio_buffer.speech_started":
-                                authorization_ledger.note_speech_started(event)
-                            elif event_type == "input_audio_buffer.speech_stopped":
-                                authorization_ledger.note_speech_stopped(event)
-                            elif event_type == "response.created":
-                                authorization_ledger.note_response_created(event)
-                            elif event_type == "response.function_call_arguments.done":
-                                event = authorization_ledger.bind_tool_event(event)
-                        if event.get("type") == "response.created":
-                            continuation_pending = False
-                        if event.get("type") == "response.function_call_arguments.done":
-                            tool_coordinator.admit(event)
-                            continue
-                        outgoing = relay.handle_event(event)
-                        if (
-                            authorization_ledger is not None
-                            and event_type == "input_audio_buffer.committed"
-                        ):
-                            response_create = authorization_ledger.response_for_commit(event)
-                            if response_create is not None:
-                                outgoing.append(response_create)
-                        if event.get("type") == "response.done":
-                            continued = bool(tool_coordinator.outputs)
-                            await tool_coordinator.response_done()
-                            response = event.get("response")
-                            response_id = (
-                                response.get("id") if isinstance(response, dict) else None
-                            )
-                            if authorization_ledger is not None:
-                                authorization_ledger.complete_response(
-                                    response_id, continued=continued
-                                )
-                        if pending:
-                            outgoing = [*outgoing, *pending]
-                            pending.clear()
-                        await send_outgoing(outgoing)
-                        if relay.last_audio_item_id != spoken_item:
-                            spoken_item = relay.last_audio_item_id
-                            audio.reset_played_ms()
-                        if event.get("type") == "response.done":
-                            print(flush=True)
-
-                announce_queue: asyncio.Queue = asyncio.Queue()
-
-                def on_subagent_event(event: dict) -> None:
-                    """Queue a finished child's announcement. Runs ON the loop
-                    thread — :mod:`talk_lifecycle` marshals hook threads here
-                    via ``call_soon_threadsafe``; the pump owns the sending."""
-
-                    messages = subagent_stop_messages(event)
-                    if messages:
-                        announce_queue.put_nowait(messages)
-
-                def on_note_landed(subagent_id: str) -> None:
-                    """Queue a landed steering note. Runs ON the loop thread."""
-
-                    messages = landed_note_messages(subagent_id)
-                    if messages:
-                        announce_queue.put_nowait(messages)
-
-                loop = asyncio.get_running_loop()
-                # Snapshot ownership once for this socket. Older Hermes builds
-                # do not expose the property; None deliberately suppresses
-                # lifecycle announcements instead of guessing from global
-                # hook traffic.
-                owner_session_id = _active_parent_session_id()
-                talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
-                # The notifier fires on HOST drain threads — marshal onto the
-                # loop; a closed loop raises into talk_steer's own containment.
-                talk_steer.set_landed_notifier(
-                    lambda sid: loop.call_soon_threadsafe(on_note_landed, sid)
-                )
-
-                sender = asyncio.create_task(send_microphone())
-                pump = asyncio.create_task(
-                    pump_announcements(
-                        announce_queue,
-                        relay,
-                        ws,
-                        send_outgoing,
-                        lambda: (
-                            relay.response_active
-                            or continuation_pending
-                            or bool(tool_coordinator.outputs)
-                        ),
-                    )
-                )
-                tool_worker = asyncio.create_task(tool_coordinator.run())
-                receiver = asyncio.create_task(receive_events())
-                drain = None
-                try:
-                    done, _pending_tasks = await asyncio.wait(
-                        {sender, receiver, tool_worker},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if sender in done:
-                        await sender
-                        raise RuntimeError("microphone sender stopped unexpectedly")
-                    if tool_worker in done:
-                        await tool_worker
-                    await receiver
-                    drain = asyncio.create_task(tool_coordinator.join())
-                    done, _pending_tasks = await asyncio.wait(
-                        {drain, tool_worker},
-                        timeout=TOOL_CLEANUP_WAIT_S,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if tool_worker in done:
-                        await tool_worker
-                    if drain not in done:
-                        raise TimeoutError("tool cleanup exceeded its bound")
-                    await drain
-                finally:
-                    talk_steer.set_landed_notifier(None)
-                    talk_lifecycle.detach_session()
-                    sender.cancel()
-                    pump.cancel()
-                    receiver.cancel()
-                    tool_worker.cancel()
-                    if drain is not None:
-                        drain.cancel()
-                    tool_coordinator.discard_pending()
-                    for watcher in watchers:
-                        watcher.cancel()
-                    await asyncio.gather(
-                        sender, pump, receiver, tool_worker,
-                        *([drain] if drain is not None else []), *watchers,
-                        return_exceptions=True
-                    )
+        session = (session_factory or _openai_session)(auth)
+        await session.connect(setup)
     except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
-        print(f"\ntalk: session ended: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        # Idempotent belts for the inner detaches: no exit path may leave the
-        # hook bus or ledger holding a callback into a dead session.
+        if session is not None:
+            with suppress(Exception):
+                await session.close()
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         if authorization_ledger is not None:
@@ -836,8 +717,289 @@ async def run_talk_session(audio: object | None = None) -> int:
         audio.stop()
         capture.finish()
         talk_transcript.sweep_transcripts(hermes_home)
+        raise
+    except Exception as exc:  # noqa: BLE001 — provider startup is a voice boundary
+        print(f"talk: {exc}", file=sys.stderr)
+        if session is not None:
+            with suppress(Exception):  # failed connect cleanup is best-effort
+                await session.close()
+        talk_steer.set_landed_notifier(None)
+        talk_lifecycle.detach_session()
+        if authorization_ledger is not None:
+            authorization_ledger.clear()
+        audio.stop()
+        capture.finish()
+        talk_transcript.sweep_transcripts(hermes_home)
+        return 1
 
-    return 0
+    try:
+        send_lock = asyncio.Lock()
+        continuation_pending = False
+        packet_lane = SpeakerPacketLane()
+
+        def start_watchers(messages) -> None:
+            for run_id in started_run_ids(messages):
+                if run_id in watched:
+                    continue
+                watched.add(run_id)
+                watchers.append(asyncio.create_task(watch_run(run_id)))
+
+        async def send_outgoing(outgoing) -> None:
+            """Serialize every provider write; keep multi-command batches contiguous."""
+
+            nonlocal continuation_pending
+            commands = tuple(outgoing)
+            async with send_lock:
+                if any(
+                    isinstance(command, talk_realtime.StartResponse)
+                    for command in commands
+                ):
+                    continuation_pending = True
+                await session.send(commands)
+            start_watchers(commands)
+
+        print(
+            f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
+            "Ctrl+C to hang up.\n"
+        )
+
+        async def send_microphone() -> None:
+            read_packet = getattr(audio, "read_input_packet", None)
+            while True:
+                if callable(read_packet):
+                    packet = read_packet()
+                    speaker = packet.speaker if packet is not None else None
+                    chunk = packet.pcm if packet is not None else None
+                else:
+                    speaker = None
+                    chunk = audio.read_input_chunk()
+                if chunk is None:
+                    await asyncio.sleep(IDLE_POLL_S)
+                    continue
+                if authorization_ledger is not None:
+                    authorization_ledger.record_packet(speaker, chunk)
+                await send_outgoing(packet_lane.commands(speaker, chunk))
+
+        async def watch_run(run_id: int) -> None:
+            """Poll one background run and speak its result when it lands.
+
+            Sends through the provider session directly rather than waiting
+            for inbound activity: if the operator has gone quiet, a completed
+            result still needs to be spoken without another prompt.
+            """
+
+            deadline = time.monotonic() + talk_config.agent_timeout_s()
+            while time.monotonic() < deadline:
+                await asyncio.sleep(WATCH_POLL_S)
+                run = talk_runs.get_run(run_id)
+                if run is None:
+                    return
+                if run["status"] in talk_runs.TERMINAL_STATUSES:
+                    await announce_queue.put(run_finished_commands(run))
+                    return
+
+        tool_coordinator = ToolResponseCoordinator(
+            relay,
+            send_outgoing,
+            max_pending=TOOL_SESSION_QUEUE_SIZE,
+            provider_neutral=True,
+        )
+
+        async def receive_events() -> None:
+            nonlocal continuation_pending, spoken_item
+            async for event in session:
+                if isinstance(event, talk_realtime.SessionTerminated):
+                    if event.state is talk_realtime.SessionState.FAILED:
+                        raise talk_realtime.RealtimeSessionError(
+                            event.detail or "provider session failed"
+                        )
+                    break
+                if authorization_ledger is not None:
+                    if isinstance(event, talk_realtime.SpeechStarted):
+                        authorization_ledger.note_speech_started(
+                            {"item_id": event.input_id, "audio_start_ms": event.offset_ms}
+                        )
+                    elif isinstance(event, talk_realtime.SpeechStopped):
+                        authorization_ledger.note_speech_stopped(
+                            {"item_id": event.input_id, "audio_end_ms": event.offset_ms}
+                        )
+                    elif isinstance(event, talk_realtime.ResponseStarted):
+                        authorization_ledger.note_response_created(
+                            {
+                                "response": {
+                                    "id": event.response_id,
+                                    "metadata": dict(event.metadata),
+                                }
+                            }
+                        )
+                    elif (
+                        isinstance(event, talk_realtime.ProviderFailure)
+                        and event.response_metadata
+                    ):
+                        authorization_ledger.note_response_created(
+                            {
+                                "response": {
+                                    "id": None,
+                                    "metadata": dict(event.response_metadata),
+                                }
+                            }
+                        )
+                if isinstance(event, talk_realtime.ProviderFailure) and event.terminal:
+                    relay.handle_realtime_event(event)
+                    raise talk_realtime.RealtimeSessionError(event.detail)
+                if isinstance(event, talk_realtime.ResponseStarted):
+                    continuation_pending = False
+                if isinstance(event, talk_realtime.FunctionCall):
+                    tool_event = {
+                        "call_id": event.call_id,
+                        "response_id": event.response_id,
+                        "name": event.name,
+                        "arguments": event.arguments,
+                    }
+                    if authorization_ledger is not None:
+                        tool_event = authorization_ledger.bind_tool_event(tool_event)
+                    tool_coordinator.admit(tool_event)
+                    continue
+                outgoing = relay.handle_realtime_event(event)
+                if (
+                    authorization_ledger is not None
+                    and isinstance(event, talk_realtime.InputAudioCommitted)
+                ):
+                    response_create = authorization_ledger.response_for_commit(
+                        {"item_id": event.input_id}
+                    )
+                    if response_create is not None:
+                        outgoing.append(_neutral_response_command(response_create))
+                if isinstance(event, talk_realtime.ResponseFinished):
+                    continued = bool(tool_coordinator.outputs)
+                    await tool_coordinator.response_done()
+                    if authorization_ledger is not None:
+                        authorization_ledger.complete_response(
+                            event.response_id, continued=continued
+                        )
+                if pending:
+                    outgoing = [*outgoing, *pending]
+                    pending.clear()
+                await send_outgoing(outgoing)
+                if relay.last_audio_item_id != spoken_item:
+                    spoken_item = relay.last_audio_item_id
+                    audio.reset_played_ms()
+                if isinstance(event, talk_realtime.ResponseFinished):
+                    print(flush=True)
+
+        announce_queue: asyncio.Queue = asyncio.Queue()
+
+        def on_subagent_event(event: dict) -> None:
+            """Queue a finished child's announcement on the session loop."""
+
+            commands = subagent_stop_commands(event)
+            if commands:
+                announce_queue.put_nowait(commands)
+
+        def on_note_landed(subagent_id: str) -> None:
+            """Queue a landed steering note on the session loop."""
+
+            commands = landed_note_commands(subagent_id)
+            if commands:
+                announce_queue.put_nowait(commands)
+
+        loop = asyncio.get_running_loop()
+        # Snapshot ownership once for this session. Older Hermes builds do not
+        # expose the property; None suppresses announcements instead of guessing.
+        owner_session_id = _active_parent_session_id()
+        talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
+        # The notifier fires on host drain threads; marshal back onto this loop.
+        talk_steer.set_landed_notifier(
+            lambda sid: loop.call_soon_threadsafe(on_note_landed, sid)
+        )
+
+        sender = asyncio.create_task(send_microphone())
+        pump = asyncio.create_task(
+            pump_announcements(
+                announce_queue,
+                relay,
+                session,
+                send_outgoing,
+                lambda: (
+                    relay.response_active
+                    or continuation_pending
+                    or bool(tool_coordinator.outputs)
+                ),
+            )
+        )
+        tool_worker = asyncio.create_task(tool_coordinator.run())
+        receiver = asyncio.create_task(receive_events())
+        drain = None
+        try:
+            done, _pending_tasks = await asyncio.wait(
+                {sender, pump, receiver, tool_worker},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender in done:
+                await sender
+                raise RuntimeError("microphone sender stopped unexpectedly")
+            if tool_worker in done:
+                await tool_worker
+            if pump in done:
+                await pump
+            await receiver
+            drain = asyncio.create_task(tool_coordinator.join())
+            done, _pending_tasks = await asyncio.wait(
+                {drain, pump, tool_worker},
+                timeout=TOOL_CLEANUP_WAIT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if tool_worker in done:
+                await tool_worker
+            if pump in done:
+                await pump
+            if drain not in done:
+                raise TimeoutError("tool cleanup exceeded its bound")
+            await drain
+        finally:
+            talk_steer.set_landed_notifier(None)
+            talk_lifecycle.detach_session()
+            sender.cancel()
+            pump.cancel()
+            receiver.cancel()
+            tool_worker.cancel()
+            if drain is not None:
+                drain.cancel()
+            tool_coordinator.discard_pending()
+            for watcher in watchers:
+                watcher.cancel()
+            await asyncio.gather(
+                sender,
+                pump,
+                receiver,
+                tool_worker,
+                *([drain] if drain is not None else []),
+                *watchers,
+                return_exceptions=True,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback
+        print(f"\ntalk: session ended: {type(exc).__name__}: {exc}", file=sys.stderr)
+        result = 1
+    finally:
+        # Idempotent belts for the inner detaches: no exit path may leave the
+        # hook bus or ledger holding a callback into a dead session.
+        talk_steer.set_landed_notifier(None)
+        talk_lifecycle.detach_session()
+        if authorization_ledger is not None:
+            authorization_ledger.clear()
+        try:
+            await session.close()
+        except Exception as exc:  # noqa: BLE001 — teardown must continue after adapter failure
+            print(f"\ntalk: session teardown failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            result = 1
+        finally:
+            audio.stop()
+            capture.finish()
+            talk_transcript.sweep_transcripts(hermes_home)
+
+    return result
 
 
 def setup_cli(subparser: argparse.ArgumentParser) -> None:

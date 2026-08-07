@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.pytest-tmp/
+.hermes-*.md
 .ruff_cache/
 dist/
 # The dashboard bundle is SOURCE, not a build artifact — it is hand-authored

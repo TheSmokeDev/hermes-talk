@@ -218,14 +218,18 @@ def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
     assert events.index("response.cancel") < events.index("tool_finished")
 
 
-def test_microphone_and_tool_batches_share_the_only_socket_writer():
+def test_openai_adapter_owns_the_only_socket_writer():
     source = inspect.getsource(talk_cli.run_talk_session)
     start = source.index("async def send_microphone")
     end = source.index("async def watch_run")
     microphone = source[start:end]
+    adapter_writer = inspect.getsource(
+        talk_cli.talk_openai_realtime.OpenAIRealtimeSession._send_wire
+    )
 
     assert "await send_outgoing(" in microphone
-    assert source.count("ws.send_json(") == 1
+    assert "send_json(" not in source
+    assert adapter_writer.count("self._ws.send_json(") == 1
 
 
 def test_speaker_transition_context_precedes_its_exact_pcm_without_response_create():
@@ -309,7 +313,7 @@ def test_metadata_audio_batch_uses_serialized_writer_not_announcement_queue():
     microphone = source[start:end]
 
     assert "read_input_packet" in microphone
-    assert "packet_lane.outgoing" in microphone
+    assert "packet_lane.commands" in microphone
     assert "await send_outgoing(" in microphone
     assert "announce_queue" not in microphone
 
@@ -382,7 +386,12 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
 
     async def competing_pump(_queue, _relay, _ws, send_batch, _response_busy):
         await ws.speaker_create_seen.wait()
-        await send_batch([{"type": "announcement-a"}, {"type": "announcement-b"}])
+        await send_batch(
+            [
+                talk_cli.talk_realtime.AddContext(item_id="announcement-a", text="A"),
+                talk_cli.talk_realtime.AddContext(item_id="announcement-b", text="B"),
+            ]
+        )
         ws.announcement_done.set()
         await asyncio.Event().wait()
 
@@ -423,6 +432,10 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
     assert [message["type"] for message in payload] == [
         "conversation.item.create",
         "input_audio_buffer.append",
+        "conversation.item.create",
+        "conversation.item.create",
+    ]
+    assert [message["item"]["id"] for message in payload[2:]] == [
         "announcement-a",
         "announcement-b",
     ]
