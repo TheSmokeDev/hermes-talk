@@ -67,13 +67,16 @@ hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 593 offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 650+ offline tests, CI on ubuntu + windows × py3.11–3.13.
 
 **Verify it** (no talking required):
 
 ```bash
 hermes plugins list    # → hermes-talk · enabled · current version
 hermes talk --help     # → registration proof: the command only exists if the plugin loaded
+hermes talk setup      # → guided, confirmation-gated setup plus doctor verification
+hermes talk doctor     # → read-only human diagnostics
+hermes talk doctor --json  # → the same versioned receipt for scripts/issues
 # then, in any session: say "status report" — talk_status answers with
 # version, auth lane, agent lane, and audio state.
 ```
@@ -100,6 +103,17 @@ Resolved fail-closed in this order:
    refresh automatically and write back atomically, so the Codex CLI keeps
    working.
 
+That historical order remains unchanged when `TALK_PREFER_CODEX_OAUTH` is
+absent or explicitly false. Set `TALK_PREFER_CODEX_OAUTH=true` to require the
+subscription lane even when API keys exist. The preference is fail-closed: a
+missing/unusable Codex login refuses instead of spending a metered key, and a
+blank or invalid preference refuses until corrected. `hermes talk doctor`
+names the winning lane and distinguishes valid OAuth from an expired credential
+that still requires a successful refresh; it never prints the key or token.
+When setup offers the API-key lane under an enabled OAuth preference, it reuses
+an existing metered key when present and separately confirms the required
+`TALK_PREFER_CODEX_OAUTH=false` policy transition.
+
 Whatever the lane, the session is minted server-side into an **ephemeral
 client secret** — the raw key or OAuth token touches exactly one OpenAI
 endpoint and never reaches the socket, a log line, or a client.
@@ -107,8 +121,22 @@ endpoint and never reaches the socket, a log line, or a client.
 ## Use
 
 ```bash
-hermes talk        # terminal duplex voice session
+hermes talk       # terminal duplex voice session
+hermes talk setup # detect → ask only missing decisions → confirm/write → verify
+hermes talk doctor # strictly read-only configuration and host diagnostics
 ```
+
+Setup commits all individually confirmed settings to the active Hermes home's
+`.env` as one secure atomic transaction and updates the current process to match.
+On failure it rolls both surfaces back when possible, emits a value-free
+applied/rolled-back/failed receipt, attempts and verifies every secret-bearing
+temporary-file cleanup, and reruns doctor whenever a mutation may remain. Any
+surviving temp is a surviving mutation: setup returns `failed` and identifies
+the cleanup slot/error class without printing the path nonce or secret value.
+New secret files keep POSIX `0600` behavior and receive a protected owner-only
+DACL on Windows; an existing Windows destination DACL is preserved. A healthy
+configuration asks no questions and performs no writes. Doctor never delegates
+to setup.
 
 or `/talk` inside an interactive Hermes session, which additionally reaches the
 agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
@@ -315,8 +343,9 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 
 | Variable | Default | What it does |
 |---|---|---|
-| `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model |
+| `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model; doctor certifies only the bounded duplex-audio + tool-calling policy and labels other Realtime-shaped ids compatibility-unknown |
 | `TALK_VOICE` | `cedar` | Realtime voice (fail-closed on unknown ids) |
+| `TALK_PREFER_CODEX_OAUTH` | unset | `true` requires Codex OAuth and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Where the api-server lane looks |

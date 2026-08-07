@@ -34,6 +34,8 @@ that survives both that loader and `pip install`. Don't restructure it.
 |---|---|
 | `talk_wire.py` | Pure OpenAI Realtime protocol — payloads and ephemeral mints, zero host knowledge |
 | `talk_auth.py` | The three credential lanes, resolved fail-closed |
+| `talk_doctor.py` | Read-only detect/decide/verify diagnostics and renderers |
+| `talk_setup.py` | Interactive missing-decision prompts, per-write confirmation, and post-write doctor verification |
 | `talk_config.py` | Every knob, resolved at call time — never cached at import |
 | `talk_identity.py` | Identity sections → session instructions, budgeted |
 | `talk_relay.py` | Realtime event loop — transport-agnostic, fully testable offline |

@@ -11,6 +11,36 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Added
+- Native `hermes talk setup`: detect current state, ask only unresolved
+  auth/model/voice decisions, explicitly confirm each setting, securely commit
+  the confirmed set as one rollback-capable atomic transaction, emit a redacted
+  apply receipt, then rerun the separately read-only doctor and verify the
+  result. Key selection under preferred Codex OAuth now reuses an existing key
+  and separately confirms the required policy transition.
+- Native `hermes talk doctor` human and `--json` diagnostics for registration,
+  auth selection, model/voice, audio, identity profile/root/count receipts,
+  Discord operators, and host capabilities. The command is strictly read-only
+  and redacts credentials, identity content, operator IDs, and secret-shaped
+  values pasted into malformed configuration fields.
+- `TALK_PREFER_CODEX_OAUTH=true` as an explicit fail-closed subscription lane.
+  Without it, the existing scoped-key → shared-key → Codex order is unchanged;
+  doctor warns when a metered key wins and distinguishes valid OAuth from an
+  expired credential that still requires refresh.
+- Cross-platform dotenv mutation: Windows names match case-insensitively and
+  duplicate case variants collapse deterministically; POSIX names stay
+  case-sensitive. New secret files use POSIX owner-only modes or a native
+  protected owner-only Windows DACL while existing Windows destination DACLs
+  are preserved. Every staged path is cleanup-verified; a surviving temp makes
+  the redacted receipt fail instead of claiming rollback. Hermes-home
+  provenance follows the host's exact tilde, relative, and platform-default
+  path semantics or reports unknown.
+- Bounded model compatibility policy for Talk's duplex-audio and live-tool
+  requirements. Specialized Whisper/Translate models fail explicitly; unknown
+  Realtime-shaped ids are labeled syntax-only instead of certified valid.
+
 ## [0.8.0] — 2026-08-04
 
 The session stops arriving as a stranger. It now knows who it is talking

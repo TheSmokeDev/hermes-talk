@@ -51,6 +51,33 @@ def test_default_model_and_override(monkeypatch):
     assert talk_config.talk_model() == "gpt-realtime-mini"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-mini"],
+)
+def test_model_policy_explicitly_allows_known_duplex_tool_models(model):
+    assert talk_config.realtime_model_compatibility(model) == "compatible"
+    assert talk_config.realtime_model_valid(model) is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-realtime-whisper", "gpt-realtime-translate", "gpt-5.6"],
+)
+def test_model_policy_rejects_known_incompatible_models(model):
+    assert talk_config.realtime_model_compatibility(model) == "incompatible"
+    assert talk_config.realtime_model_valid(model) is False
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-realtime-totally-fake", "gpt-realtime-2099-01-01"],
+)
+def test_model_policy_labels_unlisted_realtime_syntax_as_unknown(model):
+    assert talk_config.realtime_model_compatibility(model) == "unknown"
+    assert talk_config.realtime_model_valid(model) is False
+
+
 def test_voice_defaults_and_normalizes(monkeypatch):
     monkeypatch.delenv("TALK_VOICE", raising=False)
     assert talk_config.talk_voice() == talk_config.DEFAULT_TALK_VOICE

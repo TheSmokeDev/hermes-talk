@@ -18,3 +18,5 @@ build/
 node_modules/
 .codex/
 uv.lock
+.hermes-*-review.md
+.hermes-*-tdd.md

@@ -43,12 +43,48 @@ logger = logging.getLogger(__name__)
 #: talk_tools so the tool reads its own module state instead of importing the
 #: package back into itself.
 REGISTRATION_FAILURES = talk_tools.REGISTRATION_FAILURES
+REGISTRATION_RECEIPTS = talk_tools.REGISTRATION_RECEIPTS
 
 
-def _record(surface: str, exc: Exception) -> None:
-    detail = f"{surface}: {type(exc).__name__}: {exc}"
+def _record(surface: str, receipt: str, exc: Exception) -> None:
+    # Host exceptions are untrusted and may contain config values. The receipt
+    # needs the surface and exception class, never the raw message.
+    detail = f"{surface}: {type(exc).__name__}"
     REGISTRATION_FAILURES.append(detail)
+    REGISTRATION_RECEIPTS[receipt] = "failed"
     logger.warning("hermes-talk could not register %s", detail)
+
+
+def _registered(receipt: str) -> None:
+    REGISTRATION_RECEIPTS[receipt] = "registered"
+
+
+def _unsupported(surface: str, receipt: str) -> None:
+    requirement = talk_tools.REGISTRATION_REQUIREMENTS[receipt]
+    REGISTRATION_RECEIPTS[receipt] = f"unsupported-{requirement}"
+    logger.info("hermes-talk host has no %s registration method", surface)
+
+
+def _attempt_registration(
+    ctx,
+    method_name: str,
+    surface: str,
+    receipt: str,
+    *args,
+    **kwargs,
+) -> None:
+    """Call a present host method; absence and implementation errors differ."""
+
+    method = getattr(ctx, method_name, None)
+    if not callable(method):
+        _unsupported(surface, receipt)
+        return
+    try:
+        method(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - isolate one registration surface
+        _record(surface, receipt, exc)
+    else:
+        _registered(receipt)
 
 
 def _talk_command(raw_args: str = "") -> str:
@@ -96,60 +132,85 @@ def _on_session_end(**kwargs) -> None:
 def register(ctx) -> None:
     """Called once by the plugin loader when hermes-talk is enabled."""
 
+    REGISTRATION_FAILURES.clear()
+    REGISTRATION_RECEIPTS.clear()
     talk_host.bind_ctx(ctx)
 
-    try:
-        ctx.register_cli_command(
-            name="talk",
-            help="Realtime duplex voice session",
-            setup_fn=talk_cli.setup_cli,
-            handler_fn=talk_cli.cli_entry,
-            description=(
-                "Talk to Hermes over the OpenAI Realtime API: speech in, speech "
-                "out, interrupt it mid-sentence, and its tool calls run live."
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 — one dead surface, not four
-        _record("cli command", exc)
+    _attempt_registration(
+        ctx,
+        "register_cli_command",
+        "cli command",
+        "cli_command",
+        name="talk",
+        help="Realtime duplex voice session",
+        setup_fn=talk_cli.setup_cli,
+        handler_fn=talk_cli.cli_entry,
+        description=(
+            "Talk to Hermes over the OpenAI Realtime API: speech in, speech "
+            "out, interrupt it mid-sentence, and its tool calls run live."
+        ),
+    )
 
-    try:
-        ctx.register_command(
-            "talk",
-            handler=_talk_command,
-            description="Start a Realtime voice session (gateway: join|leave|status)",
-            args_hint="[join|leave|status]",
-        )
-    except Exception as exc:  # noqa: BLE001
-        _record("slash command", exc)
+    _attempt_registration(
+        ctx,
+        "register_command",
+        "slash command",
+        "slash_command",
+        "talk",
+        handler=_talk_command,
+        description="Start a Realtime voice session (gateway: join|leave|status)",
+        args_hint="[join|leave|status]",
+    )
 
-    try:
-        ctx.register_hook("on_session_end", _on_session_end)
-    except Exception as exc:  # noqa: BLE001
-        _record("session-end hook", exc)
+    _attempt_registration(
+        ctx,
+        "register_hook",
+        "session-end hook",
+        "session_end_hook",
+        "on_session_end",
+        _on_session_end,
+    )
 
     # Push-based child lifecycle (v0.6): ledger degrades and in-call
     # announcements ride the host's own subagent hooks instead of waiting
     # for the next check_work sweep. Each registration guarded on its own —
     # a host without these hook names keeps every other surface.
-    try:
-        ctx.register_hook("subagent_start", talk_lifecycle.on_subagent_start)
-    except Exception as exc:  # noqa: BLE001
-        _record("subagent-start hook", exc)
+    _attempt_registration(
+        ctx,
+        "register_hook",
+        "subagent-start hook",
+        "subagent_start_hook",
+        "subagent_start",
+        talk_lifecycle.on_subagent_start,
+    )
 
-    try:
-        ctx.register_hook("subagent_stop", talk_lifecycle.on_subagent_stop)
-    except Exception as exc:  # noqa: BLE001
-        _record("subagent-stop hook", exc)
+    _attempt_registration(
+        ctx,
+        "register_hook",
+        "subagent-stop hook",
+        "subagent_stop_hook",
+        "subagent_stop",
+        talk_lifecycle.on_subagent_stop,
+    )
 
     if talk_providers.providers_available():
-        try:
-            ctx.register_tts_provider(talk_providers.OpenAITTSProvider())
-        except Exception as exc:  # noqa: BLE001
-            _record("tts provider", exc)
-        try:
-            ctx.register_transcription_provider(talk_providers.OpenAITranscriptionProvider())
-        except Exception as exc:  # noqa: BLE001
-            _record("transcription provider", exc)
+        _attempt_registration(
+            ctx,
+            "register_tts_provider",
+            "tts provider",
+            "tts_provider",
+            talk_providers.OpenAITTSProvider(),
+        )
+        _attempt_registration(
+            ctx,
+            "register_transcription_provider",
+            "transcription provider",
+            "transcription_provider",
+            talk_providers.OpenAITranscriptionProvider(),
+        )
+    else:
+        _unsupported("tts provider", "tts_provider")
+        _unsupported("transcription provider", "transcription_provider")
 
 
-__all__ = ["REGISTRATION_FAILURES", "register"]
+__all__ = ["REGISTRATION_FAILURES", "REGISTRATION_RECEIPTS", "register"]

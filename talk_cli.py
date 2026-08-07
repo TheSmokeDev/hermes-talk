@@ -36,6 +36,7 @@ try:
         talk_audio,
         talk_auth,
         talk_config,
+        talk_doctor,
         talk_host,
         talk_identity,
         talk_lifecycle,
@@ -43,6 +44,7 @@ try:
         talk_operator_auth,
         talk_realtime,
         talk_runs,
+        talk_setup,
         talk_steer,
         talk_tools,
         talk_transcript,
@@ -54,6 +56,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_audio
     import talk_auth
     import talk_config
+    import talk_doctor
     import talk_host
     import talk_identity
     import talk_lifecycle
@@ -61,6 +64,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_operator_auth
     import talk_realtime
     import talk_runs
+    import talk_setup
     import talk_steer
     import talk_tools
     import talk_transcript
@@ -1003,8 +1007,20 @@ async def run_talk_session(
 
 
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
-    """Build the ``hermes talk`` argparse tree. v0.1 takes no arguments."""
+    """Build the native ``hermes talk`` session/setup/doctor argparse tree."""
 
+    commands = subparser.add_subparsers(dest="talk_command")
+    commands.add_parser(
+        "setup",
+        help="Interactively configure only missing Talk decisions",
+    )
+    doctor = commands.add_parser("doctor", help="Read-only Talk readiness diagnostics")
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        dest="doctor_json",
+        help="emit the versioned machine-readable report",
+    )
     subparser.set_defaults(talk_command="session")
 
 
@@ -1017,6 +1033,18 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
     would exit the process 0 on failure — scripts and CI would read a dead
     session as success.
     """
+
+    command = getattr(args, "talk_command", "session") if args is not None else "session"
+    if command == "setup":
+        code = talk_setup.cli_entry()
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "doctor":
+        code = talk_doctor.cli_entry(json_output=bool(getattr(args, "doctor_json", False)))
+        if code:
+            raise SystemExit(code)
+        return 0
 
     try:
         code = asyncio.run(run_talk_session())
