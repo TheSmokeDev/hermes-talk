@@ -36,6 +36,8 @@ that survives both that loader and `pip install`. Don't restructure it.
 | `talk_auth.py` | The three credential lanes, resolved fail-closed |
 | `talk_doctor.py` | Read-only detect/decide/verify diagnostics and renderers |
 | `talk_setup.py` | Interactive missing-decision prompts, per-write confirmation, and post-write doctor verification |
+| `talk_realtime.py` | Typed provider-neutral session setup, events, commands, lifecycle states, and adapter protocol |
+| `talk_openai_realtime.py` | OpenAI ephemeral-mint/WebSocket adapter and neutral-to-wire translation |
 | `talk_config.py` | Every knob, resolved at call time — never cached at import |
 | `talk_identity.py` | Identity sections → session instructions, budgeted |
 | `talk_relay.py` | Realtime event loop — transport-agnostic, fully testable offline |

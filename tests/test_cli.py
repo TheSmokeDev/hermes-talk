@@ -812,6 +812,49 @@ def test_tool_coordinator_send_failure_does_not_deadlock_queued_cleanup():
     asyncio.run(scenario())
 
 
+def test_tool_coordinator_stop_is_acknowledged_and_discards_queued_call():
+    async def scenario():
+        sent = []
+        discarded = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Relay:
+            async def handle_event_async(self, event):
+                started.set()
+                await release.wait()
+                return [{"type": "output", "call_id": event["call_id"]}]
+
+            def tool_queue_full_output(self, _event):
+                raise AssertionError("queue should admit both calls")
+
+            def discard_tool_event(self, event):
+                discarded.append(event["call_id"])
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=1)
+        coordinator.admit({"call_id": "active"})
+        worker = asyncio.create_task(coordinator.run())
+        await started.wait()
+        coordinator.admit({"call_id": "queued"})
+        await coordinator.response_done()
+
+        stop_ack = asyncio.create_task(coordinator.stop())
+        await asyncio.sleep(0)
+        assert not stop_ack.done()
+        assert discarded == ["queued"]
+
+        release.set()
+        await asyncio.wait_for(stop_ack, 0.2)
+        await asyncio.wait_for(worker, 0.2)
+        await asyncio.wait_for(coordinator.queue.join(), 0.2)
+        assert sent == []
+
+    asyncio.run(scenario())
+
+
 def test_microphone_send_failure_terminates_a_blocked_receiver(monkeypatch, capsys):
     """A failed audio append must not leave the socket receiver live forever."""
 

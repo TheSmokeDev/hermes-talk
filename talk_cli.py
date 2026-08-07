@@ -204,6 +204,7 @@ ANNOUNCE_IDLE_POLL_S = 0.05
 TOOL_SESSION_QUEUE_SIZE = 1
 TOOL_CLEANUP_WAIT_S = 6.0
 MAX_SPEAKER_DISPLAY_NAME_CHARS = 256
+_TOOL_COORDINATOR_STOP = object()
 
 
 class SpeakerPacketLane:
@@ -302,6 +303,8 @@ class ToolResponseCoordinator:
         self.closed = False
         self.failed = False
         self.provider_neutral = provider_neutral
+        self._stop_requested = False
+        self._stopped = asyncio.Event()
         self._continuation = self._default_continuation()
         self._flush_lock = asyncio.Lock()
 
@@ -321,6 +324,8 @@ class ToolResponseCoordinator:
         )
 
     def admit(self, event: dict) -> bool:
+        if self._stop_requested:
+            raise RuntimeError("tool call arrived after coordinator stop")
         if self.closed:
             raise RuntimeError("tool call arrived after response.done")
         position = len(self.outputs)
@@ -353,11 +358,19 @@ class ToolResponseCoordinator:
         await self._flush_if_ready()
 
     async def _flush_if_ready(self) -> None:
-        if not self.closed or not self.outputs or any(item is None for item in self.outputs):
+        if (
+            self._stop_requested
+            or not self.closed
+            or not self.outputs
+            or any(item is None for item in self.outputs)
+        ):
             return
         async with self._flush_lock:
-            if not self.closed or not self.outputs or any(
-                item is None for item in self.outputs
+            if (
+                self._stop_requested
+                or not self.closed
+                or not self.outputs
+                or any(item is None for item in self.outputs)
             ):
                 return
             batch = [message for result in self.outputs for message in result or []]
@@ -372,36 +385,61 @@ class ToolResponseCoordinator:
             self._continuation = self._default_continuation()
 
     async def run(self) -> None:
-        while True:
-            position, event = await self.queue.get()
-            try:
-                self.outputs[position] = await (
-                    self.relay.handle_tool_call_async(event)
-                    if self.provider_neutral
-                    else self.relay.handle_event_async(event)
-                )
-                await self._flush_if_ready()
-            finally:
-                self.queue.task_done()
+        try:
+            while True:
+                item = await self.queue.get()
+                try:
+                    if item is _TOOL_COORDINATOR_STOP:
+                        return
+                    position, event = item
+                    self.outputs[position] = await (
+                        self.relay.handle_tool_call_async(event)
+                        if self.provider_neutral
+                        else self.relay.handle_event_async(event)
+                    )
+                    await self._flush_if_ready()
+                finally:
+                    self.queue.task_done()
+        finally:
+            # A worker failure can race the stop request. Balance anything the
+            # worker will never handle before acknowledging its terminal state.
+            self.discard_pending()
+            self._stopped.set()
 
     async def join(self) -> None:
         await self.queue.join()
         if not self.failed:
             await self._flush_if_ready()
 
+    async def stop(self) -> None:
+        """Discard queued calls, stop after the active call settles, and acknowledge."""
+
+        if not self._stop_requested:
+            self._stop_requested = True
+            if not self._stopped.is_set():
+                # Empty first so the sentinel is never rejected by the bounded
+                # queue. Discarding calls consumes their one-shot permits.
+                self.discard_pending()
+                self.queue.put_nowait(_TOOL_COORDINATOR_STOP)
+        await self._stopped.wait()
+
     def discard_pending(self) -> None:
         """Balance queue accounting during failed-send/session teardown."""
 
         while True:
             try:
-                _position, event = self.queue.get_nowait()
+                item = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             else:
-                discard = getattr(self.relay, "discard_tool_event", None)
-                if callable(discard):
-                    discard(event)
-                self.queue.task_done()
+                try:
+                    if item is not _TOOL_COORDINATOR_STOP:
+                        _position, event = item
+                        discard = getattr(self.relay, "discard_tool_event", None)
+                        if callable(discard):
+                            discard(event)
+                finally:
+                    self.queue.task_done()
 
 
 async def pump_announcements(
@@ -966,21 +1004,34 @@ async def run_talk_session(
             sender.cancel()
             pump.cancel()
             receiver.cancel()
-            tool_worker.cancel()
             if drain is not None:
                 drain.cancel()
-            tool_coordinator.discard_pending()
             for watcher in watchers:
                 watcher.cancel()
-            await asyncio.gather(
+            stop_ack = asyncio.create_task(tool_coordinator.stop())
+            cleanup_tasks = {
                 sender,
                 pump,
                 receiver,
                 tool_worker,
+                stop_ack,
                 *([drain] if drain is not None else []),
                 *watchers,
-                return_exceptions=True,
+            }
+            done, pending_cleanup = await asyncio.wait(
+                cleanup_tasks,
+                timeout=TOOL_CLEANUP_WAIT_S,
             )
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending_cleanup:
+                for task in pending_cleanup:
+                    task.cancel()
+                # Give cooperative cancellation one scheduling turn without
+                # turning the final join back into an unbounded await.
+                await asyncio.sleep(0)
+                finished = {task for task in pending_cleanup if task.done()}
+                await asyncio.gather(*finished, return_exceptions=True)
+                raise TimeoutError("session task cleanup exceeded its bound")
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — one line at the operator, not a traceback

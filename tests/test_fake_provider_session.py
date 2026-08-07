@@ -123,6 +123,31 @@ def _run(fake, audio=None):
     return result, audio
 
 
+def _run_bounded(fake, audio=None, *, timeout=1.0):
+    """Run one failure-path session under an in-test bound and prove task cleanup."""
+
+    async def scenario():
+        current = asyncio.current_task()
+        session = asyncio.create_task(
+            talk_cli.run_talk_session(
+                audio=audio,
+                session_factory=lambda _auth: fake,
+            )
+        )
+        result = await asyncio.wait_for(session, timeout)
+        await asyncio.sleep(0)
+        leaked = [
+            task.get_coro().__qualname__
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        assert leaked == []
+        return result
+
+    audio = audio or Audio()
+    return asyncio.run(scenario()), audio
+
+
 def test_fake_provider_ordinary_turn_preserves_audio_and_transcript_provenance():
     fake = FakeProviderSession(
         [
@@ -499,7 +524,7 @@ def test_abnormal_openai_eof_fails_session_without_flushing_active_tool_batch(
         mint_session=lambda _setup: types.SimpleNamespace(client_secret="ephemeral"),
     )
 
-    result, audio = _run(adapter)
+    result, audio = _run_bounded(adapter)
 
     assert result == 1
     assert adapter.state is rt.SessionState.FAILED
@@ -529,7 +554,7 @@ def test_malformed_response_done_terminates_without_flushing_live_tool_batch(
         ]
     )
 
-    result, audio = _run(fake)
+    result, audio = _run_bounded(fake)
 
     assert result == 1
     assert not any(

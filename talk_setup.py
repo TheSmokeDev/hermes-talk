@@ -813,7 +813,16 @@ def _auth_changes(
             ("oauth", "key"),
             input_fn,
         )
-        return [("TALK_PREFER_CODEX_OAUTH", "true" if lane == "oauth" else "false", False)]
+        if lane == "oauth":
+            return [("TALK_PREFER_CODEX_OAUTH", "true", False)]
+        changes: list[EnvChange] = []
+        if not metered_present:
+            secret = _ask_nonempty_secret(
+                "Enter TALK_OPENAI_API_KEY (input hidden): ", secret_input_fn
+            )
+            changes.append(("TALK_OPENAI_API_KEY", secret, True))
+        changes.append(("TALK_PREFER_CODEX_OAUTH", "false", False))
+        return changes
 
     if status == "fail":
         lane = _ask_choice(

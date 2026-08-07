@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -453,6 +454,102 @@ def test_setup_key_choice_confirms_new_secret_and_policy_as_separate_settings(
     )
     assert secret not in output
     assert "Verification: PASS" in output
+
+
+def test_invalid_preference_key_choice_completes_real_doctor_setup_doctor_in_one_run(
+    monkeypatch, tmp_path, capsys, request
+):
+    managed_environment = (
+        "HERMES_HOME",
+        "CODEX_HOME",
+        "TALK_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "TALK_PREFER_CODEX_OAUTH",
+        "TALK_DISCORD_OPERATOR_USER_IDS",
+    )
+    environment_before = {
+        name: (name in os.environ, os.environ.get(name)) for name in managed_environment
+    }
+
+    def restore_environment():
+        for name, (present, value) in environment_before.items():
+            if present:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
+
+    request.addfinalizer(restore_environment)
+    secret = "sk-proj-synthetic-setup-regression"
+    prompts = []
+    secret_prompts = []
+    transactions = []
+
+    with monkeypatch.context() as scoped:
+        scoped.setitem(sys.modules, "hermes_constants", None)
+        scoped.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        scoped.setenv("CODEX_HOME", str(tmp_path / "codex-missing"))
+        scoped.setenv("TALK_PREFER_CODEX_OAUTH", "definitely-not-a-bool")
+        scoped.delenv("TALK_OPENAI_API_KEY", raising=False)
+        scoped.delenv("OPENAI_API_KEY", raising=False)
+        scoped.delenv("TALK_DISCORD_OPERATOR_USER_IDS", raising=False)
+
+        real_apply = talk_setup.apply_env_transaction
+
+        def record_transaction(env_path, changes, **kwargs):
+            transactions.append(
+                tuple(
+                    (key, "<redacted>" if is_secret else value, is_secret)
+                    for key, value, is_secret in changes
+                )
+            )
+            return real_apply(env_path, changes, **kwargs)
+
+        scoped.setattr(talk_setup, "apply_env_transaction", record_transaction)
+
+        before = talk_setup.talk_doctor.collect_report()
+        before_auth = {check["id"]: check for check in before["checks"]}["auth"]
+        assert before_auth["status"] == "fail"
+        assert before_auth["details"]["blocked_by"] == "invalid-preference"
+        assert before_auth["details"]["codex_oauth"] == "missing"
+        assert before_auth["details"]["metered_key_present"] is False
+
+        answers = iter(["key", "yes", "yes"])
+
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        def read_secret(prompt):
+            secret_prompts.append(prompt)
+            return secret
+
+        assert talk_setup.cli_entry(input_fn=answer, secret_input_fn=read_secret) == 0
+
+        after = talk_setup.talk_doctor.collect_report()
+        after_auth = {check["id"]: check for check in after["checks"]}["auth"]
+        assert after_auth["status"] == "pass"
+        assert after_auth["details"]["winning_lane"] == "configured"
+        assert after_auth["details"]["preference"] == "disabled"
+        assert secret_prompts == ["Enter TALK_OPENAI_API_KEY (input hidden): "]
+        assert transactions == [
+            (
+                ("TALK_OPENAI_API_KEY", "<redacted>", True),
+                ("TALK_PREFER_CODEX_OAUTH", "false", False),
+            )
+        ]
+        assert (tmp_path / "hermes" / ".env").read_text(encoding="utf-8") == (
+            f"TALK_OPENAI_API_KEY={secret}\nTALK_PREFER_CODEX_OAUTH=false\n"
+        )
+
+    restore_environment()
+    assert {
+        name: (name in os.environ, os.environ.get(name)) for name in managed_environment
+    } == environment_before
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert "state=applied" in output
+    assert "Verification: PASS" in output
+    assert len([prompt for prompt in prompts if prompt.startswith("Write ")]) == 2
 
 
 def test_declined_write_is_not_applied_and_failed_verification_is_returned(
