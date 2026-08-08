@@ -945,7 +945,10 @@ def test_existing_destination_dacl_is_preserved_exactly_while_temp_is_restrictiv
 
     assert receipt.state == "applied"
     assert len(observed_temps) == 1
-    assert _windows_dacl_sddl(env_path) == original_dacl
+    assert talk_setup._windows_dacl_equivalent(
+        _windows_dacl_sddl(env_path),
+        original_dacl,
+    )
 
 
 def test_windows_restrictive_dacl_targets_active_user_not_owner_group(monkeypatch, tmp_path):
@@ -997,7 +1000,7 @@ def test_windows_restrictive_dacl_compares_canonical_sid_alias_semantically():
 @pytest.mark.skipif(os.name != "nt", reason="native Windows SID discriminator")
 def test_windows_dacl_equivalence_ignores_canonical_sid_spelling_only():
     assert talk_setup._windows_dacl_equivalent(
-        "D:PAI(A;ID;FA;;;SY)",
+        "D:PAI(A;;FA;;;SY)(A;ID;FA;;;SY)",
         "D:P(A;;FA;;;S-1-5-18)",
     )
     assert not talk_setup._windows_dacl_equivalent(

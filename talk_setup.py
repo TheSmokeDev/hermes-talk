@@ -457,25 +457,49 @@ def _windows_dacl_equivalent(left: str, right: str) -> bool:
         aces = [raw.split(";") for raw in re.findall(r"\(([^()]*)\)", sddl)]
         return flags, aces
 
+    def normalized(ace):
+        if len(ace) != 6:
+            return None
+        fields = ace[:]
+        fields[1] = fields[1].replace("ID", "")
+        return fields
+
+    def ace_equivalent(left_ace, right_ace):
+        return bool(
+            left_ace
+            and right_ace
+            and left_ace[:5] == right_ace[:5]
+            and _windows_dacl_grants_only_full_control(
+                f"D:P(A;;FA;;;{left_ace[5]})",
+                right_ace[5],
+            )
+        )
+
+    def unique(aces):
+        result = []
+        for raw in aces:
+            ace = normalized(raw)
+            if ace is None:
+                return None
+            if not any(ace_equivalent(ace, present) for present in result):
+                result.append(ace)
+        return result
+
     left_flags, left_aces = parsed(left)
     right_flags, right_aces = parsed(right)
-    if left_flags != right_flags or len(left_aces) != len(right_aces):
+    if left_flags != right_flags:
         return False
-    for left_ace, right_ace in zip(left_aces, right_aces, strict=True):
-        if len(left_ace) != 6 or len(right_ace) != 6:
-            return False
-        left_security_fields = left_ace[:5]
-        right_security_fields = right_ace[:5]
-        left_security_fields[1] = left_security_fields[1].replace("ID", "")
-        right_security_fields[1] = right_security_fields[1].replace("ID", "")
-        if left_security_fields != right_security_fields:
-            return False
-        if not _windows_dacl_grants_only_full_control(
-            f"D:P(A;;FA;;;{left_ace[5]})",
-            right_ace[5],
-        ):
-            return False
-    return True
+    left_unique = unique(left_aces)
+    right_unique = unique(right_aces)
+    return bool(
+        left_unique is not None
+        and right_unique is not None
+        and len(left_unique) == len(right_unique)
+        and all(
+            ace_equivalent(left_ace, right_ace)
+            for left_ace, right_ace in zip(left_unique, right_unique, strict=True)
+        )
+    )
 
 
 def _windows_dacl_grants_only_full_control(sddl: str, principal_sid: str) -> bool:
