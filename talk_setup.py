@@ -448,83 +448,34 @@ def _windows_apply_dacl_sddl(path: Path, sddl: str) -> None:
 
 
 def _windows_dacl_equivalent(left: str, right: str) -> bool:
-    """Compare protection and native ACL bytes, independent of SDDL SID aliases."""
+    """Compare DACL security semantics independent of SDDL aliases and ACL padding."""
 
-    import ctypes
-    from ctypes import wintypes
+    import re
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    get_acl_information = advapi32.GetAclInformation
-    get_acl_information.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.c_int,
-    ]
-    get_acl_information.restype = wintypes.BOOL
+    def parsed(sddl: str):
+        flags = sddl.partition("(")[0].replace("AI", "").replace("AR", "")
+        aces = [raw.split(";") for raw in re.findall(r"\(([^()]*)\)", sddl)]
+        return flags, aces
 
-    class AclSizeInformation(ctypes.Structure):
-        _fields_ = [
-            ("ace_count", wintypes.DWORD),
-            ("acl_bytes_in_use", wintypes.DWORD),
-            ("acl_bytes_free", wintypes.DWORD),
-        ]
-
-    (
-        _ctypes,
-        _wintypes,
-        _get_named_security,
-        _convert_sid,
-        _descriptor_to_sddl,
-        sddl_to_descriptor,
-        get_dacl,
-        get_control,
-        _set_named_security,
-        local_free,
-    ) = _windows_security_api()
-    descriptors: list[ctypes.c_void_p] = []
-
-    def native_dacl(sddl: str):
-        descriptor = ctypes.c_void_p()
-        if not sddl_to_descriptor(sddl, 1, ctypes.byref(descriptor), None):
-            raise ctypes.WinError(ctypes.get_last_error())
-        descriptors.append(descriptor)
-        dacl = ctypes.c_void_p()
-        present = wintypes.BOOL()
-        defaulted = wintypes.BOOL()
-        control = wintypes.WORD()
-        revision = wintypes.DWORD()
-        if not get_dacl(
-            descriptor,
-            ctypes.byref(present),
-            ctypes.byref(dacl),
-            ctypes.byref(defaulted),
+    left_flags, left_aces = parsed(left)
+    right_flags, right_aces = parsed(right)
+    if left_flags != right_flags or len(left_aces) != len(right_aces):
+        return False
+    for left_ace, right_ace in zip(left_aces, right_aces, strict=True):
+        if len(left_ace) != 6 or len(right_ace) != 6:
+            return False
+        left_security_fields = left_ace[:5]
+        right_security_fields = right_ace[:5]
+        left_security_fields[1] = left_security_fields[1].replace("ID", "")
+        right_security_fields[1] = right_security_fields[1].replace("ID", "")
+        if left_security_fields != right_security_fields:
+            return False
+        if not _windows_dacl_grants_only_full_control(
+            f"D:P(A;;FA;;;{left_ace[5]})",
+            right_ace[5],
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        protected = bool(control.value & 0x1000)  # SE_DACL_PROTECTED
-        if not present.value or not dacl:
-            return present.value, protected, None
-        size = AclSizeInformation()
-        if not get_acl_information(
-            dacl,
-            ctypes.byref(size),
-            ctypes.sizeof(size),
-            2,  # AclSizeInformation
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return (
-            present.value,
-            protected,
-            ctypes.string_at(dacl, size.acl_bytes_in_use),
-        )
-
-    try:
-        return native_dacl(left) == native_dacl(right)
-    finally:
-        for descriptor in descriptors:
-            local_free(descriptor)
+            return False
+    return True
 
 
 def _windows_dacl_grants_only_full_control(sddl: str, principal_sid: str) -> bool:

@@ -997,7 +997,7 @@ def test_windows_restrictive_dacl_compares_canonical_sid_alias_semantically():
 @pytest.mark.skipif(os.name != "nt", reason="native Windows SID discriminator")
 def test_windows_dacl_equivalence_ignores_canonical_sid_spelling_only():
     assert talk_setup._windows_dacl_equivalent(
-        "D:PAI(A;;FA;;;SY)",
+        "D:PAI(A;ID;FA;;;SY)",
         "D:P(A;;FA;;;S-1-5-18)",
     )
     assert not talk_setup._windows_dacl_equivalent(
