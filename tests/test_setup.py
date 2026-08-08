@@ -181,10 +181,7 @@ def _windows_set_dacl(path: Path, sddl: str) -> None:
 def _assert_windows_owner_only_dacl(path: Path) -> None:
     owner_sid = talk_setup._windows_current_user_sid()
     dacl = _windows_dacl_sddl(path)
-    assert dacl.startswith("D:P")
-    assert dacl.count("(A;") == 1
-    assert ";;;WD)" not in dacl
-    assert f";;;{owner_sid})" in dacl
+    assert talk_setup._windows_dacl_grants_only_full_control(dacl, owner_sid)
 
 
 @pytest.fixture(autouse=True)
