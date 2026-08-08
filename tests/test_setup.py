@@ -1006,6 +1006,51 @@ def test_windows_dacl_equivalence_ignores_canonical_sid_spelling_only():
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows CI discriminator")
+def test_windows_transaction_dacl_transition_shape_is_safe(monkeypatch, tmp_path):
+    observations = []
+    real_equivalent = talk_setup._windows_dacl_equivalent
+    real_restrictive = talk_setup._windows_dacl_grants_only_full_control
+
+    def safe(sddl):
+        return re.sub(r"S-\d+(?:-\d+)+", "<numeric-sid>", sddl)
+
+    def observe_equivalent(left, right):
+        result = real_equivalent(left, right)
+        if not result:
+            observations.append(("equivalent", safe(left), safe(right)))
+        return result
+
+    def observe_restrictive(sddl, principal):
+        result = real_restrictive(sddl, principal)
+        if not result:
+            observations.append(("restrictive", safe(sddl), "<active-user>"))
+        return result
+
+    monkeypatch.setattr(talk_setup, "_windows_dacl_equivalent", observe_equivalent)
+    monkeypatch.setattr(
+        talk_setup,
+        "_windows_dacl_grants_only_full_control",
+        observe_restrictive,
+    )
+
+    existing = tmp_path / "existing.env"
+    existing.write_text("TALK_VOICE=ash\n", encoding="utf-8")
+    existing_receipt = talk_setup.apply_env_transaction(
+        existing,
+        [("TALK_VOICE", "cedar", False)],
+        environ={},
+    )
+    fresh = tmp_path / "fresh.env"
+    fresh_receipt = talk_setup.apply_env_transaction(
+        fresh,
+        [("TALK_VOICE", "cedar", False)],
+        environ={},
+    )
+
+    assert existing_receipt.state == fresh_receipt.state == "applied", observations
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows handle discriminator")
 def test_windows_stage_closes_empty_temp_before_applying_dacl(monkeypatch, tmp_path):
     captured_fd = None
