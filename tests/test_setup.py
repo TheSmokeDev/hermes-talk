@@ -1051,7 +1051,33 @@ def test_windows_transaction_dacl_transition_shape_is_safe(monkeypatch, tmp_path
         environ={},
     )
 
-    assert existing_receipt.state == fresh_receipt.state == "applied", observations
+    permissive_parent = tmp_path / "permissive-diagnostic"
+    permissive_parent.mkdir()
+    _windows_set_dacl(permissive_parent, "D:P(A;OICI;FA;;;WD)")
+    permissive_fresh = permissive_parent / "fresh.env"
+    permissive_receipt = talk_setup.apply_env_transaction(
+        permissive_fresh,
+        [("TALK_VOICE", "cedar", False)],
+        environ={},
+    )
+
+    custom = tmp_path / "custom.env"
+    custom.write_text("TALK_VOICE=ash\n", encoding="utf-8")
+    active_user = talk_setup._windows_current_user_sid()
+    _windows_set_dacl(custom, f"D:P(A;;FA;;;{active_user})(A;;FR;;;WD)")
+    custom_receipt = talk_setup.apply_env_transaction(
+        custom,
+        [("TALK_VOICE", "cedar", False)],
+        environ={},
+    )
+
+    assert (
+        existing_receipt.state
+        == fresh_receipt.state
+        == permissive_receipt.state
+        == custom_receipt.state
+        == "applied"
+    ), observations
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows handle discriminator")
