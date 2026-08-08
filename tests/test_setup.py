@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -988,7 +989,29 @@ def test_windows_stage_closes_empty_temp_before_applying_dacl(monkeypatch, tmp_p
         with pytest.raises(OSError):
             os.fstat(captured_fd)
         assert path.read_bytes() == b""
-        real_restrict(path)
+        try:
+            real_restrict(path)
+        except PermissionError:
+            actual = talk_setup._windows_dacl_sddl(path)
+            active_user = talk_setup._windows_current_user_sid()
+            flags = actual.partition("(")[0]
+            entries = []
+            for raw_ace in re.findall(r"\(([^()]*)\)", actual):
+                fields = raw_ace.split(";")
+                entries.append(
+                    {
+                        "type": fields[0] if len(fields) > 0 else None,
+                        "flags": fields[1] if len(fields) > 1 else None,
+                        "rights": fields[2] if len(fields) > 2 else None,
+                        "object_guid": fields[3] if len(fields) > 3 else None,
+                        "inherit_guid": fields[4] if len(fields) > 4 else None,
+                        "active_user": len(fields) > 5 and fields[5] == active_user,
+                    }
+                )
+            pytest.fail(
+                f"restrictive DACL verification shape: flags={flags!r}; "
+                f"ace_count={len(entries)}; entries={entries!r}"
+            )
 
     monkeypatch.setattr(talk_setup.tempfile, "mkstemp", capture_mkstemp)
     monkeypatch.setattr(talk_setup, "_windows_restrict_owner_only_dacl", inspect_restrict)
