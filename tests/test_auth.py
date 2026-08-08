@@ -16,6 +16,11 @@ def _jwt_with_exp(exp: float) -> str:
     return f"header.{payload}.sig"
 
 
+def _jwt_with_payload(value) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    return f"header.{payload}.sig"
+
+
 def _write_codex_auth(
     home,
     *,
@@ -45,6 +50,7 @@ def _hermetic_lanes(monkeypatch, tmp_path):
 
     monkeypatch.delenv("TALK_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TALK_PREFER_CODEX_OAUTH", raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
 
 
@@ -73,6 +79,15 @@ def test_env_key_second(monkeypatch):
     auth = talk_auth.resolve_auth()
     assert auth.token == "sk-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+
+def test_shared_key_set_but_empty_fails_closed_before_oauth(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "   ")
+    _write_codex_auth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+    with pytest.raises(talk_auth.TalkAuthError, match="OPENAI_API_KEY is set but empty"):
+        talk_auth.resolve_auth()
 
 
 def test_codex_oauth_third(monkeypatch, tmp_path):
@@ -184,3 +199,96 @@ def test_status_unconfigured_is_actionable():
 def test_jwt_decode_tolerates_garbage():
     assert talk_auth._decode_jwt_expiry_s("not-a-jwt") is None
     assert talk_auth._decode_jwt_expiry_s("a.!!!.c") is None
+
+
+@pytest.mark.parametrize("payload", [[], None, "not-an-object", 7])
+def test_non_object_jwt_payload_is_invalid_without_raising(monkeypatch, tmp_path, payload):
+    home = tmp_path / "codex"
+    access = _jwt_with_payload(payload)
+    _write_codex_auth(home, access=access)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    assert talk_auth._decode_jwt_expiry_s(access) is None
+    receipt = talk_auth.auth_diagnostic()
+    assert receipt["codex_oauth"] == "invalid"
+    assert receipt["winning_lane"] is None
+
+
+def test_prefer_codex_outranks_metered_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
+    monkeypatch.setenv("TALK_OPENAI_API_KEY", "sk-scoped-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-secret")
+    _write_codex_auth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+    auth = talk_auth.resolve_auth()
+
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
+def test_prefer_codex_fails_closed_when_oauth_is_missing(monkeypatch, value):
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", value)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
+
+    with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
+        talk_auth.resolve_auth()
+
+
+def test_blank_preference_fails_closed_instead_of_spending_a_key(monkeypatch):
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "   ")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared")
+
+    with pytest.raises(talk_auth.TalkAuthError, match="TALK_PREFER_CODEX_OAUTH"):
+        talk_auth.resolve_auth()
+
+
+def test_invalid_preference_fails_closed_instead_of_spending_a_key(monkeypatch):
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "sometimes")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared")
+
+    with pytest.raises(talk_auth.TalkAuthError, match="TALK_PREFER_CODEX_OAUTH"):
+        talk_auth.resolve_auth()
+
+
+def test_explicit_false_keeps_existing_key_precedence(monkeypatch, tmp_path):
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "false")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared")
+    _write_codex_auth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+    assert talk_auth.resolve_auth().source == talk_auth.SOURCE_ENV
+
+
+def test_preferred_expired_oauth_refreshes_instead_of_spending_a_key(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10), refresh="refresh-old")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
+    monkeypatch.setattr(
+        talk_auth,
+        "_post_token_form",
+        lambda fields: {
+            "access_token": _jwt_with_exp(time.time() + 3600),
+            "refresh_token": "refresh-new",
+            "expires_in": 3600,
+        },
+    )
+
+    assert talk_auth.resolve_auth().source == talk_auth.SOURCE_CODEX_OAUTH
+
+
+def test_preferred_blank_oauth_fails_closed_without_spending_a_key(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access="", refresh="")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
+
+    with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
+        talk_auth.resolve_auth()

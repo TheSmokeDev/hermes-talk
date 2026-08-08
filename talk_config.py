@@ -47,6 +47,38 @@ OPENAI_REALTIME_VOICES = (
     "marin",
     "cedar",
 )
+MODEL_COMPATIBILITY_POLICY_VERSION = 1
+# Exact aliases/snapshots whose published contracts include audio input,
+# audio output, and function calling: all three are required by Talk.
+DUPLEX_TOOL_COMPATIBLE_MODELS = frozenset(
+    {
+        "gpt-realtime-2.1",
+        "gpt-realtime-2.1-mini",
+        "gpt-realtime-2",
+        "gpt-realtime-1.5",
+        "gpt-realtime",
+        "gpt-realtime-mini",
+        "gpt-realtime-mini-2025-10-06",
+        "gpt-realtime-mini-2025-12-15",
+        "gpt-4o-realtime-preview",
+        "gpt-4o-realtime-preview-2024-10-01",
+        "gpt-4o-realtime-preview-2024-12-17",
+        "gpt-4o-realtime-preview-2025-06-03",
+        "gpt-4o-mini-realtime-preview",
+        "gpt-4o-mini-realtime-preview-2024-12-17",
+    }
+)
+KNOWN_INCOMPATIBLE_REALTIME_MODELS = frozenset(
+    {
+        # Streaming transcription: audio input only, no function calling.
+        "gpt-realtime-whisper",
+        # Dedicated translation: no function calling.
+        "gpt-realtime-translate",
+    }
+)
+_REALTIME_MODEL_SYNTAX_RE = re.compile(
+    r"^(?:gpt-realtime(?:-[A-Za-z0-9.]+)*|gpt-4o-realtime-preview(?:-[A-Za-z0-9.-]+)?)$"
+)
 
 # Discord snowflakes are unsigned 64-bit decimal integers. Treating the whole
 # list as one configuration unit is intentional: a typo must narrow authority
@@ -250,6 +282,31 @@ def talk_model() -> str:
     return (os.environ.get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
 
 
+def realtime_model_compatibility(model: str) -> str:
+    """Return ``compatible``, ``incompatible``, or honest syntax-only ``unknown``.
+
+    This is a bounded local policy, not a provider availability probe. Only
+    exact ids with a published duplex-audio and function-calling contract are
+    certified compatible. Realtime-shaped ids outside that set remain usable
+    at runtime but are reported as unknown by diagnostics.
+    """
+
+    candidate = model.strip()
+    if candidate in DUPLEX_TOOL_COMPATIBLE_MODELS:
+        return "compatible"
+    if candidate in KNOWN_INCOMPATIBLE_REALTIME_MODELS:
+        return "incompatible"
+    if _REALTIME_MODEL_SYNTAX_RE.fullmatch(candidate):
+        return "unknown"
+    return "incompatible"
+
+
+def realtime_model_valid(model: str) -> bool:
+    """Backward-compatible boolean for the bounded compatibility policy."""
+
+    return realtime_model_compatibility(model) == "compatible"
+
+
 def talk_voice() -> str:
     """Realtime voice, fail-closed on unknown ids."""
 
@@ -417,6 +474,9 @@ __all__ = [
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
+    "DUPLEX_TOOL_COMPATIBLE_MODELS",
+    "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
+    "MODEL_COMPATIBILITY_POLICY_VERSION",
     "OPENAI_REALTIME_VOICES",
     "TalkConfigError",
     "agent_profile",
@@ -432,6 +492,8 @@ __all__ = [
     "discord_operator_user_ids",
     "get_hermes_home",
     "identity_include",
+    "realtime_model_compatibility",
+    "realtime_model_valid",
     "resolve_openai_key",
     "state_dir",
     "talk_model",

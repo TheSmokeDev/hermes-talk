@@ -70,7 +70,56 @@ hermes talk --help       # → the talk command's own help text
 The second command is the deeper receipt: the CLI surface only exists if
 the plugin registered inside the host.
 
-### 2. `talk_status` — the one command
+### 2. `hermes talk setup` — confirmation-gated configuration
+
+```bash
+hermes talk setup
+```
+
+Setup first runs the read-only detector, asks only decisions that are unresolved
+(auth, incompatible/unknown model, or invalid voice), and shows the exact
+`.env` key plus winning Hermes-home path before each write. Every setting needs
+its own `yes`; declined settings are untouched. The complete confirmed set is
+staged in a unique, securely created sibling file and committed to that home's
+`.env` with one atomic replacement while the current process environment is
+updated under the same rollback boundary. Existing permissions are preserved;
+new secret files use POSIX `0600` or a protected owner-only Windows DACL. Any
+apply error is caught, every staged path is cleanup-attempted and independently
+verified, and file/environment changes are rolled back when possible. A temp
+that survives denied cleanup counts as a surviving mutation: the value-free
+receipt says `failed` and emits only its redacted staged slot plus error class.
+Otherwise the receipt says `applied` or `rolled-back`. Setup reruns doctor
+immediately after the transaction attempt and uses that report plus the apply
+receipt as its verification/exit result. API-key input is hidden and never
+echoed. If an existing metered key is blocked only by
+`TALK_PREFER_CODEX_OAUTH=true`, choosing the key reuses it and separately asks
+to write the required `false` policy transition. If the only missing action is
+`codex login`, setup names it and writes nothing.
+
+Dotenv setting names follow the target platform: Windows matching is
+case-insensitive and collapses duplicate case variants to one canonical entry;
+POSIX matching remains case-sensitive.
+
+### 3. `hermes talk doctor` — read-only readiness
+
+```bash
+hermes talk doctor
+hermes talk doctor --json
+```
+
+Both forms run the same deterministic checks: plugin registration receipts,
+the winning auth lane, model compatibility/voice validity, audio dependency availability,
+identity section counts plus active profile/root provenance, Discord operator
+configuration, and host capability surfaces. The JSON envelope is versioned
+with `schema_version: 1` and marks `read_only: true`.
+
+Doctor performs no setup or repair. In particular it does not refresh expired
+OAuth, rewrite `auth.json`, create Hermes state directories, open audio devices,
+start services, or probe an api-server sidecar. Remediations are instructions
+only. Identity content, credentials, and Discord IDs are never included; only
+section/operator counts and lane/state receipts are emitted.
+
+### 4. `talk_status` — the in-session command
 
 In any session (voice, or the dashboard's tool relay), ask for a status
 report. The model calls `talk_status` and reads back a JSON object. What
@@ -87,14 +136,14 @@ good looks like, field by field:
 | `auth` | `{configured: true, source: ..., detail: ...}` | `configured: false` → no credential on any lane |
 | `registration_failures` | **absent** | present → a surface failed to register; each line names which |
 
-### 3. Dashboard
+### 5. Dashboard
 
 With the Hermes dashboard running, `GET /api/plugins/hermes-talk/status`
 returns the same auth/lane/voice picture as JSON. From the machine itself
 no token is needed; from anywhere else the route requires
 `TALK_DASHBOARD_TOKEN` (see Configuration).
 
-### 4. The wire canary — proving a session mints and connects
+### 6. The wire canary — proving a session mints and connects
 
 The full end-to-end proof short of speech. `hermes talk` buffers its
 stdout when backgrounded, so **do not judge it by a redirected log file** —
@@ -125,7 +174,7 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model id for the session. |
+| `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
 
 ### Audio (terminal lane)
@@ -225,12 +274,13 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_OPENAI_API_KEY` | unset | Talk-scoped key, first in order. **Set-but-empty is a hard refusal, never a fall-through.** |
 | `OPENAI_API_KEY` | unset | Shared key, second in order. Same set-but-empty refusal. |
 | `CODEX_HOME` | `~/.codex` | Where the Codex OAuth lane (third in order) reads `auth.json` from. |
+| `TALK_PREFER_CODEX_OAUTH` | unset | Absent/`false` preserves the order above. `true` requires Codex OAuth and ignores API keys; missing/unusable OAuth refuses. Blank or invalid values also refuse. |
 
 ### Host
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `HERMES_HOME` | `~/.hermes` | Read as a **fallback** — the host's own constant wins when running inside Hermes. Determines the state dir (`$HERMES_HOME/state/`, home of `talk-runs.jsonl`) and is inherited by spawned children. |
+| `HERMES_HOME` | platform default | The host resolves context override → process `HERMES_HOME` → platform default. Doctor compares host API results using the host's exact `Path(value)` semantics, including literal tilde/relative values and Windows defaults; it reports unknown provenance when those semantics cannot be established. Determines the state dir (`$HERMES_HOME/state/`, home of `talk-runs.jsonl`) and is inherited by spawned children. |
 
 (One internal: the presence of `PYTEST_CURRENT_TEST` disables the durable
 run-history tee so test suites can't write into a real Hermes home.)

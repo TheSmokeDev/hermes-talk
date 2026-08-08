@@ -28,8 +28,10 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 try:
+    from . import talk_realtime as rt
     from .talk_tools import TalkToolError, execute_talk_tool
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_realtime as rt
     from talk_tools import TalkToolError, execute_talk_tool
 
 BARGE_IN_MESSAGE: dict = {"type": "response.cancel"}
@@ -258,6 +260,83 @@ class RealtimeRelay:
                 return self._function_output(call_id, output, continue_response=False)
         return handler(self, event)
 
+    def handle_realtime_event(self, event: rt.RealtimeEvent) -> list[rt.RealtimeCommand]:
+        """Handle one provider-neutral event on the transport loop."""
+
+        if isinstance(event, rt.SessionReady):
+            self.session_id = event.session_id
+        elif isinstance(event, rt.ResponseStarted):
+            self.response_active = True
+        elif isinstance(event, rt.SpeechStarted):
+            self.on_barge_in()
+            if self.response_active:
+                return [rt.CancelResponse()]
+        elif isinstance(event, rt.OutputAudio):
+            if event.item_id is not None:
+                self.last_audio_item_id = event.item_id
+            self.on_audio(event.data)
+        elif isinstance(event, rt.Transcript):
+            if event.provenance is rt.TranscriptProvenance.INPUT_AUDIO:
+                if event.final and event.text.strip():
+                    self.on_transcript_turn(rt.TranscriptRole.USER.value, event.text.strip())
+            elif event.final:
+                transcript = event.text or "".join(self._assistant_transcript)
+                self._assistant_transcript.clear()
+                if transcript.strip():
+                    self.on_transcript_turn(
+                        rt.TranscriptRole.ASSISTANT.value, transcript.strip()
+                    )
+            elif event.text:
+                self._assistant_transcript.append(event.text)
+                self.on_caption(event.text)
+        elif isinstance(event, rt.ResponseFinished):
+            self.last_audio_item_id = None
+            self.response_active = False
+        elif isinstance(event, rt.ProviderFailure):
+            self._report_error(event.detail)
+        return []
+
+    async def handle_tool_call_async(self, event: dict) -> list[rt.RealtimeCommand]:
+        """Execute one neutral function-call event off the transport loop."""
+
+        try:
+            messages = await run_bounded_on_daemon(
+                self._neutral_function_call, event, timeout=TOOL_EXECUTION_WAIT_S
+            )
+            return [
+                message for message in messages if not isinstance(message, rt.StartResponse)
+            ]
+        except ToolWorkerBusy:
+            call_id = str(event.get("call_id") or "")
+            name = str(event.get("name") or "tool")
+            self._consume_tool_attempt(event)
+            return self._neutral_function_output(
+                call_id,
+                f"Earlier tools are still running, so the {name} tool was not "
+                "started. Wait for them to finish, then ask me to try again.",
+                continue_response=False,
+            )
+        except ToolExecutionTimeout as exc:
+            call_id = str(event.get("call_id") or "")
+            name = str(event.get("name") or "tool")
+            self._consume_tool_attempt(event)
+            if exc.started:
+                output = (
+                    f"The {name} tool is still running after "
+                    f"{TOOL_EXECUTION_WAIT_S:g} seconds. I detached it so the "
+                    "call can continue, but its eventual result won't return "
+                    "to this conversation. Ask me to check again if you still need it."
+                )
+            else:
+                output = (
+                    f"The {name} tool did not start within "
+                    f"{TOOL_EXECUTION_WAIT_S:g} seconds because earlier tools "
+                    "were still using the workers. Ask me to try again."
+                )
+            return self._neutral_function_output(
+                call_id, output, continue_response=False
+            )
+
     def tool_queue_full_output(self, event: dict) -> list[dict]:
         """Answer a tool event that the session's bounded queue could not admit."""
 
@@ -268,6 +347,19 @@ class RealtimeRelay:
         # later when queue capacity becomes available.
         self._consume_tool_attempt(event)
         return self._function_output(
+            call_id,
+            f"Earlier tools are still running, so the {name} tool was not started. "
+            "Wait for them to finish, then ask me to try again.",
+            continue_response=False,
+        )
+
+    def tool_queue_full_commands(self, event: dict) -> list[rt.RealtimeCommand]:
+        """Neutral equivalent of :meth:`tool_queue_full_output`."""
+
+        call_id = str(event.get("call_id") or "")
+        name = str(event.get("name") or "tool")
+        self._consume_tool_attempt(event)
+        return self._neutral_function_output(
             call_id,
             f"Earlier tools are still running, so the {name} tool was not started. "
             "Wait for them to finish, then ask me to try again.",
@@ -345,27 +437,35 @@ class RealtimeRelay:
             self.on_transcript_turn("assistant", transcript.strip())
         return []
 
-    def _on_function_call(self, event: dict) -> list[dict]:
+    def _tool_result(self, event: dict) -> tuple[str, str]:
         call_id = str(event.get("call_id") or "")
         name = str(event.get("name") or "")
         if self.tool_authorizer is not None:
             denial = self.tool_authorizer(name, event)
             if denial is not None:
-                return self._function_output(call_id, denial)
+                return call_id, denial
         raw = event.get("arguments")
         try:
             arguments = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
         except ValueError:
-            return self._function_output(call_id, UNPARSEABLE_ARGS_TEXT)
+            return call_id, UNPARSEABLE_ARGS_TEXT
         if not isinstance(arguments, dict):
-            return self._function_output(call_id, UNPARSEABLE_ARGS_TEXT)
+            return call_id, UNPARSEABLE_ARGS_TEXT
         try:
             output = self.tool_executor(name, arguments)
         except TalkToolError as exc:
             # Unknown tool: the model asked for something that does not exist.
             # It still gets an answer, so the turn completes instead of hanging.
             output = f"That tool isn't available: {exc}"
+        return call_id, output
+
+    def _on_function_call(self, event: dict) -> list[dict]:
+        call_id, output = self._tool_result(event)
         return self._function_output(call_id, output)
+
+    def _neutral_function_call(self, event: dict) -> list[rt.RealtimeCommand]:
+        call_id, output = self._tool_result(event)
+        return self._neutral_function_output(call_id, output)
 
     def _on_error(self, event: dict) -> list[dict]:
         error = event.get("error")
@@ -374,16 +474,19 @@ class RealtimeRelay:
             detail = str(error.get("message") or error.get("type") or "")
         elif isinstance(error, str):
             detail = error
-        # A cancel that lost the race with response.done is not an error the
-        # operator can act on — the state gate makes it rare, this makes the
-        # residue silent instead of a line of noise per turn.
+        self._report_error(detail)
+        return []
+
+    def _report_error(self, detail: str) -> None:
+        # A cancel that lost the race with response completion is not an error
+        # the operator can act on.
         if "no active response" in detail.lower():
-            return []
+            return
         self.on_error(
-            f"Something went wrong on the call: {detail}" if detail
+            f"Something went wrong on the call: {detail}"
+            if detail
             else "Something went wrong on the call."
         )
-        return []
 
     def _on_response_done(self, _event: dict) -> list[dict]:
         self.last_audio_item_id = None
@@ -406,6 +509,17 @@ class RealtimeRelay:
         ]
         if continue_response:
             messages.append({"type": "response.create"})
+        return messages
+
+    @staticmethod
+    def _neutral_function_output(
+        call_id: str, output: str, *, continue_response: bool = True
+    ) -> list[rt.RealtimeCommand]:
+        messages: list[rt.RealtimeCommand] = [
+            rt.SubmitToolResult(call_id=call_id, output=output)
+        ]
+        if continue_response:
+            messages.append(rt.StartResponse())
         return messages
 
     _DISPATCH: ClassVar[dict[str, Callable[[RealtimeRelay, dict], list[dict]]]] = {
