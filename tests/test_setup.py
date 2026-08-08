@@ -7,6 +7,7 @@ import ctypes
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -969,6 +970,40 @@ def test_windows_restrictive_dacl_targets_active_user_not_owner_group(monkeypatc
     talk_setup._windows_restrict_owner_only_dacl(path)
 
     assert applied == [(path, f"D:P(A;;FA;;;{active_user})")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows handle discriminator")
+def test_windows_stage_closes_empty_temp_before_applying_dacl(monkeypatch, tmp_path):
+    captured_fd = None
+    real_mkstemp = tempfile.mkstemp
+    real_restrict = talk_setup._windows_restrict_owner_only_dacl
+
+    def capture_mkstemp(*args, **kwargs):
+        nonlocal captured_fd
+        captured_fd, name = real_mkstemp(*args, **kwargs)
+        return captured_fd, name
+
+    def inspect_restrict(path):
+        assert captured_fd is not None
+        with pytest.raises(OSError):
+            os.fstat(captured_fd)
+        assert path.read_bytes() == b""
+        real_restrict(path)
+
+    monkeypatch.setattr(talk_setup.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(talk_setup, "_windows_restrict_owner_only_dacl", inspect_restrict)
+    staged_paths = []
+    destination = tmp_path / ".env"
+
+    temporary = talk_setup._stage_env_file(
+        destination,
+        b"TALK_OPENAI_API_KEY=secret\n",
+        stat.S_IRUSR | stat.S_IWUSR,
+        staged_paths=staged_paths,
+    )
+
+    assert temporary.read_bytes() == b"TALK_OPENAI_API_KEY=secret\n"
+    temporary.unlink()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows ACL discriminator")

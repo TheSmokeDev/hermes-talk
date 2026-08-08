@@ -541,7 +541,18 @@ def _stage_env_file(
     staged_paths.append(temporary)
     try:
         if os.name == "nt":
+            # GitHub-hosted Windows runners reject SetNamedSecurityInfoW while
+            # the CRT descriptor returned by mkstemp remains open. Close the
+            # still-empty file first, harden and verify its DACL, then reopen
+            # it for the secret payload. No secret bytes exist before the ACL
+            # is private.
+            os.close(fd)
+            fd = -1
             _windows_restrict_owner_only_dacl(temporary)
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+            )
         elif hasattr(os, "fchmod"):
             os.fchmod(fd, mode)
         else:  # pragma: no cover - supported targets expose fchmod
