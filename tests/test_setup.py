@@ -973,6 +973,22 @@ def test_windows_restrictive_dacl_targets_active_user_not_owner_group(monkeypatc
     assert applied == [(path, f"D:P(A;;FA;;;{active_user})")]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows SID discriminator")
+def test_windows_restrictive_dacl_compares_canonical_sid_alias_semantically():
+    assert talk_setup._windows_dacl_grants_only_full_control(
+        "D:PAI(A;;FA;;;SY)",
+        "S-1-5-18",
+    )
+    assert not talk_setup._windows_dacl_grants_only_full_control(
+        "D:PAI(A;;FR;;;SY)",
+        "S-1-5-18",
+    )
+    assert not talk_setup._windows_dacl_grants_only_full_control(
+        "D:PAI(A;;FA;;;SY)(A;;FR;;;WD)",
+        "S-1-5-18",
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows handle discriminator")
 def test_windows_stage_closes_empty_temp_before_applying_dacl(monkeypatch, tmp_path):
     captured_fd = None
