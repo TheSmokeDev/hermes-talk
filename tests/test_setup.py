@@ -177,7 +177,7 @@ def _windows_set_dacl(path: Path, sddl: str) -> None:
 
 
 def _assert_windows_owner_only_dacl(path: Path) -> None:
-    owner_sid = _windows_owner_sid(path)
+    owner_sid = talk_setup._windows_current_user_sid()
     dacl = _windows_dacl_sddl(path)
     assert dacl.startswith("D:P")
     assert dacl.count("(A;") == 1
@@ -922,7 +922,7 @@ def test_existing_destination_dacl_is_preserved_exactly_while_temp_is_restrictiv
 ):
     env_path = tmp_path / ".env"
     env_path.write_text("TALK_VOICE=ash\n", encoding="utf-8")
-    owner_sid = _windows_owner_sid(env_path)
+    owner_sid = talk_setup._windows_current_user_sid()
     _windows_set_dacl(env_path, f"D:P(A;;FA;;;{owner_sid})(A;;FR;;;WD)")
     original_dacl = _windows_dacl_sddl(env_path)
     observed_temps = []
@@ -944,6 +944,31 @@ def test_existing_destination_dacl_is_preserved_exactly_while_temp_is_restrictiv
     assert receipt.state == "applied"
     assert len(observed_temps) == 1
     assert _windows_dacl_sddl(env_path) == original_dacl
+
+
+def test_windows_restrictive_dacl_targets_active_user_not_owner_group(monkeypatch, tmp_path):
+    path = tmp_path / "secret.env"
+    path.write_text("secret", encoding="utf-8")
+    active_user = "S-1-5-21-111-222-333-1001"
+    owner_group = "S-1-5-32-544"
+    applied = []
+
+    monkeypatch.setattr(talk_setup, "_windows_current_user_sid", lambda: active_user)
+    monkeypatch.setattr(talk_setup, "_windows_owner_sid", lambda _path: owner_group)
+    monkeypatch.setattr(
+        talk_setup,
+        "_windows_apply_dacl_sddl",
+        lambda target, sddl: applied.append((target, sddl)),
+    )
+    monkeypatch.setattr(
+        talk_setup,
+        "_windows_dacl_sddl",
+        lambda _path: f"D:P(A;;FA;;;{active_user})",
+    )
+
+    talk_setup._windows_restrict_owner_only_dacl(path)
+
+    assert applied == [(path, f"D:P(A;;FA;;;{active_user})")]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows ACL discriminator")

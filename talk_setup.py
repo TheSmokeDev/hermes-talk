@@ -235,6 +235,85 @@ def _windows_security_api():
     )
 
 
+def _windows_current_user_sid() -> str:
+    """Return the SID of the user token running this process."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    open_process_token.restype = wintypes.BOOL
+    get_token_information = advapi32.GetTokenInformation
+    get_token_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_token_information.restype = wintypes.BOOL
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("user", SidAndAttributes)]
+
+    token = wintypes.HANDLE()
+    if not open_process_token(get_current_process(), 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size = wintypes.DWORD()
+        get_token_information(token, 1, None, 0, ctypes.byref(size))
+        error = ctypes.get_last_error()
+        if error != 122:  # ERROR_INSUFFICIENT_BUFFER is the size probe result.
+            raise ctypes.WinError(error)
+        buffer = ctypes.create_string_buffer(size.value)
+        if not get_token_information(
+            token,
+            1,
+            buffer,
+            size,
+            ctypes.byref(size),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        token_user = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents
+        (
+            _ctypes,
+            _wintypes,
+            _get_named_security,
+            convert_sid,
+            _descriptor_to_sddl,
+            _sddl_to_descriptor,
+            _get_dacl,
+            _get_control,
+            _set_named_security,
+            local_free,
+        ) = _windows_security_api()
+        sid_text = wintypes.LPWSTR()
+        try:
+            if not convert_sid(token_user.user.sid, ctypes.byref(sid_text)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return sid_text.value
+        finally:
+            if sid_text:
+                local_free(sid_text)
+    finally:
+        close_handle(token)
+
+
 def _windows_owner_sid(path: Path) -> str:
     (
         ctypes,
@@ -380,14 +459,14 @@ def _windows_dacl_equivalent(left: str, right: str) -> bool:
 
 
 def _windows_restrict_owner_only_dacl(path: Path) -> None:
-    owner_sid = _windows_owner_sid(path)
-    desired = f"D:P(A;;FA;;;{owner_sid})"
+    user_sid = _windows_current_user_sid()
+    desired = f"D:P(A;;FA;;;{user_sid})"
     _windows_apply_dacl_sddl(path, desired)
     actual = _windows_dacl_sddl(path)
     if not (
         actual.startswith("D:P")
         and actual.count("(") == 1
-        and f"(A;;FA;;;{owner_sid})" in actual
+        and f"(A;;FA;;;{user_sid})" in actual
     ):
         raise PermissionError("secret-file DACL verification failed")
 
