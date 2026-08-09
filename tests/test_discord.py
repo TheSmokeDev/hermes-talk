@@ -548,6 +548,109 @@ def test_stop_restores_the_host_exactly(monkeypatch):
     assert adapter._voice_mixers == {}, "a closed mixer must not be handed back"
 
 
+def test_capture_only_borrows_receive_without_touching_host_playback(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_play = adapter.play_in_voice_channel
+    original_mode = adapter._voice_mode_getter
+    host_source = object()
+    vc.playing = host_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    bridge.start()
+
+    assert connection.callbacks != [original_listener]
+    assert vc.playing is host_source
+    assert adapter.play_in_voice_channel == original_play
+    assert adapter._voice_mode_getter is original_mode
+    assert adapter._voice_mixers == {7: "the-host-mixer"}
+    assert bridge._source is None
+    connection.deliver(b"\x01\x02" * 8)
+    assert bridge.read_input_chunk() is not None
+
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+
+
+def test_capture_only_playback_fails_closed():
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="capture-only"):
+        bridge.queue_playback(b"\x01\x00")
+
+
+def test_capture_only_failed_start_restores_listener_once(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    host_source = object()
+    vc.playing = host_source
+    removed: list = []
+    original_remove = connection.remove_socket_listener
+
+    def fail_after_removing_original(callback):
+        original_remove(callback)
+        removed.append(callback)
+        if callback == original_listener:
+            raise RuntimeError("swap failed after removal")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_after_removing_original)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't listen in"):
+        bridge.start()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+    assert adapter._voice_mixers == {7: "the-host-mixer"}
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+
+
+def test_capture_only_repeated_stop_restores_listener_exactly_once(monkeypatch):
+    connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    host_source = object()
+    vc.playing = host_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+
+    bridge.stop()
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+
+
+def test_capture_only_bridge_replacement_does_not_stop_either_playback(monkeypatch):
+    old_connection, old_receiver, old_vc, adapter = _wired_host(monkeypatch)
+    old_source = object()
+    old_vc.playing = old_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_source = object()
+    new_vc.playing = new_source
+    new_receiver = _FakeReceiver(new_vc)
+    new_connection.add_socket_listener(new_receiver._on_packet)
+    old_receiver._running = False
+    adapter._voice_clients[7] = new_vc
+    adapter._voice_receivers[7] = new_receiver
+
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection changed"):
+        bridge.read_input_chunk()
+
+    assert old_connection.callbacks == []
+    assert old_vc.playing is old_source
+    assert new_connection.callbacks == [new_receiver._on_packet]
+    assert new_vc.playing is new_source
+
+
 def test_capture_rearms_the_hosts_inactivity_timer(monkeypatch):
     # The host auto-leaves the channel when its silence gate sees nothing —
     # and we drain the very buffers that gate measures. Without re-arming,

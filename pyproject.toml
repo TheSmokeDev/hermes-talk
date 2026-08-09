@@ -43,6 +43,7 @@ py-modules = [
   "talk_realtime",
   "talk_openai_realtime",
   "talk_core_realtime",
+  "talk_core_session",
   "talk_discord",
   "talk_relay",
   "talk_transcript",

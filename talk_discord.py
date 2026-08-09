@@ -330,8 +330,9 @@ class DiscordAudio:
     # dashboard sessions deliberately keep their existing authorization path.
     discord_speaker_authorization = True
 
-    def __init__(self, guild_id: int | None = None) -> None:
+    def __init__(self, guild_id: int | None = None, *, capture_only: bool = False) -> None:
         self._guild_id = guild_id
+        self._capture_only = capture_only
         self._bridge: dict[str, Any] | None = None
         self._source: _RealtimeSource | None = None
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
@@ -384,7 +385,8 @@ class DiscordAudio:
         self._bridge = bridge
         self._bridge_failure = None
         self._disconnected_since = None
-        self._source = _new_source(self._outbound)
+        if not self._capture_only:
+            self._source = _new_source(self._outbound)
         self._audio_clock = time.monotonic()
         self._loop = _running_loop()
         if self._loop is None:
@@ -439,6 +441,9 @@ class DiscordAudio:
                 f"couldn't listen in on the voice channel: {exc}"
             ) from exc
         receiver._on_packet = tapped
+
+        if self._capture_only:
+            return
 
         # Park the host's own speech while we own the conversation. Its
         # reply path waits on ``is_playing()`` — which our continuous source
@@ -527,8 +532,9 @@ class DiscordAudio:
                 with suppress(Exception):
                     adapter._voice_mode_getter = self._restore_voice_mode
             self._restore_voice_mode = _UNSET
-            with suppress(Exception):
-                bridge["voice_client"].stop()
+            if not self._capture_only:
+                with suppress(Exception):
+                    bridge["voice_client"].stop()
         source, self._source = self._source, None
         if source is not None:
             with self._lock:
@@ -837,6 +843,8 @@ class DiscordAudio:
     def queue_playback(self, pcm: bytes) -> None:
         """Queue 24 kHz mono from the model for the voice channel."""
 
+        if self._capture_only:
+            raise talk_audio.TalkAudioError("capture-only Discord audio cannot queue playback")
         if not pcm:
             return
         converted, self._carry_sample = session_to_discord(pcm, carry=self._carry_sample)
