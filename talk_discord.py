@@ -367,6 +367,10 @@ class DiscordAudio:
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
+        # Serialize every externally visible lifecycle mutation, including
+        # the host listener registry calls below. Reentrant because startup
+        # unwinds an existing bridge and playback failures self-stop.
+        self._lifecycle_lock = threading.RLock()
         self._listener_lock = threading.RLock()
         self._listener_condition = threading.Condition(self._listener_lock)
         self._played_baseline = 0
@@ -402,6 +406,12 @@ class DiscordAudio:
         startup already turns that into one spoken line, and a voice
         surface should fail the same way whichever room it's in.
         """
+
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        """Start while owning the complete lifecycle transaction."""
 
         # A repeated start while this exact tap generation is still installed
         # is a no-op. Rewrapping our own tap would save that tap as the
@@ -599,6 +609,12 @@ class DiscordAudio:
 
     def stop(self) -> None:
         """Hand the connection back. Safe twice, and after a failed start."""
+
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        """Stop while owning the complete lifecycle transaction."""
 
         self._detach_speaker_notifier()
         with self._listener_condition:

@@ -806,6 +806,161 @@ def test_capture_only_repeated_start_restores_the_original_listener(monkeypatch)
     assert first_tap not in connection.callbacks
 
 
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_concurrent_starts_share_one_complete_listener_install(monkeypatch, capture_only):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_add = connection.add_socket_listener
+    add_entered = threading.Event()
+    release_add = threading.Event()
+    second_returned = threading.Event()
+    errors: list[Exception] = []
+    tap_adds: list = []
+
+    def blocking_add(callback):
+        if callback is not original_listener:
+            tap_adds.append(callback)
+            if len(tap_adds) == 1:
+                add_entered.set()
+                assert release_add.wait(2), "test never released the first listener install"
+        original_add(callback)
+
+    monkeypatch.setattr(connection, "add_socket_listener", blocking_add)
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    def run_start(returned=None):
+        try:
+            bridge.start()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+        finally:
+            if returned is not None:
+                returned.set()
+
+    first = threading.Thread(target=run_start)
+    second = threading.Thread(target=run_start, args=(second_returned,))
+    first.start()
+    assert add_entered.wait(2), "first start never reached listener installation"
+    second.start()
+    try:
+        assert not second_returned.wait(0.2), "second start escaped an incomplete first start"
+    finally:
+        release_add.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(tap_adds) == 1
+    assert connection.callbacks == [tap_adds[0]]
+    assert receiver._on_packet is tap_adds[0]
+
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_stop_waits_for_blocked_start_then_unwinds_the_complete_lifecycle(
+    monkeypatch, capture_only
+):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_add = connection.add_socket_listener
+    add_entered = threading.Event()
+    release_add = threading.Event()
+    stop_called = threading.Event()
+    stop_returned = threading.Event()
+    errors: list[Exception] = []
+    block_next_tap = True
+
+    def blocking_add(callback):
+        nonlocal block_next_tap
+        if callback is not original_listener and block_next_tap:
+            block_next_tap = False
+            add_entered.set()
+            assert release_add.wait(2), "test never released the blocked listener install"
+        original_add(callback)
+
+    monkeypatch.setattr(connection, "add_socket_listener", blocking_add)
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    def run_start():
+        try:
+            bridge.start()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+
+    def run_stop():
+        stop_called.set()
+        try:
+            bridge.stop()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+        finally:
+            stop_returned.set()
+
+    start_thread = threading.Thread(target=run_start)
+    stop_thread = threading.Thread(target=run_stop)
+    start_thread.start()
+    assert add_entered.wait(2), "start never reached the blocked listener install"
+    stop_thread.start()
+    assert stop_called.wait(2)
+    try:
+        assert not stop_returned.wait(0.2), "stop returned before the earlier start linearized"
+    finally:
+        release_add.set()
+    start_thread.join(2)
+    stop_thread.join(2)
+
+    assert not start_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert errors == []
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert bridge._bridge is None
+    assert bridge._source is None
+    assert bridge._original_on_packet is None
+    assert bridge._tapped is None
+    assert bridge._installed_listener_generation is None
+    assert bridge._capture_listener_generation is None
+    assert bridge._audio_clock == 0.0
+
+    bridge.start()
+    second_tap = connection.callbacks[0]
+    assert second_tap is not original_listener
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert second_tap not in connection.callbacks
+
+
+def test_playback_failure_self_stop_is_reentrant_and_restores_the_host(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_play = adapter.play_in_voice_channel
+    original_mode = adapter._voice_mode_getter
+
+    def fail_play(_source):
+        raise RuntimeError("player rejected source")
+
+    monkeypatch.setattr(vc, "play", fail_play)
+    bridge = talk_discord.DiscordAudio(7)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't take over playback"):
+        bridge.start()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert adapter.play_in_voice_channel == original_play
+    assert adapter._voice_mode_getter is original_mode
+    assert bridge._bridge is None
+    assert bridge._source is None
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+
+
 def test_capture_only_bridge_replacement_does_not_stop_either_playback(monkeypatch):
     old_connection, old_receiver, old_vc, adapter = _wired_host(monkeypatch)
     old_source = object()
