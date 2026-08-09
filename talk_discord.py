@@ -229,9 +229,7 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
 
     if guild_id is None:
         if len(clients) > 1:
-            raise TalkDiscordError(
-                "I'm in more than one voice channel — say which server"
-            )
+            raise TalkDiscordError("I'm in more than one voice channel — say which server")
         guild_id = next(iter(clients))
 
     voice_client = clients.get(guild_id)
@@ -369,7 +367,8 @@ class DiscordAudio:
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
-        self._listener_lock = threading.Lock()
+        self._listener_lock = threading.RLock()
+        self._listener_condition = threading.Condition(self._listener_lock)
         self._played_baseline = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
@@ -380,6 +379,9 @@ class DiscordAudio:
         self._tapped = None
         self._listener_generation = 0
         self._installed_listener_generation: int | None = None
+        self._capture_listener_generation: int | None = None
+        self._closing_listener_handoff_generation: int | None = None
+        self._active_listener_callbacks: dict[int, int] = {}
         self._loop = None
         self._last_keepalive = 0.0
         self._restore_voice_mode: Any = _UNSET
@@ -438,9 +440,7 @@ class DiscordAudio:
             # Without a loop we cannot marshal the host's inactivity-timer
             # reset, and the host would evict us mid-conversation with no
             # signal. Say it once rather than fail silently.
-            _log.warning(
-                "no running loop — the host's voice inactivity timer will not be re-armed"
-            )
+            _log.warning("no running loop — the host's voice inactivity timer will not be re-armed")
         voice_client = bridge["voice_client"]
 
         # Tap the host's receive path. We wrap rather than replace so the
@@ -449,18 +449,35 @@ class DiscordAudio:
         generation = self._listener_generation + 1
 
         def tapped(data: bytes) -> None:
+            with self._listener_condition:
+                while (
+                    self._closing_listener_handoff_generation == generation
+                    and self._installed_listener_generation == generation
+                    and self._tapped is tapped
+                ):
+                    self._listener_condition.wait()
+                self._active_listener_callbacks[generation] = (
+                    self._active_listener_callbacks.get(generation, 0) + 1
+                )
             try:
                 original(data)
             finally:
                 # Linearize draining with stop()'s generation invalidation.
                 # Once teardown acquires this lock, no copied/in-flight tap
                 # from the old generation can enqueue afterward.
-                with self._listener_lock:
+                with self._listener_condition:
                     if (
                         self._installed_listener_generation == generation
+                        and self._capture_listener_generation == generation
                         and self._tapped is tapped
                     ):
                         self._drain_receiver(receiver)
+                    remaining = self._active_listener_callbacks[generation] - 1
+                    if remaining:
+                        self._active_listener_callbacks[generation] = remaining
+                    else:
+                        self._active_listener_callbacks.pop(generation, None)
+                        self._listener_condition.notify_all()
 
         # The registration is what matters, NOT the attribute. discord.py
         # appends the BOUND METHOD OBJECT to its listener list and calls the
@@ -478,6 +495,7 @@ class DiscordAudio:
             self._tapped = tapped
             self._listener_generation = generation
             self._installed_listener_generation = generation
+            self._capture_listener_generation = None
         try:
             connection = voice_client._connection
             # Add first, then remove: unregistering the only callback pauses
@@ -491,23 +509,37 @@ class DiscordAudio:
             # A dispatcher may already have copied the tap and still be inside
             # the original callback; once it returns it must not drain into a
             # failed generation while remove/add repairs the host registry.
-            with self._listener_lock:
+            with self._listener_condition:
                 self._installed_listener_generation = None
+                self._capture_listener_generation = None
+                self._closing_listener_handoff_generation = None
                 self._original_on_packet = None
                 self._tapped = None
                 self._bridge = None
-                self._reset_capture_generation()
+                self._listener_condition.notify_all()
             # Removal and restoration are independent best-effort operations:
             # a half-completed swap can leave either callback absent.
             with suppress(Exception):  # never leave the host deaf
                 connection.remove_socket_listener(tapped)
             with suppress(Exception):
                 _add_socket_listener_once(connection, original)
+            self._wait_for_listener_generation(generation)
+            self._reset_capture_generation()
             self._source = None
             raise talk_audio.TalkAudioError(
                 f"couldn't listen in on the voice channel: {exc}"
             ) from exc
         receiver._on_packet = tapped
+        # New packets now route through the parked tap. Drop PCM accumulated
+        # before this handoff, then publish the generation and release callbacks.
+        with self._listener_condition:
+            self._closing_listener_handoff_generation = generation
+            while self._active_listener_callbacks.get(generation, 0):
+                self._listener_condition.wait()
+            self._discard_receiver_buffers(receiver)
+            self._capture_listener_generation = generation
+            self._closing_listener_handoff_generation = None
+            self._listener_condition.notify_all()
 
         if self._capture_only:
             return
@@ -569,8 +601,9 @@ class DiscordAudio:
         """Hand the connection back. Safe twice, and after a failed start."""
 
         self._detach_speaker_notifier()
-        with self._listener_lock:
+        with self._listener_condition:
             listener_is_owned = self._listener_install_is_owned()
+            generation = self._installed_listener_generation
             bridge, self._bridge = self._bridge, None
             original, self._original_on_packet = self._original_on_packet, None
             tapped, self._tapped = self._tapped, None
@@ -578,6 +611,9 @@ class DiscordAudio:
             # registry. Removal can invoke or race such a callback, and it must
             # not drain receiver buffers into a detached generation.
             self._installed_listener_generation = None
+            self._capture_listener_generation = None
+            self._closing_listener_handoff_generation = None
+            self._listener_condition.notify_all()
         # Teardown is best-effort at every step: a half-torn-down bridge
         # must still hand the connection back to the host, in the reverse
         # order it was taken.
@@ -600,6 +636,8 @@ class DiscordAudio:
                 with suppress(Exception):
                     if getattr(receiver, "_on_packet", None) is tapped:
                         receiver._on_packet = original
+        if generation is not None:
+            self._wait_for_listener_generation(generation)
         # The old tap is fenced before this reset, so no old generation can
         # refill the queue or rebuild a partial conversion afterward.
         self._reset_capture_generation()
@@ -647,9 +685,30 @@ class DiscordAudio:
         self._bridge_failure = None
         self._disconnected_since = None
 
-    def _deliver_speaker(
-        self, generation: int, notifier: Any, speaker: dict[str, Any]
-    ) -> None:
+    @staticmethod
+    def _discard_receiver_buffers(receiver: Any) -> None:
+        """Drop host PCM that predates a newly published Talk generation."""
+
+        buffers = getattr(receiver, "_buffers", None)
+        if not buffers:
+            return
+        lock = getattr(receiver, "_lock", None)
+        if lock is not None:
+            with lock:
+                for buf in buffers.values():
+                    del buf[:]
+            return
+        for buf in buffers.values():  # pragma: no cover - shipped hosts have the lock
+            del buf[:]
+
+    def _wait_for_listener_generation(self, generation: int) -> None:
+        """Wait until admitted callbacks finish the host's original bookkeeping."""
+
+        with self._listener_condition:
+            while self._active_listener_callbacks.get(generation, 0):
+                self._listener_condition.wait()
+
+    def _deliver_speaker(self, generation: int, notifier: Any, speaker: dict[str, Any]) -> None:
         if (
             generation == self._speaker_notifier_generation
             and notifier is self._speaker_notifier
@@ -690,9 +749,7 @@ class DiscordAudio:
             self._deliver_speaker(generation, notifier, speaker)
             return
         with suppress(RuntimeError):  # loop closed while the receiver thread drains
-            loop.call_soon_threadsafe(
-                self._deliver_speaker, generation, notifier, speaker
-            )
+            loop.call_soon_threadsafe(self._deliver_speaker, generation, notifier, speaker)
 
     def _drain_receiver(self, receiver: Any) -> None:
         """Move whatever the host just decoded into our queue, at our rate.
@@ -704,9 +761,7 @@ class DiscordAudio:
         """
 
         if not self._bridge_identity_is_current(receiver):
-            self._mark_bridge_failure(
-                "the Discord voice connection changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice connection changed while I was listening")
             return
 
         try:
@@ -735,9 +790,7 @@ class DiscordAudio:
                 chunks = [
                     (
                         ssrc,
-                        receiver_mapping.get(ssrc)
-                        if isinstance(receiver_mapping, dict)
-                        else None,
+                        receiver_mapping.get(ssrc) if isinstance(receiver_mapping, dict) else None,
                         bytes(buf),
                     )
                     for ssrc, buf in buffers.items()
@@ -831,13 +884,9 @@ class DiscordAudio:
 
     def _fail_if_bridge_lost(self) -> None:
         if not self._bridge_identity_is_current():
-            self._mark_bridge_failure(
-                "the Discord voice connection changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice connection changed while I was listening")
         elif not self._bridge_credentials_are_current():
-            self._mark_bridge_failure(
-                "the Discord voice credentials changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice credentials changed while I was listening")
         bridge = self._bridge
         if bridge is not None and self._bridge_failure is None:
             try:

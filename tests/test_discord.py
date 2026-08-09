@@ -611,9 +611,7 @@ def test_capture_only_failed_start_restores_listener_once(monkeypatch):
 
 
 @pytest.mark.parametrize("capture_only", [True, False])
-def test_failed_swap_fences_inflight_tap_before_rollback_and_restart(
-    monkeypatch, capture_only
-):
+def test_failed_swap_fences_inflight_tap_before_rollback_and_restart(monkeypatch, capture_only):
     connection, receiver, vc, _adapter = _wired_host(monkeypatch)
     host_source = object()
     vc.playing = host_source
@@ -673,8 +671,34 @@ def test_failed_swap_fences_inflight_tap_before_rollback_and_restart(
     assert bridge._inbound.empty(), "failed generation PCM survived the restart"
     assert bridge._capture_remainder == {}
     assert bridge._audio_clock == 200.0
-    connection.deliver(b"\x02\x00" * 8)
+    new_pcm = b"\x02\x00" * 8
+    connection.deliver(new_pcm)
     packet = bridge._inbound.get_nowait()
+    assert packet.pcm == talk_discord.discord_to_session(new_pcm)[0]
+    assert packet.speaker["user_id"] == 101
+    assert speaker_events == [packet.speaker]
+    bridge.stop()
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_restart_discards_pcm_received_by_host_between_generations(monkeypatch, capture_only):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    receiver._ssrc_to_user[1] = 101
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+    bridge.start()
+    bridge.stop()
+
+    connection.deliver(b"\x01\x00" * 5)
+    assert receiver._buffers[1], "host did not preserve between-generation PCM"
+
+    bridge.start()
+    speaker_events = []
+    bridge.set_speaker_notifier(speaker_events.append)
+    new_pcm = b"\x02\x00" * 8
+    connection.deliver(new_pcm)
+
+    packet = bridge._inbound.get_nowait()
+    assert packet.pcm == talk_discord.discord_to_session(new_pcm)[0]
     assert packet.speaker["user_id"] == 101
     assert speaker_events == [packet.speaker]
     bridge.stop()
