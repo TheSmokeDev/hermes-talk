@@ -644,6 +644,30 @@ def test_capture_only_stop_preserves_a_newer_host_listener(monkeypatch):
     assert receiver._on_packet is replacement
 
 
+def test_capture_only_stop_restores_original_when_tap_removal_raises(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    stale_tap = connection.callbacks[0]
+    connection.callbacks.remove(stale_tap)  # concurrent host teardown won the race
+
+    def fail_removal(_callback):
+        stale_tap(b"\x01\x02" * 8)  # copied callback runs after teardown begins
+        raise ValueError("listener was already removed")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_removal)
+
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert bridge.read_input_chunk() is None
+
+    stale_tap(b"\x03\x04" * 8)
+    assert bridge.read_input_chunk() is None
+
+
 def test_capture_only_repeated_start_restores_the_original_listener(monkeypatch):
     connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
     original_listener = connection.callbacks[0]
@@ -914,6 +938,44 @@ def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):
     bridge._drain_receiver(receiver)
     assert set(bridge._capture_remainder) == {1, 2}
     assert bridge._capture_remainder[1] != bridge._capture_remainder[2]
+    bridge.stop()
+
+
+def test_capture_state_does_not_cross_stop_restart_generation(monkeypatch):
+    _connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    old_events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(old_events.append)
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 5)
+    bridge._drain_receiver(receiver)
+    assert not bridge._inbound.empty()
+    assert bridge._capture_remainder[11]
+    assert len(old_events) == 1
+
+    bridge.stop()
+    bridge.start()
+    new_events: list[dict] = []
+    bridge.set_speaker_notifier(new_events.append)
+    bridge._audio_clock = talk_discord.time.monotonic() + 1
+
+    assert bridge.read_input_packet() is None, "old unread PCM crossed the restart"
+    assert bridge._capture_remainder == {}
+
+    new_chunk = b"\x04\x00" * 4
+    expected_pcm, expected_remainder = talk_discord.discord_to_session(new_chunk)
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(new_chunk)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.pcm == expected_pcm
+    assert bridge._capture_remainder[11] == expected_remainder
+    assert len(new_events) == 1, "same speaker needs a fresh-generation transition"
     bridge.stop()
 
 

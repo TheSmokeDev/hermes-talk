@@ -338,6 +338,7 @@ class DiscordAudio:
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
+        self._listener_lock = threading.Lock()
         self._played_baseline = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
@@ -420,11 +421,15 @@ class DiscordAudio:
             try:
                 original(data)
             finally:
-                if (
-                    self._installed_listener_generation == generation
-                    and self._tapped is tapped
-                ):
-                    self._drain_receiver(receiver)
+                # Linearize draining with stop()'s generation invalidation.
+                # Once teardown acquires this lock, no copied/in-flight tap
+                # from the old generation can enqueue afterward.
+                with self._listener_lock:
+                    if (
+                        self._installed_listener_generation == generation
+                        and self._tapped is tapped
+                    ):
+                        self._drain_receiver(receiver)
 
         # The registration is what matters, NOT the attribute. discord.py
         # appends the BOUND METHOD OBJECT to its listener list and calls the
@@ -437,10 +442,11 @@ class DiscordAudio:
         # is the only thing that can put the original listener back, and it
         # is gated on these being set. Losing that leg leaves the host
         # permanently deaf with no path back.
-        self._original_on_packet = original
-        self._tapped = tapped
-        self._listener_generation = generation
-        self._installed_listener_generation = generation
+        with self._listener_lock:
+            self._original_on_packet = original
+            self._tapped = tapped
+            self._listener_generation = generation
+            self._installed_listener_generation = generation
         try:
             connection = voice_client._connection
             # Add first, then remove: unregistering the only callback pauses
@@ -523,28 +529,40 @@ class DiscordAudio:
         """Hand the connection back. Safe twice, and after a failed start."""
 
         self._detach_speaker_notifier()
-        listener_is_owned = self._listener_install_is_owned()
-        bridge, self._bridge = self._bridge, None
+        with self._listener_lock:
+            listener_is_owned = self._listener_install_is_owned()
+            bridge, self._bridge = self._bridge, None
+            original, self._original_on_packet = self._original_on_packet, None
+            tapped, self._tapped = self._tapped, None
+            # Fence callbacks copied by the host before touching its listener
+            # registry. Removal can invoke or race such a callback, and it must
+            # not drain receiver buffers into a detached generation.
+            self._installed_listener_generation = None
         # Teardown is best-effort at every step: a half-torn-down bridge
         # must still hand the connection back to the host, in the reverse
         # order it was taken.
-        if bridge is not None and self._original_on_packet is not None:
+        if bridge is not None and original is not None:
             receiver = bridge.get("receiver")
+            connection = bridge["voice_client"]._connection
             with suppress(Exception):
-                connection = bridge["voice_client"]._connection
-                connection.remove_socket_listener(self._tapped)
-                # Only re-register for a receiver that is still alive. If the
-                # host already tore it down, re-adding an inert callback keeps
-                # its reader thread awake for the life of the connection.
-                if listener_is_owned and getattr(receiver, "_running", False):
-                    connection.add_socket_listener(self._original_on_packet)
-            if listener_is_owned:
+                connection.remove_socket_listener(tapped)
+            # Removal and restoration are independent: a concurrent host
+            # removal may make the first operation raise, but the host still
+            # needs its original listener back. Re-check callback identity so
+            # a newer host replacement remains authoritative.
+            if (
+                listener_is_owned
+                and getattr(receiver, "_running", False)
+                and getattr(receiver, "_on_packet", None) is tapped
+            ):
                 with suppress(Exception):
-                    receiver._on_packet = self._original_on_packet
-        self._original_on_packet = None
-        self._tapped = None
-        self._installed_listener_generation = None
-        self._audio_clock = 0.0
+                    connection.add_socket_listener(original)
+                with suppress(Exception):
+                    if getattr(receiver, "_on_packet", None) is tapped:
+                        receiver._on_packet = original
+        # The old tap is fenced before this reset, so no old generation can
+        # refill the queue or rebuild a partial conversion afterward.
+        self._reset_capture_generation()
         if bridge is not None:
             adapter = bridge.get("adapter")
             if self._restore_play is not _UNSET:
@@ -574,6 +592,20 @@ class DiscordAudio:
 
     def _detach_speaker_notifier(self) -> None:
         self.set_speaker_notifier(None)
+
+    def _reset_capture_generation(self) -> None:
+        while True:
+            try:
+                self._inbound.get_nowait()
+            except queue.Empty:
+                break
+        self._capture_remainder.clear()
+        self._audio_clock = 0.0
+        self._last_keepalive = 0.0
+        self._loop = None
+        self._last_speaker_key = _UNSET
+        self._bridge_failure = None
+        self._disconnected_since = None
 
     def _deliver_speaker(
         self, generation: int, notifier: Any, speaker: dict[str, Any]
