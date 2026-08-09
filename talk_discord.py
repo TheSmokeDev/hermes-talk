@@ -346,6 +346,8 @@ class DiscordAudio:
         self._audio_clock = 0.0
         self._original_on_packet = None
         self._tapped = None
+        self._listener_generation = 0
+        self._installed_listener_generation: int | None = None
         self._loop = None
         self._last_keepalive = 0.0
         self._restore_voice_mode: Any = _UNSET
@@ -366,6 +368,17 @@ class DiscordAudio:
         startup already turns that into one spoken line, and a voice
         surface should fail the same way whichever room it's in.
         """
+
+        # A repeated start while this exact tap generation is still installed
+        # is a no-op. Rewrapping our own tap would save that tap as the
+        # "original" and later restore it instead of the host callback.
+        if self._listener_install_is_owned():
+            return
+        if self._bridge is not None:
+            # The host may have replaced our listener on the live receiver.
+            # Unwind only what we still own before borrowing that replacement
+            # as the next generation's original.
+            self.stop()
 
         # A reused bridge must never carry a callback from an earlier session.
         # Do this before any operation that can fail so every failed-start path
@@ -401,12 +414,17 @@ class DiscordAudio:
         # Tap the host's receive path. We wrap rather than replace so the
         # host's own bookkeeping keeps working.
         original = receiver._on_packet
+        generation = self._listener_generation + 1
 
         def tapped(data: bytes) -> None:
             try:
                 original(data)
             finally:
-                self._drain_receiver(receiver)
+                if (
+                    self._installed_listener_generation == generation
+                    and self._tapped is tapped
+                ):
+                    self._drain_receiver(receiver)
 
         # The registration is what matters, NOT the attribute. discord.py
         # appends the BOUND METHOD OBJECT to its listener list and calls the
@@ -421,6 +439,8 @@ class DiscordAudio:
         # permanently deaf with no path back.
         self._original_on_packet = original
         self._tapped = tapped
+        self._listener_generation = generation
+        self._installed_listener_generation = generation
         try:
             connection = voice_client._connection
             # Add first, then remove: unregistering the only callback pauses
@@ -436,6 +456,7 @@ class DiscordAudio:
                 connection.add_socket_listener(original)
             self._original_on_packet = None
             self._tapped = None
+            self._installed_listener_generation = None
             self._bridge = None
             raise talk_audio.TalkAudioError(
                 f"couldn't listen in on the voice channel: {exc}"
@@ -502,7 +523,7 @@ class DiscordAudio:
         """Hand the connection back. Safe twice, and after a failed start."""
 
         self._detach_speaker_notifier()
-        bridge_is_current = self._bridge_identity_is_current()
+        listener_is_owned = self._listener_install_is_owned()
         bridge, self._bridge = self._bridge, None
         # Teardown is best-effort at every step: a half-torn-down bridge
         # must still hand the connection back to the host, in the reverse
@@ -515,12 +536,14 @@ class DiscordAudio:
                 # Only re-register for a receiver that is still alive. If the
                 # host already tore it down, re-adding an inert callback keeps
                 # its reader thread awake for the life of the connection.
-                if bridge_is_current and getattr(receiver, "_running", False):
+                if listener_is_owned and getattr(receiver, "_running", False):
                     connection.add_socket_listener(self._original_on_packet)
-            with suppress(Exception):
-                receiver._on_packet = self._original_on_packet
+            if listener_is_owned:
+                with suppress(Exception):
+                    receiver._on_packet = self._original_on_packet
         self._original_on_packet = None
         self._tapped = None
+        self._installed_listener_generation = None
         self._audio_clock = 0.0
         if bridge is not None:
             adapter = bridge.get("adapter")
@@ -565,12 +588,9 @@ class DiscordAudio:
     def _speaker_for_ssrc(self, ssrc: Any, raw_user_id: Any) -> dict[str, Any]:
         """Resolve display metadata from the receiver's already-captured mapping."""
 
-        try:
-            user_id = int(raw_user_id)
-        except (TypeError, ValueError):
-            user_id = 0
+        user_id = raw_user_id if type(raw_user_id) is int and raw_user_id > 0 else None
         display_name = ""
-        if user_id > 0 and self._bridge is not None:
+        if user_id is not None and self._bridge is not None:
             voice_client = self._bridge.get("voice_client")
             channel = getattr(voice_client, "channel", None)
             for member in getattr(channel, "members", ()) or ():
@@ -700,6 +720,19 @@ class DiscordAudio:
             )
         except Exception:  # noqa: BLE001 — host internals are an untrusted boundary
             return False
+
+    def _listener_install_is_owned(self) -> bool:
+        """Whether our exact current tap generation still owns the receiver slot."""
+
+        bridge = self._bridge
+        tapped = self._tapped
+        return bool(
+            bridge is not None
+            and tapped is not None
+            and self._installed_listener_generation == self._listener_generation
+            and self._bridge_identity_is_current()
+            and getattr(bridge.get("receiver"), "_on_packet", None) is tapped
+        )
 
     def _mark_bridge_failure(self, message: str) -> None:
         if self._bridge_failure is None:

@@ -625,6 +625,40 @@ def test_capture_only_repeated_stop_restores_listener_exactly_once(monkeypatch):
     assert vc.playing is host_source
 
 
+def test_capture_only_stop_preserves_a_newer_host_listener(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    tapped = connection.callbacks[0]
+
+    def replacement(_data: bytes) -> None:
+        pass
+
+    connection.remove_socket_listener(tapped)
+    connection.add_socket_listener(replacement)
+    receiver._on_packet = replacement
+
+    bridge.stop()
+
+    assert connection.callbacks == [replacement]
+    assert receiver._on_packet is replacement
+
+
+def test_capture_only_repeated_start_restores_the_original_listener(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    bridge.start()
+    first_tap = connection.callbacks[0]
+    bridge.start()
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert first_tap not in connection.callbacks
+
+
 def test_capture_only_bridge_replacement_does_not_stop_either_playback(monkeypatch):
     old_connection, old_receiver, old_vc, adapter = _wired_host(monkeypatch)
     old_source = object()
@@ -900,6 +934,34 @@ def test_drain_resolves_the_discord_speaker_for_each_audio_chunk(monkeypatch):
 
     assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
     assert bridge.read_input_chunk() is not None
+    bridge.stop()
+
+
+class _CoerciveDiscordUserId:
+    def __int__(self) -> int:
+        return 101
+
+
+@pytest.mark.parametrize(
+    "raw_user_id",
+    ["101", "00101", True, 101.0, 101.5, _CoerciveDiscordUserId()],
+)
+def test_drain_does_not_coerce_receiver_user_id_mappings(monkeypatch, raw_user_id):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = raw_user_id
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.speaker == {"ssrc": 11, "user_id": None, "display_name": ""}
     bridge.stop()
 
 

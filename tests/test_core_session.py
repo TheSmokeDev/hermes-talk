@@ -24,6 +24,19 @@ def test_synthesized_silence_is_admitted_to_close_the_operator_turn():
     assert admission.admit(InputAudioPacket(speaker=None, pcm=silence)) == silence
 
 
+def test_unattributed_nonzero_pcm_is_not_treated_as_synthesized_silence():
+    admission = OperatorPacketAdmission(42)
+
+    assert admission.admit(InputAudioPacket(speaker=None, pcm=b"\x01\x00")) is None
+
+
+@pytest.mark.parametrize("speaker", [{"user_id": 42}, None])
+def test_odd_length_pcm_is_rejected_before_identity_or_silence_admission(speaker):
+    admission = OperatorPacketAdmission(42)
+
+    assert admission.admit(InputAudioPacket(speaker=speaker, pcm=b"\x00")) is None
+
+
 def test_display_name_ssrc_and_provider_metadata_never_grant_authority():
     admission = OperatorPacketAdmission(42)
     packet = InputAudioPacket(

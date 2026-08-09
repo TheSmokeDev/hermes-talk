@@ -31,10 +31,10 @@ class OperatorPacketAdmission:
             pcm = packet.pcm
         except Exception:  # noqa: BLE001 - malformed transport objects fail closed
             return None
-        if type(pcm) is not bytes or not pcm:
+        if type(pcm) is not bytes or not pcm or len(pcm) % 2:
             return None
         if speaker is None:
-            return pcm
+            return pcm if not any(pcm) else None
         if type(speaker) is not dict:
             return None
         user_id = speaker.get("user_id")
