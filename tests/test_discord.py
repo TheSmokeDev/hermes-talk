@@ -436,6 +436,7 @@ class _FakeConnection:
 
     def __init__(self) -> None:
         self.callbacks: list = []
+        self._socket_reader = types.SimpleNamespace(_callbacks=self.callbacks)
 
     def add_socket_listener(self, cb) -> None:
         self.callbacks.append(cb)
@@ -609,6 +610,76 @@ def test_capture_only_failed_start_restores_listener_once(monkeypatch):
     assert connection.callbacks == [original_listener]
 
 
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_failed_swap_fences_inflight_tap_before_rollback_and_restart(
+    monkeypatch, capture_only
+):
+    connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    host_source = object()
+    vc.playing = host_source
+    original_listener = connection.callbacks[0]
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_thread = None
+
+    def blocking_original(data: bytes) -> None:
+        callback_entered.set()
+        assert release_callback.wait(2), "rollback never released the copied tap"
+        original_listener(data)
+
+    connection.callbacks[:] = [blocking_original]
+    receiver._on_packet = blocking_original
+    receiver._ssrc_to_user[1] = 101
+    original_remove = connection.remove_socket_listener
+
+    def fail_swap_and_release_during_rollback(callback):
+        nonlocal callback_thread
+        if callback is blocking_original:
+            original_remove(callback)
+            tapped = connection.callbacks[0]
+            callback_thread = threading.Thread(target=tapped, args=(b"\x01\x00" * 5,))
+            callback_thread.start()
+            assert callback_entered.wait(2), "copied tap never entered the host callback"
+            raise RuntimeError("swap failed after original removal")
+        release_callback.set()
+        original_remove(callback)
+        callback_thread.join(2)
+        assert not callback_thread.is_alive(), "copied tap did not finish during rollback"
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_swap_and_release_during_rollback)
+    clock = [100.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't listen in"):
+        bridge.start()
+
+    assert connection.callbacks == [blocking_original]
+    assert receiver._on_packet is blocking_original
+    assert vc.playing is host_source
+    assert bridge._source is None
+    assert bridge._inbound.empty()
+    assert bridge._capture_remainder == {}
+    assert bridge._audio_clock == 0.0
+    assert bridge._last_keepalive == 0.0
+    assert bridge._last_speaker_key is talk_discord._UNSET
+
+    monkeypatch.setattr(connection, "remove_socket_listener", original_remove)
+    clock[0] = 200.0
+    bridge.start()
+    speaker_events = []
+    bridge.set_speaker_notifier(speaker_events.append)
+
+    assert bridge._inbound.empty(), "failed generation PCM survived the restart"
+    assert bridge._capture_remainder == {}
+    assert bridge._audio_clock == 200.0
+    connection.deliver(b"\x02\x00" * 8)
+    packet = bridge._inbound.get_nowait()
+    assert packet.speaker["user_id"] == 101
+    assert speaker_events == [packet.speaker]
+    bridge.stop()
+
+
 def test_capture_only_repeated_stop_restores_listener_exactly_once(monkeypatch):
     connection, receiver, vc, _adapter = _wired_host(monkeypatch)
     original_listener = connection.callbacks[0]
@@ -666,6 +737,34 @@ def test_capture_only_stop_restores_original_when_tap_removal_raises(monkeypatch
 
     stale_tap(b"\x03\x04" * 8)
     assert bridge.read_input_chunk() is None
+
+
+def test_stop_does_not_duplicate_original_already_restored_by_host(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    stale_tap = connection.callbacks[0]
+
+    def unrelated_listener(_data: bytes) -> None:
+        pass
+
+    # Concurrent host recovery wins the registry race but has not yet repaired
+    # the receiver attribute observed by stop().
+    connection.callbacks[:] = [unrelated_listener, original_listener]
+
+    def already_absent(callback):
+        assert callback is stale_tap
+        raise ValueError("tap was already removed by host recovery")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", already_absent)
+
+    bridge.stop()
+
+    assert stale_tap not in connection.callbacks
+    assert connection.callbacks.count(original_listener) == 1
+    assert unrelated_listener in connection.callbacks
+    assert receiver._on_packet == original_listener
 
 
 def test_capture_only_repeated_start_restores_the_original_listener(monkeypatch):

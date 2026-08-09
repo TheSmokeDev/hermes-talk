@@ -323,6 +323,37 @@ def _new_source(frames: queue.Queue) -> Any:
     return cls(frames)
 
 
+def _add_socket_listener_once(connection: Any, callback: Any) -> None:
+    """Register an exact callback only when the host registry does not have it."""
+
+    reader = getattr(connection, "_socket_reader", None)
+    registries = [
+        getattr(reader, "_callbacks", None),
+        getattr(connection, "callbacks", None),
+    ]
+    for callbacks in registries:
+        if callbacks is not None:
+            try:
+                callback_self = getattr(callback, "__self__", _UNSET)
+                callback_func = getattr(callback, "__func__", _UNSET)
+                if any(
+                    registered is callback
+                    or (
+                        callback_self is not _UNSET
+                        and callback_func is not _UNSET
+                        and getattr(registered, "__self__", _UNSET) is callback_self
+                        and getattr(registered, "__func__", _UNSET) is callback_func
+                    )
+                    for registered in callbacks
+                ):
+                    return
+            except (TypeError, RuntimeError):
+                # An opaque or concurrently changing host registry cannot be
+                # inspected reliably; fall back to its registration API.
+                continue
+    connection.add_socket_listener(callback)
+
+
 class DiscordAudio:
     """A voice channel wearing :class:`talk_audio.DuplexAudio`'s interface."""
 
@@ -456,14 +487,23 @@ class DiscordAudio:
             connection.add_socket_listener(tapped)
             connection.remove_socket_listener(original)
         except Exception as exc:  # host receive surface, any type
+            # Fence this generation before any rollback callback operation.
+            # A dispatcher may already have copied the tap and still be inside
+            # the original callback; once it returns it must not drain into a
+            # failed generation while remove/add repairs the host registry.
+            with self._listener_lock:
+                self._installed_listener_generation = None
+                self._original_on_packet = None
+                self._tapped = None
+                self._bridge = None
+                self._reset_capture_generation()
+            # Removal and restoration are independent best-effort operations:
+            # a half-completed swap can leave either callback absent.
             with suppress(Exception):  # never leave the host deaf
                 connection.remove_socket_listener(tapped)
             with suppress(Exception):
-                connection.add_socket_listener(original)
-            self._original_on_packet = None
-            self._tapped = None
-            self._installed_listener_generation = None
-            self._bridge = None
+                _add_socket_listener_once(connection, original)
+            self._source = None
             raise talk_audio.TalkAudioError(
                 f"couldn't listen in on the voice channel: {exc}"
             ) from exc
@@ -556,7 +596,7 @@ class DiscordAudio:
                 and getattr(receiver, "_on_packet", None) is tapped
             ):
                 with suppress(Exception):
-                    connection.add_socket_listener(original)
+                    _add_socket_listener_once(connection, original)
                 with suppress(Exception):
                     if getattr(receiver, "_on_packet", None) is tapped:
                         receiver._on_packet = original
