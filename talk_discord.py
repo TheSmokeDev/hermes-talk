@@ -646,12 +646,17 @@ class DiscordAudio:
                 listener_is_owned
                 and getattr(receiver, "_running", False)
                 and getattr(receiver, "_on_packet", None) is tapped
+                and self._published_bridge_is_exact(bridge)
             ):
                 with suppress(Exception):
                     _add_socket_listener_once(connection, original)
-                with suppress(Exception):
-                    if getattr(receiver, "_on_packet", None) is tapped:
-                        receiver._on_packet = original
+                if not self._published_bridge_is_exact(bridge):
+                    with suppress(Exception):
+                        connection.remove_socket_listener(original)
+                else:
+                    with suppress(Exception):
+                        if getattr(receiver, "_on_packet", None) is tapped:
+                            receiver._on_packet = original
         if generation is not None:
             self._wait_for_listener_generation(generation)
         # The old tap is fenced before this reset, so no old generation can
@@ -847,6 +852,12 @@ class DiscordAudio:
         bridge = self._bridge
         if bridge is None:
             return True
+        return self._published_bridge_is_exact(bridge, receiver)
+
+    @staticmethod
+    def _published_bridge_is_exact(bridge: dict[str, Any], receiver: Any | None = None) -> bool:
+        """Whether the adapter still publishes this exact borrowed generation."""
+
         try:
             adapter = bridge["adapter"]
             guild_id = bridge["guild_id"]
@@ -1091,7 +1102,33 @@ __all__ = [
 _SESSION: dict[str, Any] = {}
 _SESSION_LOCK = threading.Lock()
 _LAST_FAILURE: str | None = None
+_LAST_FAILURE_GENERATION: int | None = None
+_SESSION_GENERATION = 0
 _NOTIFICATION_TASKS: set[Any] = set()
+
+_SAFE_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectionError",
+        "OSError",
+        "RuntimeError",
+        "TalkAudioError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    }
+)
+
+
+def _safe_exception_name(error: BaseException) -> str:
+    name = type(error).__name__
+    return name if name in _SAFE_EXCEPTION_NAMES else "unexpected error"
+
+
+def _public_exception_failure(error: BaseException) -> str:
+    """Return a bounded allowlisted failure with no exception text or repr."""
+
+    return f"session error ({_safe_exception_name(error)})"
+
 
 JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
 
@@ -1163,7 +1200,7 @@ async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) ->
 def start_core_session(factory: object, guild_id: int | None = None) -> str:
     """Start the canonical input-only lane without falling back to legacy Talk."""
 
-    global _LAST_FAILURE
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
 
     try:
         import asyncio as _asyncio
@@ -1183,64 +1220,83 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
         import talk_core_session
 
     audio = DiscordAudio(bridge["guild_id"], capture_only=True)
-
     task = None
+    generation = None
 
     def _project_status(status: str) -> None:
         if status != "listening":
             return
         with _SESSION_LOCK:
-            if _SESSION.get("task") is task:
+            if _SESSION.get("task") is task and _SESSION.get("generation") == generation:
                 _SESSION["status"] = status
 
     def _done(finished) -> None:
-        global _LAST_FAILURE
+        global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
         failure = None
+        diagnostic_name = None
         try:
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None:
-                    failure = f"{type(error).__name__}: {error}"
+                    failure = _public_exception_failure(error)
+                    diagnostic_name = _safe_exception_name(error)
         except Exception as exc:  # noqa: BLE001 - callback must not escape
-            failure = f"core session outcome could not be read: {exc}"
+            failure = "session outcome unavailable"
+            diagnostic_name = _safe_exception_name(exc)
         with _SESSION_LOCK:
-            if _SESSION.get("task") is finished:
+            owns_session = (
+                _SESSION.get("task") is finished and _SESSION.get("generation") == generation
+            )
+            if owns_session:
                 _SESSION.clear()
-            if failure:
-                _LAST_FAILURE = f"canonical core voice: {failure}"
+                if failure:
+                    _LAST_FAILURE = f"canonical core voice: {failure}"
+                    _LAST_FAILURE_GENERATION = generation
+        if not owns_session:
+            try:
+                audio.stop()
+            except Exception as exc:  # noqa: BLE001 - runner also owns idempotent teardown
+                _log.debug("canonical core audio teardown failed (%s)", _safe_exception_name(exc))
+            return
         if failure:
-            _log.warning("canonical core voice session failed: %s", failure)
+            _log.warning(
+                "canonical core voice session failed closed (%s)",
+                diagnostic_name or "unknown outcome",
+            )
             receipt = (
                 f"Canonical core voice failed closed: {failure}. "
                 "No legacy voice session was started."
             )
 
             async def _notify() -> None:
-                global _LAST_FAILURE
+                global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
                 delivered = await _deliver_failure_receipt(
                     bridge["adapter"], bridge["guild_id"], receipt
                 )
                 if delivered:
                     with _SESSION_LOCK:
-                        expected = f"canonical core voice: {failure}"
-                        if expected == _LAST_FAILURE:
+                        if generation == _LAST_FAILURE_GENERATION:
                             _LAST_FAILURE = None
+                            _LAST_FAILURE_GENERATION = None
 
             notification = loop.create_task(_notify())
             _NOTIFICATION_TASKS.add(notification)
             notification.add_done_callback(_NOTIFICATION_TASKS.discard)
         try:
             audio.stop()
-        except Exception:  # noqa: BLE001 - runner also owns idempotent teardown
-            _log.debug("canonical core audio teardown failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - runner also owns idempotent teardown
+            _log.debug("canonical core audio teardown failed (%s)", _safe_exception_name(exc))
 
     with _SESSION_LOCK:
         existing = _SESSION.get("task")
         if existing is not None and not existing.done():
             return "I'm already live in a voice channel — say `talk leave` first."
         _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION += 1
+        generation = _SESSION_GENERATION
         task = loop.create_task(
             talk_core_session.run_core_session(
                 factory,
@@ -1257,6 +1313,7 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
                 "audio": audio,
                 "mode": "core",
                 "status": "starting",
+                "generation": generation,
             }
         )
     return (
@@ -1272,7 +1329,7 @@ def start_session(guild_id: int | None = None) -> str:
     this is the gateway path; the terminal path is ``hermes talk``.
     """
 
-    global _LAST_FAILURE
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
 
     try:
         import asyncio as _asyncio
@@ -1292,46 +1349,78 @@ def start_session(guild_id: int | None = None) -> str:
         import talk_cli
 
     audio = DiscordAudio(bridge["guild_id"])
+    generation = None
 
     def _done(finished) -> None:
-        global _LAST_FAILURE
+        global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
         failure = None
+        diagnostic_name = None
         try:
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None:
-                    failure = f"{type(error).__name__}: {error}"
+                    failure = _public_exception_failure(error)
+                    diagnostic_name = _safe_exception_name(error)
                 else:
                     status = finished.result()
                     if status:
-                        failure = audio._bridge_failure or f"session exited with status {status}"
+                        bridge_failure = audio._bridge_failure
+                        safe_bridge_failures = {
+                            "the Discord voice connection changed",
+                            "the Discord voice credentials changed",
+                            "the Discord voice connection changed while I was listening",
+                            "the Discord voice credentials changed while I was listening",
+                            "the Discord voice connection liveness could not be verified",
+                            "the Discord voice connection disconnected while I was listening",
+                        }
+                        failure = (
+                            bridge_failure
+                            if bridge_failure in safe_bridge_failures
+                            else "session exited unsuccessfully"
+                        )
         except Exception as exc:  # noqa: BLE001 — a receipt must not raise
-            failure = f"session outcome could not be read: {exc}"
+            failure = "session outcome unavailable"
+            diagnostic_name = _safe_exception_name(exc)
 
         with _SESSION_LOCK:
-            if _SESSION.get("task") is finished:
+            owns_session = (
+                _SESSION.get("task") is finished and _SESSION.get("generation") == generation
+            )
+            if owns_session:
                 _SESSION.clear()
-            if failure:
-                _LAST_FAILURE = failure
+                if failure:
+                    _LAST_FAILURE = failure
+                    _LAST_FAILURE_GENERATION = generation
+
+        if not owns_session:
+            try:
+                audio.stop()
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
+            return
 
         if failure:
-            _log.warning("discord voice session failed: %s", failure)
+            _log.warning(
+                "discord voice session failed closed (%s)",
+                diagnostic_name or "nonzero status",
+            )
             receipt = (
                 f"Voice session failed closed: {failure}. The voice channel was handed "
                 "back; say `talk join` when you want to start a new session."
             )
 
             async def _notify() -> None:
-                global _LAST_FAILURE
+                global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
                 delivered = await _deliver_failure_receipt(
                     bridge["adapter"], bridge["guild_id"], receipt
                 )
                 if delivered:
                     with _SESSION_LOCK:
-                        if failure == _LAST_FAILURE:
+                        if generation == _LAST_FAILURE_GENERATION:
                             _LAST_FAILURE = None
+                            _LAST_FAILURE_GENERATION = None
 
             notification = loop.create_task(_notify())
             _NOTIFICATION_TASKS.add(notification)
@@ -1339,8 +1428,8 @@ def start_session(guild_id: int | None = None) -> str:
 
         try:
             audio.stop()
-        except Exception:  # noqa: BLE001 — teardown is best-effort
-            _log.debug("discord audio teardown failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
 
     # Claim the slot and publish the task under ONE lock: checking in one
     # acquisition and publishing in another lets two joins both pass the
@@ -1350,9 +1439,19 @@ def start_session(guild_id: int | None = None) -> str:
         if existing is not None and not existing.done():
             return "I'm already live in a voice channel — say `talk leave` first."
         _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION += 1
+        generation = _SESSION_GENERATION
         task = loop.create_task(talk_cli.run_talk_session(audio=audio))
         task.add_done_callback(_done)
-        _SESSION.update({"task": task, "guild_id": bridge["guild_id"], "audio": audio})
+        _SESSION.update(
+            {
+                "task": task,
+                "guild_id": bridge["guild_id"],
+                "audio": audio,
+                "generation": generation,
+            }
+        )
 
     # Deliberately not "I'm live": nothing has connected yet. The session
     # still has to mint, open a socket, and take the channel, and any of
@@ -1376,17 +1475,19 @@ def stop_session() -> str:
     if audio is not None:
         try:
             audio.stop()
-        except Exception:  # noqa: BLE001 — teardown is best-effort
-            _log.debug("discord audio teardown failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
     return "Left the voice session — the channel is yours again."
 
 
 def reset_for_tests() -> None:
-    global _LAST_FAILURE
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
 
     with _SESSION_LOCK:
         _SESSION.clear()
         _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION = 0
         for notification in _NOTIFICATION_TASKS:
             notification.cancel()
         _NOTIFICATION_TASKS.clear()

@@ -550,6 +550,58 @@ def test_stop_restores_the_host_exactly(monkeypatch):
     assert adapter._voice_mixers == {}, "a closed mixer must not be handed back"
 
 
+@pytest.mark.parametrize("replacement_point", ["remove", "add"])
+def test_stop_never_restores_listener_to_a_replaced_voice_generation(
+    monkeypatch, replacement_point
+):
+    old_connection, old_receiver, _old_vc, adapter = _wired_host(monkeypatch)
+    original_listener = old_connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    tapped = old_connection.callbacks[0]
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_receiver = _FakeReceiver(new_vc)
+    new_listener = new_receiver._on_packet
+    new_connection.add_socket_listener(new_listener)
+    published = False
+
+    def publish_replacement():
+        nonlocal published
+        if published:
+            return
+        published = True
+        adapter._voice_clients[7] = new_vc
+        adapter._voice_receivers[7] = new_receiver
+
+    original_remove = old_connection.remove_socket_listener
+    original_add = old_connection.add_socket_listener
+
+    def racing_remove(callback):
+        original_remove(callback)
+        if replacement_point == "remove" and callback is tapped:
+            publish_replacement()
+
+    def racing_add(callback):
+        original_add(callback)
+        if replacement_point == "add" and callback == original_listener:
+            publish_replacement()
+
+    monkeypatch.setattr(old_connection, "remove_socket_listener", racing_remove)
+    monkeypatch.setattr(old_connection, "add_socket_listener", racing_add)
+
+    bridge.stop()
+
+    assert published
+    assert old_receiver._running is True
+    assert original_listener not in old_connection.callbacks
+    assert adapter._voice_clients[7] is new_vc
+    assert adapter._voice_receivers[7] is new_receiver
+    assert new_receiver._on_packet == new_listener
+    assert new_connection.callbacks == [new_listener]
+
+
 def test_capture_only_borrows_receive_without_touching_host_playback(monkeypatch):
     connection, receiver, vc, adapter = _wired_host(monkeypatch)
     original_listener = connection.callbacks[0]
@@ -1712,8 +1764,9 @@ def test_core_status_becomes_listening_and_stale_callback_cannot_change_replacem
     asyncio.run(scenario())
 
 
-def test_core_failure_delivers_a_core_specific_receipt_without_legacy_fallback(monkeypatch):
+def test_core_failure_delivers_a_secret_safe_receipt_without_legacy_fallback(monkeypatch, caplog):
     delivered = []
+    secret = "Authorization: Bearer TALK-SECRET-MARKER"
 
     class Audio:
         def __init__(self, _guild_id, *, capture_only=False):
@@ -1723,7 +1776,7 @@ def test_core_failure_delivers_a_core_specific_receipt_without_legacy_fallback(m
             pass
 
     async def fail_core(*_args, **_kwargs):
-        raise RuntimeError("provider closed")
+        raise RuntimeError(secret)
 
     async def deliver(adapter, guild_id, receipt):
         delivered.append((adapter, guild_id, receipt))
@@ -1752,5 +1805,180 @@ def test_core_failure_delivers_a_core_specific_receipt_without_legacy_fallback(m
     assert delivered and delivered[0][:2] == (adapter, 7)
     receipt = delivered[0][2].lower()
     assert "canonical core voice" in receipt
-    assert "provider closed" in receipt
+    assert "runtimeerror" in receipt
     assert "talk join" not in receipt
+    public_output = delivered[0][2] + talk_discord.session_status() + caplog.text
+    assert "TALK-SECRET-MARKER" not in public_output
+    assert secret not in public_output
+
+
+@pytest.mark.parametrize("failure_point", ["factory", "feed", "audio", "close"])
+def test_core_boundaries_never_publish_raw_exception_secrets(monkeypatch, caplog, failure_point):
+    delivered = []
+    secret = "Authorization: Bearer TALK-BOUNDARY-SECRET"
+
+    class Attachment:
+        operator_user_id = 42
+
+        def feed_audio(self, *_args, **_kwargs):
+            if failure_point == "feed":
+                raise RuntimeError(secret)
+            return "accepted"
+
+        async def close(self):
+            if failure_point == "close":
+                raise RuntimeError(secret)
+
+    class Factory:
+        async def open(self, *_args, **_kwargs):
+            if failure_point == "factory":
+                raise RuntimeError(secret)
+            return Attachment()
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+            self.reads = 0
+
+        def start(self):
+            if failure_point == "audio":
+                raise RuntimeError(secret)
+
+        def read_input_packet(self):
+            self.reads += 1
+            if failure_point == "feed" and self.reads == 1:
+                return talk_discord.InputAudioPacket(speaker={"user_id": 42}, pcm=b"\x01\x00")
+            raise asyncio.CancelledError
+
+        def stop(self):
+            return None
+
+    async def deliver(_adapter, _guild_id, receipt):
+        delivered.append(receipt)
+        return False
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "build_core_setup", lambda: object())
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(Factory())
+        task = talk_discord._SESSION["task"]
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())
+
+    assert len(delivered) == 1
+    public_output = delivered[0] + talk_discord.session_status() + caplog.text
+    assert "RuntimeError" in public_output
+    assert "TALK-BOUNDARY-SECRET" not in public_output
+    assert secret not in public_output
+
+
+def test_stale_core_completion_cannot_publish_over_a_live_replacement(monkeypatch):
+    delivered = []
+    replacement_entered = asyncio.Event()
+    calls = 0
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def run_core(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            asyncio.get_running_loop().call_soon(talk_discord.start_core_session, object())
+            raise RuntimeError("identical failure")
+        replacement_entered.set()
+        await asyncio.Event().wait()
+
+    async def deliver(*args):
+        delivered.append(args)
+        return True
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        first = talk_discord._SESSION["task"]
+        await asyncio.wait_for(replacement_entered.wait(), 0.2)
+        replacement = talk_discord._SESSION["task"]
+        await asyncio.sleep(0)
+        assert first.done()
+        assert replacement is not first and not replacement.done()
+        assert talk_discord._LAST_FAILURE is None
+        assert delivered == []
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_old_delayed_receipt_cannot_clear_identical_new_generation_failure(monkeypatch):
+    release_first = asyncio.Event()
+    first_delivery_entered = asyncio.Event()
+    deliveries = 0
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def fail_core(*_args, **_kwargs):
+        raise RuntimeError("identical failure")
+
+    async def deliver(*_args):
+        nonlocal deliveries
+        deliveries += 1
+        if deliveries == 1:
+            first_delivery_entered.set()
+            await release_first.wait()
+            return True
+        return False
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", fail_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        await asyncio.wait_for(first_delivery_entered.wait(), 0.2)
+        talk_discord.start_core_session(object())
+        second = talk_discord._SESSION["task"]
+        await asyncio.gather(second, return_exceptions=True)
+        await asyncio.sleep(0)
+        expected = talk_discord._LAST_FAILURE
+        assert expected is not None
+        release_first.set()
+        await asyncio.sleep(0)
+        assert expected == talk_discord._LAST_FAILURE
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())
