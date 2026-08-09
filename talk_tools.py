@@ -50,6 +50,16 @@ MAX_OUTPUT_CHARS = 4_000
 #: ``talk_status`` so a half-registered plugin says so out loud instead of
 #: looking healthy.
 REGISTRATION_FAILURES: list[str] = []
+REGISTRATION_RECEIPTS: dict[str, str] = {}
+REGISTRATION_REQUIREMENTS: dict[str, str] = {
+    "cli_command": "required",
+    "slash_command": "required",
+    "session_end_hook": "optional",
+    "subagent_start_hook": "optional",
+    "subagent_stop_hook": "optional",
+    "tts_provider": "optional",
+    "transcription_provider": "optional",
+}
 
 _TOOL_SEARCH_MEMORY: dict = {
     "type": "function",
@@ -535,6 +545,8 @@ _HANDLERS = {
 __all__ = [
     "MAX_OUTPUT_CHARS",
     "REGISTRATION_FAILURES",
+    "REGISTRATION_RECEIPTS",
+    "REGISTRATION_REQUIREMENTS",
     "TalkToolError",
     "default_talk_tools",
     "execute_talk_tool",

@@ -492,6 +492,39 @@ def _resolve_memory_block() -> str:
 class HostAdapter:
     """Binds hermes-talk to Hermes, degrading to speakable text off-host."""
 
+    def diagnostic_identity_sections(self) -> dict[str, str]:
+        """File-backed identity presence/size input for read-only diagnostics.
+
+        Unlike :meth:`identity_sections`, this calls neither Hermes's persona
+        loader (which provisions a default home/SOUL.md) nor a vault provider.
+        It reads only already-existing files. The returned content stays
+        in-process; doctor emits only post-cap character counts.
+        """
+
+        sections: dict[str, str] = {}
+        home = talk_config.get_hermes_home()
+        files = {
+            "PERSONA": ("SOUL.md", None),
+            "USER": ("memories/USER.md", "user_char_limit"),
+            "MEMORY": ("memories/MEMORY.md", "memory_char_limit"),
+        }
+        for name, (relative, limit_key) in files.items():
+            try:
+                body = (home / relative).read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
+            except OSError:
+                continue
+            if not body:
+                continue
+            limit = talk_config.identity_char_limit(limit_key) if limit_key else 0
+            sections[name] = body[:limit] if limit else body
+
+        include = talk_config.identity_include()
+        if include is None:
+            return sections
+        return {name: body for name, body in sections.items() if name in include}
+
     def identity_sections(self) -> dict[str, str]:
         """What the host knows, as ordered named sections for the prompt.
 
@@ -521,7 +554,6 @@ class HostAdapter:
         ]
         if memory_parts:
             sections["MEMORY"] = "\n\n".join(memory_parts)
-
         include = talk_config.identity_include()
         if include is None:
             return sections
@@ -542,7 +574,8 @@ class HostAdapter:
         """The voice-session credential — key OR ChatGPT subscription.
 
         Fail-closed dual lane: TALK_OPENAI_API_KEY -> OPENAI_API_KEY -> Codex
-        CLI OAuth (the operator's ChatGPT subscription). The other method that
+        CLI OAuth (the operator's ChatGPT subscription) by default, or required
+        Codex OAuth when TALK_PREFER_CODEX_OAUTH=true. The other method that
         raises.
         """
 

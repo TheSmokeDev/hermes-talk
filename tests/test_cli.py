@@ -218,14 +218,18 @@ def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
     assert events.index("response.cancel") < events.index("tool_finished")
 
 
-def test_microphone_and_tool_batches_share_the_only_socket_writer():
+def test_openai_adapter_owns_the_only_socket_writer():
     source = inspect.getsource(talk_cli.run_talk_session)
     start = source.index("async def send_microphone")
     end = source.index("async def watch_run")
     microphone = source[start:end]
+    adapter_writer = inspect.getsource(
+        talk_cli.talk_openai_realtime.OpenAIRealtimeSession._send_wire
+    )
 
     assert "await send_outgoing(" in microphone
-    assert source.count("ws.send_json(") == 1
+    assert "send_json(" not in source
+    assert adapter_writer.count("self._ws.send_json(") == 1
 
 
 def test_speaker_transition_context_precedes_its_exact_pcm_without_response_create():
@@ -309,7 +313,7 @@ def test_metadata_audio_batch_uses_serialized_writer_not_announcement_queue():
     microphone = source[start:end]
 
     assert "read_input_packet" in microphone
-    assert "packet_lane.outgoing" in microphone
+    assert "packet_lane.commands" in microphone
     assert "await send_outgoing(" in microphone
     assert "announce_queue" not in microphone
 
@@ -382,7 +386,12 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
 
     async def competing_pump(_queue, _relay, _ws, send_batch, _response_busy):
         await ws.speaker_create_seen.wait()
-        await send_batch([{"type": "announcement-a"}, {"type": "announcement-b"}])
+        await send_batch(
+            [
+                talk_cli.talk_realtime.AddContext(item_id="announcement-a", text="A"),
+                talk_cli.talk_realtime.AddContext(item_id="announcement-b", text="B"),
+            ]
+        )
         ws.announcement_done.set()
         await asyncio.Event().wait()
 
@@ -423,6 +432,10 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
     assert [message["type"] for message in payload] == [
         "conversation.item.create",
         "input_audio_buffer.append",
+        "conversation.item.create",
+        "conversation.item.create",
+    ]
+    assert [message["item"]["id"] for message in payload[2:]] == [
         "announcement-a",
         "announcement-b",
     ]
@@ -795,6 +808,49 @@ def test_tool_coordinator_send_failure_does_not_deadlock_queued_cleanup():
             await asyncio.wait_for(worker, 0.2)
         coordinator.discard_pending()
         await asyncio.wait_for(coordinator.join(), 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_tool_coordinator_stop_is_acknowledged_and_discards_queued_call():
+    async def scenario():
+        sent = []
+        discarded = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Relay:
+            async def handle_event_async(self, event):
+                started.set()
+                await release.wait()
+                return [{"type": "output", "call_id": event["call_id"]}]
+
+            def tool_queue_full_output(self, _event):
+                raise AssertionError("queue should admit both calls")
+
+            def discard_tool_event(self, event):
+                discarded.append(event["call_id"])
+
+        async def send(batch):
+            sent.extend(batch)
+
+        coordinator = talk_cli.ToolResponseCoordinator(Relay(), send, max_pending=1)
+        coordinator.admit({"call_id": "active"})
+        worker = asyncio.create_task(coordinator.run())
+        await started.wait()
+        coordinator.admit({"call_id": "queued"})
+        await coordinator.response_done()
+
+        stop_ack = asyncio.create_task(coordinator.stop())
+        await asyncio.sleep(0)
+        assert not stop_ack.done()
+        assert discarded == ["queued"]
+
+        release.set()
+        await asyncio.wait_for(stop_ack, 0.2)
+        await asyncio.wait_for(worker, 0.2)
+        await asyncio.wait_for(coordinator.queue.join(), 0.2)
+        assert sent == []
 
     asyncio.run(scenario())
 

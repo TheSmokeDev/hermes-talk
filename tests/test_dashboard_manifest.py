@@ -123,3 +123,9 @@ def test_every_talk_module_is_packaged():
 
     assert on_disk - declared == set(), "module on disk is missing from py-modules"
     assert declared - on_disk == set(), "py-modules names a module that does not exist"
+
+
+def test_plugin_manifest_does_not_block_codex_oauth_only_installs():
+    manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+
+    assert "requires_env:" not in manifest

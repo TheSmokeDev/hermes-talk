@@ -118,6 +118,7 @@ def test_register_wires_every_surface(plugin, monkeypatch):
     assert len(ctx.tts_providers) == 1
     assert len(ctx.stt_providers) == 1
     assert plugin.REGISTRATION_FAILURES == []
+    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == {"registered"}
 
 
 def test_register_binds_the_context(plugin):
@@ -151,6 +152,21 @@ def test_every_surface_failing_is_recorded_separately(plugin, monkeypatch):
     # cli + slash + three hooks + tts + stt, each recorded on its own line.
     assert len(plugin.REGISTRATION_FAILURES) == 7
     assert plugin.talk_host.get_ctx() is ctx
+    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == {"failed"}
+
+
+def test_registration_failure_receipts_redact_host_exception_text(plugin, monkeypatch):
+    class SecretFailureCtx(StubCtx):
+        def _maybe_fail(self, surface):
+            raise RuntimeError("sk-host-secret must not reach status")
+
+    monkeypatch.setattr(plugin.talk_providers, "providers_available", lambda: True)
+
+    plugin.register(SecretFailureCtx())
+
+    rendered = " ".join(plugin.REGISTRATION_FAILURES)
+    assert "RuntimeError" in rendered
+    assert "sk-host-secret" not in rendered
 
 
 def test_providers_skipped_when_the_host_abcs_are_absent(plugin, monkeypatch):
@@ -162,6 +178,72 @@ def test_providers_skipped_when_the_host_abcs_are_absent(plugin, monkeypatch):
     assert ctx.tts_providers == []
     assert ctx.stt_providers == []
     assert plugin.REGISTRATION_FAILURES == []
+    assert plugin.talk_tools.REGISTRATION_RECEIPTS["tts_provider"] == "unsupported-optional"
+    assert (
+        plugin.talk_tools.REGISTRATION_RECEIPTS["transcription_provider"]
+        == "unsupported-optional"
+    )
+
+
+def test_attribute_error_inside_present_registration_method_is_failure(plugin, monkeypatch):
+    class InternalAttributeErrorCtx(StubCtx):
+        def register_cli_command(self, *args, **kwargs):
+            raise AttributeError("internal implementation bug")
+
+    monkeypatch.setattr(plugin.talk_providers, "providers_available", lambda: False)
+
+    plugin.register(InternalAttributeErrorCtx())
+
+    assert plugin.REGISTRATION_RECEIPTS["cli_command"] == "failed"
+    assert any("cli command: AttributeError" in item for item in plugin.REGISTRATION_FAILURES)
+    check = plugin.talk_cli.talk_doctor._plugin_check()
+    assert check["status"] == "fail"
+    assert check["details"]["required_issue_count"] == 1
+
+
+def test_absent_optional_methods_warn_without_registration_failure(plugin, monkeypatch):
+    class CoreOnlyCtx:
+        def register_cli_command(self, **kwargs):
+            pass
+
+        def register_command(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(plugin.talk_providers, "providers_available", lambda: True)
+
+    plugin.register(CoreOnlyCtx())
+
+    assert plugin.REGISTRATION_FAILURES == []
+    assert plugin.REGISTRATION_RECEIPTS["cli_command"] == "registered"
+    assert plugin.REGISTRATION_RECEIPTS["slash_command"] == "registered"
+    assert {
+        state
+        for receipt, state in plugin.REGISTRATION_RECEIPTS.items()
+        if plugin.talk_tools.REGISTRATION_REQUIREMENTS[receipt] == "optional"
+    } == {"unsupported-optional"}
+    check = plugin.talk_cli.talk_doctor._plugin_check()
+    assert check["status"] == "warn"
+    assert check["details"]["required_issue_count"] == 0
+    assert check["details"]["optional_issue_count"] == 5
+
+
+def test_absent_required_method_is_a_required_failure_not_an_exception(plugin, monkeypatch):
+    class MissingCliCtx:
+        def register_command(self, *args, **kwargs):
+            pass
+
+        def register_hook(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(plugin.talk_providers, "providers_available", lambda: False)
+
+    plugin.register(MissingCliCtx())
+
+    assert plugin.REGISTRATION_RECEIPTS["cli_command"] == "unsupported-required"
+    assert plugin.REGISTRATION_FAILURES == []
+    check = plugin.talk_cli.talk_doctor._plugin_check()
+    assert check["status"] == "fail"
+    assert check["details"]["required_issue_count"] == 1
 
 
 def test_session_end_hook_sweeps_transcripts_fail_open(plugin, monkeypatch, tmp_path):
