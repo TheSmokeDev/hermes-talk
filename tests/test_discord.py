@@ -1630,10 +1630,11 @@ def test_core_session_claims_shared_slot_with_capture_only_audio(monkeypatch):
         def stop(self):
             pass
 
-    async def run_core(factory, *, guild_id, audio):
+    async def run_core(factory, *, guild_id, audio, status_callback):
         assert factory is sentinel
         assert guild_id == 7
         assert audio is created[0][2]
+        assert callable(status_callback)
         entered.set()
         await asyncio.Event().wait()
 
@@ -1664,6 +1665,51 @@ def test_core_session_claims_shared_slot_with_capture_only_audio(monkeypatch):
     assert created[0][:2] == (7, True)
     assert "starting" in reply.lower() and "core" in reply.lower()
     assert "left" in stopped.lower()
+
+
+def test_core_status_becomes_listening_and_stale_callback_cannot_change_replacement(monkeypatch):
+    callbacks = []
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def run_core(_factory, *, guild_id, audio, status_callback):
+        assert guild_id == 7
+        assert audio is not None
+        callbacks.append(status_callback)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        await asyncio.sleep(0)
+        assert "starting" in talk_discord.session_status().lower()
+        callbacks[0]("listening")
+        assert "listening" in talk_discord.session_status().lower()
+
+        first = talk_discord._SESSION["task"]
+        talk_discord.stop_session()
+        await asyncio.gather(first, return_exceptions=True)
+
+        talk_discord.start_core_session(object())
+        await asyncio.sleep(0)
+        assert "starting" in talk_discord.session_status().lower()
+        callbacks[0]("listening")
+        assert "starting" in talk_discord.session_status().lower()
+        talk_discord.stop_session()
+
+    asyncio.run(scenario())
 
 
 def test_core_failure_delivers_a_core_specific_receipt_without_legacy_fallback(monkeypatch):

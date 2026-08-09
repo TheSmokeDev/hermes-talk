@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +58,12 @@ class OperatorPacketAdmission:
     def admit(self, packet: Any) -> bytes | None:
         """Return authorized PCM, otherwise ``None``."""
 
+        admitted = self.admit_record(packet)
+        return admitted.pcm if admitted is not None else None
+
+    def admit_record(self, packet: Any) -> AdmittedOperatorPacket | None:
+        """Snapshot authorized PCM and attribution into one immutable record."""
+
         try:
             speaker = packet.speaker
             pcm = packet.pcm
@@ -65,13 +72,37 @@ class OperatorPacketAdmission:
         if type(pcm) is not bytes or not pcm or len(pcm) % 2:
             return None
         if speaker is None:
-            return pcm if not any(pcm) else None
+            return AdmittedOperatorPacket(pcm, None) if not any(pcm) else None
         if type(speaker) is not dict:
             return None
         user_id = speaker.get("user_id")
         if type(user_id) is not int or user_id != self.operator_user_id:
             return None
-        return pcm
+        return AdmittedOperatorPacket(pcm, user_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedOperatorPacket:
+    """PCM plus the exact speaker attribution captured at admission."""
+
+    pcm: bytes
+    speaker_user_id: int | None
+
+
+def _attachment_is_listening(attachment: object) -> bool:
+    """Project readiness only from the host controller lifecycle."""
+
+    try:
+        events = attachment.lifecycle_events
+    except Exception:  # noqa: BLE001 - unavailable lifecycle remains starting
+        return False
+    if type(events) is not tuple:
+        return False
+    return any(
+        isinstance(lifecycle := getattr(event, "lifecycle", None), str)
+        and lifecycle in {"ready", "listening"}
+        for event in events
+    )
 
 
 async def run_core_session(
@@ -79,6 +110,7 @@ async def run_core_session(
     *,
     guild_id: int,
     audio: object | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> None:
     """Pump one capture-only Discord lane into a host-owned attachment."""
 
@@ -100,23 +132,31 @@ async def run_core_session(
         )
         admission = OperatorPacketAdmission(attachment.operator_user_id)
         audio.start()
+        listening_projected = False
         while True:
             # Discord capture is a paced synchronous bridge. Keep that blocking
             # read off the gateway loop so text turns, stop, and teardown remain
             # responsive while voice capture is idle.
             packet = await asyncio.to_thread(audio.read_input_packet)
+            if (
+                not listening_projected
+                and status_callback is not None
+                and _attachment_is_listening(attachment)
+            ):
+                status_callback("listening")
+                listening_projected = True
             if packet is None:
                 await asyncio.sleep(CORE_AUDIO_POLL_S)
                 continue
-            pcm = admission.admit(packet)
-            if pcm is None:
+            admitted = admission.admit_record(packet)
+            if admitted is None:
                 continue
-            if packet.speaker is None:
-                result = attachment.feed_synthesized_silence(pcm)
+            if admitted.speaker_user_id is None:
+                result = attachment.feed_synthesized_silence(admitted.pcm)
             else:
                 result = attachment.feed_audio(
-                    pcm,
-                    speaker_user_id=packet.speaker["user_id"],
+                    admitted.pcm,
+                    speaker_user_id=admitted.speaker_user_id,
                     mime_type="audio/pcm",
                 )
             if str(result) != "accepted":
@@ -129,4 +169,9 @@ async def run_core_session(
                 await attachment.close()
 
 
-__all__ = ["OperatorPacketAdmission", "build_core_setup", "run_core_session"]
+__all__ = [
+    "AdmittedOperatorPacket",
+    "OperatorPacketAdmission",
+    "build_core_setup",
+    "run_core_session",
+]

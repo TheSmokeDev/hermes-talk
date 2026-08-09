@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import types
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -87,6 +88,10 @@ def test_operator_id_cannot_be_rebound():
 
     with pytest.raises(FrozenInstanceError):
         admission.operator_user_id = 7
+
+    admitted = admission.admit_record(InputAudioPacket(speaker={"user_id": 42}, pcm=b"\x01\x00"))
+    with pytest.raises(FrozenInstanceError):
+        admitted.speaker_user_id = 7
 
 
 def test_core_setup_is_input_only_and_requests_only_commit_transcription():
@@ -179,6 +184,127 @@ def test_core_runner_opens_exact_provider_and_routes_only_authorized_pcm():
     assert attachment.operator_audio == [(operator_pcm, 42, "audio/pcm")]
     assert attachment.silence == [silence]
     assert attachment.closed == 1
+
+
+def test_core_runner_snapshots_packet_attribution_once_before_forwarding(monkeypatch):
+    operator_pcm = b"\x01\x00"
+
+    class MutablePacket:
+        pcm = operator_pcm
+
+        def __init__(self):
+            self.speaker_reads = 0
+
+        @property
+        def speaker(self):
+            self.speaker_reads += 1
+            if self.speaker_reads == 1:
+                return {"user_id": 42}
+            return {"user_id": 7}
+
+    packet = MutablePacket()
+    packets = iter((packet,))
+
+    class Audio:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def read_input_packet(self):
+            try:
+                return next(packets)
+            except StopIteration as exc:
+                raise RuntimeError("bridge lost") from exc
+
+    class Attachment:
+        operator_user_id = 42
+
+        def __init__(self):
+            self.operator_audio = []
+            self.silence = []
+
+        def feed_audio(self, pcm, *, speaker_user_id, mime_type=None):
+            self.operator_audio.append((pcm, speaker_user_id, mime_type))
+            return "accepted"
+
+        def feed_synthesized_silence(self, pcm):
+            self.silence.append(pcm)
+            return "accepted"
+
+        async def close(self):
+            return None
+
+    attachment = Attachment()
+
+    class Factory:
+        async def open(self, *_args, **_kwargs):
+            return attachment
+
+    monkeypatch.setattr(talk_core_session, "build_core_setup", lambda: object())
+
+    with pytest.raises(RuntimeError, match="bridge lost"):
+        asyncio.run(talk_core_session.run_core_session(Factory(), guild_id=9, audio=Audio()))
+
+    assert packet.speaker_reads == 1
+    assert attachment.operator_audio == [(operator_pcm, 42, "audio/pcm")]
+    assert attachment.silence == []
+
+
+def test_core_runner_projects_listening_only_from_attachment_lifecycle(monkeypatch):
+    statuses = []
+
+    class Attachment:
+        operator_user_id = 42
+
+        def __init__(self):
+            self.lifecycle_events = (
+                types.SimpleNamespace(
+                    lifecycle="connecting",
+                    provider_event=types.SimpleNamespace(session_id="untrusted-provider-metadata"),
+                ),
+            )
+
+        async def close(self):
+            return None
+
+    attachment = Attachment()
+
+    class Factory:
+        async def open(self, *_args, **_kwargs):
+            return attachment
+
+    class Audio:
+        reads = 0
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def read_input_packet(self):
+            self.reads += 1
+            if self.reads == 1:
+                assert statuses == []
+                attachment.lifecycle_events += (
+                    types.SimpleNamespace(lifecycle="ready"),
+                    types.SimpleNamespace(lifecycle="listening"),
+                )
+                return None
+            raise RuntimeError("bridge lost")
+
+    monkeypatch.setattr(talk_core_session, "build_core_setup", lambda: object())
+
+    with pytest.raises(RuntimeError, match="bridge lost"):
+        asyncio.run(
+            talk_core_session.run_core_session(
+                Factory(), guild_id=9, audio=Audio(), status_callback=statuses.append
+            )
+        )
+
+    assert statuses == ["listening"]
 
 
 def test_core_audio_read_does_not_block_the_gateway_event_loop(monkeypatch):

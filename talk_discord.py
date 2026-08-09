@@ -1103,16 +1103,19 @@ def session_status() -> str:
         task = _SESSION.get("task")
         guild_id = _SESSION.get("guild_id")
         mode = _SESSION.get("mode", "legacy")
+        core_status = _SESSION.get("status", "starting")
         last_failure = _LAST_FAILURE
     if task is None or task.done():
         if last_failure:
             return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
     if mode == "core":
-        return (
-            f"Canonical core voice is starting on server {guild_id} — "
-            "say `talk leave` to stop."
-        )
+        if core_status == "listening":
+            return (
+                f"Canonical core voice is listening live on server {guild_id} — "
+                "say `talk leave` to stop."
+            )
+        return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
     return f"Live in the voice channel on server {guild_id} — say `talk leave` to stop."
 
 
@@ -1181,6 +1184,15 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
 
     audio = DiscordAudio(bridge["guild_id"], capture_only=True)
 
+    task = None
+
+    def _project_status(status: str) -> None:
+        if status != "listening":
+            return
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is task:
+                _SESSION["status"] = status
+
     def _done(finished) -> None:
         global _LAST_FAILURE
 
@@ -1234,6 +1246,7 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
                 factory,
                 guild_id=bridge["guild_id"],
                 audio=audio,
+                status_callback=_project_status,
             )
         )
         task.add_done_callback(_done)
@@ -1243,6 +1256,7 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
                 "guild_id": bridge["guild_id"],
                 "audio": audio,
                 "mode": "core",
+                "status": "starting",
             }
         )
     return (
