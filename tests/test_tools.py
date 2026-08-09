@@ -162,6 +162,11 @@ def test_talk_status_reports_state(monkeypatch):
     assert status["voice"] == "cedar"
     assert status["attached_to_hermes"] is False
     assert isinstance(status["audio_available"], bool)
+    assert status["legacy_lane"] == "legacy-provider-executor"
+    assert status["core_realtime"]["contract"] == "api-v2-input-only"
+    assert isinstance(status["core_realtime"]["contract_available"], bool)
+    assert isinstance(status["core_realtime"]["provider_available"], bool)
+    assert status["core_realtime"]["registration"] == "unsupported-optional"
     assert "registration_failures" not in status
 
 

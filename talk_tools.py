@@ -26,6 +26,7 @@ try:
         talk_audio,
         talk_auth,
         talk_config,
+        talk_core_realtime,
         talk_host,
         talk_identity,
         talk_runs,
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_audio
     import talk_auth
     import talk_config
+    import talk_core_realtime
     import talk_host
     import talk_identity
     import talk_runs
@@ -59,6 +61,7 @@ REGISTRATION_REQUIREMENTS: dict[str, str] = {
     "subagent_stop_hook": "optional",
     "tts_provider": "optional",
     "transcription_provider": "optional",
+    "realtime_voice_provider": "optional",
 }
 
 _TOOL_SEARCH_MEMORY: dict = {
@@ -127,8 +130,7 @@ _TOOL_DELEGATE_TASK: dict = {
             "task": {
                 "type": "string",
                 "description": (
-                    "The complete, self-contained brief. No references back "
-                    "to this conversation."
+                    "The complete, self-contained brief. No references back to this conversation."
                 ),
             },
             "background": {
@@ -196,9 +198,7 @@ _TOOL_STEER_AGENT: dict = {
         "properties": {
             "agent_id": {
                 "type": "string",
-                "description": (
-                    "The subagent id from list_agents. Not a run number."
-                ),
+                "description": ("The subagent id from list_agents. Not a run number."),
             },
             "text": {
                 "type": "string",
@@ -231,9 +231,7 @@ _TOOL_REDIRECT_AGENT: dict = {
         "properties": {
             "agent_id": {
                 "type": "string",
-                "description": (
-                    "The subagent id from list_agents. Not a run number."
-                ),
+                "description": ("The subagent id from list_agents. Not a run number."),
             },
             "text": {
                 "type": "string",
@@ -496,9 +494,7 @@ def _identity_summary() -> dict[str, int]:
     except Exception as exc:  # noqa: BLE001 — status must survive a bad host
         _log.debug("identity summary unavailable: %s: %s", type(exc).__name__, exc)
         return {}
-    return {
-        name: len(talk_identity.cap_section(name, body)) for name, body in sections.items()
-    }
+    return {name: len(talk_identity.cap_section(name, body)) for name, body in sections.items()}
 
 
 def _handle_talk_status(arguments: dict) -> str:
@@ -506,6 +502,15 @@ def _handle_talk_status(arguments: dict) -> str:
         voice = talk_config.talk_voice()
     except talk_config.TalkConfigError as exc:
         voice = f"unusable ({exc})"
+    core_realtime = talk_core_realtime.core_provider_diagnostic()
+    core_realtime.update(
+        {
+            "contract": "api-v2-input-only",
+            "registration": REGISTRATION_RECEIPTS.get(
+                "realtime_voice_provider", "unsupported-optional"
+            ),
+        }
+    )
     status = {
         "version": plugin_version(),
         "model": talk_config.talk_model(),
@@ -523,6 +528,10 @@ def _handle_talk_status(arguments: dict) -> str:
         "identity": _identity_summary(),
         # Which credential lane a session would use — never the token itself.
         "auth": talk_auth.auth_status(),
+        # The old duplex lane still owns provider tools/output. The optional
+        # core lane is deliberately input-only and never executes them.
+        "legacy_lane": "legacy-provider-executor",
+        "core_realtime": core_realtime,
     }
     if REGISTRATION_FAILURES:
         status["registration_failures"] = list(REGISTRATION_FAILURES)

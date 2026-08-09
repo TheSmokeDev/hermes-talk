@@ -278,6 +278,28 @@ def test_websocket_error_frame_fails_adapter_instead_of_reporting_clean_eof():
     assert state_before_close is rt.SessionState.FAILED
 
 
+def test_binary_websocket_frame_fails_adapter_instead_of_reporting_clean_eof():
+    async def scenario():
+        adapter, _client = _adapter(
+            _Socket(
+                [_Message("not-json", message_type="binary")],
+                close_code=1000,
+            )
+        )
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert events[0] == rt.ProviderFailure(
+        detail="Provider sent unsupported WebSocket frame type: binary",
+        terminal=True,
+    )
+    assert events[1] == rt.SessionTerminated(state=rt.SessionState.FAILED)
+
+
 @pytest.mark.parametrize(
     ("close_code", "socket_exception", "detail"),
     [
@@ -377,3 +399,93 @@ def test_connect_cancellation_unwinds_the_partial_http_context():
     assert adapter.state is rt.SessionState.CLOSED
     assert client.exited
     assert not socket.exited  # its context was never entered
+
+
+def test_cancelled_close_waiter_does_not_retain_completed_cleanup_task():
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingStack:
+            closed = False
+
+            async def aclose(self):
+                started.set()
+                await release.wait()
+                self.closed = True
+
+        stack = BlockingStack()
+        wire = openai_rt._OpenAIWireSession(auth_token="token", auth_source="test")
+        wire._stack = stack
+        close_waiter = asyncio.create_task(wire.close())
+        await started.wait()
+        close_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_waiter
+        release.set()
+        for _ in range(100):
+            if stack.closed and wire._close_task is None:
+                break
+            await asyncio.sleep(0)
+        return stack, wire
+
+    stack, wire = asyncio.run(scenario())
+
+    assert stack.closed is True
+    assert wire._closed is True
+    assert wire._close_task is None
+
+
+def test_cancelled_sole_close_waiter_retains_late_cleanup_failure_for_retry():
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        unhandled = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+        class FailsOnceStack:
+            calls = 0
+            closed = False
+
+            async def aclose(self):
+                self.calls += 1
+                if self.calls == 1:
+                    started.set()
+                    await release.wait()
+                    raise RuntimeError("cleanup exploded")
+                self.closed = True
+
+        try:
+            stack = FailsOnceStack()
+            wire = openai_rt._OpenAIWireSession(auth_token="token", auth_source="test")
+            wire._stack = stack
+            close_waiter = asyncio.create_task(wire.close())
+            await started.wait()
+            close_waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close_waiter
+            release.set()
+            for _ in range(100):
+                if wire._close_task is None:
+                    break
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            retained = wire._close_failure
+            await wire.close()
+            await asyncio.sleep(0)
+            return stack, wire, retained, unhandled
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    stack, wire, retained, unhandled = asyncio.run(scenario())
+
+    assert isinstance(retained, RuntimeError)
+    assert str(retained) == "cleanup exploded"
+    assert unhandled == []
+    assert stack.calls == 2
+    assert stack.closed is True
+    assert wire._closed is True
+    assert wire._close_task is None
+    assert wire._close_failure is None

@@ -65,6 +65,7 @@ def build_session_payload(
     voice: str = DEFAULT_TALK_VOICE,
     instructions: str,
     tools: list[dict] | None = None,
+    automatic_response: bool = True,
 ) -> dict:
     """OpenAI Realtime session config — server VAD, barge-in enabled."""
 
@@ -77,7 +78,7 @@ def build_session_payload(
                 "noise_reduction": {"type": "near_field"},
                 "turn_detection": {
                     "type": "server_vad",
-                    "create_response": True,
+                    "create_response": automatic_response,
                     "interrupt_response": True,
                 },
                 "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
@@ -140,6 +141,7 @@ def mint_ephemeral_session(
     voice: str,
     instructions: str,
     tools: list[dict] | None = None,
+    automatic_response: bool = True,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
 
@@ -149,7 +151,11 @@ def mint_ephemeral_session(
     """
 
     session = build_session_payload(
-        model=model, voice=voice, instructions=instructions, tools=tools
+        model=model,
+        voice=voice,
+        instructions=instructions,
+        tools=tools,
+        automatic_response=automatic_response,
     )
     payload = post_client_secret(auth_token, session)
     secret, expires_at_ms = parse_client_secret(payload)

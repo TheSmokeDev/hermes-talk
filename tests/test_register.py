@@ -9,7 +9,9 @@ surfaces themselves.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import textwrap
 import types
 from pathlib import Path
 
@@ -52,6 +54,8 @@ class StubCtx:
         self.hooks: list[tuple[str, object]] = []
         self.tts_providers: list[object] = []
         self.stt_providers: list[object] = []
+        self.realtime_providers: list[object] = []
+        self.realtime_receipt = True
 
     def _maybe_fail(self, surface: str) -> None:
         if surface in self.failing:
@@ -86,6 +90,11 @@ class StubCtx:
         self._maybe_fail("stt")
         self.stt_providers.append(provider)
 
+    def register_realtime_voice_provider(self, provider):
+        self._maybe_fail("realtime")
+        self.realtime_providers.append(provider)
+        return self.realtime_receipt
+
     def dispatch_tool(self, tool_name, args, **kwargs):  # pragma: no cover - unused here
         return "{}"
 
@@ -117,8 +126,79 @@ def test_register_wires_every_surface(plugin, monkeypatch):
     ]
     assert len(ctx.tts_providers) == 1
     assert len(ctx.stt_providers) == 1
+    if plugin.talk_core_realtime.core_provider_available():
+        assert len(ctx.realtime_providers) == 1
+        assert ctx.realtime_providers[0].name == "talk_openai_realtime"
+    else:
+        assert ctx.realtime_providers == []
     assert plugin.REGISTRATION_FAILURES == []
-    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == {"registered"}
+    expected_receipts = (
+        {"registered"}
+        if plugin.talk_core_realtime.core_provider_available()
+        else {"registered", "unsupported-optional"}
+    )
+    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == expected_receipts
+
+
+def test_realtime_registration_false_is_rejected_not_registered(plugin):
+    if not plugin.talk_core_realtime.core_provider_available():
+        pytest.skip("optional Hermes core API-v2 is absent")
+    ctx = StubCtx()
+    ctx.realtime_receipt = False
+
+    plugin.register(ctx)
+
+    assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "rejected"
+    assert len(ctx.realtime_providers) == 1
+
+
+def test_real_api_v2_context_accepts_the_talk_provider(plugin):
+    if not plugin.talk_core_realtime.core_provider_available():
+        pytest.skip("optional Hermes core API-v2 is absent")
+    try:
+        from agent import realtime_voice_registry
+        from hermes_cli.plugins import PluginContext, PluginManifest
+    except ImportError:
+        pytest.skip("optional Hermes plugin API is absent")
+
+    realtime_voice_registry._reset_for_tests()
+    ctx = PluginContext(PluginManifest(name="hermes-talk-test"), object())
+    try:
+        plugin._attempt_boolean_registration(
+            ctx,
+            "register_realtime_voice_provider",
+            "realtime voice provider",
+            "realtime_voice_provider",
+            plugin.talk_core_realtime.TalkOpenAIRealtimeProvider(),
+        )
+        registered = realtime_voice_registry.get_provider("talk_openai_realtime")
+        assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "registered"
+        assert registered is not None
+        assert registered.api_version == 2
+    finally:
+        realtime_voice_registry._reset_for_tests()
+
+
+def test_realtime_registration_exception_is_redacted_failure(plugin):
+    if not plugin.talk_core_realtime.core_provider_available():
+        pytest.skip("optional Hermes core API-v2 is absent")
+    ctx = StubCtx(failing={"realtime"})
+
+    plugin.register(ctx)
+
+    assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "failed"
+    assert any(
+        "realtime voice provider: RuntimeError" in item for item in plugin.REGISTRATION_FAILURES
+    )
+
+
+def test_missing_realtime_host_surface_is_unsupported_optional(plugin):
+    ctx = StubCtx()
+    ctx.register_realtime_voice_provider = None
+
+    plugin.register(ctx)
+
+    assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "unsupported-optional"
 
 
 def test_register_binds_the_context(plugin):
@@ -145,14 +225,21 @@ def test_a_failing_provider_does_not_abort_registration(plugin, monkeypatch):
 
 def test_every_surface_failing_is_recorded_separately(plugin, monkeypatch):
     monkeypatch.setattr(plugin.talk_providers, "providers_available", lambda: True)
-    ctx = StubCtx(failing={"cli", "slash", "hook", "tts", "stt"})
+    ctx = StubCtx(failing={"cli", "slash", "hook", "tts", "stt", "realtime"})
 
     plugin.register(ctx)
 
-    # cli + slash + three hooks + tts + stt, each recorded on its own line.
-    assert len(plugin.REGISTRATION_FAILURES) == 7
+    # Core-absent standalone Talk records realtime as unsupported-optional;
+    # a core-present host attempts it and records the eighth failure.
+    expected_failures = 8 if plugin.talk_core_realtime.core_provider_available() else 7
+    assert len(plugin.REGISTRATION_FAILURES) == expected_failures
     assert plugin.talk_host.get_ctx() is ctx
-    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == {"failed"}
+    expected_receipts = (
+        {"failed"}
+        if plugin.talk_core_realtime.core_provider_available()
+        else {"failed", "unsupported-optional"}
+    )
+    assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == expected_receipts
 
 
 def test_registration_failure_receipts_redact_host_exception_text(plugin, monkeypatch):
@@ -180,8 +267,7 @@ def test_providers_skipped_when_the_host_abcs_are_absent(plugin, monkeypatch):
     assert plugin.REGISTRATION_FAILURES == []
     assert plugin.talk_tools.REGISTRATION_RECEIPTS["tts_provider"] == "unsupported-optional"
     assert (
-        plugin.talk_tools.REGISTRATION_RECEIPTS["transcription_provider"]
-        == "unsupported-optional"
+        plugin.talk_tools.REGISTRATION_RECEIPTS["transcription_provider"] == "unsupported-optional"
     )
 
 
@@ -224,7 +310,7 @@ def test_absent_optional_methods_warn_without_registration_failure(plugin, monke
     check = plugin.talk_cli.talk_doctor._plugin_check()
     assert check["status"] == "warn"
     assert check["details"]["required_issue_count"] == 0
-    assert check["details"]["optional_issue_count"] == 5
+    assert check["details"]["optional_issue_count"] == 6
 
 
 def test_absent_required_method_is_a_required_failure_not_an_exception(plugin, monkeypatch):
@@ -292,3 +378,62 @@ def test_slash_command_runs_the_session_outside_a_loop(plugin, monkeypatch):
     monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda *a, **k: 0)
 
     assert ctx.commands["talk"]["handler"]("") == "Voice session ended."
+
+
+def test_core_absent_process_keeps_legacy_imports_and_reports_optional():
+    script = textwrap.dedent(
+        f"""
+        import importlib.abc
+        import importlib.util
+        import sys
+        import types
+        from pathlib import Path
+
+        class BlockCore(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "agent" or fullname.startswith("agent."):
+                    raise ModuleNotFoundError(fullname)
+                if fullname == "hermes_cli" or fullname.startswith("hermes_cli."):
+                    raise ModuleNotFoundError(fullname)
+                return None
+
+        sys.meta_path.insert(0, BlockCore())
+        root = Path({str(REPO_ROOT)!r})
+        sys.path.insert(0, str(root))
+        parent = types.ModuleType("hermes_plugins")
+        parent.__path__ = []
+        sys.modules["hermes_plugins"] = parent
+        name = "hermes_plugins.hermes_talk_core_absent"
+        spec = importlib.util.spec_from_file_location(
+            name, root / "__init__.py", submodule_search_locations=[str(root)]
+        )
+        plugin = importlib.util.module_from_spec(spec)
+        plugin.__package__ = name
+        plugin.__path__ = [str(root)]
+        sys.modules[name] = plugin
+        spec.loader.exec_module(plugin)
+
+        class OldHost:
+            def register_cli_command(self, **kwargs): pass
+            def register_command(self, *args, **kwargs): pass
+            def register_hook(self, *args, **kwargs): pass
+            def register_tts_provider(self, provider): pass
+            def register_transcription_provider(self, provider): pass
+
+        plugin.register(OldHost())
+        assert plugin.talk_core_realtime.core_provider_available() is False
+        assert plugin.talk_core_realtime.TalkOpenAIRealtimeProvider is None
+        assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "unsupported-optional"
+        assert plugin.talk_openai_realtime.OpenAIRealtimeSession
+        assert plugin.talk_cli.cli_entry
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr

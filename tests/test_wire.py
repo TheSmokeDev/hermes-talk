@@ -23,10 +23,22 @@ def test_session_payload_enables_server_vad_and_barge_in():
     # the operator and every interrupt is cosmetic.
     assert turn_detection["interrupt_response"] is True
     assert (
-        payload["audio"]["input"]["transcription"]["model"]
-        == talk_wire.INPUT_TRANSCRIPTION_MODEL
+        payload["audio"]["input"]["transcription"]["model"] == talk_wire.INPUT_TRANSCRIPTION_MODEL
     )
     assert payload["audio"]["output"]["voice"] == "cedar"
+
+
+def test_input_only_payload_disables_automatic_response_at_mint_time():
+    payload = talk_wire.build_session_payload(
+        model="gpt-realtime-2.1",
+        voice="cedar",
+        instructions="transcribe only",
+        automatic_response=False,
+    )
+
+    assert payload["audio"]["input"]["turn_detection"]["create_response"] is False
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
 
 
 def test_session_payload_omits_tools_when_none_passed():
@@ -104,3 +116,23 @@ def test_mint_never_returns_the_auth_token(monkeypatch):
     wire = json.dumps(descriptor.to_wire())
     assert "sk-super-secret" not in wire
     assert "ek_minted" in wire
+
+
+def test_input_only_mint_passes_false_into_the_http_payload(monkeypatch):
+    seen = {}
+
+    def fake_post(_auth_token, session):
+        seen.update(session)
+        return {"value": "ephemeral"}
+
+    monkeypatch.setattr(talk_wire, "post_client_secret", fake_post)
+
+    talk_wire.mint_ephemeral_session(
+        auth_token="secret",
+        model="gpt-realtime-2.1",
+        voice="cedar",
+        instructions="transcribe only",
+        automatic_response=False,
+    )
+
+    assert seen["audio"]["input"]["turn_detection"]["create_response"] is False
