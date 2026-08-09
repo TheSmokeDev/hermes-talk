@@ -188,14 +188,15 @@ def _warm_agent_lane() -> str:
 def _mint(auth_token: str, voice: str):
     """Assemble instructions and mint. Blocking — called on a worker thread."""
 
+    tools = talk_tools.default_talk_tools()
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),
         voice=voice,
         instructions=talk_identity.build_instructions(
-            talk_host.host().identity_sections()
+            talk_host.host().identity_sections(), tools=tools
         ),
-        tools=talk_tools.default_talk_tools(),
+        tools=tools,
     )
 
 

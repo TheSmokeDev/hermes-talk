@@ -191,6 +191,24 @@ def test_sweep_claims_and_flushes_a_qualifying_orphan(tmp_path):
     assert list((tmp_path / "state" / "talk-transcripts").iterdir()) == []
 
 
+def test_successful_handoff_status_retains_only_the_child_session_identity(tmp_path):
+    talk_transcript.reset_status_for_tests()
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("deployment detail"))
+    capture.append_turn("assistant", _long_turn("acknowledged detail"))
+    capture.finish()
+
+    talk_transcript.sweep_transcripts(
+        tmp_path,
+        run_agent=lambda _prompt: "WORK_STARTED — session 20260809_132351_722cfd accepted",
+    )
+
+    assert talk_transcript.handoff_status() == {
+        "state": "handoff pending",
+        "child_session_id": "20260809_132351_722cfd",
+    }
+
+
 def test_next_start_recovers_a_claim_left_by_a_killed_sweeper(tmp_path):
     capture = talk_transcript.TranscriptCapture(tmp_path)
     capture.append_turn("user", _long_turn("orphan user"))

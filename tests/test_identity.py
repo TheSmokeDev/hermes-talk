@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import talk_identity
+import talk_tools
 
 
 def test_preamble_plus_the_clock_when_the_host_has_nothing():
@@ -13,7 +14,8 @@ def test_preamble_plus_the_clock_when_the_host_has_nothing():
         built = talk_identity.build_instructions(empty)
         assert built.startswith(talk_identity.VOICE_PREAMBLE)
         remainder = built[len(talk_identity.VOICE_PREAMBLE) :]
-        assert remainder.strip() == talk_identity.current_moment()
+        assert "Advertised legacy tools: none." in remainder
+        assert remainder.strip().endswith(talk_identity.current_moment())
 
 
 def test_the_clock_is_built_per_call_not_at_import():
@@ -42,6 +44,35 @@ def test_preamble_states_the_load_bearing_rules():
     # The port must not carry the source system's identity across.
     for leaked in ("Homie", "Pedro", "Archon", "CLUTCH"):
         assert leaked not in text
+
+
+def test_legacy_capability_claims_are_derived_from_the_advertised_tool_schemas():
+    tools = talk_tools.default_talk_tools()
+    instructions = talk_identity.build_instructions(None, tools=tools)
+
+    assert {tool["name"] for tool in tools} == set(
+        talk_identity.advertised_tool_names(instructions)
+    )
+    for unavailable_claim in (
+        "what is on the web",
+        "state of this machine",
+        "code on a branch",
+        "read-only terminal command",
+        "HUD",
+        "Discord tools",
+        "full Hermes tools",
+    ):
+        assert unavailable_claim not in instructions
+
+
+def test_legacy_prompt_tells_the_truth_about_current_call_transcripts():
+    instructions = talk_identity.build_instructions(None, tools=talk_tools.default_talk_tools())
+
+    assert "temporary local transcript" in instructions
+    assert "after the call closes" in instructions
+    assert "durable-memory review" in instructions
+    assert "not a live searchable or user-facing archive" in instructions
+    assert "no transcript exists" not in instructions
 
 
 def test_sections_render_in_priority_order():

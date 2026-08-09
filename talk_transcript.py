@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import stat
 import threading
 import uuid
@@ -17,6 +18,39 @@ MIN_TURNS = 2
 MIN_CHARS = 200
 _ACTIVE_TRANSCRIPTS: set[Path] = set()
 _ACTIVE_LOCK = threading.RLock()
+_HANDOFF_STATUS: dict[str, str] = {"state": "unknown"}
+_HANDOFF_LOCK = threading.Lock()
+_CHILD_SESSION_PATTERN = re.compile(r"\b\d{8}_\d{6}_[A-Za-z0-9]+\b")
+
+
+def handoff_status() -> dict[str, str]:
+    """Return bounded handoff metadata, never transcript text or an absence claim."""
+
+    with _HANDOFF_LOCK:
+        return dict(_HANDOFF_STATUS)
+
+
+def _record_handoff(result: object) -> None:
+    status = {"state": "handoff pending"}
+    if isinstance(result, str):
+        child = _CHILD_SESSION_PATTERN.search(result)
+        if child is not None:
+            status["child_session_id"] = child.group(0)
+    with _HANDOFF_LOCK:
+        _HANDOFF_STATUS.clear()
+        _HANDOFF_STATUS.update(status)
+
+
+def _record_handoff_failure() -> None:
+    with _HANDOFF_LOCK:
+        _HANDOFF_STATUS.clear()
+        _HANDOFF_STATUS["state"] = "handoff failed"
+
+
+def reset_status_for_tests() -> None:
+    with _HANDOFF_LOCK:
+        _HANDOFF_STATUS.clear()
+        _HANDOFF_STATUS["state"] = "unknown"
 
 
 def _roots(hermes_home: Path) -> tuple[Path, Path]:
@@ -265,8 +299,12 @@ def _finish_claim(
             return
         result = flush(_memory_prompt(turns))
         if isinstance(result, str) and not result.startswith("WORK_STARTED"):
+            _record_handoff_failure()
             _log.warning("Talk transcript memory handoff was refused and dropped: %s", result)
+        else:
+            _record_handoff(result)
     except Exception as exc:  # noqa: BLE001 - one bad memory handoff is isolated
+        _record_handoff_failure()
         _log.warning(
             "dropping claimed Talk transcript after flush failure: %s: %s",
             type(exc).__name__,

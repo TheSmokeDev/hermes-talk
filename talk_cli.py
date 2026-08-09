@@ -674,8 +674,10 @@ async def run_talk_session(
         print(f"talk: {exc}", file=sys.stderr)
         return 1
 
-    instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
     tools = talk_tools.default_talk_tools()
+    instructions = talk_identity.build_instructions(
+        talk_host.host().identity_sections(), tools=tools
+    )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
     # the first tool call; warming it before then avoids spending that tool's

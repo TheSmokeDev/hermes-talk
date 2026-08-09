@@ -122,8 +122,11 @@ def _register_talk_command(ctx) -> None:
             contextual = False
     kwargs = {
         "handler": _talk_command,
-        "description": "Start a Realtime voice session (gateway: join|leave|status)",
-        "args_hint": "[join|leave|status]",
+        "description": (
+            "Start limited legacy voice (join) or canonical parity voice (core join); "
+            "gateway also supports leave and status"
+        ),
+        "args_hint": "[join|core join|leave|status]",
     }
     if contextual:
         kwargs["invocation_context"] = True

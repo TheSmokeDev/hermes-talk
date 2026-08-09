@@ -1153,7 +1153,10 @@ def session_status() -> str:
                 "say `talk leave` to stop."
             )
         return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
-    return f"Live in the voice channel on server {guild_id} — say `talk leave` to stop."
+    return (
+        f"Limited legacy provider-owned voice is live on server {guild_id}. "
+        "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
+    )
 
 
 async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) -> bool:
@@ -1449,6 +1452,7 @@ def start_session(guild_id: int | None = None) -> str:
                 "task": task,
                 "guild_id": bridge["guild_id"],
                 "audio": audio,
+                "mode": "legacy",
                 "generation": generation,
             }
         )
@@ -1458,8 +1462,8 @@ def start_session(guild_id: int | None = None) -> str:
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
     return (
-        "Starting up in the voice channel — give me a second, then talk to "
-        "me. Say `talk status` if you want to check, or `talk leave` to stop."
+        "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
+        "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
     )
 
 

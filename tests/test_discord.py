@@ -339,7 +339,7 @@ def test_bridge_loss_exits_session_cancels_socket_clears_slot_and_notifies(monke
         )
 
         reply = talk_discord.start_session(7)
-        assert "Starting up" in reply
+        assert "Starting limited legacy provider-owned voice" in reply
         task = talk_discord._SESSION["task"]
         for _ in range(20):
             if task.done() and not talk_discord._SESSION:
@@ -418,6 +418,30 @@ def test_undeliverable_failure_receipt_is_preserved_for_status(monkeypatch):
 
 def test_status_with_no_session():
     assert "No live voice session" in talk_discord.session_status()
+
+
+def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(monkeypatch):
+    async def scenario():
+        _wired_host(monkeypatch)
+        gate = asyncio.Event()
+
+        async def keep_open(audio):
+            await gate.wait()
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", keep_open)
+
+        receipt = talk_discord.start_session(7)
+        status = talk_discord.session_status()
+
+        for text in (receipt, status):
+            assert "limited legacy provider-owned" in text.lower()
+            assert "/talk core join" in text.lower()
+        assert len(receipt) < 240
+        gate.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
 
 
 def test_stop_with_no_session_says_so():

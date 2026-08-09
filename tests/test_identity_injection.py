@@ -513,9 +513,9 @@ def test_no_sections_still_yields_the_preamble_and_the_clock():
     for empty in (None, {}):
         built = talk_identity.build_instructions(empty)
         assert built.startswith(talk_identity.VOICE_PREAMBLE)
-        assert built[len(talk_identity.VOICE_PREAMBLE) :].strip() == (
-            talk_identity.current_moment()
-        )
+        remainder = built[len(talk_identity.VOICE_PREAMBLE) :].strip()
+        assert "Advertised legacy tools: none." in remainder
+        assert remainder.endswith(talk_identity.current_moment())
 
 
 # --- talk_status -------------------------------------------------------------

@@ -391,6 +391,15 @@ def test_core_join_captures_and_forwards_the_exact_host_factory(plugin, monkeypa
     assert ctx.commands["talk"]["invocation_context"] is True
 
 
+def test_registered_command_description_labels_legacy_and_core_parity(plugin):
+    ctx = StubCtx()
+    plugin.register(ctx)
+
+    description = ctx.commands["talk"]["description"]
+    assert "limited legacy" in description.lower()
+    assert "core join" in description.lower()
+
+
 def test_older_host_registration_keeps_legacy_slash_command(plugin, monkeypatch):
     class OldHost(StubCtx):
         def register_command(self, name, handler, description="", args_hint=""):
