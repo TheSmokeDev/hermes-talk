@@ -21,6 +21,7 @@ try:
         talk_audio,
         talk_auth,
         talk_config,
+        talk_core_realtime,
         talk_host,
         talk_identity,
         talk_tools,
@@ -29,6 +30,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_audio
     import talk_auth
     import talk_config
+    import talk_core_realtime
     import talk_host
     import talk_identity
     import talk_tools
@@ -51,6 +53,7 @@ HOST_CAPABILITIES = (
     "register_hook",
     "register_tts_provider",
     "register_transcription_provider",
+    "register_realtime_voice_provider",
     "dispatch_tool",
 )
 _SECRET_PATTERNS = (
@@ -114,6 +117,7 @@ def _plugin_check() -> dict[str, Any]:
         if requirements.get(receipt) == "optional"
     }
     context_bound = talk_host.get_ctx() is not None
+    core_readiness = talk_core_realtime.core_provider_diagnostic()
     details = {
         "context_bound": context_bound,
         "failure_count": len(talk_tools.REGISTRATION_FAILURES),
@@ -121,6 +125,10 @@ def _plugin_check() -> dict[str, Any]:
         "optional_issue_count": len(optional_issues),
         "requirements": {receipt: requirements.get(receipt, "required") for receipt in receipts},
         "surfaces": receipts,
+        "legacy_lane": "legacy-provider-executor",
+        "core_realtime_contract": "api-v2-input-only",
+        "core_contract_available": core_readiness["contract_available"],
+        "core_provider_available": core_readiness["provider_available"],
     }
     if required_issues:
         return _check(
@@ -176,9 +184,7 @@ def _auth_check() -> dict[str, Any]:
             remediation.append("Run `codex login` or unset TALK_PREFER_CODEX_OAUTH.")
             summary = "Codex OAuth is required but no usable login was found; API keys are ignored"
         else:
-            remediation.append(
-                "Set TALK_OPENAI_API_KEY or OPENAI_API_KEY, or run `codex login`."
-            )
+            remediation.append("Set TALK_OPENAI_API_KEY or OPENAI_API_KEY, or run `codex login`.")
             summary = "no usable Realtime authentication lane was found"
         return _check("auth", "fail", summary, details, remediation)
 
@@ -379,9 +385,7 @@ def _identity_check() -> dict[str, Any]:
         )
 
     sections = {
-        str(name).upper(): {
-            "characters": len(talk_identity.cap_section(str(name), body))
-        }
+        str(name).upper(): {"characters": len(talk_identity.cap_section(str(name), body))}
         for name, body in resolved.items()
         if isinstance(body, str) and body.strip()
     }
@@ -513,10 +517,13 @@ def render_human(report: dict[str, Any]) -> str:
             )
         elif check["id"] == "identity":
             profile = details["active_profile"] or "root"
-            counts = ", ".join(
-                f"{name}:{receipt['characters']}"
-                for name, receipt in details["sections"].items()
-            ) or "none"
+            counts = (
+                ", ".join(
+                    f"{name}:{receipt['characters']}"
+                    for name, receipt in details["sections"].items()
+                )
+                or "none"
+            )
             lines.append(
                 "  receipt: "
                 f"home={details['resolved_home']} ({details['home_source']}), "
@@ -524,9 +531,10 @@ def render_human(report: dict[str, Any]) -> str:
                 f"profile={profile} ({details['profile_source']}), sections={counts}"
             )
         elif check["id"] == "plugin":
-            surfaces = ", ".join(
-                f"{name}={state}" for name, state in details["surfaces"].items()
-            ) or "unobserved"
+            surfaces = (
+                ", ".join(f"{name}={state}" for name, state in details["surfaces"].items())
+                or "unobserved"
+            )
             lines.append(f"  receipt: {surfaces}")
         elif check["id"] == "host":
             capabilities = ", ".join(
@@ -537,9 +545,7 @@ def render_human(report: dict[str, Any]) -> str:
         for action in check["remediation"]:
             lines.append(f"  -> {action}")
     totals = report["summary"]
-    lines.append(
-        f"Summary: {totals['pass']} pass, {totals['warn']} warn, {totals['fail']} fail."
-    )
+    lines.append(f"Summary: {totals['pass']} pass, {totals['warn']} warn, {totals['fail']} fail.")
     lines.append("No files, credentials, services, or setup were changed.")
     return "\n".join(lines)
 

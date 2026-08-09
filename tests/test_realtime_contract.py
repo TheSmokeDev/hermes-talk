@@ -153,3 +153,4 @@ def test_realtime_contract_and_openai_adapter_are_shipped_modules():
 
     assert "talk_realtime" in shipped
     assert "talk_openai_realtime" in shipped
+    assert "talk_core_realtime" in shipped

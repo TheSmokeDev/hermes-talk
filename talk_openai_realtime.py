@@ -48,9 +48,7 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
         voice=setup.voice,
         instructions=setup.instructions,
         tools=[_tool_wire(tool) for tool in setup.tools] or None,
-    )
-    session["audio"]["input"]["turn_detection"]["create_response"] = (
-        setup.automatic_response
+        automatic_response=setup.automatic_response,
     )
     return {
         "type": "session.update",
@@ -147,9 +145,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
         if event_type == "response.created":
             response = _mapping(event.get("response"))
             metadata = _mapping(response.get("metadata"))
-            response_metadata = {
-                str(key): str(value) for key, value in metadata.items()
-            }
+            response_metadata = {str(key): str(value) for key, value in metadata.items()}
             try:
                 return rt.ResponseStarted(
                     response_id=response.get("id"),
@@ -158,9 +154,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
             except ValueError as exc:
                 # Preserve opaque echoed metadata so Hermes can consume any
                 # one-time authority token before terminating the bad session.
-                return _protocol_failure(
-                    exc, response_metadata=response_metadata
-                )
+                return _protocol_failure(exc, response_metadata=response_metadata)
         if event_type == "response.output_audio.delta":
             delta = event.get("delta")
             if not isinstance(delta, str) or not delta:
@@ -220,8 +214,207 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
     return None
 
 
+class OpenAIWireError(RuntimeError):
+    """A terminal low-level OpenAI transport or wire-protocol failure."""
+
+
+class OpenAIWireEOF(EOFError):
+    """The WebSocket iterator ended; ``detail`` is blank only for a clean EOF."""
+
+    def __init__(self, detail: str = "") -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+class _OpenAIWireSession:
+    """Shared HTTP/WebSocket implementation used by legacy and core facades."""
+
+    def __init__(
+        self,
+        *,
+        auth_token: str,
+        auth_source: str,
+        aiohttp_module=None,
+        mint_session: Callable[..., Any] | None = None,
+    ) -> None:
+        self.auth_token = auth_token
+        self.auth_source = auth_source
+        self._aiohttp = aiohttp_module
+        self._mint_session = mint_session or self._mint
+        self._stack: AsyncExitStack | None = None
+        self._ws = None
+        self._iterator = None
+        self._send_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+        self._close_failure: BaseException | None = None
+        self._closed = False
+
+    def _mint(self, **configuration):
+        return talk_wire.mint_ephemeral_session(
+            auth_token=self.auth_token,
+            model=configuration["model"],
+            voice=configuration["voice"],
+            instructions=configuration["instructions"],
+            tools=configuration.get("tools"),
+            automatic_response=configuration["automatic_response"],
+        )
+
+    async def connect(
+        self,
+        *,
+        model: str,
+        voice: str,
+        instructions: str,
+        tools: list[dict] | None,
+        automatic_response: bool,
+        session_update: dict[str, Any],
+    ) -> None:
+        if self._stack is not None or self._closed:
+            raise OpenAIWireError("Realtime wire connect may only run once")
+        stack = AsyncExitStack()
+        try:
+            descriptor = self._mint_session(
+                model=model,
+                voice=voice,
+                instructions=instructions,
+                tools=tools,
+                automatic_response=automatic_response,
+            )
+            aiohttp = self._aiohttp or _import_aiohttp()
+            http = await stack.enter_async_context(aiohttp.ClientSession())
+            ws = await stack.enter_async_context(
+                http.ws_connect(
+                    f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={model}",
+                    headers={"Authorization": f"Bearer {descriptor.client_secret}"},
+                    timeout=CONNECT_TIMEOUT_S,
+                    heartbeat=20.0,
+                )
+            )
+            self._stack = stack
+            self._ws = ws
+            self._iterator = ws.__aiter__()
+            await self.send_json((session_update,))
+        except BaseException:
+            self._stack = None
+            await stack.aclose()
+            raise
+
+    async def send_json(self, messages: Sequence[dict[str, Any]]) -> None:
+        if self._ws is None:
+            raise OpenAIWireError("Realtime wire is not connected")
+        try:
+            async with self._send_lock:
+                for message in messages:
+                    await self._ws.send_json(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise OpenAIWireError(str(exc)) from exc
+
+    def __aiter__(self):
+        return self
+
+    def _eof_failure_detail(self) -> str:
+        if self._ws is None:
+            return ""
+        close_code = getattr(self._ws, "close_code", None)
+        socket_exception = None
+        exception = getattr(self._ws, "exception", None)
+        if callable(exception):
+            try:
+                socket_exception = exception()
+            except Exception as exc:  # noqa: BLE001 - broken status probe is failure
+                socket_exception = exc
+        if close_code in NORMAL_WEBSOCKET_CLOSE_CODES and socket_exception is None:
+            return ""
+        reasons = []
+        if close_code not in NORMAL_WEBSOCKET_CLOSE_CODES:
+            reasons.append(f"close code {close_code}")
+        if socket_exception is not None:
+            detail = str(socket_exception).strip() or type(socket_exception).__name__
+            reasons.append(detail)
+        return f"Provider WebSocket closed abnormally ({'; '.join(reasons)})"
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._iterator is None:
+            raise OpenAIWireEOF("")
+        while True:
+            try:
+                message = await self._iterator.__anext__()
+            except StopAsyncIteration:
+                raise OpenAIWireEOF(self._eof_failure_detail()) from None
+            aiohttp = self._aiohttp or _import_aiohttp()
+            if message.type == getattr(aiohttp.WSMsgType, "ERROR", object()):
+                detail = str(getattr(message, "data", "") or "").strip()
+                raise OpenAIWireError(detail or "Provider WebSocket receive failed")
+            if message.type is not aiohttp.WSMsgType.TEXT:
+                passive_types = {
+                    getattr(aiohttp.WSMsgType, name, object())
+                    for name in ("CLOSE", "CLOSED", "CLOSING", "PING", "PONG")
+                }
+                if message.type in passive_types:
+                    continue
+                frame_name = getattr(message.type, "name", str(message.type)).lower()
+                raise OpenAIWireError(
+                    f"Provider sent unsupported WebSocket frame type: {frame_name}"
+                )
+            try:
+                wire_event = json.loads(message.data)
+            except (TypeError, ValueError) as exc:
+                raise OpenAIWireError("Provider sent malformed JSON") from exc
+            if not isinstance(wire_event, dict):
+                raise OpenAIWireError("Provider sent a non-object event")
+            return wire_event
+
+    async def _close_once(self) -> None:
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except BaseException:
+                self._stack = stack
+                raise
+
+    async def _finish_close(self) -> None:
+        task = asyncio.current_task()
+        try:
+            await self._close_once()
+        except BaseException as exc:
+            async with self._close_lock:
+                self._close_failure = exc
+                if self._close_task is task:
+                    self._close_task = None
+            raise
+        async with self._close_lock:
+            if self._close_task is task:
+                self._close_failure = None
+                self._closed = True
+                self._close_task = None
+
+    @staticmethod
+    def _observe_close_task(task: asyncio.Task[None]) -> None:
+        """Retrieve late cleanup failures when every shielded waiter is gone."""
+
+        if task.cancelled():
+            return
+        task.exception()
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            task = self._close_task
+            if task is None:
+                task = asyncio.create_task(self._finish_close())
+                task.add_done_callback(self._observe_close_task)
+                self._close_task = task
+        await asyncio.wait((task,))
+        task.result()
+
+
 class OpenAIRealtimeSession:
-    """OpenAI WebSocket adapter implementing :class:`rt.RealtimeSession`."""
+    """Legacy Talk-neutral facade over the shared OpenAI wire session."""
 
     def __init__(
         self,
@@ -234,144 +427,71 @@ class OpenAIRealtimeSession:
         self.auth_token = auth_token
         self.auth_source = auth_source
         self.state = rt.SessionState.NEW
-        self._aiohttp = aiohttp_module
-        self._mint_session = mint_session or self._mint
-        self._stack: AsyncExitStack | None = None
-        self._ws = None
-        self._iterator = None
-        self._send_lock = asyncio.Lock()
-        self._terminal_emitted = False
-
-    def _mint(self, setup: rt.SessionSetup):
-        return talk_wire.mint_ephemeral_session(
-            auth_token=self.auth_token,
-            model=setup.model,
-            voice=setup.voice,
-            instructions=setup.instructions,
-            tools=[_tool_wire(tool) for tool in setup.tools] or None,
+        self._legacy_mint = mint_session
+        self._wire = _OpenAIWireSession(
+            auth_token=auth_token,
+            auth_source=auth_source,
+            aiohttp_module=aiohttp_module,
+            mint_session=None,
         )
+        self._terminal_emitted = False
 
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
         self.state = rt.SessionState.CONNECTING
-        stack = AsyncExitStack()
+        if self._legacy_mint is not None:
+            self._wire._mint_session = lambda **_configuration: self._legacy_mint(setup)
+        tools = [_tool_wire(tool) for tool in setup.tools] or None
         try:
-            descriptor = self._mint_session(setup)
-            aiohttp = self._aiohttp or _import_aiohttp()
-            http = await stack.enter_async_context(aiohttp.ClientSession())
-            ws = await stack.enter_async_context(
-                http.ws_connect(
-                    f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={setup.model}",
-                    headers={"Authorization": f"Bearer {descriptor.client_secret}"},
-                    timeout=CONNECT_TIMEOUT_S,
-                    heartbeat=20.0,
-                )
+            await self._wire.connect(
+                model=setup.model,
+                voice=setup.voice,
+                instructions=setup.instructions,
+                tools=tools,
+                automatic_response=setup.automatic_response,
+                session_update=build_session_update(setup),
             )
-            self._stack = stack
-            self._ws = ws
-            self._iterator = ws.__aiter__()
-            self.state = rt.SessionState.CONNECTED
-            await self._send_wire((build_session_update(setup),))
         except asyncio.CancelledError:
             self.state = rt.SessionState.CLOSED
-            await stack.aclose()
             raise
         except Exception as exc:
             self.state = rt.SessionState.FAILED
-            await stack.aclose()
             if isinstance(exc, rt.RealtimeSessionError):
                 raise
             raise rt.RealtimeSessionError(str(exc)) from exc
+        self.state = rt.SessionState.CONNECTED
 
-    async def _send_wire(self, messages: Sequence[dict[str, Any]]) -> None:
-        if self._ws is None:
+    async def send(self, commands: Sequence[rt.RealtimeCommand]) -> None:
+        clean_eof_flush = self.state is rt.SessionState.CLOSED and self._terminal_emitted
+        if self.state is not rt.SessionState.CONNECTED and not clean_eof_flush:
             raise rt.RealtimeSessionError("Realtime session is not connected")
         try:
-            async with self._send_lock:
-                for message in messages:
-                    await self._ws.send_json(message)
+            await self._wire.send_json(tuple(encode_command(command) for command in commands))
         except Exception as exc:
             self.state = rt.SessionState.FAILED
             raise rt.RealtimeSessionError(str(exc)) from exc
-
-    async def send(self, commands: Sequence[rt.RealtimeCommand]) -> None:
-        clean_eof_flush = (
-            self.state is rt.SessionState.CLOSED
-            and self._terminal_emitted
-            and self._stack is not None
-        )
-        if self.state is not rt.SessionState.CONNECTED and not clean_eof_flush:
-            raise rt.RealtimeSessionError("Realtime session is not connected")
-        await self._send_wire(tuple(encode_command(command) for command in commands))
 
     def __aiter__(self):
         return self
 
-    def _eof_failure_detail(self) -> str:
-        """Describe transport failure hidden by aiohttp's iterator EOF."""
-
-        if self._ws is None:
-            return ""
-        close_code = getattr(self._ws, "close_code", None)
-        socket_exception = None
-        exception = getattr(self._ws, "exception", None)
-        if callable(exception):
-            try:
-                socket_exception = exception()
-            except Exception as exc:  # noqa: BLE001 — a broken status probe is failure
-                socket_exception = exc
-        if close_code in NORMAL_WEBSOCKET_CLOSE_CODES and socket_exception is None:
-            return ""
-
-        reasons = []
-        if close_code not in NORMAL_WEBSOCKET_CLOSE_CODES:
-            reasons.append(f"close code {close_code}")
-        if socket_exception is not None:
-            detail = str(socket_exception).strip() or type(socket_exception).__name__
-            reasons.append(detail)
-        return f"Provider WebSocket closed abnormally ({'; '.join(reasons)})"
-
     async def __anext__(self) -> rt.RealtimeEvent:
-        if self._iterator is None:
+        if self._terminal_emitted:
             raise StopAsyncIteration
         while True:
             try:
-                message = await self._iterator.__anext__()
-            except StopAsyncIteration:
-                if self._terminal_emitted:
-                    raise
+                wire_event = await self._wire.__anext__()
+            except OpenAIWireEOF as exc:
                 self._terminal_emitted = True
-                failure_detail = self._eof_failure_detail()
-                terminal_state = (
+                self.state = (
                     rt.SessionState.FAILED
-                    if self.state is rt.SessionState.FAILED or failure_detail
+                    if self.state is rt.SessionState.FAILED or exc.detail
                     else rt.SessionState.CLOSED
                 )
-                self.state = terminal_state
-                # A clean EOF may still race an already-admitted tool result;
-                # send() preserves that pre-teardown flush without reopening a
-                # failed transport or changing the synchronized terminal state.
-                return rt.SessionTerminated(
-                    state=terminal_state,
-                    detail=failure_detail,
-                )
-            aiohttp = self._aiohttp or _import_aiohttp()
-            if message.type == getattr(aiohttp.WSMsgType, "ERROR", object()):
+                return rt.SessionTerminated(state=self.state, detail=exc.detail)
+            except OpenAIWireError as exc:
                 self.state = rt.SessionState.FAILED
-                detail = str(getattr(message, "data", "") or "").strip()
-                return rt.ProviderFailure(
-                    detail=detail or "Provider WebSocket receive failed",
-                    terminal=True,
-                )
-            if message.type is not aiohttp.WSMsgType.TEXT:
-                continue
-            try:
-                wire_event = json.loads(message.data)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(wire_event, dict):
-                continue
+                return rt.ProviderFailure(detail=str(exc), terminal=True)
             event = decode_event(wire_event)
             if event is not None:
                 if isinstance(event, rt.ProviderFailure) and event.terminal:
@@ -379,15 +499,17 @@ class OpenAIRealtimeSession:
                 return event
 
     async def close(self) -> None:
-        stack, self._stack = self._stack, None
-        if stack is not None:
-            await stack.aclose()
+        await self._wire.close()
         if self.state is not rt.SessionState.FAILED:
             self.state = rt.SessionState.CLOSED
+
 
 __all__ = [
     "CONNECT_TIMEOUT_S",
     "OpenAIRealtimeSession",
+    "OpenAIWireEOF",
+    "OpenAIWireError",
+    "_OpenAIWireSession",
     "build_session_update",
     "decode_event",
     "encode_command",

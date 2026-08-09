@@ -20,6 +20,7 @@ try:
     from . import (
         talk_cli,
         talk_config,
+        talk_core_realtime,
         talk_discord,
         talk_host,
         talk_lifecycle,
@@ -30,6 +31,7 @@ try:
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
     import talk_config
+    import talk_core_realtime
     import talk_discord
     import talk_host
     import talk_lifecycle
@@ -87,6 +89,21 @@ def _attempt_registration(
         _registered(receipt)
 
 
+def _attempt_boolean_registration(ctx, method_name: str, surface: str, receipt: str, *args) -> None:
+    """Record exact acceptance for host registries with boolean receipts."""
+
+    method = getattr(ctx, method_name, None)
+    if not callable(method):
+        _unsupported(surface, receipt)
+        return
+    try:
+        accepted = method(*args)
+    except Exception as exc:  # noqa: BLE001 - isolate optional registration
+        _record(surface, receipt, exc)
+        return
+    REGISTRATION_RECEIPTS[receipt] = "registered" if accepted is True else "rejected"
+
+
 def _talk_command(raw_args: str = "") -> str:
     """``/talk`` — start a voice session from inside a Hermes session.
 
@@ -106,8 +123,10 @@ def _talk_command(raw_args: str = "") -> str:
                 "Those are for the gateway's Discord voice channel. Here in a "
                 "terminal, plain `/talk` starts the call."
             )
-        return "Voice session ended." if talk_cli.cli_entry() == 0 else (
-            "Voice session ended with errors — see stderr."
+        return (
+            "Voice session ended."
+            if talk_cli.cli_entry() == 0
+            else ("Voice session ended with errors — see stderr.")
         )
 
     if sub in {"leave", "stop", "hang up"}:
@@ -135,6 +154,17 @@ def register(ctx) -> None:
     REGISTRATION_FAILURES.clear()
     REGISTRATION_RECEIPTS.clear()
     talk_host.bind_ctx(ctx)
+
+    if talk_core_realtime.core_provider_available():
+        _attempt_boolean_registration(
+            ctx,
+            "register_realtime_voice_provider",
+            "realtime voice provider",
+            "realtime_voice_provider",
+            talk_core_realtime.TalkOpenAIRealtimeProvider(),
+        )
+    else:
+        _unsupported("realtime voice provider", "realtime_voice_provider")
 
     _attempt_registration(
         ctx,

@@ -113,9 +113,7 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
 
 
 def test_doctor_is_read_only_even_when_oauth_is_expired(monkeypatch, tmp_path):
-    auth_path = _write_oauth(
-        tmp_path / "codex", access=_jwt_with_exp(time.time() - 60)
-    )
+    auth_path = _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() - 60))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     before = auth_path.read_bytes()
     before_mtime = auth_path.stat().st_mtime_ns
@@ -175,9 +173,7 @@ def test_malformed_non_object_jwt_preserves_doctor_schema(monkeypatch, tmp_path,
     assert _checks(payload)["auth"]["details"]["codex_oauth"] == "invalid"
 
 
-def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(
-    monkeypatch, tmp_path
-):
+def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(monkeypatch, tmp_path):
     _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
@@ -230,9 +226,7 @@ def test_preferred_missing_oauth_fails_closed_and_reports_ignored_key(monkeypatc
     assert auth["details"]["metered_keys_ignored"] is True
 
 
-def test_identity_profile_home_collapses_to_root_without_duplicate_profile(
-    monkeypatch, tmp_path
-):
+def test_identity_profile_home_collapses_to_root_without_duplicate_profile(monkeypatch, tmp_path):
     root = tmp_path / "hermes-root"
     profile_home = root / "profiles" / "voice"
     profile_home.mkdir(parents=True)
@@ -394,7 +388,20 @@ def test_unsupported_host_surfaces_are_diagnostic_not_an_exception(monkeypatch):
     assert host["status"] == "warn"
     assert host["details"]["context_bound"] is True
     assert host["details"]["capabilities"]["register_cli_command"] is False
+    assert host["details"]["capabilities"]["register_realtime_voice_provider"] is False
     assert host["details"]["capabilities"]["dispatch_tool"] is False
+
+
+def test_plugin_diagnostic_labels_core_and_legacy_lanes():
+    talk_tools.REGISTRATION_RECEIPTS["realtime_voice_provider"] = "rejected"
+
+    plugin = talk_doctor._plugin_check()
+
+    assert plugin["details"]["legacy_lane"] == "legacy-provider-executor"
+    assert plugin["details"]["core_realtime_contract"] == "api-v2-input-only"
+    assert isinstance(plugin["details"]["core_contract_available"], bool)
+    assert isinstance(plugin["details"]["core_provider_available"], bool)
+    assert plugin["details"]["surfaces"]["realtime_voice_provider"] == "rejected"
 
 
 def test_discord_receipt_counts_operators_without_ids(monkeypatch):
