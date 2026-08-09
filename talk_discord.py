@@ -1078,6 +1078,7 @@ __all__ = [
     "resolve_voice_bridge",
     "session_status",
     "session_to_discord",
+    "start_core_session",
     "start_session",
     "stop_session",
 ]
@@ -1101,11 +1102,17 @@ def session_status() -> str:
     with _SESSION_LOCK:
         task = _SESSION.get("task")
         guild_id = _SESSION.get("guild_id")
+        mode = _SESSION.get("mode", "legacy")
         last_failure = _LAST_FAILURE
     if task is None or task.done():
         if last_failure:
             return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
+    if mode == "core":
+        return (
+            f"Canonical core voice is starting on server {guild_id} — "
+            "say `talk leave` to stop."
+        )
     return f"Live in the voice channel on server {guild_id} — say `talk leave` to stop."
 
 
@@ -1148,6 +1155,100 @@ async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) ->
     except Exception:  # noqa: BLE001 — status remains the durable fallback
         _log.warning("could not deliver Discord voice failure receipt", exc_info=True)
     return False
+
+
+def start_core_session(factory: object, guild_id: int | None = None) -> str:
+    """Start the canonical input-only lane without falling back to legacy Talk."""
+
+    global _LAST_FAILURE
+
+    try:
+        import asyncio as _asyncio
+
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        return "Canonical core voice requires the running Hermes gateway."
+
+    try:
+        bridge = resolve_voice_bridge(guild_id)
+    except TalkDiscordError as exc:
+        return str(exc)
+
+    try:
+        from . import talk_core_session
+    except ImportError:  # pragma: no cover - flat-module fallback
+        import talk_core_session
+
+    audio = DiscordAudio(bridge["guild_id"], capture_only=True)
+
+    def _done(finished) -> None:
+        global _LAST_FAILURE
+
+        failure = None
+        try:
+            if not finished.cancelled():
+                error = finished.exception()
+                if error is not None:
+                    failure = f"{type(error).__name__}: {error}"
+        except Exception as exc:  # noqa: BLE001 - callback must not escape
+            failure = f"core session outcome could not be read: {exc}"
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is finished:
+                _SESSION.clear()
+            if failure:
+                _LAST_FAILURE = f"canonical core voice: {failure}"
+        if failure:
+            _log.warning("canonical core voice session failed: %s", failure)
+            receipt = (
+                f"Canonical core voice failed closed: {failure}. "
+                "No legacy voice session was started."
+            )
+
+            async def _notify() -> None:
+                global _LAST_FAILURE
+
+                delivered = await _deliver_failure_receipt(
+                    bridge["adapter"], bridge["guild_id"], receipt
+                )
+                if delivered:
+                    with _SESSION_LOCK:
+                        expected = f"canonical core voice: {failure}"
+                        if expected == _LAST_FAILURE:
+                            _LAST_FAILURE = None
+
+            notification = loop.create_task(_notify())
+            _NOTIFICATION_TASKS.add(notification)
+            notification.add_done_callback(_NOTIFICATION_TASKS.discard)
+        try:
+            audio.stop()
+        except Exception:  # noqa: BLE001 - runner also owns idempotent teardown
+            _log.debug("canonical core audio teardown failed", exc_info=True)
+
+    with _SESSION_LOCK:
+        existing = _SESSION.get("task")
+        if existing is not None and not existing.done():
+            return "I'm already live in a voice channel — say `talk leave` first."
+        _LAST_FAILURE = None
+        task = loop.create_task(
+            talk_core_session.run_core_session(
+                factory,
+                guild_id=bridge["guild_id"],
+                audio=audio,
+            )
+        )
+        task.add_done_callback(_done)
+        _SESSION.update(
+            {
+                "task": task,
+                "guild_id": bridge["guild_id"],
+                "audio": audio,
+                "mode": "core",
+            }
+        )
+    return (
+        "Starting the canonical core input lane in the voice channel — "
+        "say `talk status` to check it or `talk leave` to stop."
+    )
 
 
 def start_session(guild_id: int | None = None) -> str:

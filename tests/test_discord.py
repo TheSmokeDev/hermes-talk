@@ -21,6 +21,7 @@ import pytest
 
 import talk_audio
 import talk_cli
+import talk_core_session
 import talk_discord
 
 
@@ -1616,3 +1617,94 @@ def test_generic_chunk_reader_unwraps_the_atomic_packet(monkeypatch):
 
     assert bridge.read_input_chunk() == talk_discord.discord_to_session(pcm48)[0]
     bridge.stop()
+
+
+def test_core_session_claims_shared_slot_with_capture_only_audio(monkeypatch):
+    created = []
+    entered = asyncio.Event()
+
+    class Audio:
+        def __init__(self, guild_id, *, capture_only=False):
+            created.append((guild_id, capture_only, self))
+
+        def stop(self):
+            pass
+
+    async def run_core(factory, *, guild_id, audio):
+        assert factory is sentinel
+        assert guild_id == 7
+        assert audio is created[0][2]
+        entered.set()
+        await asyncio.Event().wait()
+
+    sentinel = object()
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+    monkeypatch.setattr(
+        talk_cli,
+        "run_talk_session",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("legacy fallback")),
+    )
+
+    async def scenario():
+        reply = talk_discord.start_core_session(sentinel)
+        await asyncio.wait_for(entered.wait(), 0.2)
+        assert talk_discord._SESSION["mode"] == "core"
+        assert "already" in talk_discord.start_core_session(object()).lower()
+        stopped = talk_discord.stop_session()
+        await asyncio.sleep(0)
+        return reply, stopped
+
+    reply, stopped = asyncio.run(scenario())
+    assert created[0][:2] == (7, True)
+    assert "starting" in reply.lower() and "core" in reply.lower()
+    assert "left" in stopped.lower()
+
+
+def test_core_failure_delivers_a_core_specific_receipt_without_legacy_fallback(monkeypatch):
+    delivered = []
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            pass
+
+    async def fail_core(*_args, **_kwargs):
+        raise RuntimeError("provider closed")
+
+    async def deliver(adapter, guild_id, receipt):
+        delivered.append((adapter, guild_id, receipt))
+        return True
+
+    adapter = object()
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": adapter},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", fail_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        task = talk_discord._SESSION["task"]
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())
+
+    assert delivered and delivered[0][:2] == (adapter, 7)
+    receipt = delivered[0][2].lower()
+    assert "canonical core voice" in receipt
+    assert "provider closed" in receipt
+    assert "talk join" not in receipt
