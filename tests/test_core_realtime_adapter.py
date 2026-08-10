@@ -1829,6 +1829,107 @@ def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_
     assert not session._completed_responses
 
 
+def test_documented_realtime_item_object_completes_full_output_lifecycle_exactly_once():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    events = valid_output_lifecycle_events(correlation)
+    for event in events:
+        if event["type"] in {
+            "response.output_item.added",
+            "response.output_item.done",
+            "conversation.item.done",
+        }:
+            event["item"]["object"] = "realtime.item"
+        elif event["type"] == "response.done":
+            event["response"]["output"][0]["object"] = "realtime.item"
+    harness = Harness([created, *events])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert sum(isinstance(event, ResponseCompleted) for event in received) == 1
+    assert not any(isinstance(event, Interruption) for event in received)
+    assert received[-1] == SessionClosed()
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._completed_responses
+
+
+@pytest.mark.parametrize(
+    ("object_value", "extra"),
+    [
+        (None, {}),
+        (True, {}),
+        ("realtime.item.wrong", {}),
+        ({"value": "realtime.item"}, {}),
+        ("realtime.item", {"unknown": None}),
+    ],
+    ids=["null", "bool", "wrong-string", "mapping", "extra-unknown-key"],
+)
+def test_output_item_object_variants_reject_before_lifecycle_state_mutation(
+    object_value, extra
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        item = {
+            "id": "item-1",
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+            "object": object_value,
+            **extra,
+        }
+        before = output_authority_state(session)
+        with pytest.raises((TypeError, ValueError)):
+            session._map_event(
+                {
+                    "type": "response.output_item.added",
+                    "response_id": "resp-1",
+                    "item": item,
+                }
+            )
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_wrong_output_item_object_event_pump_fails_without_completion_or_interruption():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    events = valid_output_lifecycle_events(correlation)
+    events[0]["item"]["object"] = "wrong"
+    harness = Harness([created, *events])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert not any(isinstance(event, Interruption) for event in received)
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._completed_responses
+
+
 def test_live_proven_output_envelopes_accept_event_ids_and_indexes_once():
     correlation = "token-1"
     created = {
@@ -2419,6 +2520,75 @@ def partial_cancelled_output_item(*, item_id="item-1", content=None):
     }
 
 
+def test_cancelled_done_accepts_documented_realtime_item_object_direct_and_cleans_state():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        item = {**partial_cancelled_output_item(), "object": "realtime.item"}
+        interrupted = session._map_event(
+            cancelled_response_done_event("token-1", output=[item])
+        )
+        return session, interrupted
+
+    session, interrupted = asyncio.run(scenario())
+    assert interrupted == Interruption(response_id="resp-1", turn_id="turn-41")
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._audio_delta_items
+    assert not session._cancelling_responses
+    assert session._completed_responses == {"resp-1": "token-1"}
+
+
+def test_cancelled_done_accepts_documented_realtime_item_object_through_event_pump():
+    correlation = "token-1"
+    item = {
+        **partial_cancelled_output_item(
+            content=[{"type": "output_audio", "transcript": "partial"}]
+        ),
+        "object": "realtime.item",
+    }
+    harness = Harness([cancelled_response_done_event(correlation, output=[item])])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, correlation)
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert received.count(Interruption(response_id="resp-1", turn_id="turn-41")) == 1
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert received[-1] == SessionClosed()
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._cancelling_responses
+    assert not session._completed_responses
+
+
 _STATUS_DETAILS_ABSENT = object()
 
 
@@ -2482,6 +2652,79 @@ def test_cancelled_done_rejects_malformed_partial_output_before_direct_state_mut
         assert output_authority_state(session) == before
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("object_value", "extra"),
+    [
+        (None, {}),
+        (True, {}),
+        ("realtime.item.wrong", {}),
+        ({"value": "realtime.item"}, {}),
+        ("realtime.item", {"unknown": None}),
+    ],
+    ids=["null", "bool", "wrong-string", "mapping", "extra-unknown-key"],
+)
+def test_cancelled_done_rejects_item_object_variants_before_direct_state_mutation(
+    object_value, extra
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        item = {
+            **partial_cancelled_output_item(),
+            "object": object_value,
+            **extra,
+        }
+        before = output_authority_state(session)
+        with pytest.raises((TypeError, ValueError)):
+            session._map_event(
+                cancelled_response_done_event("token-1", output=[item])
+            )
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_wrong_cancelled_item_object_event_pump_fails_without_terminal_event():
+    correlation = "token-1"
+    item = {**partial_cancelled_output_item(), "object": "wrong"}
+    harness = Harness([cancelled_response_done_event(correlation, output=[item])])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, correlation)
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert not any(isinstance(event, Interruption) for event in received)
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._completed_responses
 
 
 @pytest.mark.parametrize(

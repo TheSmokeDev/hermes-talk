@@ -205,6 +205,8 @@ if _CORE_IMPORT_ERROR is None:
         )
     )
     _OUTPUT_ITEM_KEYS = frozenset({"id", "type", "role", "status", "content"})
+    _OUTPUT_ITEM_ALLOWED_KEYS = _OUTPUT_ITEM_KEYS | {"object"}
+    _OUTPUT_ITEM_OBJECT = "realtime.item"
     _OUTPUT_AUDIO_PART_KEYS = frozenset({"type", "transcript"})
     _OUTPUT_EVENT_TYPES = frozenset(
         {
@@ -616,6 +618,24 @@ if _CORE_IMPORT_ERROR is None:
             self._item_responses[item_id] = response_id
             return correlation, binding, item_id
 
+        @staticmethod
+        def _validate_output_item_authority_shape(
+            item: Any, *, context: str
+        ) -> Mapping[str, Any]:
+            if not isinstance(item, Mapping):
+                raise TypeError(f"{context} requires an output item object")
+            if not set(item).issubset(_OUTPUT_ITEM_ALLOWED_KEYS):
+                raise ValueError(f"{context} output item has an invalid authority shape")
+            if "object" in item:
+                item_object = item["object"]
+                if type(item_object) is not str:
+                    raise TypeError(f"{context} output item object must be an exact string")
+                if item_object != _OUTPUT_ITEM_OBJECT:
+                    raise ValueError(
+                        f"{context} output item object must be {_OUTPUT_ITEM_OBJECT}"
+                    )
+            return item
+
         def _validate_output_audio_part(
             self,
             part: Any,
@@ -644,10 +664,7 @@ if _CORE_IMPORT_ERROR is None:
             response_id: str,
             stage: str,
         ) -> tuple[str, Mapping[str, Any] | None]:
-            if not isinstance(item, Mapping):
-                raise TypeError(f"{stage} requires an output item object")
-            if not set(item).issubset(_OUTPUT_ITEM_KEYS):
-                raise ValueError(f"{stage} output item has an invalid authority shape")
+            item = self._validate_output_item_authority_shape(item, context=stage)
             if item.get("type") != "message":
                 raise ValueError(f"{stage} output item type must be message")
             if item.get("role") != "assistant":
@@ -780,11 +797,13 @@ if _CORE_IMPORT_ERROR is None:
             known_item_id = self._response_items.get(response_id)
             if known_item_id is None:
                 raise ValueError("cancelled response cannot bind a new output item")
-            item = output[0]
-            if not isinstance(item, Mapping):
-                raise TypeError("cancelled response output item must be an object")
-            if set(item) != _OUTPUT_ITEM_KEYS:
-                raise ValueError("cancelled response output item has an invalid authority shape")
+            item = self._validate_output_item_authority_shape(
+                output[0], context="cancelled response"
+            )
+            if set(item) - {"object"} != _OUTPUT_ITEM_KEYS:
+                raise ValueError(
+                    "cancelled response output item has an invalid authority shape"
+                )
             if item.get("type") != "message":
                 raise ValueError("cancelled response output item type must be message")
             if item.get("role") != "assistant":
