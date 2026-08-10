@@ -2409,6 +2409,239 @@ def test_requested_cancelled_done_maps_interruption_and_cleans_exact_response_st
     assert session._completed_responses == {"resp-1": "token-1"}
 
 
+def partial_cancelled_output_item(*, item_id="item-1", content=None):
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "incomplete",
+        "content": [] if content is None else content,
+    }
+
+
+_STATUS_DETAILS_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        {},
+        [partial_cancelled_output_item(), partial_cancelled_output_item()],
+        [1],
+        [partial_cancelled_output_item(item_id="wrong-item")],
+        [{**partial_cancelled_output_item(), "type": "function_call"}],
+        [{**partial_cancelled_output_item(), "role": "user"}],
+        [{**partial_cancelled_output_item(), "status": "completed"}],
+        [{**partial_cancelled_output_item(), "response_id": "resp-2"}],
+        [{**partial_cancelled_output_item(), "content": {}}],
+        [
+            partial_cancelled_output_item(
+                content=[{"type": "output_audio"}, {"type": "output_audio"}]
+            )
+        ],
+        [partial_cancelled_output_item(content=[{"type": "output_text", "text": "no"}])],
+        [{**partial_cancelled_output_item(), "tool_calls": []}],
+    ],
+    ids=[
+        "non-list",
+        "multiple-items",
+        "nonmapping-item",
+        "wrong-item-id",
+        "wrong-item-type",
+        "wrong-role",
+        "wrong-status",
+        "conflicting-response-id",
+        "non-list-content",
+        "multiple-content-parts",
+        "nonaudio-content",
+        "structured-tool-authority",
+    ],
+)
+def test_cancelled_done_rejects_malformed_partial_output_before_direct_state_mutation(
+    bad_output,
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        event = cancelled_response_done_event("token-1", output=bad_output)
+        before = output_authority_state(session)
+        with pytest.raises((TypeError, ValueError)):
+            session._map_event(event)
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "status_details",
+    [
+        [],
+        {"type": "failed", "reason": "client_cancelled"},
+        {"type": "incomplete", "reason": "client_cancelled"},
+        {"type": "completed", "reason": "client_cancelled"},
+        {"type": "cancelled", "reason": "max_output_tokens"},
+        {"type": "cancelled", "reason": "content_filter"},
+        {"type": "cancelled", "reason": "client_cancelled", "unknown": None},
+        {"type": True, "reason": "client_cancelled"},
+        {"type": "cancelled", "reason": 1},
+        {"type": "cancelled", "reason": "client_cancelled", "error": "failed"},
+    ],
+    ids=[
+        "nonmapping",
+        "failed-type",
+        "incomplete-type",
+        "completed-type",
+        "max-token-reason",
+        "content-filter-reason",
+        "unknown-key",
+        "coercive-type",
+        "coercive-reason",
+        "non-null-error",
+    ],
+)
+def test_cancelled_done_rejects_contradictory_status_details_before_direct_state_mutation(
+    status_details,
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        event = cancelled_response_done_event("token-1")
+        event["response"]["status_details"] = status_details
+        before = output_authority_state(session)
+        with pytest.raises((TypeError, ValueError)):
+            session._map_event(event)
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("output_marker", "status_details_marker"),
+    [
+        (None, _STATUS_DETAILS_ABSENT),
+        ([], None),
+        ([partial_cancelled_output_item()], _STATUS_DETAILS_ABSENT),
+        (
+            [partial_cancelled_output_item(content=[{"type": "output_audio"}])],
+            {"type": "cancelled", "reason": "client_cancelled"},
+        ),
+        ([], {"type": "cancelled", "reason": "turn_detected"}),
+        (
+            [],
+            {"type": "cancelled", "reason": "client_cancelled", "error": None},
+        ),
+    ],
+    ids=[
+        "absent-output-and-details",
+        "empty-output-and-null-details",
+        "empty-partial-item",
+        "partial-audio-and-client-cancelled",
+        "turn-detected",
+        "explicit-null-error",
+    ],
+)
+def test_cancelled_done_accepts_only_narrow_partial_terminal_shapes(
+    output_marker, status_details_marker
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        event = cancelled_response_done_event("token-1", output=output_marker or [])
+        if output_marker is None:
+            del event["response"]["output"]
+        if status_details_marker is not _STATUS_DETAILS_ABSENT:
+            event["response"]["status_details"] = status_details_marker
+        return session._map_event(event)
+
+    assert asyncio.run(scenario()) == Interruption(
+        response_id="resp-1", turn_id="turn-41"
+    )
+
+
+def test_cancelled_done_without_bound_item_rejects_nonempty_output_without_minting_authority():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        before = output_authority_state(session)
+        with pytest.raises(ValueError):
+            session._map_event(
+                cancelled_response_done_event(
+                    "token-1", output=[partial_cancelled_output_item()]
+                )
+            )
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_done_wrong_item_id_event_pump_fails_without_interruption_and_cleans_state():
+    correlation = "token-1"
+    harness = Harness(
+        [
+            cancelled_response_done_event(
+                correlation,
+                output=[partial_cancelled_output_item(item_id="wrong-item")],
+            ),
+        ]
+    )
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, correlation)
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert not any(isinstance(event, Interruption) for event in received)
+    assert harness.wire.closed is True
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._cancelling_responses
+
+
 @pytest.mark.parametrize("mutation", ["unsolicited", "wrong-correlation", "authority"])
 def test_cancelled_done_rejects_unsolicited_wrong_metadata_and_structured_authority(mutation):
     harness = Harness()

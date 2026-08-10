@@ -701,6 +701,7 @@ if _CORE_IMPORT_ERROR is None:
             if status == "cancelled":
                 if response_id not in self._cancelling_responses:
                     raise ValueError("cancelled response terminal was not requested")
+                self._validate_cancelled_response_terminal(response, response_id=response_id)
                 if len(self._completed_responses) >= self._response_ledger_capacity:
                     raise ValueError("completed response capacity exhausted")
                 self._clear_response_state(response_id)
@@ -739,6 +740,80 @@ if _CORE_IMPORT_ERROR is None:
             self._clear_response_state(response_id)
             self._completed_responses[response_id] = correlation
             return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
+
+        def _validate_cancelled_response_terminal(
+            self, response: Mapping[str, Any], *, response_id: str
+        ) -> None:
+            """Validate requested cancellation evidence without minting item authority."""
+
+            _validate_output_event_authority(response)
+            status_details = response.get("status_details")
+            if status_details is not None:
+                if not isinstance(status_details, Mapping):
+                    raise TypeError("cancelled response status_details must be an object")
+                if set(status_details) not in (
+                    {"type", "reason"},
+                    {"type", "reason", "error"},
+                ):
+                    raise ValueError("cancelled response status_details has an invalid shape")
+                detail_type = status_details.get("type")
+                reason = status_details.get("reason")
+                if type(detail_type) is not str or detail_type != "cancelled":
+                    raise ValueError("cancelled response status_details type must be cancelled")
+                if type(reason) is not str or reason not in {
+                    "client_cancelled",
+                    "turn_detected",
+                }:
+                    raise ValueError("cancelled response status_details reason is incompatible")
+                if status_details.get("error") is not None:
+                    raise ValueError("cancelled response status_details error must be null")
+
+            if "output" not in response:
+                return
+            output = response["output"]
+            if type(output) is not list:
+                raise TypeError("cancelled response output must be a list")
+            if not output:
+                return
+            if len(output) != 1:
+                raise ValueError("cancelled response output must contain at most one item")
+            known_item_id = self._response_items.get(response_id)
+            if known_item_id is None:
+                raise ValueError("cancelled response cannot bind a new output item")
+            item = output[0]
+            if not isinstance(item, Mapping):
+                raise TypeError("cancelled response output item must be an object")
+            if set(item) != _OUTPUT_ITEM_KEYS:
+                raise ValueError("cancelled response output item has an invalid authority shape")
+            if item.get("type") != "message":
+                raise ValueError("cancelled response output item type must be message")
+            if item.get("role") != "assistant":
+                raise ValueError("cancelled response output item role must be assistant")
+            if item.get("status") != "incomplete":
+                raise ValueError("cancelled response output item status must be incomplete")
+            item_id = _validate_identifier(item.get("id"), "cancelled output item_id")
+            if item_id != known_item_id or self._item_responses.get(item_id) != response_id:
+                raise ValueError("cancelled response output item identity changed")
+            content = item.get("content")
+            if type(content) is not list:
+                raise TypeError("cancelled response output item content must be a list")
+            if len(content) > 1:
+                raise ValueError("cancelled response output item has too many content parts")
+            if not content:
+                return
+            part = content[0]
+            if not isinstance(part, Mapping):
+                raise TypeError("cancelled response output_audio part must be an object")
+            if not set(part).issubset(_OUTPUT_AUDIO_PART_KEYS):
+                raise ValueError("cancelled response output_audio part has invalid authority")
+            if part.get("type") != "output_audio":
+                raise ValueError("cancelled response content type must be output_audio")
+            if "transcript" in part:
+                transcript = part["transcript"]
+                if type(transcript) is not str:
+                    raise TypeError("cancelled response partial transcript must be a string")
+                if len(transcript) > MAX_TRANSCRIPT_LENGTH:
+                    raise ValueError("cancelled response partial transcript is too long")
 
         def _clear_response_state(self, response_id: str) -> None:
             del self._active_responses[response_id]
