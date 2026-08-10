@@ -13,7 +13,7 @@ import base64
 import binascii
 import secrets
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -183,6 +183,59 @@ if _CORE_IMPORT_ERROR is None:
     )
     _OUTPUT_ITEM_KEYS = frozenset({"id", "type", "role", "status", "content"})
     _OUTPUT_AUDIO_PART_KEYS = frozenset({"type", "transcript"})
+    _OUTPUT_EVENT_TYPES = frozenset(
+        {
+            "response.created",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "conversation.item.done",
+            "response.done",
+        }
+    )
+    _FORBIDDEN_OUTPUT_AUTHORITY_KEYS = frozenset(
+        {
+            "tool_calls",
+            "function_call",
+            "function",
+            "tool",
+            "tools",
+            "tool_choice",
+            "call_id",
+            "name",
+            "arguments",
+            "function_call_output",
+        }
+    )
+    _FORBIDDEN_OUTPUT_AUTHORITY_TYPES = frozenset(
+        {"function_call", "function_call_output", "tool", "tool_call"}
+    )
+
+    def _validate_output_event_authority(value: Any) -> None:
+        if isinstance(value, Mapping):
+            forbidden = _FORBIDDEN_OUTPUT_AUTHORITY_KEYS.intersection(value)
+            if forbidden:
+                raise ValueError(
+                    f"output event has forbidden structured authority: {sorted(forbidden)[0]}"
+                )
+            discriminator = value.get("type")
+            if (
+                isinstance(discriminator, str)
+                and discriminator in _FORBIDDEN_OUTPUT_AUTHORITY_TYPES
+            ):
+                raise ValueError(
+                    f"output event has forbidden structured authority type: {discriminator}"
+                )
+            for nested in value.values():
+                _validate_output_event_authority(nested)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for nested in value:
+                _validate_output_event_authority(nested)
 
     @dataclass(frozen=True, slots=True)
     class _ResponseBinding:
@@ -644,6 +697,8 @@ if _CORE_IMPORT_ERROR is None:
             event_type = event.get("type")
             if not isinstance(event_type, str) or not event_type:
                 raise ValueError("provider event type must be a nonblank string")
+            if event_type in _OUTPUT_EVENT_TYPES:
+                _validate_output_event_authority(event)
             if event_type == "session.created":
                 session = event.get("session")
                 session_id = _validate_identifier(

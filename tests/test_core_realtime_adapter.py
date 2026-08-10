@@ -866,7 +866,7 @@ def test_output_transcript_finality_is_terminal_and_exact(late_event, match):
                     "content": [{"type": "output_audio", "transcript": "words"}],
                 }
             ],
-            "message",
+            "authority",
         ),
         (
             [
@@ -919,7 +919,7 @@ def test_output_transcript_finality_is_terminal_and_exact(late_event, match):
                     ],
                 }
             ],
-            "shape",
+            "authority",
         ),
         (
             [
@@ -1499,6 +1499,269 @@ def test_final_lifecycle_transcript_must_match_terminal_text_before_mutation(bad
     asyncio.run(scenario())
 
 
+def output_envelope_authority_cases():
+    return [
+        pytest.param(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-1",
+                    "metadata": {"correlation": "token-1"},
+                    "tool_calls": [],
+                },
+            },
+            ResponseStarted,
+            id="response-created-nested-tool-calls-empty",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+                "tools": [],
+            },
+            ResponseCompleted,
+            id="output-item-added-top-level-tools-empty",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_item.done",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                    "metadata": {"type": "tool_call"},
+                },
+                "function": {},
+            },
+            ResponseCompleted,
+            id="output-item-done-recursive-type-and-function-empty",
+        ),
+        pytest.param(
+            {
+                "type": "response.content_part.added",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {"type": "output_audio"},
+                "tool": {},
+            },
+            ResponseCompleted,
+            id="content-part-added-top-level-tool-empty",
+        ),
+        pytest.param(
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {
+                    "type": "output_audio",
+                    "transcript": "words",
+                    "tool_choice": "none",
+                },
+            },
+            ResponseCompleted,
+            id="content-part-done-nested-tool-choice",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+                "function_call": {"name": "forbidden"},
+            },
+            OutputAudio,
+            id="output-audio-delta-function-call",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_audio.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "arguments": "{}",
+            },
+            ResponseCompleted,
+            id="output-audio-done-arguments-empty-object",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_audio_transcript.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "w",
+                "call_id": "call-forbidden",
+            },
+            OutputTranscript,
+            id="output-transcript-delta-call-id",
+        ),
+        pytest.param(
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "words",
+                "function_call_output": "",
+            },
+            OutputTranscript,
+            id="output-transcript-done-function-call-output-empty",
+        ),
+        pytest.param(
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+                "function_call": {},
+            },
+            ResponseCompleted,
+            id="conversation-item-done-top-level-function-call-empty",
+        ),
+        pytest.param(
+            {**response_done_event("token-1"), "name": "forbidden"},
+            ResponseCompleted,
+            id="response-done-top-level-name",
+        ),
+        pytest.param(
+            {
+                **response_done_event("token-1"),
+                "response": {
+                    **response_done_event("token-1")["response"],
+                    "tools": [],
+                },
+            },
+            ResponseCompleted,
+            id="response-done-nested-response-tools-empty",
+        ),
+    ]
+
+
+def output_authority_state(session):
+    return (
+        dict(session._pending_responses),
+        dict(session._active_responses),
+        dict(session._response_items),
+        dict(session._item_responses),
+        dict(session._final_output_transcripts),
+        set(session._audio_delta_items),
+        set(session._audio_done_items),
+        set(session._output_item_added),
+        set(session._content_part_added),
+        set(session._content_part_done),
+        set(session._output_item_done),
+        set(session._conversation_item_done),
+        dict(session._completed_responses),
+        dict(session._consumed_correlations),
+    )
+
+
+@pytest.mark.parametrize(("bad_event", "forbidden_output"), output_envelope_authority_cases())
+def test_every_output_event_envelope_authority_fails_before_emission(
+    bad_event, forbidden_output
+):
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    prefix = [] if bad_event["type"] == "response.created" else [created]
+    harness = Harness([*prefix, bad_event, *valid_output_lifecycle_events(correlation)])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert "authority" in received[-1].message
+    assert not any(isinstance(event, forbidden_output) for event in received)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+
+
+@pytest.mark.parametrize(("bad_event", "_forbidden_output"), output_envelope_authority_cases())
+def test_every_output_event_envelope_authority_preserves_direct_state(
+    bad_event, _forbidden_output
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        if bad_event["type"] != "response.created":
+            bind_response(session, "token-1")
+        before = output_authority_state(session)
+        with pytest.raises(ValueError, match="authority"):
+            session._map_event(bad_event)
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "discriminator",
+    ["function_call", "function_call_output", "tool", "tool_call"],
+)
+def test_recursive_output_authority_discriminator_is_rejected(discriminator):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        before = output_authority_state(session)
+        with pytest.raises(ValueError, match="authority type"):
+            session._map_event(
+                {
+                    "type": "response.output_audio.done",
+                    "response_id": "resp-1",
+                    "item_id": "item-1",
+                    "metadata": {"nested": [{"type": discriminator}]},
+                }
+            )
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_output_event_envelope_authority_fails_before_response_started():
+    correlation = "token-1"
+    bad_created = {
+        "type": "response.created",
+        "response": {
+            "id": "resp-1",
+            "metadata": {"correlation": correlation},
+            "tool_calls": [],
+        },
+    }
+    harness = Harness([bad_created, *valid_output_lifecycle_events(correlation)])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert "authority" in received[-1].message
+    assert not any(isinstance(event, ResponseStarted) for event in received)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert session._terminal is True
+
+
 def test_response_done_extra_authority_fails_event_pump_and_cleans_terminal_state():
     correlation = "token-1"
     created = {
@@ -1543,6 +1806,34 @@ def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_
     assert not session._response_items
     assert not session._item_responses
     assert not session._completed_responses
+
+
+def test_live_proven_output_envelopes_accept_event_ids_and_indexes_once():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "event_id": "evt-created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    events = valid_output_lifecycle_events(correlation)
+    for index, event in enumerate(events):
+        event["event_id"] = f"evt-{index}"
+        if event["type"].startswith("response."):
+            event["output_index"] = 0
+        if event["type"].startswith("response.content_part") or "output_audio" in event["type"]:
+            event["content_index"] = 0
+    harness = Harness([created, *events])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert sum(isinstance(event, ResponseStarted) for event in received) == 1
+    assert sum(isinstance(event, OutputAudio) for event in received) == 1
+    assert sum(isinstance(event, ResponseCompleted) for event in received) == 1
+    assert received[-1] == SessionClosed()
 
 
 def test_invalid_intermediate_shape_does_not_mutate_binding_state_directly():
