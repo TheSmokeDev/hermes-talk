@@ -117,21 +117,15 @@ def test_core_setup_uses_task1_shared_fields_and_actual_capabilities():
 
 def test_core_setup_preserves_exact_legacy_input_only_constructor(monkeypatch):
     realtime = talk_core_session.talk_core_realtime
-    input_capabilities = frozenset(
-        {
-            realtime.RealtimeCapability.INPUT_TRANSCRIPTION,
-            realtime.RealtimeCapability.INPUT_COMMIT_EVENTS,
-        }
-    )
     captured = {}
 
     def legacy_setup(**kwargs):
         captured.update(kwargs)
         return types.SimpleNamespace(**kwargs)
 
+    monkeypatch.setattr(realtime, "core_provider_available", lambda: True)
     monkeypatch.setattr(realtime, "explicit_output_available", lambda: False)
-    monkeypatch.setattr(realtime, "CORE_CAPABILITIES", input_capabilities)
-    monkeypatch.setattr(realtime, "RealtimeVoiceSetup", legacy_setup)
+    monkeypatch.setattr(realtime, "RealtimeVoiceSetup", legacy_setup, raising=False)
 
     talk_core_session.build_core_setup()
 
