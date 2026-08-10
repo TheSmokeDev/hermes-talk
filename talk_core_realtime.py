@@ -181,6 +181,8 @@ if _CORE_IMPORT_ERROR is None:
             else set()
         )
     )
+    _OUTPUT_ITEM_KEYS = frozenset({"id", "type", "role", "status", "content"})
+    _OUTPUT_AUDIO_PART_KEYS = frozenset({"type", "transcript"})
 
     @dataclass(frozen=True, slots=True)
     class _ResponseBinding:
@@ -306,6 +308,11 @@ if _CORE_IMPORT_ERROR is None:
             self._final_output_transcripts: dict[tuple[str, str], str] = {}
             self._audio_delta_items: set[tuple[str, str]] = set()
             self._audio_done_items: set[tuple[str, str]] = set()
+            self._output_item_added: set[tuple[str, str]] = set()
+            self._content_part_added: set[tuple[str, str]] = set()
+            self._content_part_done: set[tuple[str, str]] = set()
+            self._output_item_done: set[tuple[str, str]] = set()
+            self._conversation_item_done: set[tuple[str, str]] = set()
             self._completed_responses: OrderedDict[str, str] = OrderedDict()
             self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
             self._input_ledger: dict[str, str | None] = {}
@@ -507,6 +514,74 @@ if _CORE_IMPORT_ERROR is None:
             self._item_responses[item_id] = response_id
             return correlation, binding, item_id
 
+        def _validate_output_audio_part(
+            self,
+            part: Any,
+            *,
+            response_id: str,
+            item_id: str,
+            context: str,
+        ) -> Mapping[str, Any]:
+            if not isinstance(part, Mapping):
+                raise TypeError(f"{context} requires an output_audio part object")
+            if not set(part).issubset(_OUTPUT_AUDIO_PART_KEYS):
+                raise ValueError(f"{context} output_audio part has an invalid authority shape")
+            if part.get("type") != "output_audio":
+                raise ValueError(f"{context} content type must be output_audio")
+            if "transcript" in part:
+                transcript = _validate_text(part["transcript"], final=True)
+                terminal = self._final_output_transcripts.get((response_id, item_id))
+                if terminal is not None and transcript != terminal:
+                    raise ValueError(f"{context} transcript conflicts with final text")
+            return part
+
+        def _validate_output_item_shape(
+            self,
+            item: Any,
+            *,
+            response_id: str,
+            stage: str,
+        ) -> tuple[str, Mapping[str, Any] | None]:
+            if not isinstance(item, Mapping):
+                raise TypeError(f"{stage} requires an output item object")
+            if not set(item).issubset(_OUTPUT_ITEM_KEYS):
+                raise ValueError(f"{stage} output item has an invalid authority shape")
+            if item.get("type") != "message":
+                raise ValueError(f"{stage} output item type must be message")
+            if item.get("role") != "assistant":
+                raise ValueError(f"{stage} output item role must be assistant")
+            item_id = _validate_identifier(item.get("id"), "output item_id")
+            status = item.get("status")
+            if stage == "response.output_item.added":
+                if status is not None and status != "in_progress":
+                    raise ValueError("added output item status must be in_progress")
+            elif status is not None and status != "completed":
+                raise ValueError(f"{stage} output item status must be completed")
+            if "content" not in item:
+                raise ValueError(f"{stage} output item content is required")
+            content = item["content"]
+            if not isinstance(content, (list, tuple)):
+                raise TypeError(f"{stage} output item content must be a sequence")
+            if stage == "response.output_item.added" and not content:
+                return item_id, None
+            if len(content) != 1:
+                raise ValueError(f"{stage} output item content must contain exactly one part")
+            part = self._validate_output_audio_part(
+                content[0],
+                response_id=response_id,
+                item_id=item_id,
+                context=stage,
+            )
+            return item_id, part
+
+        @staticmethod
+        def _note_lifecycle_stage(
+            observed: set[tuple[str, str]], key: tuple[str, str], event_type: str
+        ) -> None:
+            if key in observed:
+                raise ValueError(f"{event_type} was replayed")
+            observed.add(key)
+
         def _complete_response(self, event: Mapping[str, Any]):
             response = event.get("response")
             if not isinstance(response, Mapping):
@@ -532,38 +607,18 @@ if _CORE_IMPORT_ERROR is None:
             if len(output) != 1:
                 raise ValueError("response output must contain exactly one item")
             item = output[0]
-            if not isinstance(item, Mapping):
-                raise TypeError("response output item must be an object")
-            if item.get("type") != "message":
-                raise ValueError("response output item type must be message")
-            if item.get("role") != "assistant":
-                raise ValueError("response output item role must be assistant")
-            if "status" in item and item.get("status") != "completed":
-                raise ValueError("response output item status must be completed")
-            output_item_id = _validate_identifier(item.get("id"), "output item_id")
+            output_item_id, _part = self._validate_output_item_shape(
+                item,
+                response_id=response_id,
+                stage="response.done",
+            )
             known_item_id = self._response_items.get(response_id)
             if known_item_id is None or output_item_id != known_item_id:
                 raise ValueError("response completion output item identity changed")
-            content = item.get("content")
-            if not isinstance(content, (list, tuple)):
-                raise TypeError("response output content must be a sequence")
-            if len(content) != 1:
-                raise ValueError("response output content must contain exactly one part")
-            part = content[0]
-            if not isinstance(part, Mapping):
-                raise TypeError("response output content part must be an object")
-            if part.get("type") != "output_audio":
-                raise ValueError("response output content type must be output_audio")
-            if not set(part).issubset({"type", "transcript"}):
-                raise ValueError("response output_audio content has an invalid shape")
             stream_key = (response_id, output_item_id)
             final_transcript = self._final_output_transcripts.get(stream_key)
             if final_transcript is None:
                 raise ValueError("response completion requires transcript done")
-            if "transcript" in part:
-                completion_transcript = _validate_text(part["transcript"], final=True)
-                if completion_transcript != final_transcript:
-                    raise ValueError("response completion transcript conflicts with final text")
             if stream_key not in self._audio_delta_items:
                 raise ValueError("response completion requires audio delta")
             if stream_key not in self._audio_done_items:
@@ -577,6 +632,11 @@ if _CORE_IMPORT_ERROR is None:
                 self._final_output_transcripts.pop((response_id, item_id), None)
                 self._audio_delta_items.discard((response_id, item_id))
                 self._audio_done_items.discard((response_id, item_id))
+                self._output_item_added.discard((response_id, item_id))
+                self._content_part_added.discard((response_id, item_id))
+                self._content_part_done.discard((response_id, item_id))
+                self._output_item_done.discard((response_id, item_id))
+                self._conversation_item_done.discard((response_id, item_id))
             self._completed_responses[response_id] = correlation
             return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
 
@@ -674,29 +734,64 @@ if _CORE_IMPORT_ERROR is None:
                 self._item_responses[item_id] = response_id
                 self._audio_done_items.add(stream_key)
                 return None
-            if event_type in {
-                "response.content_part.added",
-                "response.content_part.done",
-                "response.output_item.added",
-                "response.output_item.done",
-            }:
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                response_id = _validate_identifier(event.get("response_id"), "response_id")
+                item_id, _part = self._validate_output_item_shape(
+                    event.get("item"),
+                    response_id=response_id,
+                    stage=event_type,
+                )
                 normalized = dict(event)
-                item = event.get("item")
-                if isinstance(item, Mapping):
-                    if item.get("type") in {"function_call", "function_call_output"}:
-                        raise ValueError("function/tool output is forbidden")
-                    normalized.setdefault("item_id", item.get("id"))
-                self._active_response(normalized)
+                normalized["item_id"] = item_id
+                response_id, _correlation, _binding, item_id = self._validate_active_response(
+                    normalized
+                )
+                observed = (
+                    self._output_item_added
+                    if event_type.endswith(".added")
+                    else self._output_item_done
+                )
+                self._note_lifecycle_stage(observed, (response_id, item_id), event_type)
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                return None
+            if event_type in {"response.content_part.added", "response.content_part.done"}:
+                response_id, _correlation, _binding, item_id = self._validate_active_response(event)
+                self._validate_output_audio_part(
+                    event.get("part"),
+                    response_id=response_id,
+                    item_id=item_id,
+                    context=event_type,
+                )
+                observed = (
+                    self._content_part_added
+                    if event_type.endswith(".added")
+                    else self._content_part_done
+                )
+                self._note_lifecycle_stage(observed, (response_id, item_id), event_type)
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
                 return None
             if event_type == "conversation.item.done":
                 item = event.get("item")
                 if not isinstance(item, Mapping):
                     raise TypeError("conversation.item.done requires an item object")
-                if item.get("type") in {"function_call", "function_call_output"}:
-                    raise ValueError("function/tool output is forbidden")
                 item_id = _validate_identifier(item.get("id"), "item_id")
-                if item_id not in self._item_responses:
+                response_id = self._item_responses.get(item_id)
+                if response_id is None or response_id not in self._active_responses:
                     raise ValueError("conversation item is not bound to an active response")
+                validated_item_id, _part = self._validate_output_item_shape(
+                    item,
+                    response_id=response_id,
+                    stage=event_type,
+                )
+                if validated_item_id != item_id:
+                    raise ValueError("conversation output item identity changed")
+                self._note_lifecycle_stage(
+                    self._conversation_item_done,
+                    (response_id, item_id),
+                    event_type,
+                )
                 return None
             if event_type == "error":
                 error = event.get("error")
@@ -736,6 +831,11 @@ if _CORE_IMPORT_ERROR is None:
                 self._final_output_transcripts.clear()
                 self._audio_delta_items.clear()
                 self._audio_done_items.clear()
+                self._output_item_added.clear()
+                self._content_part_added.clear()
+                self._content_part_done.clear()
+                self._output_item_done.clear()
+                self._conversation_item_done.clear()
                 self._completed_responses.clear()
                 self._consumed_correlations.clear()
 

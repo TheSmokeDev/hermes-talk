@@ -204,6 +204,86 @@ def complete_bound_response(
     )
 
 
+def valid_output_lifecycle_events(
+    correlation="token-1", *, response_id="resp-1", item_id="item-1", transcript="words"
+):
+    return [
+        {
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        },
+        {
+            "type": "response.content_part.added",
+            "response_id": response_id,
+            "item_id": item_id,
+            "part": {"type": "output_audio"},
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "delta": "cGNt",
+        },
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "delta": transcript[:1],
+        },
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "transcript": transcript,
+        },
+        {
+            "type": "response.output_audio.done",
+            "response_id": response_id,
+            "item_id": item_id,
+        },
+        {
+            "type": "response.content_part.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "part": {"type": "output_audio", "transcript": transcript},
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": transcript}],
+            },
+        },
+        {
+            "type": "conversation.item.done",
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": transcript}],
+            },
+        },
+        response_done_event(
+            correlation,
+            response_id=response_id,
+            item_id=item_id,
+            transcript=transcript,
+        ),
+    ]
+
+
 def test_exact_api_v2_contract_and_fixed_capabilities():
     expected = frozenset(
         {
@@ -321,7 +401,13 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
         {
             "type": "response.output_item.added",
             "response_id": "resp-1",
-            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+            "item": {
+                "id": "item-out-1",
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
         },
         {
             "type": "response.content_part.added",
@@ -356,16 +442,28 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
             "type": "response.content_part.done",
             "response_id": "resp-1",
             "item_id": "item-out-1",
-            "part": {"type": "output_audio"},
+            "part": {"type": "output_audio", "transcript": "Exact words, exactly."},
         },
         {
             "type": "response.output_item.done",
             "response_id": "resp-1",
-            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+            "item": {
+                "id": "item-out-1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "Exact words, exactly."}],
+            },
         },
         {
             "type": "conversation.item.done",
-            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+            "item": {
+                "id": "item-out-1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "Exact words, exactly."}],
+            },
         },
         {
             "type": "response.done",
@@ -958,6 +1056,529 @@ def test_response_done_accepts_proven_audio_only_shape_and_clears_stream_state()
     assert not session._final_output_transcripts
     assert not session._audio_delta_items
     assert not session._audio_done_items
+
+
+@pytest.mark.parametrize(
+    ("prefix", "bad_event"),
+    [
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "tool",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "output_text",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "function_call",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                    "tool_calls": [],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                    "function": {"name": "forbidden"},
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                    "tool": {"name": "forbidden"},
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": {},
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.added",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [{"type": "output_text", "text": "forbidden"}],
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "response.output_item.done",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-wrong",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.done",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [],
+                },
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.output_item.done",
+                "response_id": "resp-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": {"type": "output_audio"},
+                },
+            },
+        ),
+        ([], {"type": "response.content_part.added", "response_id": "resp-1", "item_id": "item-1"}),
+        (
+            [],
+            {
+                "type": "response.content_part.added",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": "output_audio",
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.content_part.added",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {"type": "output_text", "text": "forbidden"},
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {"type": "function_call", "name": "forbidden"},
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {"type": "tool", "name": "forbidden"},
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-1",
+                "item_id": "item-wrong",
+                "part": {"type": "output_audio", "transcript": "words"},
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-wrong",
+                "item_id": "item-1",
+                "part": {"type": "output_audio", "transcript": "words"},
+            },
+        ),
+        (
+            [],
+            {
+                "type": "response.content_part.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "part": {"type": "output_audio", "transcript": 7},
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "function_call",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "forbidden"}],
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                    "function_call": {"name": "forbidden"},
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                    "tool": {"name": "forbidden"},
+                },
+            },
+        ),
+        (
+            [valid_output_lifecycle_events()[0]],
+            {
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                    "tool_calls": [],
+                },
+            },
+        ),
+    ],
+)
+def test_contradictory_output_lifecycle_event_fails_before_sanitized_completion(prefix, bad_event):
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    harness = Harness([created, *prefix, bad_event, *valid_output_lifecycle_events(correlation)])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"tool_calls": []},
+        {"function_call": {"name": "forbidden"}},
+        {"tool": {"name": "forbidden"}},
+        {"call_id": "call-forbidden"},
+        {"name": "forbidden", "arguments": "{}"},
+        {"content": [{"type": "output_audio", "transcript": "words", "tool": {}}]},
+    ],
+)
+def test_response_done_rejects_extra_authority_before_mutating_direct_state(extra):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        for event in valid_output_lifecycle_events()[:6]:
+            session._map_event(event)
+        output = response_done_event("token-1")["response"]["output"]
+        item = output[0]
+        if "content" in extra:
+            item["content"] = extra["content"]
+        else:
+            item.update(extra)
+        before = (
+            dict(session._active_responses),
+            dict(session._response_items),
+            dict(session._item_responses),
+            dict(session._final_output_transcripts),
+            set(session._audio_delta_items),
+            set(session._audio_done_items),
+            dict(session._completed_responses),
+        )
+        with pytest.raises((TypeError, ValueError)):
+            session._complete_response(response_done_event("token-1", output=output))
+        assert before == (
+            session._active_responses,
+            session._response_items,
+            session._item_responses,
+            session._final_output_transcripts,
+            session._audio_delta_items,
+            session._audio_done_items,
+            session._completed_responses,
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        {
+            "type": "response.content_part.done",
+            "response_id": "resp-1",
+            "item_id": "item-1",
+            "part": {"type": "output_audio", "transcript": "changed"},
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-1",
+            "item": {
+                "id": "item-1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "changed"}],
+            },
+        },
+        {
+            "type": "conversation.item.done",
+            "item": {
+                "id": "item-1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "changed"}],
+            },
+        },
+    ],
+)
+def test_final_lifecycle_transcript_must_match_terminal_text_before_mutation(bad_event):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        for event in valid_output_lifecycle_events()[:6]:
+            session._map_event(event)
+        before = (
+            dict(session._response_items),
+            dict(session._item_responses),
+            set(session._content_part_done),
+            set(session._output_item_done),
+            set(session._conversation_item_done),
+        )
+        with pytest.raises(ValueError, match="conflicts"):
+            session._map_event(bad_event)
+        assert before == (
+            session._response_items,
+            session._item_responses,
+            session._content_part_done,
+            session._output_item_done,
+            session._conversation_item_done,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_response_done_extra_authority_fails_event_pump_and_cleans_terminal_state():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    done = response_done_event(correlation)
+    done["response"]["output"][0]["tool_calls"] = []
+    harness = Harness([created, *valid_output_lifecycle_events(correlation)[:-1], done])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._completed_responses
+
+
+def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_state():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    harness = Harness([created, *valid_output_lifecycle_events(correlation)])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert sum(isinstance(event, ResponseCompleted) for event in received) == 1
+    assert received[-1] == SessionClosed()
+    assert session._terminal is True
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._completed_responses
+
+
+def test_invalid_intermediate_shape_does_not_mutate_binding_state_directly():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        before = (
+            dict(session._response_items),
+            dict(session._item_responses),
+            dict(session._final_output_transcripts),
+        )
+        with pytest.raises((TypeError, ValueError)):
+            session._map_event(
+                {
+                    "type": "response.output_item.added",
+                    "response_id": "resp-1",
+                    "item": {
+                        "id": "item-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                        "tool_calls": [],
+                    },
+                }
+            )
+        assert before == (
+            session._response_items,
+            session._item_responses,
+            session._final_output_transcripts,
+        )
+
+    asyncio.run(scenario())
 
 
 def test_explicit_response_send_failure_cleans_pending_and_is_terminally_visible():
