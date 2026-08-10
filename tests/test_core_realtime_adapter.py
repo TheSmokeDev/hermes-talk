@@ -16,7 +16,9 @@ pytest.importorskip(
     reason="Hermes core API-v2 is optional for standalone Talk",
 )
 from agent.realtime_voice_provider import (
+    InputSpeechStarted,
     InputTranscript,
+    Interruption,
     OutputAudio,
     OutputTranscript,
     RealtimeAudioFormat,
@@ -171,6 +173,23 @@ def response_done_event(
     }
 
 
+def cancelled_response_done_event(
+    correlation,
+    *,
+    response_id="resp-1",
+    output=None,
+):
+    return {
+        "type": "response.done",
+        "response": {
+            "id": response_id,
+            "status": "cancelled",
+            "metadata": {"correlation": correlation},
+            "output": [] if output is None else output,
+        },
+    }
+
+
 def complete_bound_response(
     session, correlation, *, response_id="resp-1", item_id="item-1", transcript="words"
 ):
@@ -292,6 +311,7 @@ def test_exact_api_v2_contract_and_fixed_capabilities():
             RealtimeCapability.EXPLICIT_RESPONSE,
             RealtimeCapability.RESPONSE_METADATA_ECHO,
             RealtimeCapability.OUTPUT_TRANSCRIPTION,
+            RealtimeCapability.RESPONSE_CANCELLATION,
         }
     )
 
@@ -1664,6 +1684,7 @@ def output_authority_state(session):
         set(session._conversation_item_done),
         dict(session._completed_responses),
         dict(session._consumed_correlations),
+        set(getattr(session, "_cancelling_responses", ())),
     )
 
 
@@ -1921,6 +1942,37 @@ def test_missing_task1_symbols_leave_legacy_input_only_contract_available(monkey
             }
         ) == legacy.CORE_CAPABILITIES
         assert legacy.SUPPORTED_OUTPUT_AUDIO_FORMAT is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(core_rt)
+
+
+def test_missing_task3a_symbols_preserve_task1_explicit_output_without_cancellation(monkeypatch):
+    contract = sys.modules["agent.realtime_voice_provider"]
+    shim = types.ModuleType(contract.__name__)
+    shim.__dict__.update(
+        {
+            name: value
+            for name, value in contract.__dict__.items()
+            if name not in {"InputSpeechStarted", "Interruption"}
+        }
+    )
+    agent_package = sys.modules["agent"]
+    monkeypatch.setitem(sys.modules, "agent.realtime_voice_provider", shim)
+    monkeypatch.setattr(agent_package, "realtime_voice_provider", shim)
+    legacy = importlib.reload(core_rt)
+    try:
+        assert legacy.core_provider_available() is True
+        assert legacy.explicit_output_available() is True
+        assert frozenset(
+            {
+                legacy.RealtimeCapability.INPUT_TRANSCRIPTION,
+                legacy.RealtimeCapability.INPUT_COMMIT_EVENTS,
+                legacy.RealtimeCapability.EXPLICIT_RESPONSE,
+                legacy.RealtimeCapability.RESPONSE_METADATA_ECHO,
+                legacy.RealtimeCapability.OUTPUT_TRANSCRIPTION,
+            }
+        ) == legacy.CORE_CAPABILITIES
     finally:
         monkeypatch.undo()
         importlib.reload(core_rt)
@@ -2209,3 +2261,216 @@ def test_provider_data_is_diagnostic_only_and_frozen():
     )
     assert isinstance(transcript.provider_data, Mapping)
     assert not transcript.provider_data
+
+
+def test_passive_speech_started_maps_exact_provider_identity_and_offset():
+    harness = Harness(
+        [{"type": "input_audio_buffer.speech_started", "item_id": "input-7", "audio_start_ms": 23}]
+    )
+
+    async def scenario():
+        session = await harness.provider().open_session(setup())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert received == [InputSpeechStarted(item_id="input-7", offset_ms=23), SessionClosed()]
+    assert not any(isinstance(event, Interruption) for event in received)
+
+
+@pytest.mark.parametrize(
+    "item_id,audio_start_ms",
+    [(True, 0), ("input", True), ("input", "0"), ("input", -1)],
+)
+def test_speech_started_rejects_coercive_or_negative_fields(item_id, audio_start_ms):
+    harness = Harness(
+        [
+            {
+                "type": "input_audio_buffer.speech_started",
+                "item_id": item_id,
+                "audio_start_ms": audio_start_ms,
+            }
+        ]
+    )
+
+    async def scenario():
+        session = await harness.provider().open_session(setup())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert len(received) == 1 and isinstance(received[0], SessionFailure)
+    assert harness.wire.closed is True
+
+
+def test_exact_response_cancel_payload_is_response_local_and_unique():
+    tokens = iter(("token-1", "token-2"))
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: next(tokens)).open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1", response_id="resp-1")
+        await session.start_response(
+            response_request(
+                assistant_message_id=42,
+                turn_marker="turn-42",
+                canonical_text="other",
+                content_digest=hashlib.sha256(b"other").hexdigest(),
+            )
+        )
+        bind_response(session, "token-2", response_id="resp-2")
+        await session.cancel_response("resp-1")
+        await session.cancel_response("resp-2")
+        return session
+
+    session = asyncio.run(scenario())
+    cancellations = [
+        message for message in harness.wire.sent if message["type"] == "response.cancel"
+    ]
+    payloads_without_event_ids = [
+        {key: value for key, value in message.items() if key != "event_id"}
+        for message in cancellations
+    ]
+    assert payloads_without_event_ids == [
+        {"type": "response.cancel", "response_id": "resp-1"},
+        {"type": "response.cancel", "response_id": "resp-2"},
+    ]
+    assert all(message["event_id"].startswith("evt-") for message in cancellations)
+    assert cancellations[0]["event_id"] != cancellations[1]["event_id"]
+    assert session._cancelling_responses == {"resp-1", "resp-2"}
+
+
+def test_cancel_rejects_unknown_duplicate_and_completed_before_wire_send():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        with pytest.raises(ValueError, match=r"active|bound"):
+            await session._cancel_response("unknown")
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        with pytest.raises(ValueError, match="already"):
+            await session.cancel_response("resp-1")
+        session._map_event(cancelled_response_done_event("token-1"))
+        with pytest.raises(ValueError, match=r"already|active|completed"):
+            await session._cancel_response("resp-1")
+
+    asyncio.run(scenario())
+    assert [message["type"] for message in harness.wire.sent].count("response.cancel") == 1
+
+
+def test_cancel_send_failure_releases_reservation_and_remains_terminally_visible():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        harness.wire.send_error = core_rt.OpenAIWireError("cancel exploded")
+        with pytest.raises(core_rt.OpenAIWireError, match="cancel exploded"):
+            await session.cancel_response("resp-1")
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert not session._cancelling_responses
+    assert received == [
+        SessionFailure(
+            code="response_cancellation_failed",
+            message="response cancellation provider send failed",
+        )
+    ]
+
+
+def test_requested_cancelled_done_maps_interruption_and_cleans_exact_response_state():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._map_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            }
+        )
+        await session.cancel_response("resp-1")
+        return session, session._map_event(cancelled_response_done_event("token-1"))
+
+    session, interrupted = asyncio.run(scenario())
+    assert interrupted == Interruption(response_id="resp-1", turn_id="turn-41")
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._audio_delta_items
+    assert not session._cancelling_responses
+    assert session._completed_responses == {"resp-1": "token-1"}
+
+
+@pytest.mark.parametrize("mutation", ["unsolicited", "wrong-correlation", "authority"])
+def test_cancelled_done_rejects_unsolicited_wrong_metadata_and_structured_authority(mutation):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        event = cancelled_response_done_event("token-1")
+        if mutation != "unsolicited":
+            await session.cancel_response("resp-1")
+        if mutation == "wrong-correlation":
+            event["response"]["metadata"] = {"correlation": "wrong"}
+        elif mutation == "authority":
+            event["response"]["output"] = [{"nested": {"function_call": {}}}]
+        before = output_authority_state(session)
+        with pytest.raises(ValueError):
+            session._map_event(event)
+        assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_cancel_then_strict_completed_race_emits_completion_and_clears_cancel_state():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        return session, complete_bound_response(session, "token-1")
+
+    session, completed = asyncio.run(scenario())
+    assert completed == ResponseCompleted(response_id="resp-1", turn_id="turn-41")
+    assert not session._cancelling_responses
+
+
+def test_cancelled_terminal_is_tombstoned_and_terminate_clears_cancellation_state():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        done = cancelled_response_done_event("token-1")
+        session._map_event(done)
+        with pytest.raises(ValueError, match="replayed"):
+            session._map_event(done)
+        with pytest.raises(ValueError, match="unbound"):
+            session._map_event(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "resp-1",
+                    "item_id": "item-1",
+                    "delta": "cGNt",
+                }
+            )
+        await session.close()
+        return session
+
+    session = asyncio.run(scenario())
+    assert not session._cancelling_responses
+    assert not session._completed_responses
