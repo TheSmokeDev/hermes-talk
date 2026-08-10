@@ -94,21 +94,60 @@ def test_operator_id_cannot_be_rebound():
         admitted.speaker_user_id = 7
 
 
-def test_core_setup_is_input_only_and_requests_only_commit_transcription():
+def test_core_setup_uses_task1_shared_fields_and_actual_capabilities():
     _requires_core_api()
+    realtime = talk_core_session.talk_core_realtime
+    if not realtime.explicit_output_available():
+        pytest.skip("Task1 explicit-output contract is not installed")
+
     setup = talk_core_session.build_core_setup()
 
     assert setup.model == talk_core_session.talk_config.talk_model()
     assert setup.voice == talk_core_session.talk_config.talk_voice()
     assert setup.instructions == ""
     assert setup.tools == ()
-    assert setup.audio == talk_core_session.talk_core_realtime.SUPPORTED_AUDIO_FORMAT
+    assert setup.audio == realtime.SUPPORTED_AUDIO_FORMAT
+    assert setup.input_audio == realtime.SUPPORTED_INPUT_AUDIO_FORMAT
+    assert setup.output_audio == realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT
+    assert setup.automatic_response is False
     assert setup.provider_options == {
-        "automatic_response": False,
-        "capabilities": (
-            "input_transcription",
-            "input_commit_events",
-        ),
+        "capabilities": tuple(sorted(capability.value for capability in realtime.CORE_CAPABILITIES))
+    }
+
+
+def test_core_setup_preserves_exact_legacy_input_only_constructor(monkeypatch):
+    realtime = talk_core_session.talk_core_realtime
+    input_capabilities = frozenset(
+        {
+            realtime.RealtimeCapability.INPUT_TRANSCRIPTION,
+            realtime.RealtimeCapability.INPUT_COMMIT_EVENTS,
+        }
+    )
+    captured = {}
+
+    def legacy_setup(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(realtime, "explicit_output_available", lambda: False)
+    monkeypatch.setattr(realtime, "CORE_CAPABILITIES", input_capabilities)
+    monkeypatch.setattr(realtime, "RealtimeVoiceSetup", legacy_setup)
+
+    talk_core_session.build_core_setup()
+
+    assert captured == {
+        "model": talk_core_session.talk_config.talk_model(),
+        "voice": talk_core_session.talk_config.talk_voice(),
+        "instructions": "",
+        "tools": (),
+        "audio": realtime.SUPPORTED_AUDIO_FORMAT,
+        "provider_options": {
+            "automatic_response": False,
+            "capabilities": (
+                "input_transcription",
+                "input_commit_events",
+            ),
+        },
     }
 
 

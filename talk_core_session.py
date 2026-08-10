@@ -18,24 +18,37 @@ CORE_AUDIO_POLL_S = 0.01
 
 
 def build_core_setup():
-    """Build the exact input-only Hermes realtime setup for canonical ingress."""
+    """Build the compatible Hermes realtime setup for canonical Talk ingress."""
 
     if not talk_core_realtime.core_provider_available():
         raise RuntimeError("Hermes realtime voice API-v2 is unavailable")
-    return talk_core_realtime.RealtimeVoiceSetup(
-        model=talk_config.talk_model(),
-        voice=talk_config.talk_voice(),
-        instructions="",
-        tools=(),
-        audio=talk_core_realtime.SUPPORTED_AUDIO_FORMAT,
-        provider_options={
+    setup = {
+        "model": talk_config.talk_model(),
+        "voice": talk_config.talk_voice(),
+        "instructions": "",
+        "tools": (),
+        "audio": talk_core_realtime.SUPPORTED_AUDIO_FORMAT,
+    }
+    if talk_core_realtime.explicit_output_available():
+        setup.update(
+            input_audio=talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT,
+            output_audio=talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT,
+            automatic_response=False,
+            provider_options={
+                "capabilities": tuple(
+                    sorted(capability.value for capability in talk_core_realtime.CORE_CAPABILITIES)
+                )
+            },
+        )
+    else:
+        setup["provider_options"] = {
             "automatic_response": False,
             "capabilities": (
                 "input_transcription",
                 "input_commit_events",
             ),
-        },
-    )
+        }
+    return talk_core_realtime.RealtimeVoiceSetup(**setup)
 
 
 @dataclass(frozen=True, slots=True)

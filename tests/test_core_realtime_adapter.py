@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib
+import sys
+import types
 from collections.abc import Mapping
 
 import pytest
@@ -13,10 +17,17 @@ pytest.importorskip(
 )
 from agent.realtime_voice_provider import (
     InputTranscript,
+    OutputAudio,
+    OutputTranscript,
     RealtimeAudioFormat,
     RealtimeCapability,
+    RealtimeInputAudioFormat,
+    RealtimeOutputAudioFormat,
+    RealtimeResponseRequest,
     RealtimeTool,
     RealtimeVoiceSetup,
+    ResponseCompleted,
+    ResponseStarted,
     SessionClosed,
     SessionFailure,
     SessionReady,
@@ -74,11 +85,18 @@ class Harness:
         self.wire_calls += 1
         return self.wire
 
-    def provider(self, *, ledger_capacity=1024):
+    def provider(
+        self, *, ledger_capacity=1024, token_factory=None, response_ledger_capacity=1024
+    ):
+        kwargs = {}
+        if token_factory is not None:
+            kwargs["token_factory"] = token_factory
         return core_rt.TalkOpenAIRealtimeProvider(
             auth_resolver=self.resolve_auth,
             wire_factory=self.wire_factory,
             ledger_capacity=ledger_capacity,
+            response_ledger_capacity=response_ledger_capacity,
+            **kwargs,
         )
 
 
@@ -93,6 +111,21 @@ def setup(**changes):
     return RealtimeVoiceSetup(**values)
 
 
+def response_request(**changes):
+    text = changes.pop("canonical_text", "Exact words, exactly.")
+    values = {
+        "durable_session_id": "durable-1",
+        "assistant_message_id": 41,
+        "turn_marker": "turn-41",
+        "canonical_text": text,
+        "content_digest": hashlib.sha256(text.encode()).hexdigest(),
+        "output_audio_format": core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT,
+        "allow_tools": False,
+    }
+    values.update(changes)
+    return RealtimeResponseRequest(**values)
+
+
 def collect(session):
     async def scenario():
         return [event async for event in session.events()]
@@ -105,6 +138,9 @@ def test_exact_api_v2_contract_and_fixed_capabilities():
         {
             RealtimeCapability.INPUT_TRANSCRIPTION,
             RealtimeCapability.INPUT_COMMIT_EVENTS,
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_METADATA_ECHO,
+            RealtimeCapability.OUTPUT_TRANSCRIPTION,
         }
     )
 
@@ -122,6 +158,435 @@ def test_exact_api_v2_contract_and_fixed_capabilities():
             await session.close()
 
     asyncio.run(scenario())
+
+
+def test_explicit_output_format_is_exact_pcm_s16le():
+    assert RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=24_000,
+        channels=1,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    ) == core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT
+
+
+def test_explicit_response_sends_exact_causally_opaque_no_tool_payload():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "opaque-token-1").open_session(
+            setup(output_audio=core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT)
+        )
+        await session.start_response(response_request())
+        await session.close()
+
+    asyncio.run(scenario())
+    message = harness.wire.sent[0]
+    assert message.pop("event_id").startswith("evt-")
+    assert message == {
+        "type": "response.create",
+        "response": {
+            "conversation": "none",
+            "metadata": {"correlation": "opaque-token-1"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Exact words, exactly."}],
+                }
+            ],
+            "instructions": (
+                "Render the sole user input as speech verbatim. Speak every character's "
+                "words and punctuation naturally, but add, remove, or paraphrase nothing. "
+                "Do not preface or explain."
+            ),
+            "output_modalities": ["audio"],
+            "audio": {
+                "output": {
+                    "voice": "cedar",
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                }
+            },
+            "tools": [],
+            "tool_choice": "none",
+        },
+    }
+    assert not {
+        "durable_session_id",
+        "assistant_message_id",
+        "turn_marker",
+        "content_digest",
+    }.intersection(message["response"]["metadata"])
+
+
+def test_output_format_mismatch_is_rejected_before_provider_send():
+    harness = Harness()
+    wrong = RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=16_000,
+        channels=1,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    )
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "unused").open_session(setup())
+        with pytest.raises(ValueError, match="output audio format"):
+            await session.start_response(response_request(output_audio_format=wrong))
+
+    asyncio.run(scenario())
+    assert harness.wire.sent == []
+
+
+def test_bound_response_maps_started_audio_transcript_and_completed():
+    correlation = "opaque-bound-token"
+    events = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+        },
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-1",
+            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+        },
+        {
+            "type": "response.content_part.added",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+            "part": {"type": "output_audio"},
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+            "delta": "cGNt",
+        },
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+            "delta": "Exact ",
+        },
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+            "transcript": "Exact words, exactly.",
+        },
+        {
+            "type": "response.output_audio.done",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+        },
+        {
+            "type": "response.content_part.done",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+            "part": {"type": "output_audio"},
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-1",
+            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+        },
+        {
+            "type": "conversation.item.done",
+            "item": {"id": "item-out-1", "type": "message", "role": "assistant"},
+        },
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "metadata": {"correlation": correlation},
+                "output": [
+                    {
+                        "id": "item-out-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_audio", "transcript": "Exact words, exactly."}
+                        ],
+                    }
+                ],
+            },
+        },
+    ]
+    harness = Harness(events)
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert received[:-1] == [
+        ResponseStarted(response_id="resp-1", turn_id="turn-41"),
+        OutputAudio(
+            data=b"pcm", item_id="item-out-1", response_id="resp-1", turn_id="turn-41"
+        ),
+        OutputTranscript(
+            item_id="item-out-1",
+            response_id="resp-1",
+            turn_id="turn-41",
+            text="Exact ",
+            final=False,
+        ),
+        OutputTranscript(
+            item_id="item-out-1",
+            response_id="resp-1",
+            turn_id="turn-41",
+            text="Exact words, exactly.",
+            final=True,
+        ),
+        ResponseCompleted(response_id="resp-1", turn_id="turn-41"),
+    ]
+    assert received[-1] == SessionClosed()
+    assert not session._pending_responses
+    assert not session._active_responses
+    assert not session._completed_responses
+
+
+@pytest.mark.parametrize(
+    "bad_event,match",
+    [
+        (
+            {
+                "type": "response.created",
+                "response": {"id": "resp-1", "metadata": {"correlation": "unknown"}},
+            },
+            "correlation",
+        ),
+        (
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-wrong",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            },
+            "response",
+        ),
+        (
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "%%%",
+            },
+            "base64",
+        ),
+        (
+            {"type": "response.function_call_arguments.done", "response_id": "resp-1"},
+            "function",
+        ),
+        (
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-1",
+                    "status": "failed",
+                    "metadata": {"correlation": "opaque-bad-token"},
+                },
+            },
+            "completed",
+        ),
+        (
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-1",
+                    "status": "completed",
+                    "metadata": {"correlation": "opaque-bad-token"},
+                    "output": [{"id": "wrong-item", "type": "message"}],
+                },
+            },
+            "item",
+        ),
+    ],
+)
+def test_explicit_output_protocol_violations_fail_closed(bad_event, match):
+    correlation = "opaque-bad-token"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    if bad_event["type"] == "response.created":
+        events = [bad_event]
+    elif match == "item":
+        events = [
+            created,
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            },
+            bad_event,
+        ]
+    else:
+        events = [created, bad_event]
+    harness = Harness(events)
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert isinstance(received[-1], SessionFailure)
+    assert match in received[-1].message
+    assert harness.wire.closed is True
+
+
+def test_replayed_correlation_and_changed_item_identity_fail_closed():
+    correlation = "one-time-token"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    replay_events = [
+        created,
+        {
+            "type": "response.created",
+            "response": {"id": "resp-2", "metadata": {"correlation": correlation}},
+        },
+    ]
+    wrong_item_events = [
+        created,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-1",
+            "item_id": "item-1",
+            "delta": "cGNt",
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-1",
+            "item_id": "item-2",
+            "delta": "cGNt",
+        },
+    ]
+    for events, match in ((replay_events, "replayed"), (wrong_item_events, "identity")):
+        harness = Harness(events)
+
+        async def scenario(harness=harness, correlation=correlation):
+            provider = harness.provider(token_factory=lambda: correlation)
+            session = await provider.open_session(setup())
+            await session.start_response(response_request())
+            return [event async for event in session.events()]
+
+        received = asyncio.run(scenario())
+        assert isinstance(received[-1], SessionFailure)
+        assert match in received[-1].message
+
+
+def test_exact_setup_formats_are_validated_before_credentials_or_network():
+    wrong_input = RealtimeInputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=16_000,
+        channels=1,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    )
+    wrong_output = RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=24_000,
+        channels=2,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    )
+    for bad_setup in (setup(input_audio=wrong_input), setup(output_audio=wrong_output)):
+        harness = Harness()
+        with pytest.raises(ValueError, match="audio"):
+            asyncio.run(harness.provider().open_session(bad_setup))
+        assert harness.auth_calls == harness.wire_calls == 0
+
+
+def test_response_capacity_and_close_cleanup_are_fail_closed():
+    tokens = iter(("token-1", "token-2"))
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(
+            token_factory=lambda: next(tokens), response_ledger_capacity=1
+        ).open_session(setup())
+        await session.start_response(response_request())
+        with pytest.raises(ValueError, match="capacity"):
+            await session.start_response(
+                response_request(
+                    assistant_message_id=42,
+                    turn_marker="turn-42",
+                    content_digest=hashlib.sha256(b"other").hexdigest(),
+                    canonical_text="other",
+                )
+            )
+        await session.close()
+        return session
+
+    session = asyncio.run(scenario())
+    assert not session._pending_responses
+    assert not session._active_responses
+    assert not session._completed_responses
+    assert not session._consumed_correlations
+
+
+def test_explicit_response_send_failure_cleans_pending_and_is_terminally_visible():
+    harness = Harness()
+    harness.wire.send_error = core_rt.OpenAIWireError("response send exploded")
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "failed-token").open_session(setup())
+        with pytest.raises(core_rt.OpenAIWireError, match="response send exploded"):
+            await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert not session._pending_responses
+    assert received == [
+        SessionFailure(
+            code="explicit_response_failed",
+            message="explicit response provider send failed",
+        )
+    ]
+    assert harness.wire.closed is True
+
+
+def test_missing_task1_symbols_leave_legacy_input_only_contract_available(monkeypatch):
+    contract = sys.modules["agent.realtime_voice_provider"]
+    shim = types.ModuleType(contract.__name__)
+    optional = {
+        "RealtimeInputAudioFormat",
+        "RealtimeOutputAudioFormat",
+        "RealtimeResponseRequest",
+        "ResponseStarted",
+        "OutputAudio",
+        "OutputTranscript",
+        "ResponseCompleted",
+    }
+    shim.__dict__.update(
+        {name: value for name, value in contract.__dict__.items() if name not in optional}
+    )
+    agent_package = sys.modules["agent"]
+    monkeypatch.setitem(sys.modules, "agent.realtime_voice_provider", shim)
+    monkeypatch.setattr(agent_package, "realtime_voice_provider", shim)
+    legacy = importlib.reload(core_rt)
+    try:
+        assert legacy.core_provider_available() is True
+        assert frozenset(
+            {
+                legacy.RealtimeCapability.INPUT_TRANSCRIPTION,
+                legacy.RealtimeCapability.INPUT_COMMIT_EVENTS,
+            }
+        ) == legacy.CORE_CAPABILITIES
+        assert legacy.SUPPORTED_OUTPUT_AUDIO_FORMAT is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(core_rt)
 
 
 def test_passive_diagnostic_distinguishes_contract_from_provider_readiness(monkeypatch):
@@ -155,7 +620,7 @@ def test_passive_diagnostic_distinguishes_contract_from_provider_readiness(monke
         setup(
             tools=(RealtimeTool(name="forbidden", description="must stay inert", parameters={}),)
         ),
-        setup(provider_options={"automatic_response": True}),
+        setup(automatic_response=True),
         setup(provider_options={"capabilities": ["tool_calling"]}),
         setup(audio=RealtimeAudioFormat("audio/pcm", 16_000, 1)),
         setup(audio=RealtimeAudioFormat("audio/wav", 24_000, 1)),
@@ -316,10 +781,10 @@ def test_exact_input_item_identity_maps_partial_and_final_operator_transcripts()
             ],
             "conflicting terminal transcript",
         ),
-        ([{"type": "response.created", "response": {"id": "response-1"}}], "unsolicited"),
+        ([{"type": "response.created", "response": {"id": "response-1"}}], "correlation"),
         (
             [{"type": "response.function_call_arguments.done", "call_id": "call-1"}],
-            "unsolicited",
+            "function",
         ),
         (
             [
