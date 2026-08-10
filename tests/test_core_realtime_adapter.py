@@ -133,6 +133,77 @@ def collect(session):
     return asyncio.run(scenario())
 
 
+def bind_response(session, correlation, *, response_id="resp-1"):
+    return session._map_event(
+        {
+            "type": "response.created",
+            "response": {"id": response_id, "metadata": {"correlation": correlation}},
+        }
+    )
+
+
+def response_done_event(
+    correlation,
+    *,
+    response_id="resp-1",
+    item_id="item-1",
+    transcript="words",
+    output=None,
+):
+    if output is None:
+        output = [
+            {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_audio", "transcript": transcript}],
+            }
+        ]
+    return {
+        "type": "response.done",
+        "response": {
+            "id": response_id,
+            "status": "completed",
+            "metadata": {"correlation": correlation},
+            "output": output,
+        },
+    }
+
+
+def complete_bound_response(
+    session, correlation, *, response_id="resp-1", item_id="item-1", transcript="words"
+):
+    for event in (
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "delta": "cGNt",
+        },
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "transcript": transcript,
+        },
+        {
+            "type": "response.output_audio.done",
+            "response_id": response_id,
+            "item_id": item_id,
+        },
+    ):
+        session._map_event(event)
+    return session._map_event(
+        response_done_event(
+            correlation,
+            response_id=response_id,
+            item_id=item_id,
+            transcript=transcript,
+        )
+    )
+
+
 def test_exact_api_v2_contract_and_fixed_capabilities():
     expected = frozenset(
         {
@@ -533,6 +604,360 @@ def test_response_capacity_and_close_cleanup_are_fail_closed():
     assert not session._active_responses
     assert not session._completed_responses
     assert not session._consumed_correlations
+
+
+@pytest.mark.parametrize("saturated_stage", ["pending", "bound", "completed"])
+def test_response_lifetime_capacity_is_reserved_before_provider_send(saturated_stage):
+    tokens = iter(("token-1", "token-2"))
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(
+            token_factory=lambda: next(tokens), response_ledger_capacity=1
+        ).open_session(setup())
+        await session.start_response(response_request())
+        if saturated_stage != "pending":
+            bind_response(session, "token-1")
+        if saturated_stage == "completed":
+            complete_bound_response(session, "token-1")
+        with pytest.raises(ValueError, match="capacity"):
+            await session.start_response(
+                response_request(
+                    assistant_message_id=42,
+                    turn_marker="turn-42",
+                    canonical_text="other",
+                    content_digest=hashlib.sha256(b"other").hexdigest(),
+                )
+            )
+        return session
+
+    session = asyncio.run(scenario())
+    assert len(harness.wire.sent) == 1
+    assert "token-2" not in session._pending_responses
+
+
+def test_response_created_validation_is_atomic_and_preserves_pending_reservation():
+    tokens = iter(("token-1", "token-2"))
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(
+            token_factory=lambda: next(tokens), response_ledger_capacity=2
+        ).open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.start_response(
+            response_request(
+                assistant_message_id=42,
+                turn_marker="turn-42",
+                canonical_text="other",
+                content_digest=hashlib.sha256(b"other").hexdigest(),
+            )
+        )
+        before = dict(session._pending_responses)
+        with pytest.raises(ValueError, match="duplicate"):
+            bind_response(session, "token-2", response_id="resp-1")
+        assert session._pending_responses == before
+        with pytest.raises(ValueError, match="metadata"):
+            session._map_event(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp-2",
+                        "metadata": {"correlation": "token-2", "extra": True},
+                    },
+                }
+            )
+        assert session._pending_responses == before
+        assert bind_response(session, "token-2", response_id="resp-2") == ResponseStarted(
+            response_id="resp-2", turn_id="turn-42"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "late_event,match",
+    [
+        (
+            {
+                "type": "response.output_audio_transcript.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "later",
+            },
+            "terminal",
+        ),
+        (
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "words",
+            },
+            "replayed",
+        ),
+        (
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "changed",
+            },
+            "conflicting",
+        ),
+    ],
+)
+def test_output_transcript_finality_is_terminal_and_exact(late_event, match):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        final = session._map_event(
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "words",
+            }
+        )
+        with pytest.raises(ValueError, match=match):
+            session._map_event(late_event)
+        return session, final
+
+    session, final = asyncio.run(scenario())
+    assert final == OutputTranscript(
+        item_id="item-1",
+        response_id="resp-1",
+        turn_id="turn-41",
+        text="words",
+        final=True,
+    )
+    assert session._final_output_transcripts == {("resp-1", "item-1"): "words"}
+
+
+@pytest.mark.parametrize(
+    "output,match",
+    [
+        ([], "nonempty"),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                },
+            ],
+            "exactly one",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "function_call",
+                    "role": "assistant",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                }
+            ],
+            "message",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                }
+            ],
+            "assistant",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "words"}],
+                }
+            ],
+            "output_audio",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_audio", "transcript": "words"},
+                        {"type": "output_text", "text": "words"},
+                    ],
+                }
+            ],
+            "exactly one",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_audio",
+                            "transcript": "words",
+                            "function_call": {"name": "forbidden"},
+                        }
+                    ],
+                }
+            ],
+            "shape",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_audio", "transcript": "changed"}],
+                }
+            ],
+            "conflicts",
+        ),
+        (
+            [
+                {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [{"type": "output_audio", "transcript": "words"}],
+                }
+            ],
+            "status",
+        ),
+        ({"id": "item-1"}, "sequence"),
+    ],
+)
+def test_response_done_rejects_non_exact_audio_only_schema_without_consuming_active(
+    output, match
+):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        for event in (
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            },
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "words",
+            },
+            {
+                "type": "response.output_audio.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+            },
+        ):
+            session._map_event(event)
+        event = response_done_event("token-1", output=output)
+        with pytest.raises((TypeError, ValueError), match=match):
+            session._map_event(event)
+        assert "resp-1" in session._active_responses
+        assert "resp-1" not in session._completed_responses
+
+    asyncio.run(scenario())
+
+
+def test_response_done_requires_output_member():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        event = response_done_event("token-1")
+        del event["response"]["output"]
+        with pytest.raises(ValueError, match="output"):
+            session._map_event(event)
+        assert "resp-1" in session._active_responses
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("omitted", ["audio_delta", "audio_done", "transcript_done"])
+def test_response_done_requires_observed_audio_and_transcript_terminals(omitted):
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        events = {
+            "audio_delta": {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "delta": "cGNt",
+            },
+            "audio_done": {
+                "type": "response.output_audio.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+            },
+            "transcript_done": {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "transcript": "words",
+            },
+        }
+        for name, event in events.items():
+            if name != omitted:
+                session._map_event(event)
+        with pytest.raises(ValueError, match=omitted.replace("_", " ")):
+            session._map_event(response_done_event("token-1"))
+        assert "resp-1" in session._active_responses
+
+    asyncio.run(scenario())
+
+
+def test_response_done_accepts_proven_audio_only_shape_and_clears_stream_state():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        completed = complete_bound_response(session, "token-1")
+        return session, completed
+
+    session, completed = asyncio.run(scenario())
+    assert completed == ResponseCompleted(response_id="resp-1", turn_id="turn-41")
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._final_output_transcripts
+    assert not session._audio_delta_items
+    assert not session._audio_done_items
 
 
 def test_explicit_response_send_failure_cleans_pending_and_is_terminally_visible():

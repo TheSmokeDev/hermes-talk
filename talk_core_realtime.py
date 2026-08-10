@@ -303,6 +303,9 @@ if _CORE_IMPORT_ERROR is None:
             self._active_responses: dict[str, tuple[str, _ResponseBinding]] = {}
             self._response_items: dict[str, str] = {}
             self._item_responses: dict[str, str] = {}
+            self._final_output_transcripts: dict[tuple[str, str], str] = {}
+            self._audio_delta_items: set[tuple[str, str]] = set()
+            self._audio_done_items: set[tuple[str, str]] = set()
             self._completed_responses: OrderedDict[str, str] = OrderedDict()
             self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
             self._input_ledger: dict[str, str | None] = {}
@@ -378,8 +381,13 @@ if _CORE_IMPORT_ERROR is None:
                     or correlation in active_correlations
                 ):
                     raise ValueError("correlation token was already used")
-                if len(self._pending_responses) >= self._response_ledger_capacity:
-                    raise ValueError("pending response capacity exhausted")
+                accepted_responses = (
+                    len(self._pending_responses)
+                    + len(self._active_responses)
+                    + len(self._completed_responses)
+                )
+                if accepted_responses >= self._response_ledger_capacity:
+                    raise ValueError("response lifetime capacity exhausted")
                 self._pending_responses[correlation] = binding
             message = {
                 "type": "response.create",
@@ -460,18 +468,26 @@ if _CORE_IMPORT_ERROR is None:
             correlation = self._response_metadata(response)
             if correlation in self._consumed_correlations:
                 raise ValueError("replayed correlation token")
-            binding = self._pending_responses.pop(correlation, None)
+            binding = self._pending_responses.get(correlation)
             if binding is None:
                 raise ValueError("unknown or unsolicited correlation token")
-            if len(self._active_responses) >= self._response_ledger_capacity:
-                raise ValueError("active response capacity exhausted")
+            accepted_responses = (
+                len(self._pending_responses)
+                + len(self._active_responses)
+                + len(self._completed_responses)
+            )
+            if accepted_responses > self._response_ledger_capacity:
+                raise ValueError("response lifetime capacity exhausted")
             if len(self._consumed_correlations) >= self._response_ledger_capacity:
                 raise ValueError("consumed correlation capacity exhausted")
+            del self._pending_responses[correlation]
             self._consumed_correlations[correlation] = None
             self._active_responses[response_id] = (correlation, binding)
             return ResponseStarted(response_id=response_id, turn_id=binding.turn_marker)
 
-        def _active_response(self, event: Mapping[str, Any]) -> tuple[str, _ResponseBinding, str]:
+        def _validate_active_response(
+            self, event: Mapping[str, Any]
+        ) -> tuple[str, str, _ResponseBinding, str]:
             response_id = _validate_identifier(event.get("response_id"), "response_id")
             active = self._active_responses.get(response_id)
             if active is None:
@@ -483,9 +499,13 @@ if _CORE_IMPORT_ERROR is None:
                 raise ValueError("output item identity changed for response")
             if known_response is not None and known_response != response_id:
                 raise ValueError("output item is already bound to another response")
+            return response_id, active[0], active[1], item_id
+
+        def _active_response(self, event: Mapping[str, Any]) -> tuple[str, _ResponseBinding, str]:
+            response_id, correlation, binding, item_id = self._validate_active_response(event)
             self._response_items[response_id] = item_id
             self._item_responses[item_id] = response_id
-            return active[0], active[1], item_id
+            return correlation, binding, item_id
 
         def _complete_response(self, event: Mapping[str, Any]):
             response = event.get("response")
@@ -502,24 +522,61 @@ if _CORE_IMPORT_ERROR is None:
                 raise ValueError("response completion correlation mismatch")
             if response.get("status") != "completed":
                 raise ValueError("response status must be completed")
-            output = response.get("output", ())
+            if "output" not in response:
+                raise ValueError("response output is required")
+            output = response["output"]
             if not isinstance(output, (list, tuple)):
                 raise TypeError("response output must be a sequence")
-            for item in output:
-                if not isinstance(item, Mapping):
-                    raise TypeError("response output item must be an object")
-                if item.get("type") in {"function_call", "function_call_output"}:
-                    raise ValueError("function output is forbidden")
-                output_item_id = _validate_identifier(item.get("id"), "output item_id")
-                known_item_id = self._response_items.get(response_id)
-                if known_item_id is not None and output_item_id != known_item_id:
-                    raise ValueError("response completion output item identity changed")
+            if not output:
+                raise ValueError("response output must be nonempty")
+            if len(output) != 1:
+                raise ValueError("response output must contain exactly one item")
+            item = output[0]
+            if not isinstance(item, Mapping):
+                raise TypeError("response output item must be an object")
+            if item.get("type") != "message":
+                raise ValueError("response output item type must be message")
+            if item.get("role") != "assistant":
+                raise ValueError("response output item role must be assistant")
+            if "status" in item and item.get("status") != "completed":
+                raise ValueError("response output item status must be completed")
+            output_item_id = _validate_identifier(item.get("id"), "output item_id")
+            known_item_id = self._response_items.get(response_id)
+            if known_item_id is None or output_item_id != known_item_id:
+                raise ValueError("response completion output item identity changed")
+            content = item.get("content")
+            if not isinstance(content, (list, tuple)):
+                raise TypeError("response output content must be a sequence")
+            if len(content) != 1:
+                raise ValueError("response output content must contain exactly one part")
+            part = content[0]
+            if not isinstance(part, Mapping):
+                raise TypeError("response output content part must be an object")
+            if part.get("type") != "output_audio":
+                raise ValueError("response output content type must be output_audio")
+            if not set(part).issubset({"type", "transcript"}):
+                raise ValueError("response output_audio content has an invalid shape")
+            stream_key = (response_id, output_item_id)
+            final_transcript = self._final_output_transcripts.get(stream_key)
+            if final_transcript is None:
+                raise ValueError("response completion requires transcript done")
+            if "transcript" in part:
+                completion_transcript = _validate_text(part["transcript"], final=True)
+                if completion_transcript != final_transcript:
+                    raise ValueError("response completion transcript conflicts with final text")
+            if stream_key not in self._audio_delta_items:
+                raise ValueError("response completion requires audio delta")
+            if stream_key not in self._audio_done_items:
+                raise ValueError("response completion requires audio done")
             if len(self._completed_responses) >= self._response_ledger_capacity:
                 raise ValueError("completed response capacity exhausted")
             del self._active_responses[response_id]
             item_id = self._response_items.pop(response_id, None)
             if item_id is not None:
                 self._item_responses.pop(item_id, None)
+                self._final_output_transcripts.pop((response_id, item_id), None)
+                self._audio_delta_items.discard((response_id, item_id))
+                self._audio_done_items.discard((response_id, item_id))
             self._completed_responses[response_id] = correlation
             return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
 
@@ -551,7 +608,6 @@ if _CORE_IMPORT_ERROR is None:
             if event_type == "response.created":
                 return self._bind_response_created(event)
             if event_type == "response.output_audio.delta":
-                _correlation, binding, item_id = self._active_response(event)
                 delta = event.get("delta")
                 if not isinstance(delta, str) or not delta:
                     raise ValueError("output audio delta must be nonempty base64 text")
@@ -561,10 +617,16 @@ if _CORE_IMPORT_ERROR is None:
                     raise ValueError("output audio delta is malformed base64") from exc
                 if not data:
                     raise ValueError("output audio delta decoded to empty data")
+                response_id, _correlation, binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                self._audio_delta_items.add((response_id, item_id))
                 return OutputAudio(
                     data=data,
                     item_id=item_id,
-                    response_id=event["response_id"],
+                    response_id=response_id,
                     turn_id=binding.turn_marker,
                 )
             if event_type in {
@@ -572,13 +634,27 @@ if _CORE_IMPORT_ERROR is None:
                 "response.output_audio_transcript.done",
             }:
                 final = event_type.endswith(".done")
-                _correlation, binding, item_id = self._active_response(event)
                 text = _validate_text(
                     event.get("transcript" if final else "delta"), final=final
                 )
+                response_id, _correlation, binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                transcript_key = (response_id, item_id)
+                terminal_text = self._final_output_transcripts.get(transcript_key)
+                if terminal_text is not None:
+                    if not final:
+                        raise ValueError("output transcript is already terminal")
+                    if terminal_text == text:
+                        raise ValueError("output transcript terminal event was replayed")
+                    raise ValueError("conflicting terminal output transcript")
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                if final:
+                    self._final_output_transcripts[transcript_key] = text
                 return OutputTranscript(
                     item_id=item_id,
-                    response_id=event["response_id"],
+                    response_id=response_id,
                     turn_id=binding.turn_marker,
                     text=text,
                     final=final,
@@ -587,8 +663,18 @@ if _CORE_IMPORT_ERROR is None:
                 return self._complete_response(event)
             if "function_call" in event_type:
                 raise ValueError(f"function/tool output is forbidden: {event_type}")
+            if event_type == "response.output_audio.done":
+                response_id, _correlation, _binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                stream_key = (response_id, item_id)
+                if stream_key in self._audio_done_items:
+                    raise ValueError("output audio done event was replayed")
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                self._audio_done_items.add(stream_key)
+                return None
             if event_type in {
-                "response.output_audio.done",
                 "response.content_part.added",
                 "response.content_part.done",
                 "response.output_item.added",
@@ -647,6 +733,9 @@ if _CORE_IMPORT_ERROR is None:
                 self._active_responses.clear()
                 self._response_items.clear()
                 self._item_responses.clear()
+                self._final_output_transcripts.clear()
+                self._audio_delta_items.clear()
+                self._audio_done_items.clear()
                 self._completed_responses.clear()
                 self._consumed_correlations.clear()
 
