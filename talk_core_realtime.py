@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import secrets
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -225,6 +226,17 @@ if _CORE_IMPORT_ERROR is None:
             "response.done",
         }
     )
+    _REQUIRED_OUTPUT_LIFECYCLE = (
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_audio.delta",
+        "response.output_audio_transcript.delta",
+        "response.output_audio.done",
+        "response.output_audio_transcript.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "conversation.item.done",
+    )
     _FORBIDDEN_OUTPUT_AUTHORITY_KEYS = frozenset(
         {
             "tool_calls",
@@ -393,6 +405,7 @@ if _CORE_IMPORT_ERROR is None:
             self._content_part_done: set[tuple[str, str]] = set()
             self._output_item_done: set[tuple[str, str]] = set()
             self._conversation_item_done: set[tuple[str, str]] = set()
+            self._response_lifecycle: dict[tuple[str, str], int] = {}
             self._completed_responses: OrderedDict[str, str] = OrderedDict()
             self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
             self._input_ledger: dict[str, str | None] = {}
@@ -641,6 +654,24 @@ if _CORE_IMPORT_ERROR is None:
                 raise ValueError(f"{event_type} was replayed")
             observed.add(key)
 
+        def _advance_lifecycle_stage(
+            self, key: tuple[str, str], event_type: str
+        ) -> None:
+            if key not in self._response_lifecycle:
+                if event_type != _REQUIRED_OUTPUT_LIFECYCLE[0]:
+                    return
+                self._response_lifecycle[key] = 1
+                return
+            stage = self._response_lifecycle[key]
+            if stage >= len(_REQUIRED_OUTPUT_LIFECYCLE):
+                raise ValueError(f"{event_type} was replayed")
+            expected = _REQUIRED_OUTPUT_LIFECYCLE[stage]
+            if event_type != expected:
+                raise ValueError(
+                    f"output lifecycle is out of order: expected {expected}, got {event_type}"
+                )
+            self._response_lifecycle[key] = stage + 1
+
         def _complete_response(self, event: Mapping[str, Any]):
             response = event.get("response")
             if not isinstance(response, Mapping):
@@ -682,6 +713,16 @@ if _CORE_IMPORT_ERROR is None:
                 raise ValueError("response completion requires audio delta")
             if stream_key not in self._audio_done_items:
                 raise ValueError("response completion requires audio done")
+            try:
+                final_digest = hashlib.sha256(final_transcript.encode("utf-8")).hexdigest()
+            except UnicodeEncodeError as exc:
+                raise ValueError("response terminal transcript is not valid UTF-8") from exc
+            if final_digest != binding.content_digest:
+                raise ValueError("response terminal transcript digest mismatch")
+            if self._response_lifecycle.get(stream_key) != len(
+                _REQUIRED_OUTPUT_LIFECYCLE
+            ):
+                raise ValueError("response completion requires complete output lifecycle")
             if len(self._completed_responses) >= self._response_ledger_capacity:
                 raise ValueError("completed response capacity exhausted")
             del self._active_responses[response_id]
@@ -696,6 +737,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._content_part_done.discard((response_id, item_id))
                 self._output_item_done.discard((response_id, item_id))
                 self._conversation_item_done.discard((response_id, item_id))
+                self._response_lifecycle.pop((response_id, item_id), None)
             self._completed_responses[response_id] = correlation
             return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
 
@@ -741,6 +783,7 @@ if _CORE_IMPORT_ERROR is None:
                 response_id, _correlation, binding, item_id = (
                     self._validate_active_response(event)
                 )
+                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
                 self._audio_delta_items.add((response_id, item_id))
@@ -769,6 +812,7 @@ if _CORE_IMPORT_ERROR is None:
                     if terminal_text == text:
                         raise ValueError("output transcript terminal event was replayed")
                     raise ValueError("conflicting terminal output transcript")
+                self._advance_lifecycle_stage(transcript_key, event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
                 if final:
@@ -791,6 +835,7 @@ if _CORE_IMPORT_ERROR is None:
                 stream_key = (response_id, item_id)
                 if stream_key in self._audio_done_items:
                     raise ValueError("output audio done event was replayed")
+                self._advance_lifecycle_stage(stream_key, event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
                 self._audio_done_items.add(stream_key)
@@ -807,6 +852,7 @@ if _CORE_IMPORT_ERROR is None:
                 response_id, _correlation, _binding, item_id = self._validate_active_response(
                     normalized
                 )
+                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 observed = (
                     self._output_item_added
                     if event_type.endswith(".added")
@@ -824,6 +870,7 @@ if _CORE_IMPORT_ERROR is None:
                     item_id=item_id,
                     context=event_type,
                 )
+                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 observed = (
                     self._content_part_added
                     if event_type.endswith(".added")
@@ -848,6 +895,7 @@ if _CORE_IMPORT_ERROR is None:
                 )
                 if validated_item_id != item_id:
                     raise ValueError("conversation output item identity changed")
+                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 self._note_lifecycle_stage(
                     self._conversation_item_done,
                     (response_id, item_id),
@@ -897,6 +945,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._content_part_done.clear()
                 self._output_item_done.clear()
                 self._conversation_item_done.clear()
+                self._response_lifecycle.clear()
                 self._completed_responses.clear()
                 self._consumed_correlations.clear()
 

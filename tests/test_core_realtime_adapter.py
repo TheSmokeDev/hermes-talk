@@ -172,36 +172,22 @@ def response_done_event(
 
 
 def complete_bound_response(
-    session, correlation, *, response_id="resp-1", item_id="item-1", transcript="words"
+    session,
+    correlation,
+    *,
+    response_id="resp-1",
+    item_id="item-1",
+    transcript="Exact words, exactly.",
 ):
-    for event in (
-        {
-            "type": "response.output_audio.delta",
-            "response_id": response_id,
-            "item_id": item_id,
-            "delta": "cGNt",
-        },
-        {
-            "type": "response.output_audio_transcript.done",
-            "response_id": response_id,
-            "item_id": item_id,
-            "transcript": transcript,
-        },
-        {
-            "type": "response.output_audio.done",
-            "response_id": response_id,
-            "item_id": item_id,
-        },
-    ):
-        session._map_event(event)
-    return session._map_event(
-        response_done_event(
-            correlation,
-            response_id=response_id,
-            item_id=item_id,
-            transcript=transcript,
-        )
+    events = valid_output_lifecycle_events(
+        correlation,
+        response_id=response_id,
+        item_id=item_id,
+        transcript=transcript,
     )
+    for event in events[:-1]:
+        session._map_event(event)
+    return session._map_event(events[-1])
 
 
 def valid_output_lifecycle_events(
@@ -238,15 +224,15 @@ def valid_output_lifecycle_events(
             "delta": transcript[:1],
         },
         {
+            "type": "response.output_audio.done",
+            "response_id": response_id,
+            "item_id": item_id,
+        },
+        {
             "type": "response.output_audio_transcript.done",
             "response_id": response_id,
             "item_id": item_id,
             "transcript": transcript,
-        },
-        {
-            "type": "response.output_audio.done",
-            "response_id": response_id,
-            "item_id": item_id,
         },
         {
             "type": "response.content_part.done",
@@ -428,15 +414,15 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
             "delta": "Exact ",
         },
         {
+            "type": "response.output_audio.done",
+            "response_id": "resp-1",
+            "item_id": "item-out-1",
+        },
+        {
             "type": "response.output_audio_transcript.done",
             "response_id": "resp-1",
             "item_id": "item-out-1",
             "transcript": "Exact words, exactly.",
-        },
-        {
-            "type": "response.output_audio.done",
-            "response_id": "resp-1",
-            "item_id": "item-out-1",
         },
         {
             "type": "response.content_part.done",
@@ -1040,7 +1026,7 @@ def test_response_done_requires_observed_audio_and_transcript_terminals(omitted)
 
 def test_response_done_accepts_documented_realtime_item_object():
     correlation = "token-1"
-    events = valid_output_lifecycle_events(correlation)
+    events = valid_output_lifecycle_events(correlation, transcript="Exact words, exactly.")
     events[-1]["response"]["output"][0]["object"] = "realtime.item"
     harness = Harness(
         [
@@ -1808,13 +1794,142 @@ def test_response_done_extra_authority_fails_event_pump_and_cleans_terminal_stat
     assert not session._completed_responses
 
 
+def test_terminal_transcript_digest_mismatch_fails_closed_and_clears_all_response_state():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    harness = Harness(
+        [
+            created,
+            *valid_output_lifecycle_events(
+                correlation, transcript="DIFFERENT WORDS"
+            ),
+        ]
+    )
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request(canonical_text="Exact words, exactly."))
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    failures = [event for event in received if isinstance(event, SessionFailure)]
+    assert len(failures) == 1
+    assert failures[0].code == "provider_protocol_failure"
+    assert "digest" in failures[0].message
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+    assert session._terminal is True
+    assert not session._pending_responses
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._final_output_transcripts
+    assert not session._audio_delta_items
+    assert not session._audio_done_items
+    assert not session._output_item_added
+    assert not session._content_part_added
+    assert not session._content_part_done
+    assert not session._output_item_done
+    assert not session._conversation_item_done
+    assert not session._response_lifecycle
+    assert not session._completed_responses
+    assert not session._consumed_correlations
+
+
+@pytest.mark.parametrize(
+    "omitted_type",
+    [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_audio.delta",
+        "response.output_audio_transcript.delta",
+        "response.output_audio.done",
+        "response.output_audio_transcript.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "conversation.item.done",
+    ],
+)
+def test_response_done_requires_every_live_output_lifecycle_stage(omitted_type):
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    lifecycle = valid_output_lifecycle_events(
+        correlation, transcript="Exact words, exactly."
+    )
+    events = [event for event in lifecycle[:-1] if event["type"] != omitted_type]
+    harness = Harness([created, *events, lifecycle[-1]])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    assert sum(isinstance(event, SessionFailure) for event in received) == 1
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+    assert session._terminal is True
+    assert not session._response_lifecycle
+    assert output_authority_state(session) == (
+        {}, {}, {}, {}, {}, set(), set(), set(), set(), set(), set(), set(), {}, {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("earlier_type", "later_type"),
+    [
+        ("response.output_item.added", "response.content_part.added"),
+        ("response.content_part.added", "response.output_audio.delta"),
+        ("response.output_audio.done", "response.output_audio_transcript.done"),
+        ("response.content_part.done", "response.output_item.done"),
+        ("response.output_item.done", "conversation.item.done"),
+    ],
+)
+def test_live_output_lifecycle_rejects_out_of_order_stages(earlier_type, later_type):
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    lifecycle = valid_output_lifecycle_events(
+        correlation, transcript="Exact words, exactly."
+    )
+    positions = {event["type"]: index for index, event in enumerate(lifecycle)}
+    first, second = positions[earlier_type], positions[later_type]
+    lifecycle[first], lifecycle[second] = lifecycle[second], lifecycle[first]
+    harness = Harness([created, *lifecycle])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return [event async for event in session.events()]
+
+    received = asyncio.run(scenario())
+    assert sum(isinstance(event, SessionFailure) for event in received) == 1
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+
+
 def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_state():
     correlation = "token-1"
     created = {
         "type": "response.created",
         "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
     }
-    harness = Harness([created, *valid_output_lifecycle_events(correlation)])
+    harness = Harness(
+        [
+            created,
+            *valid_output_lifecycle_events(
+                correlation, transcript="Exact words, exactly."
+            ),
+        ]
+    )
 
     async def scenario():
         session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
@@ -1828,6 +1943,7 @@ def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_
     assert not session._active_responses
     assert not session._response_items
     assert not session._item_responses
+    assert not session._response_lifecycle
     assert not session._completed_responses
 
 
@@ -1838,7 +1954,7 @@ def test_live_proven_output_envelopes_accept_event_ids_and_indexes_once():
         "event_id": "evt-created",
         "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
     }
-    events = valid_output_lifecycle_events(correlation)
+    events = valid_output_lifecycle_events(correlation, transcript="Exact words, exactly.")
     for index, event in enumerate(events):
         event["event_id"] = f"evt-{index}"
         if event["type"].startswith("response."):
