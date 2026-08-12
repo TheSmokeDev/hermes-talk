@@ -217,7 +217,7 @@ def valid_output_lifecycle_events(
             "type": "response.output_audio.delta",
             "response_id": response_id,
             "item_id": item_id,
-            "delta": "cGNt",
+            "delta": "cGNtAA==",
         },
         {
             "type": "response.output_audio_transcript.delta",
@@ -408,7 +408,7 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
             "type": "response.output_audio.delta",
             "response_id": "resp-1",
             "item_id": "item-out-1",
-            "delta": "cGNt",
+            "delta": "cGNtAA==",
         },
         {
             "type": "response.output_audio_transcript.delta",
@@ -484,7 +484,7 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
     assert received[:-1] == [
         ResponseStarted(response_id="resp-1", turn_id="turn-41"),
         OutputAudio(
-            data=b"pcm", item_id="item-out-1", response_id="resp-1", turn_id="turn-41"
+            data=b"pcm\x00", item_id="item-out-1", response_id="resp-1", turn_id="turn-41"
         ),
         OutputTranscript(
             item_id="item-out-1",
@@ -506,6 +506,114 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
     assert not session._pending_responses
     assert not session._active_responses
     assert not session._completed_responses
+
+
+def test_pcm16le_arbitrary_chunks_use_exact_one_byte_carry_and_clean_terminals():
+    async def open_bound_session():
+        harness = Harness()
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        session._enforce_output_lifecycle = True
+        lifecycle = valid_output_lifecycle_events(
+            "token-1", transcript="Exact words, exactly."
+        )
+        session._map_event(lifecycle[0])
+        session._map_event(lifecycle[1])
+        return harness, session, lifecycle
+
+    def audio_delta(data, *, response_id="resp-1", item_id="item-1"):
+        encoded = {
+            b"\x01": "AQ==",
+            b"\x02\x03\x04": "AgME",
+            b"\x05": "BQ==",
+            b"\x06": "Bg==",
+            b"\x07": "Bw==",
+        }[data]
+        return {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "delta": encoded,
+        }
+
+    async def scenario():
+        _harness, session, lifecycle = await open_bound_session()
+        assert session._map_event(audio_delta(b"\x01")) is None
+        assert session._audio_byte_carries == {("resp-1", "item-1"): b"\x01"}
+        assert max(map(len, session._audio_byte_carries.values())) == 1
+
+        before_wrong_id = dict(session._audio_byte_carries)
+        with pytest.raises(ValueError, match="identity"):
+            session._map_event(audio_delta(b"\x07", item_id="item-wrong"))
+        assert session._audio_byte_carries == before_wrong_id
+
+        reconstructed = session._map_event(audio_delta(b"\x02\x03\x04"))
+        assert reconstructed == OutputAudio(
+            data=b"\x01\x02\x03\x04",
+            item_id="item-1",
+            response_id="resp-1",
+            turn_id="turn-41",
+        )
+        assert not session._audio_byte_carries
+
+        assert session._map_event(audio_delta(b"\x05")) is None
+        before_odd_done = (
+            dict(session._audio_byte_carries),
+            set(session._audio_done_items),
+            dict(session._response_lifecycle),
+        )
+        with pytest.raises(ValueError, match="incomplete PCM16LE sample"):
+            session._map_event(lifecycle[4])
+        assert (
+            dict(session._audio_byte_carries),
+            set(session._audio_done_items),
+            dict(session._response_lifecycle),
+        ) == before_odd_done
+
+        assert session._map_event(audio_delta(b"\x06")) == OutputAudio(
+            data=b"\x05\x06",
+            item_id="item-1",
+            response_id="resp-1",
+            turn_id="turn-41",
+        )
+        session._map_event(lifecycle[3])
+        assert session._map_event(lifecycle[4]) is None
+        with pytest.raises(ValueError, match="replayed"):
+            session._map_event(lifecycle[4])
+        for event in lifecycle[5:-1]:
+            session._map_event(event)
+        assert session._map_event(lifecycle[-1]) == ResponseCompleted(
+            response_id="resp-1", turn_id="turn-41"
+        )
+        assert not session._audio_byte_carries
+
+        _cancel_harness, cancel_session, _cancel_lifecycle = await open_bound_session()
+        assert cancel_session._map_event(audio_delta(b"\x07")) is None
+        await cancel_session.cancel_response("resp-1")
+        assert cancel_session._map_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-1",
+                    "status": "cancelled",
+                    "metadata": {"correlation": "token-1"},
+                    "output": [],
+                    "status_details": {
+                        "type": "cancelled",
+                        "reason": "client_cancelled",
+                    },
+                },
+            }
+        ) == Interruption(response_id="resp-1", turn_id="turn-41")
+        assert not cancel_session._audio_byte_carries
+
+        _close_harness, close_session, _close_lifecycle = await open_bound_session()
+        assert close_session._map_event(audio_delta(b"\x07")) is None
+        await close_session.close()
+        assert not close_session._audio_byte_carries
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -948,7 +1056,7 @@ def test_response_done_rejects_non_exact_audio_only_schema_without_consuming_act
                 "type": "response.output_audio.delta",
                 "response_id": "resp-1",
                 "item_id": "item-1",
-                "delta": "cGNt",
+                "delta": "cGNtAA==",
             },
             {
                 "type": "response.output_audio_transcript.done",
@@ -1001,7 +1109,7 @@ def test_response_done_requires_observed_audio_and_transcript_terminals(omitted)
                 "type": "response.output_audio.delta",
                 "response_id": "resp-1",
                 "item_id": "item-1",
-                "delta": "cGNt",
+                "delta": "cGNtAA==",
             },
             "audio_done": {
                 "type": "response.output_audio.done",
@@ -1667,6 +1775,7 @@ def output_authority_state(session):
         dict(session._final_output_transcripts),
         set(session._audio_delta_items),
         set(session._audio_done_items),
+        dict(session._audio_byte_carries),
         set(session._output_item_added),
         set(session._content_part_added),
         set(session._content_part_done),
@@ -1743,6 +1852,134 @@ def test_recursive_output_authority_discriminator_is_rejected(discriminator):
                 }
             )
         assert output_authority_state(session) == before
+
+    asyncio.run(scenario())
+
+
+def test_recursive_authority_covers_every_recognized_nonoutput_family_atomically():
+    forbidden_events = [
+        {
+            "type": "session.created",
+            "session": {
+                "id": "session-1",
+                "metadata": {"left": [{"nested": {"tools": []}}]},
+            },
+        },
+        {
+            "type": "session.updated",
+            "session": {"metadata": {"right": {"nested": [{"type": "tool_call"}]}}},
+        },
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "input-1",
+            "audio_start_ms": 7,
+            "provider": [{"left": {"function_call": {}}}],
+        },
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": "input-1",
+            "audio_end_ms": 11,
+            "provider": {"right": [{"arguments": "{}"}]},
+        },
+        {
+            "type": "input_audio_buffer.committed",
+            "item_id": "input-1",
+            "metadata": {"left": [{"nested": {"call_id": "call-1"}}]},
+        },
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "item_id": "input-1",
+            "delta": "hel",
+            "diagnostic": {"right": [{"nested": {"tool_choice": "none"}}]},
+        },
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-1",
+            "transcript": "hello",
+            "diagnostic": [{"left": {"type": "function_call_output"}}],
+        },
+        {
+            "type": "rate_limits.updated",
+            "rate_limits": [{"name": "requests", "metadata": {"right": {"name": "tool"}}}],
+        },
+        {
+            "type": "error",
+            "error": {
+                "message": "provider error",
+                "metadata": {"left": [{"function": {}}]},
+            },
+        },
+    ]
+
+    def state(session):
+        return (
+            session._provider_session_id,
+            dict(session._input_ledger),
+            output_authority_state(session),
+        )
+
+    async def scenario():
+        for bad_event in forbidden_events:
+            harness = Harness()
+            session = await harness.provider().open_session(setup())
+            before = state(session)
+            with pytest.raises(ValueError, match="authority"):
+                session._map_event(bad_event)
+            assert state(session) == before
+            await session.close()
+
+        harness = Harness()
+        session = await harness.provider().open_session(setup())
+        assert session._map_event(
+            {
+                "type": "session.created",
+                "session": {
+                    "id": "session-1",
+                    "metadata": {"left": [{"classification": "tools-disabled"}]},
+                },
+            }
+        ) == SessionReady(session_id="session-1")
+        assert session._map_event(
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": "input-1",
+                "metadata": {"right": [{"classification": "operator-audio"}]},
+            }
+        ) is None
+        transcript = session._map_event(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "input-1",
+                "transcript": "hello",
+                "diagnostic": {"left": [{"classification": "legitimate"}]},
+            }
+        )
+        assert transcript == InputTranscript(
+            item_id="input-1",
+            turn_id="input-1",
+            text="hello",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+        before_unknown = state(session)
+        assert session._map_event(
+            {
+                "type": "vendor.future_diagnostic",
+                "metadata": {"nested": [{"tools": []}, {"type": "tool_call"}]},
+            }
+        ) is None
+        assert state(session) == before_unknown
+        with pytest.raises(core_rt.OpenAIWireError, match="legitimate provider error"):
+            session._map_event(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "legitimate provider error",
+                        "metadata": {"classification": "diagnostic-only"},
+                    },
+                }
+            )
 
     asyncio.run(scenario())
 
@@ -1921,7 +2158,7 @@ def test_response_done_requires_every_live_output_lifecycle_stage(omitted_type):
     assert session._terminal is True
     assert not session._response_lifecycle
     assert output_authority_state(session) == (
-        {}, {}, {}, {}, {}, set(), set(), set(), set(), set(), set(), set(), {}, {}
+        {}, {}, {}, {}, {}, set(), set(), {}, set(), set(), set(), set(), set(), {}, {}
     )
 
 
@@ -2348,6 +2585,114 @@ def test_cancel_response_exact_authority_and_empty_cancelled_terminal():
     assert not session._active_responses
     assert not session._cancelling_responses
     assert session._completed_responses == {"resp-1": "token-1"}
+
+
+def test_cancel_send_and_provider_terminal_are_linearized_in_both_race_orders():
+    class RacingCancelWire(FakeWire):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+            self.cancel_send_started = asyncio.Event()
+            self.release_cancel_send = asyncio.Event()
+
+        async def send_json(self, messages):
+            messages = tuple(messages)
+            self.sent.extend(messages)
+            if messages[0]["type"] == "response.cancel":
+                self.cancel_send_started.set()
+                await self.release_cancel_send.wait()
+                raise RuntimeError("cancel send exploded")
+
+        async def __anext__(self):
+            event = await self.incoming.get()
+            if event is None:
+                raise core_rt.OpenAIWireEOF("")
+            return event
+
+        async def close(self):
+            if not self.closed:
+                self.closed = True
+                self.incoming.put_nowait(None)
+
+    cancelled = {
+        "type": "response.done",
+        "response": {
+            "id": "resp-1",
+            "status": "cancelled",
+            "metadata": {"correlation": "token-1"},
+            "output": [],
+            "status_details": {
+                "type": "cancelled",
+                "reason": "client_cancelled",
+            },
+        },
+    }
+
+    async def terminal_wins():
+        harness = Harness()
+        harness.wire = RacingCancelWire()
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        stream = session.events()
+        harness.wire.incoming.put_nowait(
+            {
+                "type": "response.created",
+                "response": {"id": "resp-1", "metadata": {"correlation": "token-1"}},
+            }
+        )
+        assert await anext(stream) == ResponseStarted(response_id="resp-1", turn_id="turn-41")
+
+        waiter = asyncio.create_task(session.cancel_response("resp-1"))
+        await harness.wire.cancel_send_started.wait()
+        harness.wire.incoming.put_nowait(cancelled)
+        assert await anext(stream) == Interruption(response_id="resp-1", turn_id="turn-41")
+        harness.wire.release_cancel_send.set()
+        await waiter
+
+        harness.wire.incoming.put_nowait(None)
+        assert await anext(stream) == SessionClosed()
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        await asyncio.sleep(0)
+        assert session._pending_send_failure is None
+        assert session._completed_responses == {}
+        assert not session._active_responses
+        assert not session._cancelling_responses
+        assert not session._in_flight_response_cancellations
+        assert not session._response_cancellation_tasks
+
+    async def send_failure_wins():
+        harness = Harness()
+        harness.wire = RacingCancelWire()
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        stream = session.events()
+        pump = asyncio.create_task(_collect_async(stream))
+
+        waiter = asyncio.create_task(session.cancel_response("resp-1"))
+        await harness.wire.cancel_send_started.wait()
+        harness.wire.release_cancel_send.set()
+        with pytest.raises(RuntimeError, match="cancel send exploded"):
+            await waiter
+        harness.wire.incoming.put_nowait(cancelled)
+        received = await pump
+        await asyncio.sleep(0)
+
+        assert len(received) == 1
+        assert isinstance(received[0], SessionFailure)
+        assert received[0].code == "cancellation_failed"
+        assert session._terminal_failure is received[0]
+        assert not session._active_responses
+        assert not session._cancelling_responses
+        assert not session._in_flight_response_cancellations
+        assert not session._response_cancellation_tasks
+
+    async def _collect_async(stream):
+        return [event async for event in stream]
+
+    asyncio.run(terminal_wins())
+    asyncio.run(send_failure_wins())
 
 
 @pytest.mark.parametrize(

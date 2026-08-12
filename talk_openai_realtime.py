@@ -286,8 +286,8 @@ class _OpenAIWireSession:
         aiohttp_module=None,
         mint_session: Callable[..., Any] | None = None,
     ) -> None:
-        self.auth_token = auth_token
-        self.auth_source = auth_source
+        self._auth_token: str | None = auth_token
+        self._auth_source: str | None = auth_source
         self._aiohttp = aiohttp_module
         self._mint_session = mint_session or self._mint
         self._stack: AsyncExitStack | None = None
@@ -298,10 +298,18 @@ class _OpenAIWireSession:
         self._close_task: asyncio.Task[None] | None = None
         self._close_failure: BaseException | None = None
         self._closed = False
+        self._connect_started = False
+
+    def _clear_raw_credentials(self) -> None:
+        self._auth_token = None
+        self._auth_source = None
 
     def _mint(self, **configuration):
+        auth_token = self._auth_token
+        if auth_token is None:
+            raise OpenAIWireError("Realtime wire credentials are unavailable")
         return talk_wire.mint_ephemeral_session(
-            auth_token=self.auth_token,
+            auth_token=auth_token,
             model=configuration["model"],
             voice=configuration["voice"],
             instructions=configuration["instructions"],
@@ -319,17 +327,21 @@ class _OpenAIWireSession:
         automatic_response: bool,
         session_update: dict[str, Any],
     ) -> None:
-        if self._stack is not None or self._closed:
+        if self._connect_started or self._closed:
             raise OpenAIWireError("Realtime wire connect may only run once")
+        self._connect_started = True
         stack = AsyncExitStack()
         try:
-            descriptor = self._mint_session(
-                model=model,
-                voice=voice,
-                instructions=instructions,
-                tools=tools,
-                automatic_response=automatic_response,
-            )
+            try:
+                descriptor = self._mint_session(
+                    model=model,
+                    voice=voice,
+                    instructions=instructions,
+                    tools=tools,
+                    automatic_response=automatic_response,
+                )
+            finally:
+                self._clear_raw_credentials()
             aiohttp = self._aiohttp or _import_aiohttp()
             http = await stack.enter_async_context(aiohttp.ClientSession())
             ws = await stack.enter_async_context(
@@ -345,6 +357,7 @@ class _OpenAIWireSession:
             self._iterator = ws.__aiter__()
             await self.send_json((session_update,))
         except BaseException:
+            self._clear_raw_credentials()
             self._stack = None
             await stack.aclose()
             raise
@@ -417,6 +430,7 @@ class _OpenAIWireSession:
             return wire_event
 
     async def _close_once(self) -> None:
+        self._clear_raw_credentials()
         stack, self._stack = self._stack, None
         if stack is not None:
             try:
