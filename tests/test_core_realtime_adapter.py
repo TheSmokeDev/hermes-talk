@@ -13,8 +13,9 @@ pytest.importorskip(
 )
 from agent.realtime_voice_provider import (
     InputTranscript,
-    RealtimeAudioFormat,
     RealtimeCapability,
+    RealtimeInputAudioFormat,
+    RealtimeOutputAudioFormat,
     RealtimeTool,
     RealtimeVoiceSetup,
     SessionClosed,
@@ -87,7 +88,9 @@ def setup(**changes):
         "model": "gpt-realtime-test",
         "voice": "cedar",
         "instructions": "transcribe only",
-        "audio": core_rt.SUPPORTED_AUDIO_FORMAT,
+        "input_audio": core_rt.SUPPORTED_INPUT_AUDIO_FORMAT,
+        "output_audio": core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT,
+        "automatic_response": False,
     }
     values.update(changes)
     return RealtimeVoiceSetup(**values)
@@ -155,10 +158,18 @@ def test_passive_diagnostic_distinguishes_contract_from_provider_readiness(monke
         setup(
             tools=(RealtimeTool(name="forbidden", description="must stay inert", parameters={}),)
         ),
-        setup(provider_options={"automatic_response": True}),
+        setup(automatic_response=True),
         setup(provider_options={"capabilities": ["tool_calling"]}),
-        setup(audio=RealtimeAudioFormat("audio/pcm", 16_000, 1)),
-        setup(audio=RealtimeAudioFormat("audio/wav", 24_000, 1)),
+        setup(
+            input_audio=RealtimeInputAudioFormat(
+                "audio/pcm", 16_000, 1, "pcm_s16le", 2, "little"
+            )
+        ),
+        setup(
+            output_audio=RealtimeOutputAudioFormat(
+                "audio/pcm", 16_000, 1, "pcm_s16le", 2, "little"
+            )
+        ),
     ],
 )
 def test_unsupported_setup_is_rejected_before_credentials_or_network(bad_setup):
@@ -194,6 +205,28 @@ def test_core_connect_disables_response_in_update_and_sends_only_input_commands(
         {"type": "input_audio_buffer.commit"},
     ]
     assert harness.wire.closed is True
+
+
+def test_typed_setup_fields_are_exact_and_legacy_audio_remains_compatible():
+    assert RealtimeInputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    ) == core_rt.SUPPORTED_INPUT_AUDIO_FORMAT
+    assert RealtimeOutputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    ) == core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT
+
+    async def scenario():
+        typed = Harness()
+        session = await typed.provider().open_session(setup())
+        await session.close()
+
+        legacy = Harness()
+        session = await legacy.provider().open_session(
+            setup(input_audio=None, output_audio=None, audio=core_rt.SUPPORTED_AUDIO_FORMAT)
+        )
+        await session.close()
+
+    asyncio.run(scenario())
 
 
 def test_send_failure_closes_and_remains_visible_as_one_terminal_event():

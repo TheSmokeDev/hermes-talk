@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - flat-module fallback
 
 _CORE_IMPORT_ERROR: BaseException | None = None
 try:
+    from agent import realtime_voice_provider as _core_api
     from agent.realtime_voice_provider import (
         REALTIME_VOICE_PROVIDER_API_VERSION,
         InputTranscript,
@@ -72,6 +73,29 @@ try:
 except Exception as exc:  # noqa: BLE001 - optional core must never poison legacy imports
     _CORE_IMPORT_ERROR = exc
 
+_EXPLICIT_RESPONSE_SYMBOL_NAMES = (
+    "RealtimeInputAudioFormat",
+    "RealtimeOutputAudioFormat",
+    "RealtimeResponseRequest",
+    "ResponseStarted",
+    "OutputAudio",
+    "OutputTranscript",
+    "ResponseCompleted",
+)
+_CANCELLATION_SYMBOL_NAMES = ("InputSpeechStarted", "Interruption")
+_EXPLICIT_RESPONSE_SURFACE_AVAILABLE = _CORE_IMPORT_ERROR is None and all(
+    isinstance(getattr(_core_api, name, None), type)
+    for name in _EXPLICIT_RESPONSE_SYMBOL_NAMES
+)
+_RESPONSE_CANCELLATION_SURFACE_AVAILABLE = (
+    _CORE_IMPORT_ERROR is None
+    and all(
+        isinstance(getattr(_core_api, name, None), type)
+        for name in _CANCELLATION_SYMBOL_NAMES
+    )
+    and hasattr(RealtimeCapability, "RESPONSE_CANCELLATION")
+)
+
 DEFAULT_INPUT_LEDGER_CAPACITY = 1024
 MAX_IDENTIFIER_LENGTH = 512
 MAX_TRANSCRIPT_LENGTH = 1_000_000
@@ -104,6 +128,26 @@ if _CORE_IMPORT_ERROR is None:
     SUPPORTED_AUDIO_FORMAT = RealtimeAudioFormat(
         mime_type="audio/pcm", sample_rate_hz=24_000, channels=1
     )
+    if _EXPLICIT_RESPONSE_SURFACE_AVAILABLE:
+        SUPPORTED_INPUT_AUDIO_FORMAT = _core_api.RealtimeInputAudioFormat(
+            mime_type="audio/pcm",
+            sample_rate_hz=24_000,
+            channels=1,
+            sample_encoding="pcm_s16le",
+            sample_width_bytes=2,
+            endianness="little",
+        )
+        SUPPORTED_OUTPUT_AUDIO_FORMAT = _core_api.RealtimeOutputAudioFormat(
+            mime_type="audio/pcm",
+            sample_rate_hz=24_000,
+            channels=1,
+            sample_encoding="pcm_s16le",
+            sample_width_bytes=2,
+            endianness="little",
+        )
+    else:
+        SUPPORTED_INPUT_AUDIO_FORMAT = None
+        SUPPORTED_OUTPUT_AUDIO_FORMAT = None
     CORE_CAPABILITIES = frozenset(
         {
             RealtimeCapability.INPUT_TRANSCRIPTION,
@@ -162,17 +206,27 @@ if _CORE_IMPORT_ERROR is None:
             raise TypeError("setup must be a RealtimeVoiceSetup")
         if setup.tools:
             raise ValueError("the input-only core provider does not accept tools")
-        if setup.audio is not None and setup.audio != SUPPORTED_AUDIO_FORMAT:
+        input_audio = getattr(setup, "input_audio", None)
+        output_audio = getattr(setup, "output_audio", None)
+        if input_audio is None and output_audio is None:
+            input_audio = setup.audio
+            output_audio = setup.audio
+        if input_audio is not None and input_audio not in {
+            SUPPORTED_AUDIO_FORMAT,
+            SUPPORTED_INPUT_AUDIO_FORMAT,
+        }:
             raise ValueError("the input-only core provider requires audio/pcm at 24000 Hz mono")
+        if output_audio is not None and output_audio not in {
+            SUPPORTED_AUDIO_FORMAT,
+            SUPPORTED_OUTPUT_AUDIO_FORMAT,
+        }:
+            raise ValueError("the input-only core provider requires audio/pcm at 24000 Hz mono")
+        if getattr(setup, "automatic_response", False) is not False:
+            raise ValueError("automatic_response must remain exactly false in the core lane")
         options = setup.provider_options
-        unknown = set(options) - {"automatic_response", "capabilities"}
+        unknown = set(options) - {"capabilities"}
         if unknown:
             raise ValueError(f"unsupported provider option: {sorted(unknown)[0]}")
-        automatic_response = options.get("automatic_response", False)
-        if not isinstance(automatic_response, bool):
-            raise TypeError("automatic_response must be boolean")
-        if automatic_response:
-            raise ValueError("automatic_response must remain false in the core lane")
         if "capabilities" in options:
             _requested_capabilities(options["capabilities"])
 
@@ -469,6 +523,8 @@ if _CORE_IMPORT_ERROR is None:
 
 else:
     SUPPORTED_AUDIO_FORMAT = None
+    SUPPORTED_INPUT_AUDIO_FORMAT = None
+    SUPPORTED_OUTPUT_AUDIO_FORMAT = None
     CORE_CAPABILITIES = frozenset()
     TalkOpenAIRealtimeProvider = None
 
@@ -478,6 +534,8 @@ __all__ = [
     "DEFAULT_INPUT_LEDGER_CAPACITY",
     "PROVIDER_NAME",
     "SUPPORTED_AUDIO_FORMAT",
+    "SUPPORTED_INPUT_AUDIO_FORMAT",
+    "SUPPORTED_OUTPUT_AUDIO_FORMAT",
     "OpenAIWireEOF",
     "OpenAIWireError",
     "TalkOpenAIRealtimeProvider",

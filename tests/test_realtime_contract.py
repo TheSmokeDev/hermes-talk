@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -154,3 +157,115 @@ def test_realtime_contract_and_openai_adapter_are_shipped_modules():
     assert "talk_realtime" in shipped
     assert "talk_openai_realtime" in shipped
     assert "talk_core_realtime" in shipped
+
+
+_CORE_SHIM_PROBE = r'''
+import enum
+import json
+import sys
+import types
+
+module = types.ModuleType("agent.realtime_voice_provider")
+module.REALTIME_VOICE_PROVIDER_API_VERSION = 2
+
+class Capability(enum.Enum):
+    INPUT_TRANSCRIPTION = "input_transcription"
+    INPUT_COMMIT_EVENTS = "input_commit_events"
+    EXPLICIT_RESPONSE = "explicit_response"
+    RESPONSE_CANCELLATION = "response_cancellation"
+
+class Role(enum.Enum):
+    OPERATOR = "operator"
+
+class Provenance(enum.Enum):
+    OPERATOR_INPUT = "operator_input"
+
+class Session:
+    def __init__(self, capabilities): self.capabilities = capabilities; self._closed = False
+    async def close(self): self._closed = True; await self._close()
+    async def commit_audio(self): await self._commit_audio()
+
+class Provider: pass
+class Setup: pass
+class Audio:
+    def __init__(self, mime_type, sample_rate_hz, channels, *args, **kwargs):
+        self.mime_type, self.sample_rate_hz, self.channels = mime_type, sample_rate_hz, channels
+
+for name, value in {
+    "RealtimeCapability": Capability,
+    "TranscriptRole": Role,
+    "TranscriptProvenance": Provenance,
+    "RealtimeVoiceSession": Session,
+    "RealtimeVoiceProvider": Provider,
+    "RealtimeVoiceSetup": Setup,
+    "RealtimeAudioFormat": Audio,
+    "SessionReady": type("SessionReady", (), {}),
+    "SessionClosed": type("SessionClosed", (), {}),
+    "SessionFailure": type("SessionFailure", (), {}),
+    "InputTranscript": type("InputTranscript", (), {}),
+}.items(): setattr(module, name, value)
+
+for name in sys.argv[1].split(",") if sys.argv[1] else ():
+    setattr(module, name, type(name, (Audio,) if name.endswith("AudioFormat") else (), {}))
+
+agent = types.ModuleType("agent")
+agent.realtime_voice_provider = module
+sys.modules["agent"] = agent
+sys.modules["agent.realtime_voice_provider"] = module
+import talk_core_realtime as core
+print(json.dumps({
+    "available": core.core_provider_available(),
+    "explicit": core._EXPLICIT_RESPONSE_SURFACE_AVAILABLE,
+    "cancellation": core._RESPONSE_CANCELLATION_SURFACE_AVAILABLE,
+    "capabilities": sorted(item.value for item in core.CORE_CAPABILITIES),
+}))
+'''
+
+
+def _probe_core_shim(symbols):
+    completed = subprocess.run(
+        [sys.executable, "-c", _CORE_SHIM_PROBE, ",".join(symbols)],
+        cwd=Path.cwd(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_optional_core_surfaces_are_detected_independently_and_stay_unadvertised():
+    explicit = {
+        "RealtimeInputAudioFormat",
+        "RealtimeOutputAudioFormat",
+        "RealtimeResponseRequest",
+        "ResponseStarted",
+        "OutputAudio",
+        "OutputTranscript",
+        "ResponseCompleted",
+    }
+    cancellation = {"InputSpeechStarted", "Interruption"}
+
+    baseline = _probe_core_shim(set())
+    assert baseline == {
+        "available": True,
+        "explicit": False,
+        "cancellation": False,
+        "capabilities": ["input_commit_events", "input_transcription"],
+    }
+
+    explicit_only = _probe_core_shim(explicit)
+    assert explicit_only["available"] is True
+    assert explicit_only["explicit"] is True
+    assert explicit_only["cancellation"] is False
+    assert "explicit_response" not in explicit_only["capabilities"]
+
+    partial_cancellation = _probe_core_shim(explicit | {"InputSpeechStarted"})
+    assert partial_cancellation["available"] is True
+    assert partial_cancellation["explicit"] is True
+    assert partial_cancellation["cancellation"] is False
+
+    complete = _probe_core_shim(explicit | cancellation)
+    assert complete["available"] is True
+    assert complete["explicit"] is True
+    assert complete["cancellation"] is True
+    assert "response_cancellation" not in complete["capabilities"]
