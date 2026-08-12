@@ -13,7 +13,6 @@ import base64
 import binascii
 import contextlib
 import hashlib
-import re
 import secrets
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -154,14 +153,9 @@ DEFAULT_INPUT_LEDGER_CAPACITY = 1024
 MAX_IDENTIFIER_LENGTH = 512
 MAX_TRANSCRIPT_LENGTH = 1_000_000
 PROVIDER_NAME = "talk_openai_realtime"
-_PUBLIC_ERROR_SECRET = re.compile(
-    r"(?i)(?:bearer\s+[^\s,;]+|(?:password|api[_-]?key|token)\s*[=:]\s*[^\s,;]+|sk-[A-Za-z0-9_-]{8,})"
-)
-
-
-def _sanitize_public_error(exc: BaseException | str) -> str:
-    text = str(exc).strip() or "provider operation failed"
-    return _PUBLIC_ERROR_SECRET.sub("<redacted-secret>", text)
+_PROVIDER_SEND_FAILURE_MESSAGE = "provider send failed"
+_PROVIDER_PROTOCOL_FAILURE_MESSAGE = "provider protocol failure"
+_PROVIDER_EOF_MESSAGE = "provider connection closed unexpectedly"
 
 
 def core_provider_available() -> bool:
@@ -472,7 +466,7 @@ if _CORE_IMPORT_ERROR is None:
             self._input_ledger: dict[str, str | None] = {}
             self._provider_session_id: str | None = None
             self._terminal = False
-            self._pending_send_failure: str | None = None
+            self._pending_send_failure: bool | None = None
             self._enforce_output_lifecycle = False
 
         def _reserve_input(self, item_id: Any) -> str:
@@ -510,7 +504,8 @@ if _CORE_IMPORT_ERROR is None:
                 raise
 
         async def _record_send_failure(self, exc: Exception) -> None:
-            self._pending_send_failure = _sanitize_public_error(exc)
+            del exc
+            self._pending_send_failure = True
             with contextlib.suppress(Exception):
                 await self._wire.close()
 
@@ -1192,9 +1187,9 @@ if _CORE_IMPORT_ERROR is None:
                 self._consumed_correlations.clear()
                 self._cancelling_responses.clear()
 
-        def _take_send_failure(self) -> str | None:
+        def _take_send_failure(self) -> bool:
             failure, self._pending_send_failure = self._pending_send_failure, None
-            return failure
+            return failure is True
 
         async def _events(self) -> AsyncIterator[Any]:
             if self._terminal:
@@ -1204,7 +1199,7 @@ if _CORE_IMPORT_ERROR is None:
                 await self._terminate()
                 yield SessionFailure(
                     code="provider_send_failure",
-                    message=failure,
+                    message=_PROVIDER_SEND_FAILURE_MESSAGE,
                 )
                 return
             try:
@@ -1220,34 +1215,32 @@ if _CORE_IMPORT_ERROR is None:
                 if failure:
                     yield SessionFailure(
                         code="provider_send_failure",
-                        message=failure,
+                        message=_PROVIDER_SEND_FAILURE_MESSAGE,
                     )
                 elif exc.detail:
                     yield SessionFailure(
                         code="provider_eof",
-                        message=_sanitize_public_error(exc.detail),
+                        message=_PROVIDER_EOF_MESSAGE,
                     )
                 else:
                     yield SessionClosed()
             except asyncio.CancelledError:
                 await self._terminate()
                 raise
-            except Exception as exc:  # noqa: BLE001 - protocol errors converge here
+            except Exception:  # noqa: BLE001 - protocol errors converge here
                 failure = self._take_send_failure()
-                try:
+                with contextlib.suppress(Exception):
                     await self._terminate()
-                except Exception:  # noqa: BLE001 - public text is fixed and secret-safe
-                    message = "provider operation failed; cleanup failed"
-                else:
-                    message = _sanitize_public_error(exc)
                 failure_code = (
-                    "provider_send_failure"
-                    if failure is not None
-                    else "provider_protocol_failure"
+                    "provider_send_failure" if failure else "provider_protocol_failure"
                 )
                 yield SessionFailure(
                     code=failure_code,
-                    message=message,
+                    message=(
+                        _PROVIDER_SEND_FAILURE_MESSAGE
+                        if failure
+                        else _PROVIDER_PROTOCOL_FAILURE_MESSAGE
+                    ),
                 )
 
         async def _close(self) -> None:
