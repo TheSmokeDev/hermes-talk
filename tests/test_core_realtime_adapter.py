@@ -16,7 +16,9 @@ pytest.importorskip(
     reason="Hermes core API-v2 is optional for standalone Talk",
 )
 from agent.realtime_voice_provider import (
+    InputSpeechStarted,
     InputTranscript,
+    Interruption,
     OutputAudio,
     OutputTranscript,
     RealtimeAudioFormat,
@@ -278,6 +280,7 @@ def test_exact_api_v2_contract_and_fixed_capabilities():
             RealtimeCapability.EXPLICIT_RESPONSE,
             RealtimeCapability.RESPONSE_METADATA_ECHO,
             RealtimeCapability.OUTPUT_TRANSCRIPTION,
+            RealtimeCapability.RESPONSE_CANCELLATION,
         }
     )
 
@@ -2278,6 +2281,73 @@ def test_exact_input_item_identity_maps_partial_and_final_operator_transcripts()
     assert received[-1] == SessionClosed()
     assert harness.wire.closed is True
     assert not session._input_ledger
+
+
+def test_passive_speech_start_maps_exact_primitives_without_sending():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider().open_session(setup())
+        mapped = session._map_event(
+            {
+                "type": "input_audio_buffer.speech_started",
+                "item_id": "input-1",
+                "audio_start_ms": 7,
+            }
+        )
+        assert harness.wire.sent == []
+        for item_id, offset in (("", 0), ("input", True), ("input", 1.0), ("input", -1)):
+            with pytest.raises((TypeError, ValueError)):
+                session._map_event(
+                    {
+                        "type": "input_audio_buffer.speech_started",
+                        "item_id": item_id,
+                        "audio_start_ms": offset,
+                    }
+                )
+        return mapped
+
+    assert asyncio.run(scenario()) == InputSpeechStarted(
+        item_id="input-1", audio_start_ms=7
+    )
+
+
+def test_cancel_response_exact_authority_and_empty_cancelled_terminal():
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        bind_response(session, "token-1")
+        await session.cancel_response("resp-1")
+        with pytest.raises(ValueError):
+            await session.cancel_response("resp-1")
+        terminal = session._map_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-1",
+                    "status": "cancelled",
+                    "metadata": {"correlation": "token-1"},
+                    "output": [],
+                    "status_details": {
+                        "type": "cancelled",
+                        "reason": "client_cancelled",
+                    },
+                },
+            }
+        )
+        return session, terminal
+
+    session, terminal = asyncio.run(scenario())
+    cancel = harness.wire.sent[-1]
+    assert cancel["type"] == "response.cancel"
+    assert cancel["response_id"] == "resp-1"
+    assert cancel["event_id"].startswith("evt-")
+    assert terminal == Interruption(response_id="resp-1", turn_id="turn-41")
+    assert not session._active_responses
+    assert not session._cancelling_responses
+    assert session._completed_responses == {"resp-1": "token-1"}
 
 
 @pytest.mark.parametrize(

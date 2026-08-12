@@ -95,6 +95,16 @@ def build_core_response_create(
     }
 
 
+def build_core_response_cancel(*, response_id: str, event_id: str) -> dict[str, Any]:
+    """Build one exact response-local cancellation for the Hermes core lane."""
+
+    return {
+        "type": "response.cancel",
+        "event_id": event_id,
+        "response_id": response_id,
+    }
+
+
 def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
     """Map one provider-neutral command to OpenAI wire JSON."""
 
