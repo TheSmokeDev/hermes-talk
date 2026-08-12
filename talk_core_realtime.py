@@ -412,6 +412,7 @@ if _CORE_IMPORT_ERROR is None:
             self._provider_session_id: str | None = None
             self._terminal = False
             self._pending_send_failure: Exception | None = None
+            self._enforce_output_lifecycle = False
 
         def _reserve_input(self, item_id: Any) -> str:
             item_id = _validate_identifier(item_id, "item_id")
@@ -659,7 +660,15 @@ if _CORE_IMPORT_ERROR is None:
         ) -> None:
             if key not in self._response_lifecycle:
                 if event_type != _REQUIRED_OUTPUT_LIFECYCLE[0]:
-                    return
+                    if (
+                        not self._enforce_output_lifecycle
+                        or key[0] not in self._active_responses
+                    ):
+                        return
+                    raise ValueError(
+                        "output lifecycle is out of order: expected "
+                        f"{_REQUIRED_OUTPUT_LIFECYCLE[0]}, got {event_type}"
+                    )
                 self._response_lifecycle[key] = 1
                 return
             stage = self._response_lifecycle[key]
@@ -771,6 +780,10 @@ if _CORE_IMPORT_ERROR is None:
             if event_type == "response.created":
                 return self._bind_response_created(event)
             if event_type == "response.output_audio.delta":
+                response_id, _correlation, binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 delta = event.get("delta")
                 if not isinstance(delta, str) or not delta:
                     raise ValueError("output audio delta must be nonempty base64 text")
@@ -780,10 +793,6 @@ if _CORE_IMPORT_ERROR is None:
                     raise ValueError("output audio delta is malformed base64") from exc
                 if not data:
                     raise ValueError("output audio delta decoded to empty data")
-                response_id, _correlation, binding, item_id = (
-                    self._validate_active_response(event)
-                )
-                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
                 self._audio_delta_items.add((response_id, item_id))
@@ -965,6 +974,7 @@ if _CORE_IMPORT_ERROR is None:
                 )
                 return
             try:
+                self._enforce_output_lifecycle = True
                 while True:
                     wire_event = await self._wire.__anext__()
                     mapped = self._map_event(wire_event)
