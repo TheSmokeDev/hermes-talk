@@ -571,14 +571,11 @@ def test_explicit_output_protocol_violations_fail_closed(bad_event, match):
     if bad_event["type"] == "response.created":
         events = [bad_event]
     elif match == "item":
+        events = [created, *valid_output_lifecycle_events(correlation)[:-1], bad_event]
+    elif match == "base64":
         events = [
             created,
-            {
-                "type": "response.output_audio.delta",
-                "response_id": "resp-1",
-                "item_id": "item-1",
-                "delta": "cGNt",
-            },
+            *valid_output_lifecycle_events(correlation)[:2],
             bad_event,
         ]
     else:
@@ -611,6 +608,7 @@ def test_replayed_correlation_and_changed_item_identity_fail_closed():
     ]
     wrong_item_events = [
         created,
+        *valid_output_lifecycle_events(correlation)[:2],
         {
             "type": "response.output_audio.delta",
             "response_id": "resp-1",
@@ -1819,6 +1817,49 @@ def test_terminal_transcript_digest_mismatch_fails_closed_and_clears_all_respons
     assert len(failures) == 1
     assert failures[0].code == "provider_protocol_failure"
     assert "digest" in failures[0].message
+    assert not any(isinstance(event, ResponseCompleted) for event in received)
+    assert harness.wire.closed is True
+    assert session._terminal is True
+    assert not session._pending_responses
+    assert not session._active_responses
+    assert not session._response_items
+    assert not session._item_responses
+    assert not session._final_output_transcripts
+    assert not session._audio_delta_items
+    assert not session._audio_done_items
+    assert not session._output_item_added
+    assert not session._content_part_added
+    assert not session._content_part_done
+    assert not session._output_item_done
+    assert not session._conversation_item_done
+    assert not session._response_lifecycle
+    assert not session._completed_responses
+    assert not session._consumed_correlations
+
+
+def test_live_pre_start_audio_delta_fails_before_emission_and_cleans_all_response_state():
+    correlation = "token-1"
+    created = {
+        "type": "response.created",
+        "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
+    }
+    lifecycle = valid_output_lifecycle_events(
+        correlation, transcript="Exact words, exactly."
+    )
+    harness = Harness([created, lifecycle[2], *lifecycle])
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: correlation).open_session(setup())
+        await session.start_response(response_request())
+        return session, [event async for event in session.events()]
+
+    session, received = asyncio.run(scenario())
+    failures = [event for event in received if isinstance(event, SessionFailure)]
+    assert len(failures) == 1
+    assert failures[0].code == "provider_protocol_failure"
+    assert sum(isinstance(event, ResponseStarted) for event in received) == 1
+    assert not any(isinstance(event, OutputAudio) for event in received)
+    assert not any(isinstance(event, OutputTranscript) for event in received)
     assert not any(isinstance(event, ResponseCompleted) for event in received)
     assert harness.wire.closed is True
     assert session._terminal is True
