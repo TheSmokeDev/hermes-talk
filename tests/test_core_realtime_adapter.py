@@ -2476,6 +2476,77 @@ def test_send_failure_remains_visible_when_event_pump_is_already_waiting():
     assert "concurrent send exploded" in events[0].message
 
 
+@pytest.mark.parametrize(
+    "operation,marker",
+    [
+        ("send_audio", "Bearer sentinel-send-secret"),
+        ("start_response", "password=sentinel-response-secret"),
+    ],
+)
+def test_failure_paths_redact_credentials_and_release_raw_exceptions(operation, marker):
+    harness = Harness()
+    harness.wire.send_error = core_rt.OpenAIWireError(f"provider rejected {marker}")
+
+    async def scenario():
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        with pytest.raises(core_rt.OpenAIWireError):
+            if operation == "send_audio":
+                await session.send_audio(b"pcm")
+            else:
+                await session.start_response(response_request())
+        events = [event async for event in session.events()]
+        await asyncio.sleep(0)
+        return session, events
+
+    session, events = asyncio.run(scenario())
+    assert len(events) == 1
+    assert isinstance(events[0], SessionFailure)
+    assert events[0].code in {"provider_send_failure", "explicit_response_failed"}
+    assert marker not in repr(events)
+    assert marker not in repr(vars(session))
+    assert session._pending_send_failure is None
+    assert session._terminal is True
+    assert harness.wire.closed is True
+    assert not session._response_send_tasks
+    assert not session._detached_close_tasks
+
+
+def test_authority_validator_has_controlled_depth_and_node_budgets():
+    def nested(depth, leaf):
+        value = leaf
+        for _ in range(depth):
+            value = {"metadata": [value]}
+        return value
+
+    accepted = {"type": "session.updated", "metadata": nested(32, {"safe": True})}
+    core_rt._validate_output_event_authority(accepted)
+
+    forbidden = {"type": "session.updated", "metadata": nested(32, {"tool": "blocked"})}
+    with pytest.raises(ValueError, match="forbidden structured authority"):
+        core_rt._validate_output_event_authority(forbidden)
+
+    excessive = {"type": "session.updated", "metadata": nested(33, {"safe": True})}
+    with pytest.raises(ValueError, match="depth") as depth_error:
+        core_rt._validate_output_event_authority(excessive)
+    assert not isinstance(depth_error.value, RecursionError)
+
+    fanout = {"type": "session.updated", "metadata": [{"safe": True}] * 4097}
+    with pytest.raises(ValueError, match="node"):
+        core_rt._validate_output_event_authority(fanout)
+
+    harness = Harness()
+
+    async def scenario():
+        session = await harness.provider().open_session(setup())
+        before = session._provider_session_id
+        with pytest.raises(ValueError, match="depth"):
+            session._map_event(excessive)
+        return session, before
+
+    session, before = asyncio.run(scenario())
+    assert session._provider_session_id == before is None
+
+
 def test_exact_input_item_identity_maps_partial_and_final_operator_transcripts():
     events = [
         {"type": "session.created", "session": {"id": "session-1"}},
@@ -2693,6 +2764,78 @@ def test_cancel_send_and_provider_terminal_are_linearized_in_both_race_orders():
 
     asyncio.run(terminal_wins())
     asyncio.run(send_failure_wins())
+
+
+def test_eof_cleanup_does_not_revoke_terminal_supersession_of_late_cancel_failure():
+    class RetainedCancelWire(FakeWire):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+            self.cancel_started = asyncio.Event()
+            self.release_cancel = asyncio.Event()
+
+        async def send_json(self, messages):
+            messages = tuple(messages)
+            self.sent.extend(messages)
+            if messages[0]["type"] == "response.cancel":
+                self.cancel_started.set()
+                await self.release_cancel.wait()
+                raise RuntimeError("late cancel secret-free failure")
+
+        async def __anext__(self):
+            event = await self.incoming.get()
+            if event is None:
+                raise core_rt.OpenAIWireEOF("")
+            return event
+
+        async def close(self):
+            if not self.closed:
+                self.closed = True
+                self.incoming.put_nowait(None)
+
+    async def scenario():
+        harness = Harness()
+        harness.wire = RetainedCancelWire()
+        session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
+        await session.start_response(response_request())
+        stream = session.events()
+        harness.wire.incoming.put_nowait(
+            {
+                "type": "response.created",
+                "response": {"id": "resp-1", "metadata": {"correlation": "token-1"}},
+            }
+        )
+        assert await anext(stream) == ResponseStarted(response_id="resp-1", turn_id="turn-41")
+        waiter = asyncio.create_task(session.cancel_response("resp-1"))
+        await harness.wire.cancel_started.wait()
+        harness.wire.incoming.put_nowait(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-1",
+                    "status": "cancelled",
+                    "metadata": {"correlation": "token-1"},
+                    "output": [],
+                    "status_details": {"type": "cancelled", "reason": "client_cancelled"},
+                },
+            }
+        )
+        assert await anext(stream) == Interruption(response_id="resp-1", turn_id="turn-41")
+        harness.wire.incoming.put_nowait(None)
+        assert await anext(stream) == SessionClosed()
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        harness.wire.release_cancel.set()
+        await waiter
+        await asyncio.sleep(0)
+        assert session._terminal_failure is None
+        assert session._pending_send_failure is None
+        assert not session._terminal_cancel_supersessions
+        assert not session._in_flight_response_cancellations
+        assert not session._response_cancellation_tasks
+        assert not session._detached_close_tasks
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
