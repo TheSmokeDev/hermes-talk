@@ -700,7 +700,7 @@ def test_explicit_output_protocol_violations_fail_closed(bad_event, match):
 
     received = asyncio.run(scenario())
     assert isinstance(received[-1], SessionFailure)
-    assert match in received[-1].message
+    assert received[-1].message == "provider protocol failure"
     assert harness.wire.closed is True
 
 
@@ -733,7 +733,7 @@ def test_replayed_correlation_and_changed_item_identity_fail_closed():
             "delta": "cGNt",
         },
     ]
-    for events, match in ((replay_events, "replayed"), (wrong_item_events, "identity")):
+    for events in (replay_events, wrong_item_events):
         harness = Harness(events)
 
         async def scenario(harness=harness, correlation=correlation):
@@ -744,7 +744,7 @@ def test_replayed_correlation_and_changed_item_identity_fail_closed():
 
         received = asyncio.run(scenario())
         assert isinstance(received[-1], SessionFailure)
-        assert match in received[-1].message
+        assert received[-1].message == "provider protocol failure"
 
 
 def test_exact_setup_formats_are_validated_before_credentials_or_network():
@@ -1805,7 +1805,7 @@ def test_every_output_event_envelope_authority_fails_before_emission(
 
     received = asyncio.run(scenario())
     assert isinstance(received[-1], SessionFailure)
-    assert "authority" in received[-1].message
+    assert received[-1].message == "provider protocol failure"
     assert not any(isinstance(event, forbidden_output) for event in received)
     assert not any(isinstance(event, ResponseCompleted) for event in received)
     assert harness.wire.closed is True
@@ -2003,7 +2003,7 @@ def test_output_event_envelope_authority_fails_before_response_started():
 
     session, received = asyncio.run(scenario())
     assert isinstance(received[-1], SessionFailure)
-    assert "authority" in received[-1].message
+    assert received[-1].message == "provider protocol failure"
     assert not any(isinstance(event, ResponseStarted) for event in received)
     assert not any(isinstance(event, ResponseCompleted) for event in received)
     assert session._terminal is True
@@ -2056,7 +2056,7 @@ def test_terminal_transcript_digest_mismatch_fails_closed_and_clears_all_respons
     failures = [event for event in received if isinstance(event, SessionFailure)]
     assert len(failures) == 1
     assert failures[0].code == "provider_protocol_failure"
-    assert "digest" in failures[0].message
+    assert failures[0].message == "provider protocol failure"
     assert not any(isinstance(event, ResponseCompleted) for event in received)
     assert harness.wire.closed is True
     assert session._terminal is True
@@ -2433,7 +2433,7 @@ def test_send_failure_closes_and_remains_visible_as_one_terminal_event():
     assert harness.wire.closed is True
     assert len(events) == 1
     assert isinstance(events[0], SessionFailure)
-    assert "send exploded" in events[0].message
+    assert events[0].message == "provider send failed"
 
 
 def test_send_failure_remains_visible_when_event_pump_is_already_waiting():
@@ -2473,37 +2473,124 @@ def test_send_failure_remains_visible_when_event_pump_is_already_waiting():
     assert len(events) == 1
     assert isinstance(events[0], SessionFailure)
     assert events[0].code == "provider_send_failure"
-    assert "concurrent send exploded" in events[0].message
+    assert events[0].message == "provider send failed"
 
 
 @pytest.mark.parametrize(
-    "operation,marker",
+    ("operation", "provider_detail", "expected_code", "expected_message"),
     [
-        ("send_audio", "Bearer sentinel-send-secret"),
-        ("start_response", "password=sentinel-response-secret"),
+        (
+            "send_audio",
+            "arbitrary-sentinel-send Bearer sentinel-send-secret",
+            "provider_send_failure",
+            "provider send failed",
+        ),
+        (
+            "start_response",
+            "arbitrary-sentinel-response password=sentinel-response-secret",
+            "explicit_response_failed",
+            "explicit response provider send failed",
+        ),
+        (
+            "protocol",
+            "arbitrary-sentinel-protocol token=sentinel-protocol-secret",
+            "provider_protocol_failure",
+            "provider protocol failure",
+        ),
+        (
+            "eof",
+            "arbitrary-sentinel-eof api_key=sentinel-eof-secret",
+            "provider_eof",
+            "provider connection closed unexpectedly",
+        ),
     ],
 )
-def test_failure_paths_redact_credentials_and_release_raw_exceptions(operation, marker):
+def test_provider_failures_use_fixed_public_receipts_and_release_raw_detail(
+    operation, provider_detail, expected_code, expected_message
+):
     harness = Harness()
-    harness.wire.send_error = core_rt.OpenAIWireError(f"provider rejected {marker}")
+    if operation in {"send_audio", "start_response"}:
+        harness.wire.send_error = core_rt.OpenAIWireError(provider_detail)
+    elif operation == "protocol":
+        harness.wire.events = iter(
+            ({"type": "error", "error": {"message": provider_detail}},)
+        )
+    else:
+        harness.wire.events = iter((core_rt.OpenAIWireEOF(provider_detail),))
 
     async def scenario():
         session = await harness.provider(token_factory=lambda: "token-1").open_session(setup())
-        with pytest.raises(core_rt.OpenAIWireError):
-            if operation == "send_audio":
-                await session.send_audio(b"pcm")
-            else:
-                await session.start_response(response_request())
+        if operation in {"send_audio", "start_response"}:
+            with pytest.raises(core_rt.OpenAIWireError):
+                if operation == "send_audio":
+                    await session.send_audio(b"pcm")
+                else:
+                    await session.start_response(response_request())
         events = [event async for event in session.events()]
         await asyncio.sleep(0)
         return session, events
 
     session, events = asyncio.run(scenario())
-    assert len(events) == 1
-    assert isinstance(events[0], SessionFailure)
-    assert events[0].code in {"provider_send_failure", "explicit_response_failed"}
-    assert marker not in repr(events)
-    assert marker not in repr(vars(session))
+    assert events == [SessionFailure(code=expected_code, message=expected_message)]
+    assert provider_detail not in repr(events)
+    assert provider_detail not in repr(vars(session))
+    assert session._pending_send_failure is None
+    assert session._terminal is True
+    assert harness.wire.closed is True
+    assert not session._response_send_tasks
+    assert not session._detached_close_tasks
+
+
+def test_retained_send_failure_wins_over_secondary_protocol_failure_receipt():
+    provider_detail = "arbitrary-sentinel-race Bearer sentinel-race-secret"
+
+    class SendProtocolRaceWire(FakeWire):
+        def __init__(self):
+            super().__init__()
+            self.receive_started = asyncio.Event()
+            self.release_protocol = asyncio.Event()
+            self.send_started = asyncio.Event()
+            self.release_send = asyncio.Event()
+
+        async def __anext__(self):
+            self.receive_started.set()
+            await self.release_protocol.wait()
+            return {"type": "error", "error": {"message": "secondary protocol detail"}}
+
+        async def send_json(self, messages):
+            del messages
+            self.send_started.set()
+            await self.release_send.wait()
+            raise core_rt.OpenAIWireError(provider_detail)
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        harness = Harness()
+        harness.wire = SendProtocolRaceWire()
+        session = await harness.provider().open_session(setup())
+        pump = asyncio.create_task(_collect(session))
+        await harness.wire.receive_started.wait()
+        sender = asyncio.create_task(session.send_audio(b"pcm"))
+        await harness.wire.send_started.wait()
+        harness.wire.release_send.set()
+        with pytest.raises(core_rt.OpenAIWireError):
+            await sender
+        harness.wire.release_protocol.set()
+        events = await pump
+        await asyncio.sleep(0)
+        return session, harness, events
+
+    async def _collect(session):
+        return [event async for event in session.events()]
+
+    session, harness, events = asyncio.run(scenario())
+    assert events == [
+        SessionFailure(code="provider_send_failure", message="provider send failed")
+    ]
+    assert provider_detail not in repr(events)
+    assert provider_detail not in repr(vars(session))
     assert session._pending_send_failure is None
     assert session._terminal is True
     assert harness.wire.closed is True
@@ -2903,7 +2990,7 @@ def test_protocol_violations_emit_one_terminal_failure_and_close(events, match):
     received = asyncio.run(scenario())
     failures = [event for event in received if isinstance(event, SessionFailure)]
     assert len(failures) == 1
-    assert match in failures[0].message
+    assert failures[0].message == "provider protocol failure"
     assert harness.wire.closed is True
 
 
@@ -2921,7 +3008,7 @@ def test_input_ledger_capacity_is_non_evicting_and_terminal():
     received = asyncio.run(scenario())
     assert len(received) == 1
     assert isinstance(received[0], SessionFailure)
-    assert "capacity" in received[0].message
+    assert received[0].message == "provider protocol failure"
     assert harness.wire.closed is True
 
 
