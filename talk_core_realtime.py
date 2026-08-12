@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
+import re
 import secrets
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -152,6 +154,14 @@ DEFAULT_INPUT_LEDGER_CAPACITY = 1024
 MAX_IDENTIFIER_LENGTH = 512
 MAX_TRANSCRIPT_LENGTH = 1_000_000
 PROVIDER_NAME = "talk_openai_realtime"
+_PUBLIC_ERROR_SECRET = re.compile(
+    r"(?i)(?:bearer\s+[^\s,;]+|(?:password|api[_-]?key|token)\s*[=:]\s*[^\s,;]+|sk-[A-Za-z0-9_-]{8,})"
+)
+
+
+def _sanitize_public_error(exc: BaseException | str) -> str:
+    text = str(exc).strip() or "provider operation failed"
+    return _PUBLIC_ERROR_SECRET.sub("<redacted-secret>", text)
 
 
 def core_provider_available() -> bool:
@@ -286,27 +296,40 @@ if _CORE_IMPORT_ERROR is None:
     _FORBIDDEN_OUTPUT_AUTHORITY_TYPES = frozenset(
         {"function_call", "function_call_output", "tool", "tool_call"}
     )
+    MAX_AUTHORITY_VALIDATION_DEPTH = 66
+    MAX_AUTHORITY_VALIDATION_NODES = 4096
 
     def _validate_output_event_authority(value: Any) -> None:
-        if isinstance(value, Mapping):
-            forbidden = _FORBIDDEN_OUTPUT_AUTHORITY_KEYS.intersection(value)
-            if forbidden:
-                raise ValueError(
-                    f"output event has forbidden structured authority: {sorted(forbidden)[0]}"
-                )
-            discriminator = value.get("type")
-            if (
-                isinstance(discriminator, str)
-                and discriminator in _FORBIDDEN_OUTPUT_AUTHORITY_TYPES
+        pending = [(value, 0)]
+        visited = 0
+        while pending:
+            current, depth = pending.pop()
+            visited += 1
+            if visited > MAX_AUTHORITY_VALIDATION_NODES:
+                raise ValueError("output event authority node limit exceeded")
+            if depth > MAX_AUTHORITY_VALIDATION_DEPTH:
+                raise ValueError("output event authority depth limit exceeded")
+            if isinstance(current, Mapping):
+                forbidden = _FORBIDDEN_OUTPUT_AUTHORITY_KEYS.intersection(current)
+                if forbidden:
+                    raise ValueError(
+                        "output event has forbidden structured authority: "
+                        f"{sorted(forbidden)[0]}"
+                    )
+                discriminator = current.get("type")
+                if (
+                    isinstance(discriminator, str)
+                    and discriminator in _FORBIDDEN_OUTPUT_AUTHORITY_TYPES
+                ):
+                    raise ValueError(
+                        "output event has forbidden structured authority type: "
+                        f"{discriminator}"
+                    )
+                pending.extend((nested, depth + 1) for nested in current.values())
+            elif isinstance(current, Sequence) and not isinstance(
+                current, (str, bytes, bytearray)
             ):
-                raise ValueError(
-                    f"output event has forbidden structured authority type: {discriminator}"
-                )
-            for nested in value.values():
-                _validate_output_event_authority(nested)
-        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            for nested in value:
-                _validate_output_event_authority(nested)
+                pending.extend((nested, depth + 1) for nested in current)
 
     @dataclass(frozen=True, slots=True)
     class _ResponseBinding:
@@ -442,10 +465,14 @@ if _CORE_IMPORT_ERROR is None:
             self._completed_responses: OrderedDict[str, str] = OrderedDict()
             self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
             self._cancelling_responses: set[str] = set()
+            # Exact cancellation operations whose provider terminal won.  This
+            # authority outlives response/session ledgers only until that
+            # already-bounded retained operation settles.
+            self._terminal_cancel_supersessions: set[str] = set()
             self._input_ledger: dict[str, str | None] = {}
             self._provider_session_id: str | None = None
             self._terminal = False
-            self._pending_send_failure: Exception | None = None
+            self._pending_send_failure: str | None = None
             self._enforce_output_lifecycle = False
 
         def _reserve_input(self, item_id: Any) -> str:
@@ -483,16 +510,9 @@ if _CORE_IMPORT_ERROR is None:
                 raise
 
         async def _record_send_failure(self, exc: Exception) -> None:
-            if self._pending_send_failure is None:
-                self._pending_send_failure = exc
-            try:
+            self._pending_send_failure = _sanitize_public_error(exc)
+            with contextlib.suppress(Exception):
                 await self._wire.close()
-            except Exception as close_exc:  # noqa: BLE001 - retain cleanup class
-                if self._pending_send_failure is exc:
-                    self._pending_send_failure = RuntimeError(
-                        f"{type(exc).__name__}: {exc}; cleanup failed: "
-                        f"{type(close_exc).__name__}"
-                    )
 
         async def _submit_tool_results(self, batch_id, results) -> None:
             del batch_id, results
@@ -567,6 +587,7 @@ if _CORE_IMPORT_ERROR is None:
                 async with self._response_lock:
                     terminal_won = (
                         self._completed_responses.get(response_id) == correlation
+                        or response_id in self._terminal_cancel_supersessions
                     )
                     if not terminal_won:
                         self._cancelling_responses.discard(response_id)
@@ -578,6 +599,8 @@ if _CORE_IMPORT_ERROR is None:
                 async with self._response_lock:
                     self._cancelling_responses.discard(response_id)
                 raise
+            finally:
+                self._terminal_cancel_supersessions.discard(response_id)
 
         def _input_transcript(self, event: Mapping[str, Any], *, final: bool) -> InputTranscript:
             explicit_finality = event.get("final")
@@ -919,6 +942,8 @@ if _CORE_IMPORT_ERROR is None:
                 self._response_lifecycle.pop(key, None)
             self._cancelling_responses.remove(response_id)
             self._completed_responses[response_id] = correlation
+            if response_id in self._in_flight_response_cancellations:
+                self._terminal_cancel_supersessions.add(response_id)
             return Interruption(response_id=response_id, turn_id=binding.turn_marker)
 
         def _map_event(self, event: Mapping[str, Any]):
@@ -1147,6 +1172,7 @@ if _CORE_IMPORT_ERROR is None:
             try:
                 await self._wire.close()
             finally:
+                self._pending_send_failure = None
                 self._input_ledger.clear()
                 self._pending_responses.clear()
                 self._active_responses.clear()
@@ -1166,7 +1192,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._consumed_correlations.clear()
                 self._cancelling_responses.clear()
 
-        def _take_send_failure(self) -> Exception | None:
+        def _take_send_failure(self) -> str | None:
             failure, self._pending_send_failure = self._pending_send_failure, None
             return failure
 
@@ -1174,11 +1200,11 @@ if _CORE_IMPORT_ERROR is None:
             if self._terminal:
                 return
             failure = self._take_send_failure()
-            if failure is not None:
+            if failure:
                 await self._terminate()
                 yield SessionFailure(
                     code="provider_send_failure",
-                    message=f"{type(failure).__name__}: {failure}",
+                    message=failure,
                 )
                 return
             try:
@@ -1191,13 +1217,16 @@ if _CORE_IMPORT_ERROR is None:
             except OpenAIWireEOF as exc:
                 failure = self._take_send_failure()
                 await self._terminate()
-                if failure is not None:
+                if failure:
                     yield SessionFailure(
                         code="provider_send_failure",
-                        message=f"{type(failure).__name__}: {failure}",
+                        message=failure,
                     )
                 elif exc.detail:
-                    yield SessionFailure(code="provider_eof", message=exc.detail)
+                    yield SessionFailure(
+                        code="provider_eof",
+                        message=_sanitize_public_error(exc.detail),
+                    )
                 else:
                     yield SessionClosed()
             except asyncio.CancelledError:
@@ -1205,15 +1234,12 @@ if _CORE_IMPORT_ERROR is None:
                 raise
             except Exception as exc:  # noqa: BLE001 - protocol errors converge here
                 failure = self._take_send_failure()
-                root = failure or exc
                 try:
                     await self._terminate()
-                except Exception as close_exc:  # noqa: BLE001 - report cleanup class only
-                    message = (
-                        f"{type(root).__name__}: {root}; cleanup failed: {type(close_exc).__name__}"
-                    )
+                except Exception:  # noqa: BLE001 - public text is fixed and secret-safe
+                    message = "provider operation failed; cleanup failed"
                 else:
-                    message = f"{type(root).__name__}: {root}"
+                    message = _sanitize_public_error(exc)
                 failure_code = (
                     "provider_send_failure"
                     if failure is not None
