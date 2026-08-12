@@ -1,4 +1,4 @@
-"""Defensive Hermes core API-v2 input-only OpenAI Realtime adapter.
+"""Defensive Hermes core API-v2 OpenAI Realtime adapter.
 
 The optional core boundary is deliberately contained in this module.  Legacy
 Talk never imports Hermes core through its OpenAI transport, and this module
@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Callable, Mapping
+import binascii
+import secrets
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -19,16 +23,23 @@ try:
         OpenAIWireEOF,
         OpenAIWireError,
         _OpenAIWireSession,
+        build_core_response_create,
     )
 except ImportError:  # pragma: no cover - flat-module fallback
     import talk_auth
     import talk_config
     import talk_wire
-    from talk_openai_realtime import OpenAIWireEOF, OpenAIWireError, _OpenAIWireSession
+    from talk_openai_realtime import (
+        OpenAIWireEOF,
+        OpenAIWireError,
+        _OpenAIWireSession,
+        build_core_response_create,
+    )
 
 _CORE_IMPORT_ERROR: BaseException | None = None
+_EXPLICIT_OUTPUT_AVAILABLE = False
 try:
-    from agent import realtime_voice_provider as _core_api
+    from agent import realtime_voice_provider as _core_contract
     from agent.realtime_voice_provider import (
         REALTIME_VOICE_PROVIDER_API_VERSION,
         InputTranscript,
@@ -70,31 +81,57 @@ try:
     ):
         if not isinstance(enum_type, type) or any(not hasattr(enum_type, name) for name in names):
             raise ImportError("Hermes realtime voice API-v2 enum shape is incompatible")
+    try:
+        RealtimeInputAudioFormat = _core_contract.RealtimeInputAudioFormat
+        RealtimeOutputAudioFormat = _core_contract.RealtimeOutputAudioFormat
+        RealtimeResponseRequest = _core_contract.RealtimeResponseRequest
+        ResponseStarted = _core_contract.ResponseStarted
+        OutputAudio = _core_contract.OutputAudio
+        OutputTranscript = _core_contract.OutputTranscript
+        ResponseCompleted = _core_contract.ResponseCompleted
+        _EXPLICIT_OUTPUT_AVAILABLE = all(
+            isinstance(symbol, type)
+            for symbol in (
+                RealtimeInputAudioFormat,
+                RealtimeOutputAudioFormat,
+                RealtimeResponseRequest,
+                ResponseStarted,
+                OutputAudio,
+                OutputTranscript,
+                ResponseCompleted,
+            )
+        ) and all(
+            hasattr(RealtimeCapability, name)
+            for name in (
+                "EXPLICIT_RESPONSE",
+                "RESPONSE_METADATA_ECHO",
+                "OUTPUT_TRANSCRIPTION",
+            )
+        )
+    except (AttributeError, ImportError):
+        _EXPLICIT_OUTPUT_AVAILABLE = False
 except Exception as exc:  # noqa: BLE001 - optional core must never poison legacy imports
     _CORE_IMPORT_ERROR = exc
 
-_EXPLICIT_RESPONSE_SYMBOL_NAMES = (
-    "RealtimeInputAudioFormat",
-    "RealtimeOutputAudioFormat",
-    "RealtimeResponseRequest",
-    "ResponseStarted",
-    "OutputAudio",
-    "OutputTranscript",
-    "ResponseCompleted",
-)
-_CANCELLATION_SYMBOL_NAMES = ("InputSpeechStarted", "Interruption")
+# Compatibility diagnostics intentionally distinguish the detected data surface
+# from the complete production capability (which also requires enum claims and
+# the concrete mapper/hook implemented below).
 _EXPLICIT_RESPONSE_SURFACE_AVAILABLE = _CORE_IMPORT_ERROR is None and all(
-    isinstance(getattr(_core_api, name, None), type)
-    for name in _EXPLICIT_RESPONSE_SYMBOL_NAMES
-)
-_RESPONSE_CANCELLATION_SURFACE_AVAILABLE = (
-    _CORE_IMPORT_ERROR is None
-    and all(
-        isinstance(getattr(_core_api, name, None), type)
-        for name in _CANCELLATION_SYMBOL_NAMES
+    isinstance(getattr(_core_contract, name, None), type)
+    for name in (
+        "RealtimeInputAudioFormat",
+        "RealtimeOutputAudioFormat",
+        "RealtimeResponseRequest",
+        "ResponseStarted",
+        "OutputAudio",
+        "OutputTranscript",
+        "ResponseCompleted",
     )
-    and hasattr(RealtimeCapability, "RESPONSE_CANCELLATION")
 )
+_RESPONSE_CANCELLATION_SURFACE_AVAILABLE = _CORE_IMPORT_ERROR is None and all(
+    isinstance(getattr(_core_contract, name, None), type)
+    for name in ("InputSpeechStarted", "Interruption")
+) and hasattr(RealtimeCapability, "RESPONSE_CANCELLATION")
 
 DEFAULT_INPUT_LEDGER_CAPACITY = 1024
 MAX_IDENTIFIER_LENGTH = 512
@@ -106,6 +143,12 @@ def core_provider_available() -> bool:
     """Return only whether the exact optional Hermes core API-v2 is importable."""
 
     return _CORE_IMPORT_ERROR is None
+
+
+def explicit_output_available() -> bool:
+    """Return whether the installed API-v2 exposes native explicit output."""
+
+    return _CORE_IMPORT_ERROR is None and _EXPLICIT_OUTPUT_AVAILABLE
 
 
 def core_provider_diagnostic() -> dict[str, bool]:
@@ -128,8 +171,8 @@ if _CORE_IMPORT_ERROR is None:
     SUPPORTED_AUDIO_FORMAT = RealtimeAudioFormat(
         mime_type="audio/pcm", sample_rate_hz=24_000, channels=1
     )
-    if _EXPLICIT_RESPONSE_SURFACE_AVAILABLE:
-        SUPPORTED_INPUT_AUDIO_FORMAT = _core_api.RealtimeInputAudioFormat(
+    SUPPORTED_OUTPUT_AUDIO_FORMAT = (
+        RealtimeOutputAudioFormat(
             mime_type="audio/pcm",
             sample_rate_hz=24_000,
             channels=1,
@@ -137,7 +180,11 @@ if _CORE_IMPORT_ERROR is None:
             sample_width_bytes=2,
             endianness="little",
         )
-        SUPPORTED_OUTPUT_AUDIO_FORMAT = _core_api.RealtimeOutputAudioFormat(
+        if _EXPLICIT_OUTPUT_AVAILABLE
+        else None
+    )
+    SUPPORTED_INPUT_AUDIO_FORMAT = (
+        RealtimeInputAudioFormat(
             mime_type="audio/pcm",
             sample_rate_hz=24_000,
             channels=1,
@@ -145,15 +192,84 @@ if _CORE_IMPORT_ERROR is None:
             sample_width_bytes=2,
             endianness="little",
         )
-    else:
-        SUPPORTED_INPUT_AUDIO_FORMAT = None
-        SUPPORTED_OUTPUT_AUDIO_FORMAT = None
+        if _EXPLICIT_OUTPUT_AVAILABLE
+        else None
+    )
     CORE_CAPABILITIES = frozenset(
+        {RealtimeCapability.INPUT_TRANSCRIPTION, RealtimeCapability.INPUT_COMMIT_EVENTS}
+        | (
+            {
+                RealtimeCapability.EXPLICIT_RESPONSE,
+                RealtimeCapability.RESPONSE_METADATA_ECHO,
+                RealtimeCapability.OUTPUT_TRANSCRIPTION,
+            }
+            if _EXPLICIT_OUTPUT_AVAILABLE
+            else set()
+        )
+    )
+    _OUTPUT_ITEM_KEYS = frozenset({"id", "type", "role", "status", "content"})
+    _OUTPUT_ITEM_ALLOWED_KEYS = _OUTPUT_ITEM_KEYS | {"object"}
+    _OUTPUT_AUDIO_PART_KEYS = frozenset({"type", "transcript"})
+    _OUTPUT_EVENT_TYPES = frozenset(
         {
-            RealtimeCapability.INPUT_TRANSCRIPTION,
-            RealtimeCapability.INPUT_COMMIT_EVENTS,
+            "response.created",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "conversation.item.done",
+            "response.done",
         }
     )
+    _FORBIDDEN_OUTPUT_AUTHORITY_KEYS = frozenset(
+        {
+            "tool_calls",
+            "function_call",
+            "function",
+            "tool",
+            "tools",
+            "tool_choice",
+            "call_id",
+            "name",
+            "arguments",
+            "function_call_output",
+        }
+    )
+    _FORBIDDEN_OUTPUT_AUTHORITY_TYPES = frozenset(
+        {"function_call", "function_call_output", "tool", "tool_call"}
+    )
+
+    def _validate_output_event_authority(value: Any) -> None:
+        if isinstance(value, Mapping):
+            forbidden = _FORBIDDEN_OUTPUT_AUTHORITY_KEYS.intersection(value)
+            if forbidden:
+                raise ValueError(
+                    f"output event has forbidden structured authority: {sorted(forbidden)[0]}"
+                )
+            discriminator = value.get("type")
+            if (
+                isinstance(discriminator, str)
+                and discriminator in _FORBIDDEN_OUTPUT_AUTHORITY_TYPES
+            ):
+                raise ValueError(
+                    f"output event has forbidden structured authority type: {discriminator}"
+                )
+            for nested in value.values():
+                _validate_output_event_authority(nested)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for nested in value:
+                _validate_output_event_authority(nested)
+
+    @dataclass(frozen=True, slots=True)
+    class _ResponseBinding:
+        durable_session_id: str
+        assistant_message_id: int
+        turn_marker: str
+        content_digest: str
 
     def _validate_identifier(value: Any, field_name: str) -> str:
         if (
@@ -206,27 +322,30 @@ if _CORE_IMPORT_ERROR is None:
             raise TypeError("setup must be a RealtimeVoiceSetup")
         if setup.tools:
             raise ValueError("the input-only core provider does not accept tools")
-        input_audio = getattr(setup, "input_audio", None)
-        output_audio = getattr(setup, "output_audio", None)
-        if input_audio is None and output_audio is None:
-            input_audio = setup.audio
-            output_audio = setup.audio
-        if input_audio is not None and input_audio not in {
-            SUPPORTED_AUDIO_FORMAT,
-            SUPPORTED_INPUT_AUDIO_FORMAT,
-        }:
+        if setup.audio is not None and setup.audio != SUPPORTED_AUDIO_FORMAT:
             raise ValueError("the input-only core provider requires audio/pcm at 24000 Hz mono")
-        if output_audio is not None and output_audio not in {
-            SUPPORTED_AUDIO_FORMAT,
-            SUPPORTED_OUTPUT_AUDIO_FORMAT,
-        }:
-            raise ValueError("the input-only core provider requires audio/pcm at 24000 Hz mono")
-        if getattr(setup, "automatic_response", False) is not False:
-            raise ValueError("automatic_response must remain exactly false in the core lane")
+        if _EXPLICIT_OUTPUT_AVAILABLE:
+            if (
+                setup.input_audio is not None
+                and setup.input_audio != SUPPORTED_INPUT_AUDIO_FORMAT
+            ):
+                raise ValueError("the core provider requires exact 24kHz mono PCM input audio")
+            if (
+                setup.output_audio is not None
+                and setup.output_audio != SUPPORTED_OUTPUT_AUDIO_FORMAT
+            ):
+                raise ValueError("the core provider requires exact 24kHz mono PCM output audio")
+            if setup.automatic_response:
+                raise ValueError("automatic_response must remain false in the core lane")
         options = setup.provider_options
-        unknown = set(options) - {"capabilities"}
+        unknown = set(options) - {"automatic_response", "capabilities"}
         if unknown:
             raise ValueError(f"unsupported provider option: {sorted(unknown)[0]}")
+        automatic_response = options.get("automatic_response", False)
+        if not isinstance(automatic_response, bool):
+            raise TypeError("automatic_response must be boolean")
+        if automatic_response:
+            raise ValueError("automatic_response must remain false in the core lane")
         if "capabilities" in options:
             _requested_capabilities(options["capabilities"])
 
@@ -250,11 +369,32 @@ if _CORE_IMPORT_ERROR is None:
             wire,
             audio_format: RealtimeAudioFormat,
             ledger_capacity: int,
+            voice: str,
+            response_ledger_capacity: int,
+            token_factory: Callable[[], str],
         ) -> None:
             super().__init__(CORE_CAPABILITIES)
             self._wire = wire
             self._audio_format = audio_format
             self._ledger_capacity = ledger_capacity
+            self._voice = voice
+            self._response_ledger_capacity = response_ledger_capacity
+            self._token_factory = token_factory
+            self._response_lock = asyncio.Lock()
+            self._pending_responses: dict[str, _ResponseBinding] = {}
+            self._active_responses: dict[str, tuple[str, _ResponseBinding]] = {}
+            self._response_items: dict[str, str] = {}
+            self._item_responses: dict[str, str] = {}
+            self._final_output_transcripts: dict[tuple[str, str], str] = {}
+            self._audio_delta_items: set[tuple[str, str]] = set()
+            self._audio_done_items: set[tuple[str, str]] = set()
+            self._output_item_added: set[tuple[str, str]] = set()
+            self._content_part_added: set[tuple[str, str]] = set()
+            self._content_part_done: set[tuple[str, str]] = set()
+            self._output_item_done: set[tuple[str, str]] = set()
+            self._conversation_item_done: set[tuple[str, str]] = set()
+            self._completed_responses: OrderedDict[str, str] = OrderedDict()
+            self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
             self._input_ledger: dict[str, str | None] = {}
             self._provider_session_id: str | None = None
             self._terminal = False
@@ -307,6 +447,49 @@ if _CORE_IMPORT_ERROR is None:
             del batch_id, results
             raise RuntimeError("the input-only core provider does not accept tool results")
 
+        async def _start_response(self, request) -> None:
+            if request.output_audio_format != SUPPORTED_OUTPUT_AUDIO_FORMAT:
+                raise ValueError("explicit response output audio format is unsupported")
+            correlation = _validate_identifier(self._token_factory(), "correlation token")
+            binding = _ResponseBinding(
+                durable_session_id=request.durable_session_id,
+                assistant_message_id=request.assistant_message_id,
+                turn_marker=request.turn_marker,
+                content_digest=request.content_digest,
+            )
+            async with self._response_lock:
+                active_correlations = {
+                    active_correlation
+                    for active_correlation, _binding in self._active_responses.values()
+                }
+                if (
+                    correlation in self._pending_responses
+                    or correlation in self._consumed_correlations
+                    or correlation in active_correlations
+                ):
+                    raise ValueError("correlation token was already used")
+                accepted_responses = (
+                    len(self._pending_responses)
+                    + len(self._active_responses)
+                    + len(self._completed_responses)
+                )
+                if accepted_responses >= self._response_ledger_capacity:
+                    raise ValueError("response lifetime capacity exhausted")
+                self._pending_responses[correlation] = binding
+            message = build_core_response_create(
+                canonical_text=request.canonical_text,
+                correlation=correlation,
+                voice=self._voice,
+                event_id=f"evt-{secrets.token_urlsafe(24)}",
+            )
+            try:
+                await self._send_wire(message)
+            except BaseException:
+                async with self._response_lock:
+                    if self._pending_responses.get(correlation) == binding:
+                        del self._pending_responses[correlation]
+                raise
+
         def _input_transcript(self, event: Mapping[str, Any], *, final: bool) -> InputTranscript:
             explicit_finality = event.get("final")
             if "final" in event and not isinstance(explicit_finality, bool):
@@ -330,10 +513,198 @@ if _CORE_IMPORT_ERROR is None:
                 provenance=TranscriptProvenance.OPERATOR_INPUT,
             )
 
+        @staticmethod
+        def _response_metadata(response: Mapping[str, Any]) -> str:
+            metadata = response.get("metadata")
+            if not isinstance(metadata, Mapping) or set(metadata) != {"correlation"}:
+                raise ValueError("response metadata must contain only the correlation token")
+            return _validate_identifier(metadata.get("correlation"), "correlation token")
+
+        def _bind_response_created(self, event: Mapping[str, Any]):
+            response = event.get("response")
+            if not isinstance(response, Mapping):
+                raise TypeError("response.created requires a response object")
+            response_id = _validate_identifier(response.get("id"), "response_id")
+            if response_id in self._active_responses or response_id in self._completed_responses:
+                raise ValueError("duplicate or conflicting provider response_id")
+            correlation = self._response_metadata(response)
+            if correlation in self._consumed_correlations:
+                raise ValueError("replayed correlation token")
+            binding = self._pending_responses.get(correlation)
+            if binding is None:
+                raise ValueError("unknown or unsolicited correlation token")
+            accepted_responses = (
+                len(self._pending_responses)
+                + len(self._active_responses)
+                + len(self._completed_responses)
+            )
+            if accepted_responses > self._response_ledger_capacity:
+                raise ValueError("response lifetime capacity exhausted")
+            if len(self._consumed_correlations) >= self._response_ledger_capacity:
+                raise ValueError("consumed correlation capacity exhausted")
+            del self._pending_responses[correlation]
+            self._consumed_correlations[correlation] = None
+            self._active_responses[response_id] = (correlation, binding)
+            return ResponseStarted(response_id=response_id, turn_id=binding.turn_marker)
+
+        def _validate_active_response(
+            self, event: Mapping[str, Any]
+        ) -> tuple[str, str, _ResponseBinding, str]:
+            response_id = _validate_identifier(event.get("response_id"), "response_id")
+            active = self._active_responses.get(response_id)
+            if active is None:
+                raise ValueError("output event references an unbound response")
+            item_id = _validate_identifier(event.get("item_id"), "item_id")
+            known_item = self._response_items.get(response_id)
+            known_response = self._item_responses.get(item_id)
+            if known_item is not None and known_item != item_id:
+                raise ValueError("output item identity changed for response")
+            if known_response is not None and known_response != response_id:
+                raise ValueError("output item is already bound to another response")
+            return response_id, active[0], active[1], item_id
+
+        def _active_response(self, event: Mapping[str, Any]) -> tuple[str, _ResponseBinding, str]:
+            response_id, correlation, binding, item_id = self._validate_active_response(event)
+            self._response_items[response_id] = item_id
+            self._item_responses[item_id] = response_id
+            return correlation, binding, item_id
+
+        def _validate_output_audio_part(
+            self,
+            part: Any,
+            *,
+            response_id: str,
+            item_id: str,
+            context: str,
+        ) -> Mapping[str, Any]:
+            if not isinstance(part, Mapping):
+                raise TypeError(f"{context} requires an output_audio part object")
+            if not set(part).issubset(_OUTPUT_AUDIO_PART_KEYS):
+                raise ValueError(f"{context} output_audio part has an invalid authority shape")
+            if part.get("type") != "output_audio":
+                raise ValueError(f"{context} content type must be output_audio")
+            if "transcript" in part:
+                transcript = _validate_text(part["transcript"], final=True)
+                terminal = self._final_output_transcripts.get((response_id, item_id))
+                if terminal is not None and transcript != terminal:
+                    raise ValueError(f"{context} transcript conflicts with final text")
+            return part
+
+        def _validate_output_item_shape(
+            self,
+            item: Any,
+            *,
+            response_id: str,
+            stage: str,
+        ) -> tuple[str, Mapping[str, Any] | None]:
+            if not isinstance(item, Mapping):
+                raise TypeError(f"{stage} requires an output item object")
+            if not set(item).issubset(_OUTPUT_ITEM_ALLOWED_KEYS):
+                raise ValueError(f"{stage} output item has an invalid authority shape")
+            if "object" in item and (
+                type(item["object"]) is not str or item["object"] != "realtime.item"
+            ):
+                raise ValueError(f"{stage} output item object must be realtime.item")
+            if item.get("type") != "message":
+                raise ValueError(f"{stage} output item type must be message")
+            if item.get("role") != "assistant":
+                raise ValueError(f"{stage} output item role must be assistant")
+            item_id = _validate_identifier(item.get("id"), "output item_id")
+            status = item.get("status")
+            if stage == "response.output_item.added":
+                if status is not None and status != "in_progress":
+                    raise ValueError("added output item status must be in_progress")
+            elif status is not None and status != "completed":
+                raise ValueError(f"{stage} output item status must be completed")
+            if "content" not in item:
+                raise ValueError(f"{stage} output item content is required")
+            content = item["content"]
+            if not isinstance(content, (list, tuple)):
+                raise TypeError(f"{stage} output item content must be a sequence")
+            if stage == "response.output_item.added" and not content:
+                return item_id, None
+            if len(content) != 1:
+                raise ValueError(f"{stage} output item content must contain exactly one part")
+            part = self._validate_output_audio_part(
+                content[0],
+                response_id=response_id,
+                item_id=item_id,
+                context=stage,
+            )
+            return item_id, part
+
+        @staticmethod
+        def _note_lifecycle_stage(
+            observed: set[tuple[str, str]], key: tuple[str, str], event_type: str
+        ) -> None:
+            if key in observed:
+                raise ValueError(f"{event_type} was replayed")
+            observed.add(key)
+
+        def _complete_response(self, event: Mapping[str, Any]):
+            response = event.get("response")
+            if not isinstance(response, Mapping):
+                raise TypeError("response.done requires a response object")
+            response_id = _validate_identifier(response.get("id"), "response_id")
+            if response_id in self._completed_responses:
+                raise ValueError("response completion was replayed")
+            active = self._active_responses.get(response_id)
+            if active is None:
+                raise ValueError("completion references an unbound response")
+            correlation, binding = active
+            if self._response_metadata(response) != correlation:
+                raise ValueError("response completion correlation mismatch")
+            if response.get("status") != "completed":
+                raise ValueError("response status must be completed")
+            if "output" not in response:
+                raise ValueError("response output is required")
+            output = response["output"]
+            if not isinstance(output, (list, tuple)):
+                raise TypeError("response output must be a sequence")
+            if not output:
+                raise ValueError("response output must be nonempty")
+            if len(output) != 1:
+                raise ValueError("response output must contain exactly one item")
+            item = output[0]
+            output_item_id, _part = self._validate_output_item_shape(
+                item,
+                response_id=response_id,
+                stage="response.done",
+            )
+            known_item_id = self._response_items.get(response_id)
+            if known_item_id is None or output_item_id != known_item_id:
+                raise ValueError("response completion output item identity changed")
+            stream_key = (response_id, output_item_id)
+            final_transcript = self._final_output_transcripts.get(stream_key)
+            if final_transcript is None:
+                raise ValueError("response completion requires transcript done")
+            if stream_key not in self._audio_delta_items:
+                raise ValueError("response completion requires audio delta")
+            if stream_key not in self._audio_done_items:
+                raise ValueError("response completion requires audio done")
+            if len(self._completed_responses) >= self._response_ledger_capacity:
+                raise ValueError("completed response capacity exhausted")
+            del self._active_responses[response_id]
+            item_id = self._response_items.pop(response_id, None)
+            if item_id is not None:
+                self._item_responses.pop(item_id, None)
+                self._final_output_transcripts.pop((response_id, item_id), None)
+                self._audio_delta_items.discard((response_id, item_id))
+                self._audio_done_items.discard((response_id, item_id))
+                self._output_item_added.discard((response_id, item_id))
+                self._content_part_added.discard((response_id, item_id))
+                self._content_part_done.discard((response_id, item_id))
+                self._output_item_done.discard((response_id, item_id))
+                self._conversation_item_done.discard((response_id, item_id))
+            self._completed_responses[response_id] = correlation
+            return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
+
         def _map_event(self, event: Mapping[str, Any]):
             event_type = event.get("type")
             if not isinstance(event_type, str) or not event_type:
                 raise ValueError("provider event type must be a nonblank string")
+            if event_type in _OUTPUT_EVENT_TYPES:
+                _validate_output_event_authority(event)
             if event_type == "session.created":
                 session = event.get("session")
                 session_id = _validate_identifier(
@@ -355,6 +726,134 @@ if _CORE_IMPORT_ERROR is None:
                 return self._input_transcript(event, final=False)
             if event_type == "conversation.item.input_audio_transcription.completed":
                 return self._input_transcript(event, final=True)
+            if event_type == "response.created":
+                return self._bind_response_created(event)
+            if event_type == "response.output_audio.delta":
+                delta = event.get("delta")
+                if not isinstance(delta, str) or not delta:
+                    raise ValueError("output audio delta must be nonempty base64 text")
+                try:
+                    data = base64.b64decode(delta, validate=True)
+                except (binascii.Error, ValueError, TypeError) as exc:
+                    raise ValueError("output audio delta is malformed base64") from exc
+                if not data:
+                    raise ValueError("output audio delta decoded to empty data")
+                response_id, _correlation, binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                self._audio_delta_items.add((response_id, item_id))
+                return OutputAudio(
+                    data=data,
+                    item_id=item_id,
+                    response_id=response_id,
+                    turn_id=binding.turn_marker,
+                )
+            if event_type in {
+                "response.output_audio_transcript.delta",
+                "response.output_audio_transcript.done",
+            }:
+                final = event_type.endswith(".done")
+                text = _validate_text(
+                    event.get("transcript" if final else "delta"), final=final
+                )
+                response_id, _correlation, binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                transcript_key = (response_id, item_id)
+                terminal_text = self._final_output_transcripts.get(transcript_key)
+                if terminal_text is not None:
+                    if not final:
+                        raise ValueError("output transcript is already terminal")
+                    if terminal_text == text:
+                        raise ValueError("output transcript terminal event was replayed")
+                    raise ValueError("conflicting terminal output transcript")
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                if final:
+                    self._final_output_transcripts[transcript_key] = text
+                return OutputTranscript(
+                    item_id=item_id,
+                    response_id=response_id,
+                    turn_id=binding.turn_marker,
+                    text=text,
+                    final=final,
+                )
+            if event_type == "response.done":
+                return self._complete_response(event)
+            if "function_call" in event_type:
+                raise ValueError(f"function/tool output is forbidden: {event_type}")
+            if event_type == "response.output_audio.done":
+                response_id, _correlation, _binding, item_id = (
+                    self._validate_active_response(event)
+                )
+                stream_key = (response_id, item_id)
+                if stream_key in self._audio_done_items:
+                    raise ValueError("output audio done event was replayed")
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                self._audio_done_items.add(stream_key)
+                return None
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                response_id = _validate_identifier(event.get("response_id"), "response_id")
+                item_id, _part = self._validate_output_item_shape(
+                    event.get("item"),
+                    response_id=response_id,
+                    stage=event_type,
+                )
+                normalized = dict(event)
+                normalized["item_id"] = item_id
+                response_id, _correlation, _binding, item_id = self._validate_active_response(
+                    normalized
+                )
+                observed = (
+                    self._output_item_added
+                    if event_type.endswith(".added")
+                    else self._output_item_done
+                )
+                self._note_lifecycle_stage(observed, (response_id, item_id), event_type)
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                return None
+            if event_type in {"response.content_part.added", "response.content_part.done"}:
+                response_id, _correlation, _binding, item_id = self._validate_active_response(event)
+                self._validate_output_audio_part(
+                    event.get("part"),
+                    response_id=response_id,
+                    item_id=item_id,
+                    context=event_type,
+                )
+                observed = (
+                    self._content_part_added
+                    if event_type.endswith(".added")
+                    else self._content_part_done
+                )
+                self._note_lifecycle_stage(observed, (response_id, item_id), event_type)
+                self._response_items[response_id] = item_id
+                self._item_responses[item_id] = response_id
+                return None
+            if event_type == "conversation.item.done":
+                item = event.get("item")
+                if not isinstance(item, Mapping):
+                    raise TypeError("conversation.item.done requires an item object")
+                item_id = _validate_identifier(item.get("id"), "item_id")
+                response_id = self._item_responses.get(item_id)
+                if response_id is None or response_id not in self._active_responses:
+                    raise ValueError("conversation item is not bound to an active response")
+                validated_item_id, _part = self._validate_output_item_shape(
+                    item,
+                    response_id=response_id,
+                    stage=event_type,
+                )
+                if validated_item_id != item_id:
+                    raise ValueError("conversation output item identity changed")
+                self._note_lifecycle_stage(
+                    self._conversation_item_done,
+                    (response_id, item_id),
+                    event_type,
+                )
+                return None
             if event_type == "error":
                 error = event.get("error")
                 detail = error.get("message") if isinstance(error, Mapping) else error
@@ -382,8 +881,24 @@ if _CORE_IMPORT_ERROR is None:
 
         async def _terminate(self) -> None:
             self._terminal = True
-            await self._wire.close()
-            self._input_ledger.clear()
+            try:
+                await self._wire.close()
+            finally:
+                self._input_ledger.clear()
+                self._pending_responses.clear()
+                self._active_responses.clear()
+                self._response_items.clear()
+                self._item_responses.clear()
+                self._final_output_transcripts.clear()
+                self._audio_delta_items.clear()
+                self._audio_done_items.clear()
+                self._output_item_added.clear()
+                self._content_part_added.clear()
+                self._content_part_done.clear()
+                self._output_item_done.clear()
+                self._conversation_item_done.clear()
+                self._completed_responses.clear()
+                self._consumed_correlations.clear()
 
         def _take_send_failure(self) -> Exception | None:
             failure, self._pending_send_failure = self._pending_send_failure, None
@@ -457,6 +972,8 @@ if _CORE_IMPORT_ERROR is None:
             auth_resolver: Callable[[], Any] = talk_auth.resolve_auth,
             wire_factory: Callable[..., Any] = _OpenAIWireSession,
             ledger_capacity: int = DEFAULT_INPUT_LEDGER_CAPACITY,
+            response_ledger_capacity: int = 1024,
+            token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
         ) -> None:
             if isinstance(ledger_capacity, bool) or not isinstance(ledger_capacity, int):
                 raise TypeError("ledger_capacity must be a positive integer")
@@ -465,6 +982,16 @@ if _CORE_IMPORT_ERROR is None:
             self._auth_resolver = auth_resolver
             self._wire_factory = wire_factory
             self._ledger_capacity = ledger_capacity
+            if (
+                isinstance(response_ledger_capacity, bool)
+                or not isinstance(response_ledger_capacity, int)
+                or response_ledger_capacity <= 0
+            ):
+                raise ValueError("response_ledger_capacity must be a positive integer")
+            if not callable(token_factory):
+                raise TypeError("token_factory must be callable")
+            self._response_ledger_capacity = response_ledger_capacity
+            self._token_factory = token_factory
 
         @property
         def name(self) -> str:
@@ -472,6 +999,8 @@ if _CORE_IMPORT_ERROR is None:
 
         @property
         def display_name(self) -> str:
+            if _EXPLICIT_OUTPUT_AVAILABLE:
+                return "Hermes Talk OpenAI Realtime (native explicit output)"
             return "Hermes Talk OpenAI Realtime (input only)"
 
         def is_available(self) -> bool:
@@ -486,7 +1015,13 @@ if _CORE_IMPORT_ERROR is None:
             return bool(model and auth.get("configured"))
 
         def list_models(self):
-            return ({"id": talk_config.talk_model(), "input_only": True},)
+            return (
+                {
+                    "id": talk_config.talk_model(),
+                    "input_only": not _EXPLICIT_OUTPUT_AVAILABLE,
+                    "native_explicit_output": _EXPLICIT_OUTPUT_AVAILABLE,
+                },
+            )
 
         def list_voices(self):
             return tuple({"id": voice} for voice in talk_config.OPENAI_REALTIME_VOICES)
@@ -519,6 +1054,9 @@ if _CORE_IMPORT_ERROR is None:
                 wire=wire,
                 audio_format=SUPPORTED_AUDIO_FORMAT,
                 ledger_capacity=self._ledger_capacity,
+                voice=voice,
+                response_ledger_capacity=self._response_ledger_capacity,
+                token_factory=self._token_factory,
             )
 
 else:
@@ -541,4 +1079,5 @@ __all__ = [
     "TalkOpenAIRealtimeProvider",
     "core_provider_available",
     "core_provider_diagnostic",
+    "explicit_output_available",
 ]

@@ -56,6 +56,45 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
     }
 
 
+CORE_RENDER_VERBATIM_INSTRUCTION = (
+    "Render the sole user input as speech verbatim. Speak every character's "
+    "words and punctuation naturally, but add, remove, or paraphrase nothing. "
+    "Do not preface or explain."
+)
+
+
+def build_core_response_create(
+    *, canonical_text: str, correlation: str, voice: str, event_id: str
+) -> dict[str, Any]:
+    """Build the exact explicit canonical response for the Hermes core lane."""
+
+    return {
+        "type": "response.create",
+        "event_id": event_id,
+        "response": {
+            "conversation": "none",
+            "metadata": {"correlation": correlation},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": canonical_text}],
+                }
+            ],
+            "instructions": CORE_RENDER_VERBATIM_INSTRUCTION,
+            "output_modalities": ["audio"],
+            "audio": {
+                "output": {
+                    "voice": voice,
+                    "format": {"type": "audio/pcm", "rate": 24_000},
+                }
+            },
+            "tools": [],
+            "tool_choice": "none",
+        },
+    }
+
+
 def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
     """Map one provider-neutral command to OpenAI wire JSON."""
 

@@ -110,6 +110,53 @@ def _adapter(socket):
     return adapter, client
 
 
+def test_core_response_builder_is_exact_and_does_not_change_legacy_encoding():
+    response = openai_rt.build_core_response_create(
+        canonical_text="Exact words, exactly.",
+        correlation="opaque-correlation",
+        voice="cedar",
+        event_id="evt-opaque",
+    )
+
+    assert response == {
+        "type": "response.create",
+        "event_id": "evt-opaque",
+        "response": {
+            "conversation": "none",
+            "metadata": {"correlation": "opaque-correlation"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Exact words, exactly."}
+                    ],
+                }
+            ],
+            "instructions": (
+                "Render the sole user input as speech verbatim. Speak every character's "
+                "words and punctuation naturally, but add, remove, or paraphrase nothing. "
+                "Do not preface or explain."
+            ),
+            "output_modalities": ["audio"],
+            "audio": {
+                "output": {
+                    "voice": "cedar",
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                }
+            },
+            "tools": [],
+            "tool_choice": "none",
+        },
+    }
+    assert openai_rt.encode_command(
+        rt.StartResponse(metadata={"speaker": "opaque"})
+    ) == {
+        "type": "response.create",
+        "response": {"metadata": {"speaker": "opaque"}},
+    }
+
+
 def test_connect_configures_the_session_and_commands_map_to_openai_wire():
     async def scenario():
         socket = _Socket()
