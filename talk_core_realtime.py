@@ -24,6 +24,7 @@ try:
         OpenAIWireEOF,
         OpenAIWireError,
         _OpenAIWireSession,
+        build_core_response_cancel,
         build_core_response_create,
     )
 except ImportError:  # pragma: no cover - flat-module fallback
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - flat-module fallback
         OpenAIWireEOF,
         OpenAIWireError,
         _OpenAIWireSession,
+        build_core_response_cancel,
         build_core_response_create,
     )
 
@@ -90,6 +92,8 @@ try:
         OutputAudio = _core_contract.OutputAudio
         OutputTranscript = _core_contract.OutputTranscript
         ResponseCompleted = _core_contract.ResponseCompleted
+        InputSpeechStarted = _core_contract.InputSpeechStarted
+        Interruption = _core_contract.Interruption
         _EXPLICIT_OUTPUT_AVAILABLE = all(
             isinstance(symbol, type)
             for symbol in (
@@ -109,8 +113,18 @@ try:
                 "OUTPUT_TRANSCRIPTION",
             )
         )
+        _RESPONSE_CANCELLATION_AVAILABLE = (
+            _EXPLICIT_OUTPUT_AVAILABLE
+            and all(isinstance(symbol, type) for symbol in (InputSpeechStarted, Interruption))
+            and hasattr(RealtimeCapability, "RESPONSE_CANCELLATION")
+            and callable(getattr(RealtimeVoiceSession, "cancel_response", None))
+            and getattr(RealtimeVoiceSession, "_CAPABILITY_HOOKS", {}).get(
+                RealtimeCapability.RESPONSE_CANCELLATION
+            ) == "_cancel_response"
+        )
     except (AttributeError, ImportError):
         _EXPLICIT_OUTPUT_AVAILABLE = False
+        _RESPONSE_CANCELLATION_AVAILABLE = False
 except Exception as exc:  # noqa: BLE001 - optional core must never poison legacy imports
     _CORE_IMPORT_ERROR = exc
 
@@ -205,6 +219,11 @@ if _CORE_IMPORT_ERROR is None:
                 RealtimeCapability.OUTPUT_TRANSCRIPTION,
             }
             if _EXPLICIT_OUTPUT_AVAILABLE
+            else set()
+        )
+        | (
+            {RealtimeCapability.RESPONSE_CANCELLATION}
+            if _RESPONSE_CANCELLATION_AVAILABLE
             else set()
         )
     )
@@ -408,6 +427,7 @@ if _CORE_IMPORT_ERROR is None:
             self._response_lifecycle: dict[tuple[str, str], int] = {}
             self._completed_responses: OrderedDict[str, str] = OrderedDict()
             self._consumed_correlations: OrderedDict[str, None] = OrderedDict()
+            self._cancelling_responses: set[str] = set()
             self._input_ledger: dict[str, str | None] = {}
             self._provider_session_id: str | None = None
             self._terminal = False
@@ -502,6 +522,29 @@ if _CORE_IMPORT_ERROR is None:
                 async with self._response_lock:
                     if self._pending_responses.get(correlation) == binding:
                         del self._pending_responses[correlation]
+                raise
+
+        async def _cancel_response(self, response_id: str) -> None:
+            async with self._response_lock:
+                if response_id in self._completed_responses:
+                    raise ValueError("response is already terminal")
+                if response_id not in self._active_responses:
+                    raise ValueError("cancellation references an unbound response")
+                if response_id in self._cancelling_responses:
+                    raise ValueError("response cancellation is already pending")
+                if len(self._cancelling_responses) >= self._response_ledger_capacity:
+                    raise ValueError("response cancellation capacity exhausted")
+                self._cancelling_responses.add(response_id)
+            try:
+                await self._send_wire(
+                    build_core_response_cancel(
+                        response_id=response_id,
+                        event_id=f"evt-{secrets.token_urlsafe(24)}",
+                    )
+                )
+            except BaseException:
+                async with self._response_lock:
+                    self._cancelling_responses.discard(response_id)
                 raise
 
         def _input_transcript(self, event: Mapping[str, Any], *, final: bool) -> InputTranscript:
@@ -748,7 +791,95 @@ if _CORE_IMPORT_ERROR is None:
                 self._conversation_item_done.discard((response_id, item_id))
                 self._response_lifecycle.pop((response_id, item_id), None)
             self._completed_responses[response_id] = correlation
+            self._cancelling_responses.discard(response_id)
             return ResponseCompleted(response_id=response_id, turn_id=binding.turn_marker)
+
+        def _cancelled_response(self, event: Mapping[str, Any]):
+            response = event.get("response")
+            if not isinstance(response, Mapping):
+                raise TypeError("response.done requires a response object")
+            response_id = _validate_identifier(response.get("id"), "response_id")
+            if response_id in self._completed_responses:
+                raise ValueError("response completion was replayed")
+            active = self._active_responses.get(response_id)
+            if active is None:
+                raise ValueError("cancellation completion references an unbound response")
+            if response_id not in self._cancelling_responses:
+                raise ValueError("unsolicited response cancellation terminal")
+            correlation, binding = active
+            if self._response_metadata(response) != correlation:
+                raise ValueError("response cancellation correlation mismatch")
+            if type(response.get("status")) is not str or response["status"] != "cancelled":
+                raise ValueError("response status must be cancelled")
+            details = response.get("status_details")
+            if details is not None:
+                if type(details) is not dict:
+                    raise TypeError("cancelled status_details must be an exact mapping")
+                if not set(details).issubset({"type", "reason", "error"}):
+                    raise ValueError("cancelled status_details has unknown keys")
+                if details.get("type") != "cancelled":
+                    raise ValueError("status_details type must be cancelled")
+                if details.get("reason") not in {"client_cancelled", "turn_detected"}:
+                    raise ValueError("status_details cancellation reason is invalid")
+                if details.get("error") is not None:
+                    raise ValueError("cancelled status_details error must be absent")
+            output = response.get("output", [])
+            if type(output) is not list:
+                raise TypeError("cancelled response output must be a sequence")
+            known_item_id = self._response_items.get(response_id)
+            if known_item_id is None:
+                if output:
+                    raise ValueError("cancelled response cannot mint an output item")
+            elif len(output) > 1:
+                raise ValueError("cancelled response output must contain at most one item")
+            elif output:
+                item = output[0]
+                if type(item) is not dict or not set(item).issubset(
+                    _OUTPUT_ITEM_ALLOWED_KEYS
+                ):
+                    raise ValueError(
+                        "cancelled response output item has an invalid authority shape"
+                    )
+                if "object" in item and (
+                    type(item["object"]) is not str
+                    or item["object"] != "realtime.item"
+                ):
+                    raise ValueError("cancelled response output item object must be realtime.item")
+                if item.get("type") != "message" or item.get("role") != "assistant":
+                    raise ValueError("cancelled response output item must be an assistant message")
+                if item.get("status") not in (None, "in_progress", "completed"):
+                    raise ValueError("cancelled response output item status is invalid")
+                item_id = _validate_identifier(item.get("id"), "output item_id")
+                content = item.get("content")
+                if type(content) is not list or len(content) != 1:
+                    raise ValueError("cancelled response output item must have one audio part")
+                self._validate_output_audio_part(
+                    content[0],
+                    response_id=response_id,
+                    item_id=item_id,
+                    context="response.cancelled",
+                )
+                if item_id != known_item_id:
+                    raise ValueError("cancelled response output item identity changed")
+            if len(self._completed_responses) >= self._response_ledger_capacity:
+                raise ValueError("completed response capacity exhausted")
+            del self._active_responses[response_id]
+            item_id = self._response_items.pop(response_id, None)
+            if item_id is not None:
+                self._item_responses.pop(item_id, None)
+                key = (response_id, item_id)
+                self._final_output_transcripts.pop(key, None)
+                self._audio_delta_items.discard(key)
+                self._audio_done_items.discard(key)
+                self._output_item_added.discard(key)
+                self._content_part_added.discard(key)
+                self._content_part_done.discard(key)
+                self._output_item_done.discard(key)
+                self._conversation_item_done.discard(key)
+                self._response_lifecycle.pop(key, None)
+            self._cancelling_responses.remove(response_id)
+            self._completed_responses[response_id] = correlation
+            return Interruption(response_id=response_id, turn_id=binding.turn_marker)
 
         def _map_event(self, event: Mapping[str, Any]):
             event_type = event.get("type")
@@ -773,6 +904,18 @@ if _CORE_IMPORT_ERROR is None:
             if event_type == "input_audio_buffer.committed":
                 self._reserve_input(event.get("item_id"))
                 return None
+            if event_type == "input_audio_buffer.speech_started":
+                _validate_output_event_authority(event)
+                item_id = event.get("item_id")
+                if type(item_id) is not str:
+                    raise TypeError("speech-start item_id must be an exact str")
+                item_id = _validate_identifier(item_id, "item_id")
+                audio_start_ms = event.get("audio_start_ms")
+                if type(audio_start_ms) is not int:
+                    raise TypeError("audio_start_ms must be an exact int")
+                if audio_start_ms < 0:
+                    raise ValueError("audio_start_ms must be nonnegative")
+                return InputSpeechStarted(item_id=item_id, audio_start_ms=audio_start_ms)
             if event_type == "conversation.item.input_audio_transcription.delta":
                 return self._input_transcript(event, final=False)
             if event_type == "conversation.item.input_audio_transcription.completed":
@@ -834,6 +977,9 @@ if _CORE_IMPORT_ERROR is None:
                     final=final,
                 )
             if event_type == "response.done":
+                response = event.get("response")
+                if isinstance(response, Mapping) and response.get("status") == "cancelled":
+                    return self._cancelled_response(event)
                 return self._complete_response(event)
             if "function_call" in event_type:
                 raise ValueError(f"function/tool output is forbidden: {event_type}")
@@ -957,6 +1103,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._response_lifecycle.clear()
                 self._completed_responses.clear()
                 self._consumed_correlations.clear()
+                self._cancelling_responses.clear()
 
         def _take_send_failure(self) -> Exception | None:
             failure, self._pending_send_failure = self._pending_send_failure, None

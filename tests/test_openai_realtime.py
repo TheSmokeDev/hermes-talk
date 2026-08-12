@@ -157,6 +157,17 @@ def test_core_response_builder_is_exact_and_does_not_change_legacy_encoding():
     }
 
 
+def test_core_response_cancel_builder_is_exact_and_legacy_cancel_is_unchanged():
+    assert openai_rt.build_core_response_cancel(
+        response_id="resp-exact", event_id="evt-unpredictable"
+    ) == {
+        "type": "response.cancel",
+        "event_id": "evt-unpredictable",
+        "response_id": "resp-exact",
+    }
+    assert openai_rt.encode_command(rt.CancelResponse()) == {"type": "response.cancel"}
+
+
 def test_connect_configures_the_session_and_commands_map_to_openai_wire():
     async def scenario():
         socket = _Socket()
