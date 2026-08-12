@@ -245,6 +245,19 @@ if _CORE_IMPORT_ERROR is None:
             "response.done",
         }
     )
+    _AUTHORITY_VALIDATED_EVENT_TYPES = _OUTPUT_EVENT_TYPES | frozenset(
+        {
+            "session.created",
+            "session.updated",
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+            "conversation.item.input_audio_transcription.delta",
+            "conversation.item.input_audio_transcription.completed",
+            "rate_limits.updated",
+            "error",
+        }
+    )
     _REQUIRED_OUTPUT_LIFECYCLE = (
         "response.output_item.added",
         "response.content_part.added",
@@ -419,6 +432,7 @@ if _CORE_IMPORT_ERROR is None:
             self._final_output_transcripts: dict[tuple[str, str], str] = {}
             self._audio_delta_items: set[tuple[str, str]] = set()
             self._audio_done_items: set[tuple[str, str]] = set()
+            self._audio_byte_carries: dict[tuple[str, str], bytes] = {}
             self._output_item_added: set[tuple[str, str]] = set()
             self._content_part_added: set[tuple[str, str]] = set()
             self._content_part_done: set[tuple[str, str]] = set()
@@ -465,17 +479,20 @@ if _CORE_IMPORT_ERROR is None:
             try:
                 await self._wire.send_json((message,))
             except Exception as exc:
-                if self._pending_send_failure is None:
-                    self._pending_send_failure = exc
-                try:
-                    await self._wire.close()
-                except Exception as close_exc:  # noqa: BLE001 - retain cleanup class
-                    if self._pending_send_failure is exc:
-                        self._pending_send_failure = RuntimeError(
-                            f"{type(exc).__name__}: {exc}; cleanup failed: "
-                            f"{type(close_exc).__name__}"
-                        )
+                await self._record_send_failure(exc)
                 raise
+
+        async def _record_send_failure(self, exc: Exception) -> None:
+            if self._pending_send_failure is None:
+                self._pending_send_failure = exc
+            try:
+                await self._wire.close()
+            except Exception as close_exc:  # noqa: BLE001 - retain cleanup class
+                if self._pending_send_failure is exc:
+                    self._pending_send_failure = RuntimeError(
+                        f"{type(exc).__name__}: {exc}; cleanup failed: "
+                        f"{type(close_exc).__name__}"
+                    )
 
         async def _submit_tool_results(self, batch_id, results) -> None:
             del batch_id, results
@@ -528,20 +545,35 @@ if _CORE_IMPORT_ERROR is None:
             async with self._response_lock:
                 if response_id in self._completed_responses:
                     raise ValueError("response is already terminal")
-                if response_id not in self._active_responses:
+                active = self._active_responses.get(response_id)
+                if active is None:
                     raise ValueError("cancellation references an unbound response")
                 if response_id in self._cancelling_responses:
                     raise ValueError("response cancellation is already pending")
                 if len(self._cancelling_responses) >= self._response_ledger_capacity:
                     raise ValueError("response cancellation capacity exhausted")
+                correlation, _binding = active
                 self._cancelling_responses.add(response_id)
             try:
-                await self._send_wire(
-                    build_core_response_cancel(
-                        response_id=response_id,
-                        event_id=f"evt-{secrets.token_urlsafe(24)}",
+                await self._wire.send_json(
+                    (
+                        build_core_response_cancel(
+                            response_id=response_id,
+                            event_id=f"evt-{secrets.token_urlsafe(24)}",
+                        ),
                     )
                 )
+            except Exception as exc:
+                async with self._response_lock:
+                    terminal_won = (
+                        self._completed_responses.get(response_id) == correlation
+                    )
+                    if not terminal_won:
+                        self._cancelling_responses.discard(response_id)
+                if terminal_won:
+                    return
+                await self._record_send_failure(exc)
+                raise
             except BaseException:
                 async with self._response_lock:
                     self._cancelling_responses.discard(response_id)
@@ -717,6 +749,12 @@ if _CORE_IMPORT_ERROR is None:
             stage = self._response_lifecycle[key]
             if stage >= len(_REQUIRED_OUTPUT_LIFECYCLE):
                 raise ValueError(f"{event_type} was replayed")
+            if (
+                event_type == "response.output_audio.delta"
+                and stage
+                == _REQUIRED_OUTPUT_LIFECYCLE.index("response.output_audio.delta") + 1
+            ):
+                return
             expected = _REQUIRED_OUTPUT_LIFECYCLE[stage]
             if event_type != expected:
                 raise ValueError(
@@ -784,6 +822,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._final_output_transcripts.pop((response_id, item_id), None)
                 self._audio_delta_items.discard((response_id, item_id))
                 self._audio_done_items.discard((response_id, item_id))
+                self._audio_byte_carries.pop((response_id, item_id), None)
                 self._output_item_added.discard((response_id, item_id))
                 self._content_part_added.discard((response_id, item_id))
                 self._content_part_done.discard((response_id, item_id))
@@ -871,6 +910,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._final_output_transcripts.pop(key, None)
                 self._audio_delta_items.discard(key)
                 self._audio_done_items.discard(key)
+                self._audio_byte_carries.pop(key, None)
                 self._output_item_added.discard(key)
                 self._content_part_added.discard(key)
                 self._content_part_done.discard(key)
@@ -885,7 +925,7 @@ if _CORE_IMPORT_ERROR is None:
             event_type = event.get("type")
             if not isinstance(event_type, str) or not event_type:
                 raise ValueError("provider event type must be a nonblank string")
-            if event_type in _OUTPUT_EVENT_TYPES:
+            if event_type in _AUTHORITY_VALIDATED_EVENT_TYPES:
                 _validate_output_event_authority(event)
             if event_type == "session.created":
                 session = event.get("session")
@@ -905,7 +945,6 @@ if _CORE_IMPORT_ERROR is None:
                 self._reserve_input(event.get("item_id"))
                 return None
             if event_type == "input_audio_buffer.speech_started":
-                _validate_output_event_authority(event)
                 item_id = event.get("item_id")
                 if type(item_id) is not str:
                     raise TypeError("speech-start item_id must be an exact str")
@@ -916,6 +955,8 @@ if _CORE_IMPORT_ERROR is None:
                 if audio_start_ms < 0:
                     raise ValueError("audio_start_ms must be nonnegative")
                 return InputSpeechStarted(item_id=item_id, audio_start_ms=audio_start_ms)
+            if event_type in {"input_audio_buffer.speech_stopped", "rate_limits.updated"}:
+                return None
             if event_type == "conversation.item.input_audio_transcription.delta":
                 return self._input_transcript(event, final=False)
             if event_type == "conversation.item.input_audio_transcription.completed":
@@ -926,7 +967,6 @@ if _CORE_IMPORT_ERROR is None:
                 response_id, _correlation, binding, item_id = (
                     self._validate_active_response(event)
                 )
-                self._advance_lifecycle_stage((response_id, item_id), event_type)
                 delta = event.get("delta")
                 if not isinstance(delta, str) or not delta:
                     raise ValueError("output audio delta must be nonempty base64 text")
@@ -936,11 +976,29 @@ if _CORE_IMPORT_ERROR is None:
                     raise ValueError("output audio delta is malformed base64") from exc
                 if not data:
                     raise ValueError("output audio delta decoded to empty data")
+                stream_key = (response_id, item_id)
+                buffered = self._audio_byte_carries.get(stream_key, b"") + data
+                complete_length = len(buffered) - (len(buffered) % 2)
+                complete_data = buffered[:complete_length]
+                next_carry = buffered[complete_length:]
+                if (
+                    next_carry
+                    and stream_key not in self._audio_byte_carries
+                    and len(self._audio_byte_carries) >= self._response_ledger_capacity
+                ):
+                    raise ValueError("output audio carry capacity exhausted")
+                self._advance_lifecycle_stage(stream_key, event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
-                self._audio_delta_items.add((response_id, item_id))
+                self._audio_delta_items.add(stream_key)
+                if next_carry:
+                    self._audio_byte_carries[stream_key] = next_carry
+                else:
+                    self._audio_byte_carries.pop(stream_key, None)
+                if not complete_data:
+                    return None
                 return OutputAudio(
-                    data=data,
+                    data=complete_data,
                     item_id=item_id,
                     response_id=response_id,
                     turn_id=binding.turn_marker,
@@ -990,6 +1048,8 @@ if _CORE_IMPORT_ERROR is None:
                 stream_key = (response_id, item_id)
                 if stream_key in self._audio_done_items:
                     raise ValueError("output audio done event was replayed")
+                if stream_key in self._audio_byte_carries:
+                    raise ValueError("output audio ended with an incomplete PCM16LE sample")
                 self._advance_lifecycle_stage(stream_key, event_type)
                 self._response_items[response_id] = item_id
                 self._item_responses[item_id] = response_id
@@ -1095,6 +1155,7 @@ if _CORE_IMPORT_ERROR is None:
                 self._final_output_transcripts.clear()
                 self._audio_delta_items.clear()
                 self._audio_done_items.clear()
+                self._audio_byte_carries.clear()
                 self._output_item_added.clear()
                 self._content_part_added.clear()
                 self._content_part_done.clear()
