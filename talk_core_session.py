@@ -28,8 +28,8 @@ def build_core_setup():
         instructions="",
         tools=(),
         audio=talk_core_realtime.SUPPORTED_AUDIO_FORMAT,
+        automatic_response=False,
         provider_options={
-            "automatic_response": False,
             "capabilities": (
                 "input_transcription",
                 "input_commit_events",
