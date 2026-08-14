@@ -21,6 +21,7 @@ import pytest
 
 import talk_audio
 import talk_cli
+import talk_core_session
 import talk_discord
 
 
@@ -338,7 +339,7 @@ def test_bridge_loss_exits_session_cancels_socket_clears_slot_and_notifies(monke
         )
 
         reply = talk_discord.start_session(7)
-        assert "Starting up" in reply
+        assert "Starting limited legacy provider-owned voice" in reply
         task = talk_discord._SESSION["task"]
         for _ in range(20):
             if task.done() and not talk_discord._SESSION:
@@ -419,6 +420,30 @@ def test_status_with_no_session():
     assert "No live voice session" in talk_discord.session_status()
 
 
+def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(monkeypatch):
+    async def scenario():
+        _wired_host(monkeypatch)
+        gate = asyncio.Event()
+
+        async def keep_open(audio):
+            await gate.wait()
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", keep_open)
+
+        receipt = talk_discord.start_session(7)
+        status = talk_discord.session_status()
+
+        for text in (receipt, status):
+            assert "limited legacy provider-owned" in text.lower()
+            assert "/talk core join" in text.lower()
+        assert len(receipt) < 240
+        gate.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
 def test_stop_with_no_session_says_so():
     assert "not in a voice session" in talk_discord.stop_session()
 
@@ -436,6 +461,7 @@ class _FakeConnection:
 
     def __init__(self) -> None:
         self.callbacks: list = []
+        self._socket_reader = types.SimpleNamespace(_callbacks=self.callbacks)
 
     def add_socket_listener(self, cb) -> None:
         self.callbacks.append(cb)
@@ -546,6 +572,496 @@ def test_stop_restores_the_host_exactly(monkeypatch):
     # speech_active — so returning it would stall every later host reply
     # for the full playback timeout and drop it.
     assert adapter._voice_mixers == {}, "a closed mixer must not be handed back"
+
+
+@pytest.mark.parametrize("replacement_point", ["remove", "add"])
+def test_stop_never_restores_listener_to_a_replaced_voice_generation(
+    monkeypatch, replacement_point
+):
+    old_connection, old_receiver, _old_vc, adapter = _wired_host(monkeypatch)
+    original_listener = old_connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+    tapped = old_connection.callbacks[0]
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_receiver = _FakeReceiver(new_vc)
+    new_listener = new_receiver._on_packet
+    new_connection.add_socket_listener(new_listener)
+    published = False
+
+    def publish_replacement():
+        nonlocal published
+        if published:
+            return
+        published = True
+        adapter._voice_clients[7] = new_vc
+        adapter._voice_receivers[7] = new_receiver
+
+    original_remove = old_connection.remove_socket_listener
+    original_add = old_connection.add_socket_listener
+
+    def racing_remove(callback):
+        original_remove(callback)
+        if replacement_point == "remove" and callback is tapped:
+            publish_replacement()
+
+    def racing_add(callback):
+        original_add(callback)
+        if replacement_point == "add" and callback == original_listener:
+            publish_replacement()
+
+    monkeypatch.setattr(old_connection, "remove_socket_listener", racing_remove)
+    monkeypatch.setattr(old_connection, "add_socket_listener", racing_add)
+
+    bridge.stop()
+
+    assert published
+    assert old_receiver._running is True
+    assert original_listener not in old_connection.callbacks
+    assert adapter._voice_clients[7] is new_vc
+    assert adapter._voice_receivers[7] is new_receiver
+    assert new_receiver._on_packet == new_listener
+    assert new_connection.callbacks == [new_listener]
+
+
+def test_capture_only_borrows_receive_without_touching_host_playback(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_play = adapter.play_in_voice_channel
+    original_mode = adapter._voice_mode_getter
+    host_source = object()
+    vc.playing = host_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    bridge.start()
+
+    assert connection.callbacks != [original_listener]
+    assert vc.playing is host_source
+    assert adapter.play_in_voice_channel == original_play
+    assert adapter._voice_mode_getter is original_mode
+    assert adapter._voice_mixers == {7: "the-host-mixer"}
+    assert bridge._source is None
+    connection.deliver(b"\x01\x02" * 8)
+    assert bridge.read_input_chunk() is not None
+
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+
+
+def test_capture_only_playback_fails_closed():
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="capture-only"):
+        bridge.queue_playback(b"\x01\x00")
+
+
+def test_capture_only_failed_start_restores_listener_once(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    host_source = object()
+    vc.playing = host_source
+    removed: list = []
+    original_remove = connection.remove_socket_listener
+
+    def fail_after_removing_original(callback):
+        original_remove(callback)
+        removed.append(callback)
+        if callback == original_listener:
+            raise RuntimeError("swap failed after removal")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_after_removing_original)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't listen in"):
+        bridge.start()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+    assert adapter._voice_mixers == {7: "the-host-mixer"}
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_failed_swap_fences_inflight_tap_before_rollback_and_restart(monkeypatch, capture_only):
+    connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    host_source = object()
+    vc.playing = host_source
+    original_listener = connection.callbacks[0]
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_thread = None
+
+    def blocking_original(data: bytes) -> None:
+        callback_entered.set()
+        assert release_callback.wait(2), "rollback never released the copied tap"
+        original_listener(data)
+
+    connection.callbacks[:] = [blocking_original]
+    receiver._on_packet = blocking_original
+    receiver._ssrc_to_user[1] = 101
+    original_remove = connection.remove_socket_listener
+
+    def fail_swap_and_release_during_rollback(callback):
+        nonlocal callback_thread
+        if callback is blocking_original:
+            original_remove(callback)
+            tapped = connection.callbacks[0]
+            callback_thread = threading.Thread(target=tapped, args=(b"\x01\x00" * 5,))
+            callback_thread.start()
+            assert callback_entered.wait(2), "copied tap never entered the host callback"
+            raise RuntimeError("swap failed after original removal")
+        release_callback.set()
+        original_remove(callback)
+        callback_thread.join(2)
+        assert not callback_thread.is_alive(), "copied tap did not finish during rollback"
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_swap_and_release_during_rollback)
+    clock = [100.0]
+    monkeypatch.setattr(talk_discord.time, "monotonic", lambda: clock[0])
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't listen in"):
+        bridge.start()
+
+    assert connection.callbacks == [blocking_original]
+    assert receiver._on_packet is blocking_original
+    assert vc.playing is host_source
+    assert bridge._source is None
+    assert bridge._inbound.empty()
+    assert bridge._capture_remainder == {}
+    assert bridge._audio_clock == 0.0
+    assert bridge._last_keepalive == 0.0
+    assert bridge._last_speaker_key is talk_discord._UNSET
+
+    monkeypatch.setattr(connection, "remove_socket_listener", original_remove)
+    clock[0] = 200.0
+    bridge.start()
+    speaker_events = []
+    bridge.set_speaker_notifier(speaker_events.append)
+
+    assert bridge._inbound.empty(), "failed generation PCM survived the restart"
+    assert bridge._capture_remainder == {}
+    assert bridge._audio_clock == 200.0
+    new_pcm = b"\x02\x00" * 8
+    connection.deliver(new_pcm)
+    packet = bridge._inbound.get_nowait()
+    assert packet.pcm == talk_discord.discord_to_session(new_pcm)[0]
+    assert packet.speaker["user_id"] == 101
+    assert speaker_events == [packet.speaker]
+    bridge.stop()
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_restart_discards_pcm_received_by_host_between_generations(monkeypatch, capture_only):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    receiver._ssrc_to_user[1] = 101
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+    bridge.start()
+    bridge.stop()
+
+    connection.deliver(b"\x01\x00" * 5)
+    assert receiver._buffers[1], "host did not preserve between-generation PCM"
+
+    bridge.start()
+    speaker_events = []
+    bridge.set_speaker_notifier(speaker_events.append)
+    new_pcm = b"\x02\x00" * 8
+    connection.deliver(new_pcm)
+
+    packet = bridge._inbound.get_nowait()
+    assert packet.pcm == talk_discord.discord_to_session(new_pcm)[0]
+    assert packet.speaker["user_id"] == 101
+    assert speaker_events == [packet.speaker]
+    bridge.stop()
+
+
+def test_capture_only_repeated_stop_restores_listener_exactly_once(monkeypatch):
+    connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    host_source = object()
+    vc.playing = host_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+
+    bridge.stop()
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert vc.playing is host_source
+
+
+def test_capture_only_stop_preserves_a_newer_host_listener(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    tapped = connection.callbacks[0]
+
+    def replacement(_data: bytes) -> None:
+        pass
+
+    connection.remove_socket_listener(tapped)
+    connection.add_socket_listener(replacement)
+    receiver._on_packet = replacement
+
+    bridge.stop()
+
+    assert connection.callbacks == [replacement]
+    assert receiver._on_packet is replacement
+
+
+def test_capture_only_stop_restores_original_when_tap_removal_raises(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    stale_tap = connection.callbacks[0]
+    connection.callbacks.remove(stale_tap)  # concurrent host teardown won the race
+
+    def fail_removal(_callback):
+        stale_tap(b"\x01\x02" * 8)  # copied callback runs after teardown begins
+        raise ValueError("listener was already removed")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", fail_removal)
+
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert bridge.read_input_chunk() is None
+
+    stale_tap(b"\x03\x04" * 8)
+    assert bridge.read_input_chunk() is None
+
+
+def test_stop_does_not_duplicate_original_already_restored_by_host(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+    stale_tap = connection.callbacks[0]
+
+    def unrelated_listener(_data: bytes) -> None:
+        pass
+
+    # Concurrent host recovery wins the registry race but has not yet repaired
+    # the receiver attribute observed by stop().
+    connection.callbacks[:] = [unrelated_listener, original_listener]
+
+    def already_absent(callback):
+        assert callback is stale_tap
+        raise ValueError("tap was already removed by host recovery")
+
+    monkeypatch.setattr(connection, "remove_socket_listener", already_absent)
+
+    bridge.stop()
+
+    assert stale_tap not in connection.callbacks
+    assert connection.callbacks.count(original_listener) == 1
+    assert unrelated_listener in connection.callbacks
+    assert receiver._on_packet == original_listener
+
+
+def test_capture_only_repeated_start_restores_the_original_listener(monkeypatch):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+
+    bridge.start()
+    first_tap = connection.callbacks[0]
+    bridge.start()
+    bridge.stop()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert first_tap not in connection.callbacks
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_concurrent_starts_share_one_complete_listener_install(monkeypatch, capture_only):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_add = connection.add_socket_listener
+    add_entered = threading.Event()
+    release_add = threading.Event()
+    second_returned = threading.Event()
+    errors: list[Exception] = []
+    tap_adds: list = []
+
+    def blocking_add(callback):
+        if callback is not original_listener:
+            tap_adds.append(callback)
+            if len(tap_adds) == 1:
+                add_entered.set()
+                assert release_add.wait(2), "test never released the first listener install"
+        original_add(callback)
+
+    monkeypatch.setattr(connection, "add_socket_listener", blocking_add)
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    def run_start(returned=None):
+        try:
+            bridge.start()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+        finally:
+            if returned is not None:
+                returned.set()
+
+    first = threading.Thread(target=run_start)
+    second = threading.Thread(target=run_start, args=(second_returned,))
+    first.start()
+    assert add_entered.wait(2), "first start never reached listener installation"
+    second.start()
+    try:
+        assert not second_returned.wait(0.2), "second start escaped an incomplete first start"
+    finally:
+        release_add.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(tap_adds) == 1
+    assert connection.callbacks == [tap_adds[0]]
+    assert receiver._on_packet is tap_adds[0]
+
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_stop_waits_for_blocked_start_then_unwinds_the_complete_lifecycle(
+    monkeypatch, capture_only
+):
+    connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_add = connection.add_socket_listener
+    add_entered = threading.Event()
+    release_add = threading.Event()
+    stop_called = threading.Event()
+    stop_returned = threading.Event()
+    errors: list[Exception] = []
+    block_next_tap = True
+
+    def blocking_add(callback):
+        nonlocal block_next_tap
+        if callback is not original_listener and block_next_tap:
+            block_next_tap = False
+            add_entered.set()
+            assert release_add.wait(2), "test never released the blocked listener install"
+        original_add(callback)
+
+    monkeypatch.setattr(connection, "add_socket_listener", blocking_add)
+    bridge = talk_discord.DiscordAudio(7, capture_only=capture_only)
+
+    def run_start():
+        try:
+            bridge.start()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+
+    def run_stop():
+        stop_called.set()
+        try:
+            bridge.stop()
+        except Exception as exc:  # noqa: BLE001 - surface worker failure in the test thread
+            errors.append(exc)
+        finally:
+            stop_returned.set()
+
+    start_thread = threading.Thread(target=run_start)
+    stop_thread = threading.Thread(target=run_stop)
+    start_thread.start()
+    assert add_entered.wait(2), "start never reached the blocked listener install"
+    stop_thread.start()
+    assert stop_called.wait(2)
+    try:
+        assert not stop_returned.wait(0.2), "stop returned before the earlier start linearized"
+    finally:
+        release_add.set()
+    start_thread.join(2)
+    stop_thread.join(2)
+
+    assert not start_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert errors == []
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert bridge._bridge is None
+    assert bridge._source is None
+    assert bridge._original_on_packet is None
+    assert bridge._tapped is None
+    assert bridge._installed_listener_generation is None
+    assert bridge._capture_listener_generation is None
+    assert bridge._audio_clock == 0.0
+
+    bridge.start()
+    second_tap = connection.callbacks[0]
+    assert second_tap is not original_listener
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert second_tap not in connection.callbacks
+
+
+def test_playback_failure_self_stop_is_reentrant_and_restores_the_host(monkeypatch):
+    connection, receiver, vc, adapter = _wired_host(monkeypatch)
+    original_listener = connection.callbacks[0]
+    original_play = adapter.play_in_voice_channel
+    original_mode = adapter._voice_mode_getter
+
+    def fail_play(_source):
+        raise RuntimeError("player rejected source")
+
+    monkeypatch.setattr(vc, "play", fail_play)
+    bridge = talk_discord.DiscordAudio(7)
+
+    with pytest.raises(talk_audio.TalkAudioError, match="couldn't take over playback"):
+        bridge.start()
+
+    assert connection.callbacks == [original_listener]
+    assert receiver._on_packet == original_listener
+    assert adapter.play_in_voice_channel == original_play
+    assert adapter._voice_mode_getter is original_mode
+    assert bridge._bridge is None
+    assert bridge._source is None
+    bridge.stop()
+    assert connection.callbacks == [original_listener]
+
+
+def test_capture_only_bridge_replacement_does_not_stop_either_playback(monkeypatch):
+    old_connection, old_receiver, old_vc, adapter = _wired_host(monkeypatch)
+    old_source = object()
+    old_vc.playing = old_source
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    bridge.start()
+
+    new_connection = _FakeConnection()
+    new_vc = _FakeVoiceClient(new_connection)
+    new_source = object()
+    new_vc.playing = new_source
+    new_receiver = _FakeReceiver(new_vc)
+    new_connection.add_socket_listener(new_receiver._on_packet)
+    old_receiver._running = False
+    adapter._voice_clients[7] = new_vc
+    adapter._voice_receivers[7] = new_receiver
+
+    with pytest.raises(talk_audio.TalkAudioError, match="voice connection changed"):
+        bridge.read_input_chunk()
+
+    assert old_connection.callbacks == []
+    assert old_vc.playing is old_source
+    assert new_connection.callbacks == [new_receiver._on_packet]
+    assert new_vc.playing is new_source
 
 
 def test_capture_rearms_the_hosts_inactivity_timer(monkeypatch):
@@ -780,6 +1296,44 @@ def test_capture_remainders_do_not_bleed_between_speakers(monkeypatch):
     bridge.stop()
 
 
+def test_capture_state_does_not_cross_stop_restart_generation(monkeypatch):
+    _connection, receiver, _vc, _adapter = _wired_host(monkeypatch)
+    bridge = talk_discord.DiscordAudio(7, capture_only=True)
+    old_events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(old_events.append)
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = 101
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 5)
+    bridge._drain_receiver(receiver)
+    assert not bridge._inbound.empty()
+    assert bridge._capture_remainder[11]
+    assert len(old_events) == 1
+
+    bridge.stop()
+    bridge.start()
+    new_events: list[dict] = []
+    bridge.set_speaker_notifier(new_events.append)
+    bridge._audio_clock = talk_discord.time.monotonic() + 1
+
+    assert bridge.read_input_packet() is None, "old unread PCM crossed the restart"
+    assert bridge._capture_remainder == {}
+
+    new_chunk = b"\x04\x00" * 4
+    expected_pcm, expected_remainder = talk_discord.discord_to_session(new_chunk)
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(new_chunk)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.pcm == expected_pcm
+    assert bridge._capture_remainder[11] == expected_remainder
+    assert len(new_events) == 1, "same speaker needs a fresh-generation transition"
+    bridge.stop()
+
+
 def test_drain_resolves_the_discord_speaker_for_each_audio_chunk(monkeypatch):
     _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
     vc.channel = types.SimpleNamespace(
@@ -797,6 +1351,34 @@ def test_drain_resolves_the_discord_speaker_for_each_audio_chunk(monkeypatch):
 
     assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
     assert bridge.read_input_chunk() is not None
+    bridge.stop()
+
+
+class _CoerciveDiscordUserId:
+    def __int__(self) -> int:
+        return 101
+
+
+@pytest.mark.parametrize(
+    "raw_user_id",
+    ["101", "00101", True, 101.0, 101.5, _CoerciveDiscordUserId()],
+)
+def test_drain_does_not_coerce_receiver_user_id_mappings(monkeypatch, raw_user_id):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    with receiver._lock:
+        receiver._ssrc_to_user[11] = raw_user_id
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.speaker == {"ssrc": 11, "user_id": None, "display_name": ""}
     bridge.stop()
 
 
@@ -1111,3 +1693,316 @@ def test_generic_chunk_reader_unwraps_the_atomic_packet(monkeypatch):
 
     assert bridge.read_input_chunk() == talk_discord.discord_to_session(pcm48)[0]
     bridge.stop()
+
+
+def test_core_session_claims_shared_slot_with_capture_only_audio(monkeypatch):
+    created = []
+    entered = asyncio.Event()
+
+    class Audio:
+        def __init__(self, guild_id, *, capture_only=False):
+            created.append((guild_id, capture_only, self))
+
+        def stop(self):
+            pass
+
+    async def run_core(factory, *, guild_id, audio, status_callback):
+        assert factory is sentinel
+        assert guild_id == 7
+        assert audio is created[0][2]
+        assert callable(status_callback)
+        entered.set()
+        await asyncio.Event().wait()
+
+    sentinel = object()
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+    monkeypatch.setattr(
+        talk_cli,
+        "run_talk_session",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("legacy fallback")),
+    )
+
+    async def scenario():
+        reply = talk_discord.start_core_session(sentinel)
+        await asyncio.wait_for(entered.wait(), 0.2)
+        assert talk_discord._SESSION["mode"] == "core"
+        assert "already" in talk_discord.start_core_session(object()).lower()
+        stopped = talk_discord.stop_session()
+        await asyncio.sleep(0)
+        return reply, stopped
+
+    reply, stopped = asyncio.run(scenario())
+    assert created[0][:2] == (7, True)
+    assert "starting" in reply.lower() and "core" in reply.lower()
+    assert "left" in stopped.lower()
+
+
+def test_core_status_becomes_listening_and_stale_callback_cannot_change_replacement(monkeypatch):
+    callbacks = []
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def run_core(_factory, *, guild_id, audio, status_callback):
+        assert guild_id == 7
+        assert audio is not None
+        callbacks.append(status_callback)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        await asyncio.sleep(0)
+        assert "starting" in talk_discord.session_status().lower()
+        callbacks[0]("listening")
+        assert "listening" in talk_discord.session_status().lower()
+
+        first = talk_discord._SESSION["task"]
+        talk_discord.stop_session()
+        await asyncio.gather(first, return_exceptions=True)
+
+        talk_discord.start_core_session(object())
+        await asyncio.sleep(0)
+        assert "starting" in talk_discord.session_status().lower()
+        callbacks[0]("listening")
+        assert "starting" in talk_discord.session_status().lower()
+        talk_discord.stop_session()
+
+    asyncio.run(scenario())
+
+
+def test_core_failure_delivers_a_secret_safe_receipt_without_legacy_fallback(monkeypatch, caplog):
+    delivered = []
+    secret = "Authorization: Bearer TALK-SECRET-MARKER"
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            pass
+
+    async def fail_core(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    async def deliver(adapter, guild_id, receipt):
+        delivered.append((adapter, guild_id, receipt))
+        return True
+
+    adapter = object()
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": adapter},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", fail_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        task = talk_discord._SESSION["task"]
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())
+
+    assert delivered and delivered[0][:2] == (adapter, 7)
+    receipt = delivered[0][2].lower()
+    assert "canonical core voice" in receipt
+    assert "runtimeerror" in receipt
+    assert "talk join" not in receipt
+    public_output = delivered[0][2] + talk_discord.session_status() + caplog.text
+    assert "TALK-SECRET-MARKER" not in public_output
+    assert secret not in public_output
+
+
+@pytest.mark.parametrize("failure_point", ["factory", "feed", "audio", "close"])
+def test_core_boundaries_never_publish_raw_exception_secrets(monkeypatch, caplog, failure_point):
+    delivered = []
+    secret = "Authorization: Bearer TALK-BOUNDARY-SECRET"
+
+    class Attachment:
+        operator_user_id = 42
+
+        def feed_audio(self, *_args, **_kwargs):
+            if failure_point == "feed":
+                raise RuntimeError(secret)
+            return "accepted"
+
+        async def close(self):
+            if failure_point == "close":
+                raise RuntimeError(secret)
+
+    class Factory:
+        async def open(self, *_args, **_kwargs):
+            if failure_point == "factory":
+                raise RuntimeError(secret)
+            return Attachment()
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+            self.reads = 0
+
+        def start(self):
+            if failure_point == "audio":
+                raise RuntimeError(secret)
+
+        def read_input_packet(self):
+            self.reads += 1
+            if failure_point == "feed" and self.reads == 1:
+                return talk_discord.InputAudioPacket(speaker={"user_id": 42}, pcm=b"\x01\x00")
+            raise asyncio.CancelledError
+
+        def stop(self):
+            return None
+
+    async def deliver(_adapter, _guild_id, receipt):
+        delivered.append(receipt)
+        return False
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "build_core_setup", lambda: object())
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(Factory())
+        task = talk_discord._SESSION["task"]
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())
+
+    assert len(delivered) == 1
+    public_output = delivered[0] + talk_discord.session_status() + caplog.text
+    assert "RuntimeError" in public_output
+    assert "TALK-BOUNDARY-SECRET" not in public_output
+    assert secret not in public_output
+
+
+def test_stale_core_completion_cannot_publish_over_a_live_replacement(monkeypatch):
+    delivered = []
+    replacement_entered = asyncio.Event()
+    calls = 0
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def run_core(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            asyncio.get_running_loop().call_soon(talk_discord.start_core_session, object())
+            raise RuntimeError("identical failure")
+        replacement_entered.set()
+        await asyncio.Event().wait()
+
+    async def deliver(*args):
+        delivered.append(args)
+        return True
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", run_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        first = talk_discord._SESSION["task"]
+        await asyncio.wait_for(replacement_entered.wait(), 0.2)
+        replacement = talk_discord._SESSION["task"]
+        await asyncio.sleep(0)
+        assert first.done()
+        assert replacement is not first and not replacement.done()
+        assert talk_discord._LAST_FAILURE is None
+        assert delivered == []
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_old_delayed_receipt_cannot_clear_identical_new_generation_failure(monkeypatch):
+    release_first = asyncio.Event()
+    first_delivery_entered = asyncio.Event()
+    deliveries = 0
+
+    class Audio:
+        def __init__(self, _guild_id, *, capture_only=False):
+            assert capture_only
+
+        def stop(self):
+            return None
+
+    async def fail_core(*_args, **_kwargs):
+        raise RuntimeError("identical failure")
+
+    async def deliver(*_args):
+        nonlocal deliveries
+        deliveries += 1
+        if deliveries == 1:
+            first_delivery_entered.set()
+            await release_first.wait()
+            return True
+        return False
+
+    monkeypatch.setattr(
+        talk_discord,
+        "resolve_voice_bridge",
+        lambda guild_id=None: {"guild_id": 7, "adapter": object()},
+    )
+    monkeypatch.setattr(talk_discord, "DiscordAudio", Audio)
+    monkeypatch.setattr(talk_core_session, "run_core_session", fail_core)
+    monkeypatch.setattr(talk_discord, "_deliver_failure_receipt", deliver)
+
+    async def scenario():
+        talk_discord.start_core_session(object())
+        await asyncio.wait_for(first_delivery_entered.wait(), 0.2)
+        talk_discord.start_core_session(object())
+        second = talk_discord._SESSION["task"]
+        await asyncio.gather(second, return_exceptions=True)
+        await asyncio.sleep(0)
+        expected = talk_discord._LAST_FAILURE
+        assert expected is not None
+        release_first.set()
+        await asyncio.sleep(0)
+        assert expected == talk_discord._LAST_FAILURE
+        if talk_discord._NOTIFICATION_TASKS:
+            await asyncio.gather(*talk_discord._NOTIFICATION_TASKS)
+
+    asyncio.run(scenario())

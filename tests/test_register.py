@@ -8,6 +8,7 @@ surfaces themselves.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import subprocess
 import sys
@@ -70,12 +71,15 @@ class StubCtx:
             "description": description,
         }
 
-    def register_command(self, name, handler, description="", args_hint=""):
+    def register_command(
+        self, name, handler, description="", args_hint="", invocation_context=False
+    ):
         self._maybe_fail("slash")
         self.commands[name] = {
             "handler": handler,
             "description": description,
             "args_hint": args_hint,
+            "invocation_context": invocation_context,
         }
 
     def register_hook(self, hook_name, callback):
@@ -360,6 +364,63 @@ def test_slash_command_takes_the_discord_room_inside_an_event_loop(plugin):
     reply = asyncio.run(call_from_a_loop())
     assert "gateway" in reply.lower()
     assert "traceback" not in reply.lower()
+
+
+def test_core_join_captures_and_forwards_the_exact_host_factory(plugin, monkeypatch):
+    ctx = StubCtx()
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin.talk_core_realtime, "core_provider_available", lambda: True)
+    handler = ctx.commands["talk"]["handler"]
+    factory = object()
+    invocation = types.SimpleNamespace(
+        capture_realtime_voice_attachment_factory=lambda: factory
+    )
+    forwarded = []
+    monkeypatch.setattr(
+        plugin.talk_discord,
+        "start_core_session",
+        lambda candidate: forwarded.append(candidate) or "starting core",
+        raising=False,
+    )
+
+    async def call_from_a_loop():
+        return handler("core join", invocation=invocation)
+
+    assert asyncio.run(call_from_a_loop()) == "starting core"
+    assert forwarded == [factory]
+    assert ctx.commands["talk"]["invocation_context"] is True
+
+
+def test_registered_command_description_labels_legacy_and_core_parity(plugin):
+    ctx = StubCtx()
+    plugin.register(ctx)
+
+    description = ctx.commands["talk"]["description"]
+    assert "limited legacy" in description.lower()
+    assert "core join" in description.lower()
+
+
+def test_older_host_registration_keeps_legacy_slash_command(plugin, monkeypatch):
+    class OldHost(StubCtx):
+        def register_command(self, name, handler, description="", args_hint=""):
+            self._maybe_fail("slash")
+            self.commands[name] = {
+                "handler": handler,
+                "description": description,
+                "args_hint": args_hint,
+            }
+
+    ctx = OldHost()
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin.talk_core_realtime, "core_provider_available", lambda: True)
+
+    assert plugin.REGISTRATION_RECEIPTS["slash_command"] == "registered"
+    assert "talk" in ctx.commands
+
+    async def core_without_context():
+        return ctx.commands["talk"]["handler"]("core join")
+
+    assert "requires" in asyncio.run(core_without_context()).lower()
 
 
 def test_slash_command_subcommands_are_gateway_only(plugin):

@@ -148,15 +148,15 @@ _TOOL_CHECK_WORK: dict = {
     "name": "check_work",
     "description": (
         "Check on background work you started. Call with no arguments when "
-        "asked how things are going, or with a run number to check one job. "
-        "Reports what is still running and what has landed."
+        "asked how things are going; every finished run_id returned must then "
+        "be passed back in a specific call to retrieve that run's bounded output."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "run_id": {
                 "type": "integer",
-                "description": "A specific run number. Omit for everything recent.",
+                "description": "A specific run number whose bounded output should be returned.",
             },
         },
         "additionalProperties": False,
@@ -435,6 +435,17 @@ def _handle_check_work(arguments: dict) -> str:
     # never spawned, and saying nothing would read as "nothing is running".
     runs = talk_runs.list_runs(limit=10, include_history=True)
     lines = "; ".join(_describe_run(run) for run in runs) if runs else ""
+    finished = [
+        int(run["runId"])
+        for run in runs
+        if run.get("status") in talk_runs.TERMINAL_STATUSES and isinstance(run.get("runId"), int)
+    ]
+    if lines and finished:
+        retrieval = "; ".join(
+            f"call check_work with run_id {run_id} for that run's bounded output"
+            for run_id in finished
+        )
+        lines = f"{lines}. {retrieval}."
     # Steer receipts ride along: "did my note land?" is a check_work
     # question, and the ledger is the only place the answer lives. First
     # degrade notes whose child left the registry — "queued" with nobody
@@ -531,6 +542,16 @@ def _handle_talk_status(arguments: dict) -> str:
         # The old duplex lane still owns provider tools/output. The optional
         # core lane is deliberately input-only and never executes them.
         "legacy_lane": "legacy-provider-executor",
+        "legacy_session": {
+            "scope": "limited provider-owned session",
+            "full_parity_command": "/talk core join",
+        },
+        "transcript": {
+            "current_call": "temporary local capture",
+            "after_close": "handed off for durable-memory review",
+            "archive": "not live searchable or user-facing",
+            "core_persistence": "separate canonical session path",
+        },
         "core_realtime": core_realtime,
     }
     if REGISTRATION_FAILURES:

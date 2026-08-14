@@ -10,6 +10,7 @@ cannot answer at all still yields a usable voice prompt.
 
 from __future__ import annotations
 
+import re
 import time
 
 DEFAULT_SECTION_CAP = 4_000
@@ -46,15 +47,11 @@ VOICE_PREAMBLE = (
     "depth. Everything you say is read aloud, so no markdown, no bullet "
     "lists, no emoji, no code blocks, and no spelling out long file paths or "
     "URLs. If you do not know something, say so plainly. "
-    "You have function tools for facts and for actions: use them whenever you "
-    "are asked for anything you could not know offhand — what was said in "
-    "past sessions, what is saved in memory, what is on the web, the state of "
-    "this machine, or real work that needs doing. After a tool result, answer "
+    "Use only the function tools explicitly listed for this session. After a tool result, answer "
     "in one to three spoken sentences; never read raw output verbatim. "
     "Judge how much permission an action needs by what it can DAMAGE, not by "
     "how big it feels. Work that only costs tokens and lands somewhere "
-    "reversible — a lookup, research, a draft, code on a branch, a task "
-    "handed to delegate_task, a read-only terminal command — you start on "
+    "reversible — a lookup, a draft, or a task handed to delegate_task — you start on "
     "request: say in one short sentence what you are about to do, then do it, "
     "no confirmation. Plain lookups need not even that. But anything that "
     "spends real money, reaches a real person, or changes something live — a "
@@ -73,6 +70,36 @@ VOICE_PREAMBLE = (
     "then, use check_work. Do not narrate progress you cannot see, and never "
     "report a result you have not actually been given."
 )
+
+_TOOLS_MARKER = "Advertised legacy tools:"
+_TRANSCRIPT_CONTRACT = (
+    "This limited legacy provider-owned call keeps a temporary local transcript while live. "
+    "It is handed off after the call closes for durable-memory review; it is not a live "
+    "searchable or user-facing archive. Current-call search unavailability is not evidence about "
+    "whether capture occurred. Canonical core-session persistence is separate; users "
+    "who need full Hermes parity should use /talk core join."
+)
+
+
+def _tool_contract(tools: list[dict] | None) -> str:
+    """Render the exact schema names supplied to the provider session."""
+
+    names = [
+        tool.get("name")
+        for tool in tools or []
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    ]
+    rendered = ", ".join(names) if names else "none"
+    return f"{_TOOLS_MARKER} {rendered}. Do not claim or simulate tools outside this list."
+
+
+def advertised_tool_names(instructions: str) -> tuple[str, ...]:
+    """Read back the machine-checkable tool-name claim from built instructions."""
+
+    match = re.search(rf"{re.escape(_TOOLS_MARKER)} ([^.]+)\.", instructions)
+    if match is None or match.group(1) == "none":
+        return ()
+    return tuple(name.strip() for name in match.group(1).split(",") if name.strip())
 
 
 def cap_section(name: str, body: str) -> str:
@@ -95,7 +122,9 @@ def current_moment() -> str:
     return f"Right now it is {stamp}{' ' + zone if zone else ''}."
 
 
-def build_instructions(host_sections: dict[str, str] | None) -> str:
+def build_instructions(
+    host_sections: dict[str, str] | None, *, tools: list[dict] | None = None
+) -> str:
     """Assemble the Realtime session prompt.
 
     ``host_sections`` is whatever the host adapter could resolve, keyed by
@@ -123,7 +152,8 @@ def build_instructions(host_sections: dict[str, str] | None) -> str:
     # perishable thing in the prompt, and a session with no host sections at
     # all should still be able to say what day it is.
     sections.append(current_moment())
-    return VOICE_PREAMBLE + "\n\n" + "\n\n".join(sections)
+    contracts = [_tool_contract(tools), _TRANSCRIPT_CONTRACT]
+    return VOICE_PREAMBLE + "\n\n" + "\n\n".join([*contracts, *sections])
 
 
 __all__ = [
@@ -132,6 +162,7 @@ __all__ = [
     "IDENTITY_HEADERS",
     "IDENTITY_ORDER",
     "VOICE_PREAMBLE",
+    "advertised_tool_names",
     "build_instructions",
     "cap_section",
     "current_moment",

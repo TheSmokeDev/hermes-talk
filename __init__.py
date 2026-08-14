@@ -14,6 +14,7 @@ plugin looking healthy while half of it is missing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 
 try:
@@ -104,7 +105,42 @@ def _attempt_boolean_registration(ctx, method_name: str, surface: str, receipt: 
     REGISTRATION_RECEIPTS[receipt] = "registered" if accepted is True else "rejected"
 
 
-def _talk_command(raw_args: str = "") -> str:
+def _register_talk_command(ctx) -> None:
+    """Opt into invocation capture when supported, preserving older hosts."""
+
+    method = getattr(ctx, "register_command", None)
+    contextual = False
+    if callable(method):
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            contextual = any(
+                parameter.name == "invocation_context"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            contextual = False
+    kwargs = {
+        "handler": _talk_command,
+        "description": (
+            "Start limited legacy voice (join) or canonical parity voice (core join); "
+            "gateway also supports leave and status"
+        ),
+        "args_hint": "[join|core join|leave|status]",
+    }
+    if contextual:
+        kwargs["invocation_context"] = True
+    _attempt_registration(
+        ctx,
+        "register_command",
+        "slash command",
+        "slash_command",
+        "talk",
+        **kwargs,
+    )
+
+
+def _talk_command(raw_args: str = "", invocation=None) -> str:
     """``/talk`` — start a voice session from inside a Hermes session.
 
     Two rooms, one command. Outside an event loop (a terminal session) the
@@ -118,7 +154,7 @@ def _talk_command(raw_args: str = "") -> str:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        if sub in {"join", "leave", "status"}:
+        if sub in {"join", "core join", "leave", "status"}:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
                 "terminal, plain `/talk` starts the call."
@@ -133,6 +169,17 @@ def _talk_command(raw_args: str = "") -> str:
         return talk_discord.stop_session()
     if sub == "status":
         return talk_discord.session_status()
+    if sub == "core join":
+        if not talk_core_realtime.core_provider_available():
+            return "Canonical core voice is unsupported by this Hermes host."
+        capture = getattr(invocation, "capture_realtime_voice_attachment_factory", None)
+        if not callable(capture):
+            return "Canonical core voice requires a host-authorized command invocation."
+        try:
+            factory = capture()
+        except Exception as exc:  # noqa: BLE001 - capability refusal is speakable
+            return f"Canonical core voice was refused by the host ({type(exc).__name__})."
+        return talk_discord.start_core_session(factory)
     if sub in {"", "join"}:
         return talk_discord.start_session()
     return talk_discord.JOIN_USAGE
@@ -181,16 +228,7 @@ def register(ctx) -> None:
         ),
     )
 
-    _attempt_registration(
-        ctx,
-        "register_command",
-        "slash command",
-        "slash_command",
-        "talk",
-        handler=_talk_command,
-        description="Start a Realtime voice session (gateway: join|leave|status)",
-        args_hint="[join|leave|status]",
-    )
+    _register_talk_command(ctx)
 
     _attempt_registration(
         ctx,

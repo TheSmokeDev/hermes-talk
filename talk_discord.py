@@ -229,9 +229,7 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
 
     if guild_id is None:
         if len(clients) > 1:
-            raise TalkDiscordError(
-                "I'm in more than one voice channel — say which server"
-            )
+            raise TalkDiscordError("I'm in more than one voice channel — say which server")
         guild_id = next(iter(clients))
 
     voice_client = clients.get(guild_id)
@@ -323,6 +321,37 @@ def _new_source(frames: queue.Queue) -> Any:
     return cls(frames)
 
 
+def _add_socket_listener_once(connection: Any, callback: Any) -> None:
+    """Register an exact callback only when the host registry does not have it."""
+
+    reader = getattr(connection, "_socket_reader", None)
+    registries = [
+        getattr(reader, "_callbacks", None),
+        getattr(connection, "callbacks", None),
+    ]
+    for callbacks in registries:
+        if callbacks is not None:
+            try:
+                callback_self = getattr(callback, "__self__", _UNSET)
+                callback_func = getattr(callback, "__func__", _UNSET)
+                if any(
+                    registered is callback
+                    or (
+                        callback_self is not _UNSET
+                        and callback_func is not _UNSET
+                        and getattr(registered, "__self__", _UNSET) is callback_self
+                        and getattr(registered, "__func__", _UNSET) is callback_func
+                    )
+                    for registered in callbacks
+                ):
+                    return
+            except (TypeError, RuntimeError):
+                # An opaque or concurrently changing host registry cannot be
+                # inspected reliably; fall back to its registration API.
+                continue
+    connection.add_socket_listener(callback)
+
+
 class DiscordAudio:
     """A voice channel wearing :class:`talk_audio.DuplexAudio`'s interface."""
 
@@ -330,13 +359,20 @@ class DiscordAudio:
     # dashboard sessions deliberately keep their existing authorization path.
     discord_speaker_authorization = True
 
-    def __init__(self, guild_id: int | None = None) -> None:
+    def __init__(self, guild_id: int | None = None, *, capture_only: bool = False) -> None:
         self._guild_id = guild_id
+        self._capture_only = capture_only
         self._bridge: dict[str, Any] | None = None
         self._source: _RealtimeSource | None = None
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
         self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
+        # Serialize every externally visible lifecycle mutation, including
+        # the host listener registry calls below. Reentrant because startup
+        # unwinds an existing bridge and playback failures self-stop.
+        self._lifecycle_lock = threading.RLock()
+        self._listener_lock = threading.RLock()
+        self._listener_condition = threading.Condition(self._listener_lock)
         self._played_baseline = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
@@ -345,6 +381,11 @@ class DiscordAudio:
         self._audio_clock = 0.0
         self._original_on_packet = None
         self._tapped = None
+        self._listener_generation = 0
+        self._installed_listener_generation: int | None = None
+        self._capture_listener_generation: int | None = None
+        self._closing_listener_handoff_generation: int | None = None
+        self._active_listener_callbacks: dict[int, int] = {}
         self._loop = None
         self._last_keepalive = 0.0
         self._restore_voice_mode: Any = _UNSET
@@ -366,6 +407,23 @@ class DiscordAudio:
         surface should fail the same way whichever room it's in.
         """
 
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        """Start while owning the complete lifecycle transaction."""
+
+        # A repeated start while this exact tap generation is still installed
+        # is a no-op. Rewrapping our own tap would save that tap as the
+        # "original" and later restore it instead of the host callback.
+        if self._listener_install_is_owned():
+            return
+        if self._bridge is not None:
+            # The host may have replaced our listener on the live receiver.
+            # Unwind only what we still own before borrowing that replacement
+            # as the next generation's original.
+            self.stop()
+
         # A reused bridge must never carry a callback from an earlier session.
         # Do this before any operation that can fail so every failed-start path
         # also invalidates deliveries already queued on the old loop.
@@ -384,27 +442,52 @@ class DiscordAudio:
         self._bridge = bridge
         self._bridge_failure = None
         self._disconnected_since = None
-        self._source = _new_source(self._outbound)
+        if not self._capture_only:
+            self._source = _new_source(self._outbound)
         self._audio_clock = time.monotonic()
         self._loop = _running_loop()
         if self._loop is None:
             # Without a loop we cannot marshal the host's inactivity-timer
             # reset, and the host would evict us mid-conversation with no
             # signal. Say it once rather than fail silently.
-            _log.warning(
-                "no running loop — the host's voice inactivity timer will not be re-armed"
-            )
+            _log.warning("no running loop — the host's voice inactivity timer will not be re-armed")
         voice_client = bridge["voice_client"]
 
         # Tap the host's receive path. We wrap rather than replace so the
         # host's own bookkeeping keeps working.
         original = receiver._on_packet
+        generation = self._listener_generation + 1
 
         def tapped(data: bytes) -> None:
+            with self._listener_condition:
+                while (
+                    self._closing_listener_handoff_generation == generation
+                    and self._installed_listener_generation == generation
+                    and self._tapped is tapped
+                ):
+                    self._listener_condition.wait()
+                self._active_listener_callbacks[generation] = (
+                    self._active_listener_callbacks.get(generation, 0) + 1
+                )
             try:
                 original(data)
             finally:
-                self._drain_receiver(receiver)
+                # Linearize draining with stop()'s generation invalidation.
+                # Once teardown acquires this lock, no copied/in-flight tap
+                # from the old generation can enqueue afterward.
+                with self._listener_condition:
+                    if (
+                        self._installed_listener_generation == generation
+                        and self._capture_listener_generation == generation
+                        and self._tapped is tapped
+                    ):
+                        self._drain_receiver(receiver)
+                    remaining = self._active_listener_callbacks[generation] - 1
+                    if remaining:
+                        self._active_listener_callbacks[generation] = remaining
+                    else:
+                        self._active_listener_callbacks.pop(generation, None)
+                        self._listener_condition.notify_all()
 
         # The registration is what matters, NOT the attribute. discord.py
         # appends the BOUND METHOD OBJECT to its listener list and calls the
@@ -417,8 +500,12 @@ class DiscordAudio:
         # is the only thing that can put the original listener back, and it
         # is gated on these being set. Losing that leg leaves the host
         # permanently deaf with no path back.
-        self._original_on_packet = original
-        self._tapped = tapped
+        with self._listener_lock:
+            self._original_on_packet = original
+            self._tapped = tapped
+            self._listener_generation = generation
+            self._installed_listener_generation = generation
+            self._capture_listener_generation = None
         try:
             connection = voice_client._connection
             # Add first, then remove: unregistering the only callback pauses
@@ -428,17 +515,44 @@ class DiscordAudio:
             connection.add_socket_listener(tapped)
             connection.remove_socket_listener(original)
         except Exception as exc:  # host receive surface, any type
+            # Fence this generation before any rollback callback operation.
+            # A dispatcher may already have copied the tap and still be inside
+            # the original callback; once it returns it must not drain into a
+            # failed generation while remove/add repairs the host registry.
+            with self._listener_condition:
+                self._installed_listener_generation = None
+                self._capture_listener_generation = None
+                self._closing_listener_handoff_generation = None
+                self._original_on_packet = None
+                self._tapped = None
+                self._bridge = None
+                self._listener_condition.notify_all()
+            # Removal and restoration are independent best-effort operations:
+            # a half-completed swap can leave either callback absent.
             with suppress(Exception):  # never leave the host deaf
                 connection.remove_socket_listener(tapped)
             with suppress(Exception):
-                connection.add_socket_listener(original)
-            self._original_on_packet = None
-            self._tapped = None
-            self._bridge = None
+                _add_socket_listener_once(connection, original)
+            self._wait_for_listener_generation(generation)
+            self._reset_capture_generation()
+            self._source = None
             raise talk_audio.TalkAudioError(
                 f"couldn't listen in on the voice channel: {exc}"
             ) from exc
         receiver._on_packet = tapped
+        # New packets now route through the parked tap. Drop PCM accumulated
+        # before this handoff, then publish the generation and release callbacks.
+        with self._listener_condition:
+            self._closing_listener_handoff_generation = generation
+            while self._active_listener_callbacks.get(generation, 0):
+                self._listener_condition.wait()
+            self._discard_receiver_buffers(receiver)
+            self._capture_listener_generation = generation
+            self._closing_listener_handoff_generation = None
+            self._listener_condition.notify_all()
+
+        if self._capture_only:
+            return
 
         # Park the host's own speech while we own the conversation. Its
         # reply path waits on ``is_playing()`` — which our continuous source
@@ -496,27 +610,58 @@ class DiscordAudio:
     def stop(self) -> None:
         """Hand the connection back. Safe twice, and after a failed start."""
 
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        """Stop while owning the complete lifecycle transaction."""
+
         self._detach_speaker_notifier()
-        bridge_is_current = self._bridge_identity_is_current()
-        bridge, self._bridge = self._bridge, None
+        with self._listener_condition:
+            listener_is_owned = self._listener_install_is_owned()
+            generation = self._installed_listener_generation
+            bridge, self._bridge = self._bridge, None
+            original, self._original_on_packet = self._original_on_packet, None
+            tapped, self._tapped = self._tapped, None
+            # Fence callbacks copied by the host before touching its listener
+            # registry. Removal can invoke or race such a callback, and it must
+            # not drain receiver buffers into a detached generation.
+            self._installed_listener_generation = None
+            self._capture_listener_generation = None
+            self._closing_listener_handoff_generation = None
+            self._listener_condition.notify_all()
         # Teardown is best-effort at every step: a half-torn-down bridge
         # must still hand the connection back to the host, in the reverse
         # order it was taken.
-        if bridge is not None and self._original_on_packet is not None:
+        if bridge is not None and original is not None:
             receiver = bridge.get("receiver")
+            connection = bridge["voice_client"]._connection
             with suppress(Exception):
-                connection = bridge["voice_client"]._connection
-                connection.remove_socket_listener(self._tapped)
-                # Only re-register for a receiver that is still alive. If the
-                # host already tore it down, re-adding an inert callback keeps
-                # its reader thread awake for the life of the connection.
-                if bridge_is_current and getattr(receiver, "_running", False):
-                    connection.add_socket_listener(self._original_on_packet)
-            with suppress(Exception):
-                receiver._on_packet = self._original_on_packet
-        self._original_on_packet = None
-        self._tapped = None
-        self._audio_clock = 0.0
+                connection.remove_socket_listener(tapped)
+            # Removal and restoration are independent: a concurrent host
+            # removal may make the first operation raise, but the host still
+            # needs its original listener back. Re-check callback identity so
+            # a newer host replacement remains authoritative.
+            if (
+                listener_is_owned
+                and getattr(receiver, "_running", False)
+                and getattr(receiver, "_on_packet", None) is tapped
+                and self._published_bridge_is_exact(bridge)
+            ):
+                with suppress(Exception):
+                    _add_socket_listener_once(connection, original)
+                if not self._published_bridge_is_exact(bridge):
+                    with suppress(Exception):
+                        connection.remove_socket_listener(original)
+                else:
+                    with suppress(Exception):
+                        if getattr(receiver, "_on_packet", None) is tapped:
+                            receiver._on_packet = original
+        if generation is not None:
+            self._wait_for_listener_generation(generation)
+        # The old tap is fenced before this reset, so no old generation can
+        # refill the queue or rebuild a partial conversion afterward.
+        self._reset_capture_generation()
         if bridge is not None:
             adapter = bridge.get("adapter")
             if self._restore_play is not _UNSET:
@@ -527,8 +672,9 @@ class DiscordAudio:
                 with suppress(Exception):
                     adapter._voice_mode_getter = self._restore_voice_mode
             self._restore_voice_mode = _UNSET
-            with suppress(Exception):
-                bridge["voice_client"].stop()
+            if not self._capture_only:
+                with suppress(Exception):
+                    bridge["voice_client"].stop()
         source, self._source = self._source, None
         if source is not None:
             with self._lock:
@@ -546,9 +692,44 @@ class DiscordAudio:
     def _detach_speaker_notifier(self) -> None:
         self.set_speaker_notifier(None)
 
-    def _deliver_speaker(
-        self, generation: int, notifier: Any, speaker: dict[str, Any]
-    ) -> None:
+    def _reset_capture_generation(self) -> None:
+        while True:
+            try:
+                self._inbound.get_nowait()
+            except queue.Empty:
+                break
+        self._capture_remainder.clear()
+        self._audio_clock = 0.0
+        self._last_keepalive = 0.0
+        self._loop = None
+        self._last_speaker_key = _UNSET
+        self._bridge_failure = None
+        self._disconnected_since = None
+
+    @staticmethod
+    def _discard_receiver_buffers(receiver: Any) -> None:
+        """Drop host PCM that predates a newly published Talk generation."""
+
+        buffers = getattr(receiver, "_buffers", None)
+        if not buffers:
+            return
+        lock = getattr(receiver, "_lock", None)
+        if lock is not None:
+            with lock:
+                for buf in buffers.values():
+                    del buf[:]
+            return
+        for buf in buffers.values():  # pragma: no cover - shipped hosts have the lock
+            del buf[:]
+
+    def _wait_for_listener_generation(self, generation: int) -> None:
+        """Wait until admitted callbacks finish the host's original bookkeeping."""
+
+        with self._listener_condition:
+            while self._active_listener_callbacks.get(generation, 0):
+                self._listener_condition.wait()
+
+    def _deliver_speaker(self, generation: int, notifier: Any, speaker: dict[str, Any]) -> None:
         if (
             generation == self._speaker_notifier_generation
             and notifier is self._speaker_notifier
@@ -559,12 +740,9 @@ class DiscordAudio:
     def _speaker_for_ssrc(self, ssrc: Any, raw_user_id: Any) -> dict[str, Any]:
         """Resolve display metadata from the receiver's already-captured mapping."""
 
-        try:
-            user_id = int(raw_user_id)
-        except (TypeError, ValueError):
-            user_id = 0
+        user_id = raw_user_id if type(raw_user_id) is int and raw_user_id > 0 else None
         display_name = ""
-        if user_id > 0 and self._bridge is not None:
+        if user_id is not None and self._bridge is not None:
             voice_client = self._bridge.get("voice_client")
             channel = getattr(voice_client, "channel", None)
             for member in getattr(channel, "members", ()) or ():
@@ -592,9 +770,7 @@ class DiscordAudio:
             self._deliver_speaker(generation, notifier, speaker)
             return
         with suppress(RuntimeError):  # loop closed while the receiver thread drains
-            loop.call_soon_threadsafe(
-                self._deliver_speaker, generation, notifier, speaker
-            )
+            loop.call_soon_threadsafe(self._deliver_speaker, generation, notifier, speaker)
 
     def _drain_receiver(self, receiver: Any) -> None:
         """Move whatever the host just decoded into our queue, at our rate.
@@ -606,9 +782,7 @@ class DiscordAudio:
         """
 
         if not self._bridge_identity_is_current(receiver):
-            self._mark_bridge_failure(
-                "the Discord voice connection changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice connection changed while I was listening")
             return
 
         try:
@@ -637,9 +811,7 @@ class DiscordAudio:
                 chunks = [
                     (
                         ssrc,
-                        receiver_mapping.get(ssrc)
-                        if isinstance(receiver_mapping, dict)
-                        else None,
+                        receiver_mapping.get(ssrc) if isinstance(receiver_mapping, dict) else None,
                         bytes(buf),
                     )
                     for ssrc, buf in buffers.items()
@@ -680,6 +852,12 @@ class DiscordAudio:
         bridge = self._bridge
         if bridge is None:
             return True
+        return self._published_bridge_is_exact(bridge, receiver)
+
+    @staticmethod
+    def _published_bridge_is_exact(bridge: dict[str, Any], receiver: Any | None = None) -> bool:
+        """Whether the adapter still publishes this exact borrowed generation."""
+
         try:
             adapter = bridge["adapter"]
             guild_id = bridge["guild_id"]
@@ -694,6 +872,19 @@ class DiscordAudio:
             )
         except Exception:  # noqa: BLE001 — host internals are an untrusted boundary
             return False
+
+    def _listener_install_is_owned(self) -> bool:
+        """Whether our exact current tap generation still owns the receiver slot."""
+
+        bridge = self._bridge
+        tapped = self._tapped
+        return bool(
+            bridge is not None
+            and tapped is not None
+            and self._installed_listener_generation == self._listener_generation
+            and self._bridge_identity_is_current()
+            and getattr(bridge.get("receiver"), "_on_packet", None) is tapped
+        )
 
     def _mark_bridge_failure(self, message: str) -> None:
         if self._bridge_failure is None:
@@ -720,13 +911,9 @@ class DiscordAudio:
 
     def _fail_if_bridge_lost(self) -> None:
         if not self._bridge_identity_is_current():
-            self._mark_bridge_failure(
-                "the Discord voice connection changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice connection changed while I was listening")
         elif not self._bridge_credentials_are_current():
-            self._mark_bridge_failure(
-                "the Discord voice credentials changed while I was listening"
-            )
+            self._mark_bridge_failure("the Discord voice credentials changed while I was listening")
         bridge = self._bridge
         if bridge is not None and self._bridge_failure is None:
             try:
@@ -837,6 +1024,8 @@ class DiscordAudio:
     def queue_playback(self, pcm: bytes) -> None:
         """Queue 24 kHz mono from the model for the voice channel."""
 
+        if self._capture_only:
+            raise talk_audio.TalkAudioError("capture-only Discord audio cannot queue playback")
         if not pcm:
             return
         converted, self._carry_sample = session_to_discord(pcm, carry=self._carry_sample)
@@ -900,6 +1089,7 @@ __all__ = [
     "resolve_voice_bridge",
     "session_status",
     "session_to_discord",
+    "start_core_session",
     "start_session",
     "stop_session",
 ]
@@ -912,7 +1102,33 @@ __all__ = [
 _SESSION: dict[str, Any] = {}
 _SESSION_LOCK = threading.Lock()
 _LAST_FAILURE: str | None = None
+_LAST_FAILURE_GENERATION: int | None = None
+_SESSION_GENERATION = 0
 _NOTIFICATION_TASKS: set[Any] = set()
+
+_SAFE_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectionError",
+        "OSError",
+        "RuntimeError",
+        "TalkAudioError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    }
+)
+
+
+def _safe_exception_name(error: BaseException) -> str:
+    name = type(error).__name__
+    return name if name in _SAFE_EXCEPTION_NAMES else "unexpected error"
+
+
+def _public_exception_failure(error: BaseException) -> str:
+    """Return a bounded allowlisted failure with no exception text or repr."""
+
+    return f"session error ({_safe_exception_name(error)})"
+
 
 JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
 
@@ -923,12 +1139,24 @@ def session_status() -> str:
     with _SESSION_LOCK:
         task = _SESSION.get("task")
         guild_id = _SESSION.get("guild_id")
+        mode = _SESSION.get("mode", "legacy")
+        core_status = _SESSION.get("status", "starting")
         last_failure = _LAST_FAILURE
     if task is None or task.done():
         if last_failure:
             return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
-    return f"Live in the voice channel on server {guild_id} — say `talk leave` to stop."
+    if mode == "core":
+        if core_status == "listening":
+            return (
+                f"Canonical core voice is listening live on server {guild_id} — "
+                "say `talk leave` to stop."
+            )
+        return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
+    return (
+        f"Limited legacy provider-owned voice is live on server {guild_id}. "
+        "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
+    )
 
 
 async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) -> bool:
@@ -972,6 +1200,131 @@ async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) ->
     return False
 
 
+def start_core_session(factory: object, guild_id: int | None = None) -> str:
+    """Start the canonical input-only lane without falling back to legacy Talk."""
+
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
+
+    try:
+        import asyncio as _asyncio
+
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        return "Canonical core voice requires the running Hermes gateway."
+
+    try:
+        bridge = resolve_voice_bridge(guild_id)
+    except TalkDiscordError as exc:
+        return str(exc)
+
+    try:
+        from . import talk_core_session
+    except ImportError:  # pragma: no cover - flat-module fallback
+        import talk_core_session
+
+    audio = DiscordAudio(bridge["guild_id"], capture_only=True)
+    task = None
+    generation = None
+
+    def _project_status(status: str) -> None:
+        if status != "listening":
+            return
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is task and _SESSION.get("generation") == generation:
+                _SESSION["status"] = status
+
+    def _done(finished) -> None:
+        global _LAST_FAILURE, _LAST_FAILURE_GENERATION
+
+        failure = None
+        diagnostic_name = None
+        try:
+            if not finished.cancelled():
+                error = finished.exception()
+                if error is not None:
+                    failure = _public_exception_failure(error)
+                    diagnostic_name = _safe_exception_name(error)
+        except Exception as exc:  # noqa: BLE001 - callback must not escape
+            failure = "session outcome unavailable"
+            diagnostic_name = _safe_exception_name(exc)
+        with _SESSION_LOCK:
+            owns_session = (
+                _SESSION.get("task") is finished and _SESSION.get("generation") == generation
+            )
+            if owns_session:
+                _SESSION.clear()
+                if failure:
+                    _LAST_FAILURE = f"canonical core voice: {failure}"
+                    _LAST_FAILURE_GENERATION = generation
+        if not owns_session:
+            try:
+                audio.stop()
+            except Exception as exc:  # noqa: BLE001 - runner also owns idempotent teardown
+                _log.debug("canonical core audio teardown failed (%s)", _safe_exception_name(exc))
+            return
+        if failure:
+            _log.warning(
+                "canonical core voice session failed closed (%s)",
+                diagnostic_name or "unknown outcome",
+            )
+            receipt = (
+                f"Canonical core voice failed closed: {failure}. "
+                "No legacy voice session was started."
+            )
+
+            async def _notify() -> None:
+                global _LAST_FAILURE, _LAST_FAILURE_GENERATION
+
+                delivered = await _deliver_failure_receipt(
+                    bridge["adapter"], bridge["guild_id"], receipt
+                )
+                if delivered:
+                    with _SESSION_LOCK:
+                        if generation == _LAST_FAILURE_GENERATION:
+                            _LAST_FAILURE = None
+                            _LAST_FAILURE_GENERATION = None
+
+            notification = loop.create_task(_notify())
+            _NOTIFICATION_TASKS.add(notification)
+            notification.add_done_callback(_NOTIFICATION_TASKS.discard)
+        try:
+            audio.stop()
+        except Exception as exc:  # noqa: BLE001 - runner also owns idempotent teardown
+            _log.debug("canonical core audio teardown failed (%s)", _safe_exception_name(exc))
+
+    with _SESSION_LOCK:
+        existing = _SESSION.get("task")
+        if existing is not None and not existing.done():
+            return "I'm already live in a voice channel — say `talk leave` first."
+        _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION += 1
+        generation = _SESSION_GENERATION
+        task = loop.create_task(
+            talk_core_session.run_core_session(
+                factory,
+                guild_id=bridge["guild_id"],
+                audio=audio,
+                status_callback=_project_status,
+            )
+        )
+        task.add_done_callback(_done)
+        _SESSION.update(
+            {
+                "task": task,
+                "guild_id": bridge["guild_id"],
+                "audio": audio,
+                "mode": "core",
+                "status": "starting",
+                "generation": generation,
+            }
+        )
+    return (
+        "Starting the canonical core input lane in the voice channel — "
+        "say `talk status` to check it or `talk leave` to stop."
+    )
+
+
 def start_session(guild_id: int | None = None) -> str:
     """Start a realtime session on the host's voice connection.
 
@@ -979,7 +1332,7 @@ def start_session(guild_id: int | None = None) -> str:
     this is the gateway path; the terminal path is ``hermes talk``.
     """
 
-    global _LAST_FAILURE
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
 
     try:
         import asyncio as _asyncio
@@ -999,46 +1352,78 @@ def start_session(guild_id: int | None = None) -> str:
         import talk_cli
 
     audio = DiscordAudio(bridge["guild_id"])
+    generation = None
 
     def _done(finished) -> None:
-        global _LAST_FAILURE
+        global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
         failure = None
+        diagnostic_name = None
         try:
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None:
-                    failure = f"{type(error).__name__}: {error}"
+                    failure = _public_exception_failure(error)
+                    diagnostic_name = _safe_exception_name(error)
                 else:
                     status = finished.result()
                     if status:
-                        failure = audio._bridge_failure or f"session exited with status {status}"
+                        bridge_failure = audio._bridge_failure
+                        safe_bridge_failures = {
+                            "the Discord voice connection changed",
+                            "the Discord voice credentials changed",
+                            "the Discord voice connection changed while I was listening",
+                            "the Discord voice credentials changed while I was listening",
+                            "the Discord voice connection liveness could not be verified",
+                            "the Discord voice connection disconnected while I was listening",
+                        }
+                        failure = (
+                            bridge_failure
+                            if bridge_failure in safe_bridge_failures
+                            else "session exited unsuccessfully"
+                        )
         except Exception as exc:  # noqa: BLE001 — a receipt must not raise
-            failure = f"session outcome could not be read: {exc}"
+            failure = "session outcome unavailable"
+            diagnostic_name = _safe_exception_name(exc)
 
         with _SESSION_LOCK:
-            if _SESSION.get("task") is finished:
+            owns_session = (
+                _SESSION.get("task") is finished and _SESSION.get("generation") == generation
+            )
+            if owns_session:
                 _SESSION.clear()
-            if failure:
-                _LAST_FAILURE = failure
+                if failure:
+                    _LAST_FAILURE = failure
+                    _LAST_FAILURE_GENERATION = generation
+
+        if not owns_session:
+            try:
+                audio.stop()
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
+            return
 
         if failure:
-            _log.warning("discord voice session failed: %s", failure)
+            _log.warning(
+                "discord voice session failed closed (%s)",
+                diagnostic_name or "nonzero status",
+            )
             receipt = (
                 f"Voice session failed closed: {failure}. The voice channel was handed "
                 "back; say `talk join` when you want to start a new session."
             )
 
             async def _notify() -> None:
-                global _LAST_FAILURE
+                global _LAST_FAILURE, _LAST_FAILURE_GENERATION
 
                 delivered = await _deliver_failure_receipt(
                     bridge["adapter"], bridge["guild_id"], receipt
                 )
                 if delivered:
                     with _SESSION_LOCK:
-                        if failure == _LAST_FAILURE:
+                        if generation == _LAST_FAILURE_GENERATION:
                             _LAST_FAILURE = None
+                            _LAST_FAILURE_GENERATION = None
 
             notification = loop.create_task(_notify())
             _NOTIFICATION_TASKS.add(notification)
@@ -1046,8 +1431,8 @@ def start_session(guild_id: int | None = None) -> str:
 
         try:
             audio.stop()
-        except Exception:  # noqa: BLE001 — teardown is best-effort
-            _log.debug("discord audio teardown failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
 
     # Claim the slot and publish the task under ONE lock: checking in one
     # acquisition and publishing in another lets two joins both pass the
@@ -1057,17 +1442,28 @@ def start_session(guild_id: int | None = None) -> str:
         if existing is not None and not existing.done():
             return "I'm already live in a voice channel — say `talk leave` first."
         _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION += 1
+        generation = _SESSION_GENERATION
         task = loop.create_task(talk_cli.run_talk_session(audio=audio))
         task.add_done_callback(_done)
-        _SESSION.update({"task": task, "guild_id": bridge["guild_id"], "audio": audio})
+        _SESSION.update(
+            {
+                "task": task,
+                "guild_id": bridge["guild_id"],
+                "audio": audio,
+                "mode": "legacy",
+                "generation": generation,
+            }
+        )
 
     # Deliberately not "I'm live": nothing has connected yet. The session
     # still has to mint, open a socket, and take the channel, and any of
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
     return (
-        "Starting up in the voice channel — give me a second, then talk to "
-        "me. Say `talk status` if you want to check, or `talk leave` to stop."
+        "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
+        "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
     )
 
 
@@ -1083,17 +1479,19 @@ def stop_session() -> str:
     if audio is not None:
         try:
             audio.stop()
-        except Exception:  # noqa: BLE001 — teardown is best-effort
-            _log.debug("discord audio teardown failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            _log.debug("discord audio teardown failed (%s)", _safe_exception_name(exc))
     return "Left the voice session — the channel is yours again."
 
 
 def reset_for_tests() -> None:
-    global _LAST_FAILURE
+    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
 
     with _SESSION_LOCK:
         _SESSION.clear()
         _LAST_FAILURE = None
+        _LAST_FAILURE_GENERATION = None
+        _SESSION_GENERATION = 0
         for notification in _NOTIFICATION_TASKS:
             notification.cancel()
         _NOTIFICATION_TASKS.clear()

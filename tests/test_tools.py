@@ -163,6 +163,16 @@ def test_talk_status_reports_state(monkeypatch):
     assert status["attached_to_hermes"] is False
     assert isinstance(status["audio_available"], bool)
     assert status["legacy_lane"] == "legacy-provider-executor"
+    assert status["legacy_session"] == {
+        "scope": "limited provider-owned session",
+        "full_parity_command": "/talk core join",
+    }
+    assert status["transcript"] == {
+        "current_call": "temporary local capture",
+        "after_close": "handed off for durable-memory review",
+        "archive": "not live searchable or user-facing",
+        "core_persistence": "separate canonical session path",
+    }
     assert status["core_realtime"]["contract"] == "api-v2-input-only"
     assert isinstance(status["core_realtime"]["contract_available"], bool)
     assert isinstance(status["core_realtime"]["provider_available"], bool)
@@ -223,7 +233,17 @@ def test_check_work_lists_a_finished_run():
     run_id = talk_runs.start_run("agent", "audit", lambda _rid: "the index is rebuilt")
     _wait_terminal(run_id)
 
-    assert f"run {run_id} (agent) done" in talk_tools.execute_talk_tool("check_work", {})
+    result = talk_tools.execute_talk_tool("check_work", {})
+    assert f"run {run_id} (agent) done" in result
+    assert f"check_work with run_id {run_id}" in result
+    assert "the index is rebuilt" not in result
+
+
+def test_check_work_schema_directs_specific_bounded_finished_output_retrieval():
+    schema = next(tool for tool in talk_tools.default_talk_tools() if tool["name"] == "check_work")
+
+    assert "finished run_id" in schema["description"]
+    assert "output" in schema["parameters"]["properties"]["run_id"]["description"]
 
 
 def test_check_work_by_id_speaks_the_output():
