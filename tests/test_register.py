@@ -161,12 +161,12 @@ def test_real_api_v2_context_accepts_the_talk_provider(plugin):
         pytest.skip("optional Hermes core API-v2 is absent")
     try:
         from agent import realtime_voice_registry
-        from hermes_cli.plugins import PluginContext, PluginManifest
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     except ImportError:
         pytest.skip("optional Hermes plugin API is absent")
 
     realtime_voice_registry._reset_for_tests()
-    ctx = PluginContext(PluginManifest(name="hermes-talk-test"), object())
+    ctx = PluginContext(PluginManifest(name="hermes-talk-test"), PluginManager())
     try:
         plugin._attempt_boolean_registration(
             ctx,
