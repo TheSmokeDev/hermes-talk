@@ -1153,6 +1153,11 @@ def session_status() -> str:
                 "say `talk leave` to stop."
             )
         return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
+    if mode == "provider-host-tools":
+        return (
+            f"Provider-owned Realtime voice with canonical Hermes tools is live on server "
+            f"{guild_id}. Say `talk leave` to stop."
+        )
     return (
         f"Limited legacy provider-owned voice is live on server {guild_id}. "
         "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
@@ -1325,7 +1330,9 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
     )
 
 
-def start_session(guild_id: int | None = None) -> str:
+def start_session(
+    guild_id: int | None = None, *, host_execution_attachment=None
+) -> str:
     """Start a realtime session on the host's voice connection.
 
     Returns the sentence to speak back. Requires a running event loop —
@@ -1445,14 +1452,25 @@ def start_session(guild_id: int | None = None) -> str:
         _LAST_FAILURE_GENERATION = None
         _SESSION_GENERATION += 1
         generation = _SESSION_GENERATION
-        task = loop.create_task(talk_cli.run_talk_session(audio=audio))
+        if host_execution_attachment is None:
+            session = talk_cli.run_talk_session(audio=audio)
+        else:
+            session = talk_cli.run_talk_session(
+                audio=audio,
+                host_execution_attachment=host_execution_attachment,
+            )
+        task = loop.create_task(session)
         task.add_done_callback(_done)
         _SESSION.update(
             {
                 "task": task,
                 "guild_id": bridge["guild_id"],
                 "audio": audio,
-                "mode": "legacy",
+                "mode": (
+                    "provider-host-tools"
+                    if host_execution_attachment is not None
+                    else "legacy"
+                ),
                 "generation": generation,
             }
         )
@@ -1461,6 +1479,11 @@ def start_session(guild_id: int | None = None) -> str:
     # still has to mint, open a socket, and take the channel, and any of
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
+    if host_execution_attachment is not None:
+        return (
+            "Starting provider-owned Realtime voice with canonical Hermes tools; say "
+            "`talk status` to check or `talk leave` to stop."
+        )
     return (
         "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
         "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."

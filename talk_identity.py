@@ -72,6 +72,7 @@ VOICE_PREAMBLE = (
 )
 
 _TOOLS_MARKER = "Advertised legacy tools:"
+_HOST_TOOLS_MARKER = "Canonical Hermes host tools:"
 _TRANSCRIPT_CONTRACT = (
     "This limited legacy provider-owned call keeps a temporary local transcript while live. "
     "It is handed off after the call closes for durable-memory review; it is not a live "
@@ -79,9 +80,15 @@ _TRANSCRIPT_CONTRACT = (
     "whether capture occurred. Canonical core-session persistence is separate; users "
     "who need full Hermes parity should use /talk core join."
 )
+_HOST_TRANSCRIPT_CONTRACT = (
+    "This provider-owned Realtime call executes tools through the canonical Hermes host. "
+    "Ordinary speech and native PCM remain provider-owned; they are never routed through "
+    "a second canonical Hermes inference turn. The temporary live transcript is handed off "
+    "after the call closes for durable-memory review."
+)
 
 
-def _tool_contract(tools: list[dict] | None) -> str:
+def _tool_contract(tools: list[dict] | None, *, host_execution: bool = False) -> str:
     """Render the exact schema names supplied to the provider session."""
 
     names = [
@@ -90,13 +97,15 @@ def _tool_contract(tools: list[dict] | None) -> str:
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     ]
     rendered = ", ".join(names) if names else "none"
-    return f"{_TOOLS_MARKER} {rendered}. Do not claim or simulate tools outside this list."
+    marker = _HOST_TOOLS_MARKER if host_execution else _TOOLS_MARKER
+    return f"{marker} {rendered}. Do not claim or simulate tools outside this list."
 
 
 def advertised_tool_names(instructions: str) -> tuple[str, ...]:
     """Read back the machine-checkable tool-name claim from built instructions."""
 
-    match = re.search(rf"{re.escape(_TOOLS_MARKER)} ([^.]+)\.", instructions)
+    markers = f"(?:{re.escape(_TOOLS_MARKER)}|{re.escape(_HOST_TOOLS_MARKER)})"
+    match = re.search(rf"{markers} ([^.]+)\.", instructions)
     if match is None or match.group(1) == "none":
         return ()
     return tuple(name.strip() for name in match.group(1).split(",") if name.strip())
@@ -123,7 +132,10 @@ def current_moment() -> str:
 
 
 def build_instructions(
-    host_sections: dict[str, str] | None, *, tools: list[dict] | None = None
+    host_sections: dict[str, str] | None,
+    *,
+    tools: list[dict] | None = None,
+    host_execution: bool = False,
 ) -> str:
     """Assemble the Realtime session prompt.
 
@@ -152,7 +164,10 @@ def build_instructions(
     # perishable thing in the prompt, and a session with no host sections at
     # all should still be able to say what day it is.
     sections.append(current_moment())
-    contracts = [_tool_contract(tools), _TRANSCRIPT_CONTRACT]
+    contracts = [
+        _tool_contract(tools, host_execution=host_execution),
+        _HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT,
+    ]
     return VOICE_PREAMBLE + "\n\n" + "\n\n".join([*contracts, *sections])
 
 

@@ -355,6 +355,7 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
             {
                 "type": "response.function_call_arguments.done",
                 "call_id": "call-1",
+                "item_id": "item-1",
                 "response_id": "resp-1",
                 "name": "search_memory",
                 "arguments": "{}",
@@ -386,6 +387,7 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
     assert events[8].final is True
     assert events[9] == rt.FunctionCall(
         call_id="call-1",
+        item_id="item-1",
         response_id="resp-1",
         name="search_memory",
         arguments="{}",
