@@ -22,14 +22,21 @@ def build_core_setup():
 
     if not talk_core_realtime.core_provider_available():
         raise RuntimeError("Hermes realtime voice API-v2 is unavailable")
+    typed_audio = {}
+    if talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT is not None:
+        typed_audio = {
+            "input_audio": talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT,
+            "output_audio": talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT,
+        }
     return talk_core_realtime.RealtimeVoiceSetup(
         model=talk_config.talk_model(),
         voice=talk_config.talk_voice(),
         instructions="",
         tools=(),
         audio=talk_core_realtime.SUPPORTED_AUDIO_FORMAT,
+        **typed_audio,
+        automatic_response=False,
         provider_options={
-            "automatic_response": False,
             "capabilities": (
                 "input_transcription",
                 "input_commit_events",

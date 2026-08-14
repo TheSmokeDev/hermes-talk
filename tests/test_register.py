@@ -391,12 +391,55 @@ def test_core_join_captures_and_forwards_the_exact_host_factory(plugin, monkeypa
     assert ctx.commands["talk"]["invocation_context"] is True
 
 
+def test_join_captures_and_forwards_the_exact_host_execution_attachment(plugin, monkeypatch):
+    ctx = StubCtx()
+    plugin.register(ctx)
+    handler = ctx.commands["talk"]["handler"]
+    attachment = object()
+    invocation = types.SimpleNamespace(
+        capture_realtime_execution_attachment=lambda: attachment
+    )
+    forwarded = []
+    monkeypatch.setattr(
+        plugin.talk_discord,
+        "start_session",
+        lambda *, host_execution_attachment=None: (
+            forwarded.append(host_execution_attachment) or "starting provider-owned"
+        ),
+    )
+
+    async def call_from_a_loop():
+        return handler("join", invocation=invocation)
+
+    assert asyncio.run(call_from_a_loop()) == "starting provider-owned"
+    assert forwarded == [attachment]
+
+
+def test_join_on_an_older_host_keeps_the_explicitly_limited_fallback(plugin, monkeypatch):
+    ctx = StubCtx()
+    plugin.register(ctx)
+    handler = ctx.commands["talk"]["handler"]
+    calls = []
+    monkeypatch.setattr(
+        plugin.talk_discord,
+        "start_session",
+        lambda: calls.append("legacy") or "Starting limited legacy provider-owned voice.",
+    )
+
+    async def call_from_a_loop():
+        return handler("join", invocation=types.SimpleNamespace())
+
+    reply = asyncio.run(call_from_a_loop())
+    assert calls == ["legacy"]
+    assert "limited legacy" in reply.lower()
+
+
 def test_registered_command_description_labels_legacy_and_core_parity(plugin):
     ctx = StubCtx()
     plugin.register(ctx)
 
     description = ctx.commands["talk"]["description"]
-    assert "limited legacy" in description.lower()
+    assert "provider-owned" in description.lower()
     assert "core join" in description.lower()
 
 

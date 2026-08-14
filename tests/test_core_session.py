@@ -103,13 +103,22 @@ def test_core_setup_is_input_only_and_requests_only_commit_transcription():
     assert setup.instructions == ""
     assert setup.tools == ()
     assert setup.audio == talk_core_session.talk_core_realtime.SUPPORTED_AUDIO_FORMAT
+    assert (
+        setup.input_audio
+        == talk_core_session.talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT
+    )
+    assert (
+        setup.output_audio
+        == talk_core_session.talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT
+    )
+    assert setup.automatic_response is False
     assert setup.provider_options == {
-        "automatic_response": False,
         "capabilities": (
             "input_transcription",
             "input_commit_events",
         ),
     }
+    assert "automatic_response" not in setup.provider_options
 
 
 def test_core_runner_opens_exact_provider_and_routes_only_authorized_pcm():
@@ -177,6 +186,15 @@ def test_core_runner_opens_exact_provider_and_routes_only_authorized_pcm():
 
     assert audio.started and audio.stopped
     assert factory.opened[0][0] == talk_core_session.talk_core_realtime.PROVIDER_NAME
+    opened_setup = factory.opened[0][1]
+    assert (
+        opened_setup.input_audio
+        == talk_core_session.talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT
+    )
+    assert (
+        opened_setup.output_audio
+        == talk_core_session.talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT
+    )
     assert factory.opened[0][2]["required_capabilities"] == (
         talk_core_session.talk_core_realtime.CORE_CAPABILITIES
     )

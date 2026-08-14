@@ -123,7 +123,8 @@ def _register_talk_command(ctx) -> None:
     kwargs = {
         "handler": _talk_command,
         "description": (
-            "Start limited legacy voice (join) or canonical parity voice (core join); "
+            "Start provider-owned voice with canonical Hermes tools (join), or the "
+            "canonical core voice lane (core join); "
             "gateway also supports leave and status"
         ),
         "args_hint": "[join|core join|leave|status]",
@@ -181,6 +182,13 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
             return f"Canonical core voice was refused by the host ({type(exc).__name__})."
         return talk_discord.start_core_session(factory)
     if sub in {"", "join"}:
+        capture = getattr(invocation, "capture_realtime_execution_attachment", None)
+        if callable(capture):
+            try:
+                attachment = capture()
+            except Exception as exc:  # noqa: BLE001 - capability refusal is speakable
+                return f"Provider-owned voice was refused by the host ({type(exc).__name__})."
+            return talk_discord.start_session(host_execution_attachment=attachment)
         return talk_discord.start_session()
     return talk_discord.JOIN_USAGE
 

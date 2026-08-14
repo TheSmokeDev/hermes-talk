@@ -56,6 +56,55 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
     }
 
 
+CORE_RENDER_VERBATIM_INSTRUCTION = (
+    "Render the sole user input as speech verbatim. Speak every character's "
+    "words and punctuation naturally, but add, remove, or paraphrase nothing. "
+    "Do not preface or explain."
+)
+
+
+def build_core_response_create(
+    *, canonical_text: str, correlation: str, voice: str, event_id: str
+) -> dict[str, Any]:
+    """Build the exact explicit canonical response for the Hermes core lane."""
+
+    return {
+        "type": "response.create",
+        "event_id": event_id,
+        "response": {
+            "conversation": "none",
+            "metadata": {"correlation": correlation},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": canonical_text}],
+                }
+            ],
+            "instructions": CORE_RENDER_VERBATIM_INSTRUCTION,
+            "output_modalities": ["audio"],
+            "audio": {
+                "output": {
+                    "voice": voice,
+                    "format": {"type": "audio/pcm", "rate": 24_000},
+                }
+            },
+            "tools": [],
+            "tool_choice": "none",
+        },
+    }
+
+
+def build_core_response_cancel(*, response_id: str, event_id: str) -> dict[str, Any]:
+    """Build one exact response-local cancellation for the Hermes core lane."""
+
+    return {
+        "type": "response.cancel",
+        "event_id": event_id,
+        "response_id": response_id,
+    }
+
+
 def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
     """Map one provider-neutral command to OpenAI wire JSON."""
 
@@ -198,6 +247,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 name=event.get("name"),
                 arguments=event.get("arguments") if isinstance(event.get("arguments"), str) else "",
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.done":
             response = _mapping(event.get("response"))
@@ -237,8 +287,8 @@ class _OpenAIWireSession:
         aiohttp_module=None,
         mint_session: Callable[..., Any] | None = None,
     ) -> None:
-        self.auth_token = auth_token
-        self.auth_source = auth_source
+        self._auth_token: str | None = auth_token
+        self._auth_source: str | None = auth_source
         self._aiohttp = aiohttp_module
         self._mint_session = mint_session or self._mint
         self._stack: AsyncExitStack | None = None
@@ -249,10 +299,18 @@ class _OpenAIWireSession:
         self._close_task: asyncio.Task[None] | None = None
         self._close_failure: BaseException | None = None
         self._closed = False
+        self._connect_started = False
+
+    def _clear_raw_credentials(self) -> None:
+        self._auth_token = None
+        self._auth_source = None
 
     def _mint(self, **configuration):
+        auth_token = self._auth_token
+        if auth_token is None:
+            raise OpenAIWireError("Realtime wire credentials are unavailable")
         return talk_wire.mint_ephemeral_session(
-            auth_token=self.auth_token,
+            auth_token=auth_token,
             model=configuration["model"],
             voice=configuration["voice"],
             instructions=configuration["instructions"],
@@ -270,17 +328,21 @@ class _OpenAIWireSession:
         automatic_response: bool,
         session_update: dict[str, Any],
     ) -> None:
-        if self._stack is not None or self._closed:
+        if self._connect_started or self._closed:
             raise OpenAIWireError("Realtime wire connect may only run once")
+        self._connect_started = True
         stack = AsyncExitStack()
         try:
-            descriptor = self._mint_session(
-                model=model,
-                voice=voice,
-                instructions=instructions,
-                tools=tools,
-                automatic_response=automatic_response,
-            )
+            try:
+                descriptor = self._mint_session(
+                    model=model,
+                    voice=voice,
+                    instructions=instructions,
+                    tools=tools,
+                    automatic_response=automatic_response,
+                )
+            finally:
+                self._clear_raw_credentials()
             aiohttp = self._aiohttp or _import_aiohttp()
             http = await stack.enter_async_context(aiohttp.ClientSession())
             ws = await stack.enter_async_context(
@@ -296,6 +358,7 @@ class _OpenAIWireSession:
             self._iterator = ws.__aiter__()
             await self.send_json((session_update,))
         except BaseException:
+            self._clear_raw_credentials()
             self._stack = None
             await stack.aclose()
             raise
@@ -368,6 +431,7 @@ class _OpenAIWireSession:
             return wire_event
 
     async def _close_once(self) -> None:
+        self._clear_raw_credentials()
         stack, self._stack = self._stack, None
         if stack is not None:
             try:

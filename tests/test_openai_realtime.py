@@ -110,6 +110,64 @@ def _adapter(socket):
     return adapter, client
 
 
+def test_core_response_builder_is_exact_and_does_not_change_legacy_encoding():
+    response = openai_rt.build_core_response_create(
+        canonical_text="Exact words, exactly.",
+        correlation="opaque-correlation",
+        voice="cedar",
+        event_id="evt-opaque",
+    )
+
+    assert response == {
+        "type": "response.create",
+        "event_id": "evt-opaque",
+        "response": {
+            "conversation": "none",
+            "metadata": {"correlation": "opaque-correlation"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Exact words, exactly."}
+                    ],
+                }
+            ],
+            "instructions": (
+                "Render the sole user input as speech verbatim. Speak every character's "
+                "words and punctuation naturally, but add, remove, or paraphrase nothing. "
+                "Do not preface or explain."
+            ),
+            "output_modalities": ["audio"],
+            "audio": {
+                "output": {
+                    "voice": "cedar",
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                }
+            },
+            "tools": [],
+            "tool_choice": "none",
+        },
+    }
+    assert openai_rt.encode_command(
+        rt.StartResponse(metadata={"speaker": "opaque"})
+    ) == {
+        "type": "response.create",
+        "response": {"metadata": {"speaker": "opaque"}},
+    }
+
+
+def test_core_response_cancel_builder_is_exact_and_legacy_cancel_is_unchanged():
+    assert openai_rt.build_core_response_cancel(
+        response_id="resp-exact", event_id="evt-unpredictable"
+    ) == {
+        "type": "response.cancel",
+        "event_id": "evt-unpredictable",
+        "response_id": "resp-exact",
+    }
+    assert openai_rt.encode_command(rt.CancelResponse()) == {"type": "response.cancel"}
+
+
 def test_connect_configures_the_session_and_commands_map_to_openai_wire():
     async def scenario():
         socket = _Socket()
@@ -154,6 +212,115 @@ def test_connect_configures_the_session_and_commands_map_to_openai_wire():
     assert adapter.state is rt.SessionState.CLOSED
 
 
+def test_wire_credentials_are_private_one_shot_and_cleared_on_every_terminal_path(
+    monkeypatch,
+):
+    token = "unit-test-token"
+    source = "unit-test-source"
+    descriptor = types.SimpleNamespace(client_secret="ephemeral")
+    configuration = {
+        "model": "gpt-realtime-test",
+        "voice": "cedar",
+        "instructions": "Be brief.",
+        "tools": None,
+        "automatic_response": False,
+        "session_update": {"type": "session.update", "session": {}},
+    }
+
+    def aiohttp_for(client):
+        return types.SimpleNamespace(
+            ClientSession=lambda: client,
+            WSMsgType=types.SimpleNamespace(TEXT="text", ERROR="error"),
+        )
+
+    def assert_private_and_cleared(wire):
+        assert not hasattr(wire, "auth_token")
+        assert not hasattr(wire, "auth_source")
+        assert wire._auth_token is None
+        assert wire._auth_source is None
+        snapshot = repr(vars(wire))
+        assert token not in snapshot
+        assert source not in snapshot
+
+    async def scenario():
+        minted = []
+
+        def mint_ephemeral_session(**kwargs):
+            minted.append((kwargs["auth_token"], kwargs["model"]))
+            return descriptor
+
+        monkeypatch.setattr(
+            openai_rt.talk_wire,
+            "mint_ephemeral_session",
+            mint_ephemeral_session,
+        )
+        success_client = _Client(_Socket())
+        success = openai_rt._OpenAIWireSession(
+            auth_token=token,
+            auth_source=source,
+            aiohttp_module=aiohttp_for(success_client),
+        )
+        await success.connect(**configuration)
+        assert minted == [(token, "gpt-realtime-test")]
+        assert_private_and_cleared(success)
+        with pytest.raises(openai_rt.OpenAIWireError, match="only run once"):
+            await success.connect(**configuration)
+        await success.close()
+        assert_private_and_cleared(success)
+
+        def fail_mint(**_kwargs):
+            raise RuntimeError("mint failed")
+
+        mint_failure = openai_rt._OpenAIWireSession(
+            auth_token=token,
+            auth_source=source,
+            mint_session=fail_mint,
+        )
+        with pytest.raises(RuntimeError, match="mint failed"):
+            await mint_failure.connect(**configuration)
+        assert_private_and_cleared(mint_failure)
+        with pytest.raises(openai_rt.OpenAIWireError, match="only run once"):
+            await mint_failure.connect(**configuration)
+        await mint_failure.close()
+        assert_private_and_cleared(mint_failure)
+
+        class FailingSocketContext:
+            async def __aenter__(self):
+                raise RuntimeError("socket connect failed")
+
+            async def __aexit__(self, *_exc):
+                return None
+
+        connect_client = _Client(_Socket())
+        connect_client.ws_connect = lambda *_args, **_kwargs: FailingSocketContext()
+        connect_failure = openai_rt._OpenAIWireSession(
+            auth_token=token,
+            auth_source=source,
+            aiohttp_module=aiohttp_for(connect_client),
+            mint_session=lambda **_configuration: descriptor,
+        )
+        with pytest.raises(RuntimeError, match="socket connect failed"):
+            await connect_failure.connect(**configuration)
+        assert connect_client.exited is True
+        assert_private_and_cleared(connect_failure)
+        with pytest.raises(openai_rt.OpenAIWireError, match="only run once"):
+            await connect_failure.connect(**configuration)
+        await connect_failure.close()
+        assert_private_and_cleared(connect_failure)
+
+        close_before_connect = openai_rt._OpenAIWireSession(
+            auth_token=token,
+            auth_source=source,
+            mint_session=lambda **_configuration: descriptor,
+        )
+        await close_before_connect.close()
+        assert_private_and_cleared(close_before_connect)
+        with pytest.raises(openai_rt.OpenAIWireError, match="only run once"):
+            await close_before_connect.connect(**configuration)
+
+    asyncio.run(scenario())
+
+
 def test_server_events_map_to_neutral_events_with_transcript_provenance():
     async def scenario():
         pcm = b"assistant pcm"
@@ -188,6 +355,7 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
             {
                 "type": "response.function_call_arguments.done",
                 "call_id": "call-1",
+                "item_id": "item-1",
                 "response_id": "resp-1",
                 "name": "search_memory",
                 "arguments": "{}",
@@ -219,6 +387,7 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
     assert events[8].final is True
     assert events[9] == rt.FunctionCall(
         call_id="call-1",
+        item_id="item-1",
         response_id="resp-1",
         name="search_memory",
         arguments="{}",

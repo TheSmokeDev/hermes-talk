@@ -95,6 +95,52 @@ class Capture:
         self.finished = True
 
 
+class HostExecutionAttachment:
+    def __init__(self, *, block=False):
+        self.definitions = [
+            {
+                "name": "host_tool",
+                "description": "Run the canonical host tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                },
+            }
+        ]
+        self.minted = []
+        self.executions = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.block = block
+        self.closed = False
+
+    def tool_definitions(self):
+        return self.definitions
+
+    def mint_tool_call_permit(self, **kwargs):
+        permit = object()
+        self.minted.append((kwargs, permit))
+        return permit
+
+    async def execute_tool_batch(self, permits):
+        self.executions.append(permits)
+        self.started.set()
+        if self.block:
+            await self.release.wait()
+        call_ids = [entry[0]["call_id"] for entry in self.minted]
+        return tuple(
+            {
+                "call_id": call_id,
+                "output": f"exact host output for {call_id}",
+                "receipt_id": f"receipt-{call_id}",
+            }
+            for call_id in reversed(call_ids)
+        )
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture(autouse=True)
 def _offline_policy(monkeypatch, tmp_path):
     Capture.instances.clear()
@@ -186,6 +232,124 @@ def test_fake_provider_ordinary_turn_preserves_audio_and_transcript_provenance()
     assert Capture.instances[0].turns == [("user", "hello"), ("assistant", "hi there")]
     assert Capture.instances[0].finished
     assert fake.closed and audio.stopped
+
+
+def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
+    attachment = HostExecutionAttachment(block=True)
+    audio = Audio()
+    fake = FakeProviderSession(
+        [
+            rt.ResponseStarted(response_id="response-1"),
+            rt.FunctionCall(
+                response_id="response-1",
+                item_id="item-1",
+                call_id="call-1",
+                name="host_tool",
+                arguments='{"value":1}',
+            ),
+            rt.FunctionCall(
+                response_id="response-1",
+                item_id="item-2",
+                call_id="call-2",
+                name="host_tool",
+                arguments='{"value":2}',
+            ),
+            rt.ResponseFinished(response_id="response-1"),
+            rt.OutputAudio(data=b"audio-while-host-awaits", item_id="audio-1"),
+        ]
+    )
+
+    async def scenario():
+        running = asyncio.create_task(
+            talk_cli.run_talk_session(
+                audio=audio,
+                session_factory=lambda _auth: fake,
+                host_execution_attachment=attachment,
+            )
+        )
+        await asyncio.wait_for(attachment.started.wait(), 0.2)
+        for _ in range(20):
+            if audio.playback:
+                break
+            await asyncio.sleep(0)
+        assert audio.playback == [b"audio-while-host-awaits"]
+        assert not running.done()
+        attachment.release.set()
+        return await asyncio.wait_for(running, 0.5)
+
+    assert asyncio.run(scenario()) == 0
+    assert [tool.name for tool in fake.setup.tools] == ["host_tool"]
+    assert fake.setup.tools[0].parameters == attachment.definitions[0]["parameters"]
+    assert "limited legacy" not in fake.setup.instructions.lower()
+    assert "canonical hermes host tools" in fake.setup.instructions.lower()
+    assert [entry[0] for entry in attachment.minted] == [
+        {
+            "response_id": "response-1",
+            "item_id": "item-1",
+            "call_id": "call-1",
+            "batch_id": attachment.minted[0][0]["batch_id"],
+            "tool_name": "host_tool",
+            "arguments": {"value": 1},
+        },
+        {
+            "response_id": "response-1",
+            "item_id": "item-2",
+            "call_id": "call-2",
+            "batch_id": attachment.minted[0][0]["batch_id"],
+            "tool_name": "host_tool",
+            "arguments": {"value": 2},
+        },
+    ]
+    assert len(attachment.executions) == 1
+    assert attachment.executions[0] == tuple(entry[1] for entry in attachment.minted)
+    tool_batch = next(
+        batch for batch in fake.sent if any(isinstance(item, rt.SubmitToolResult) for item in batch)
+    )
+    assert tool_batch == (
+        rt.SubmitToolResult(call_id="call-1", output="exact host output for call-1"),
+        rt.SubmitToolResult(call_id="call-2", output="exact host output for call-2"),
+        rt.StartResponse(),
+    )
+    assert attachment.closed
+
+
+def test_malformed_host_tool_arguments_return_an_error_without_authority_or_effect():
+    attachment = HostExecutionAttachment()
+    fake = FakeProviderSession(
+        [
+            rt.ResponseStarted(response_id="response-1"),
+            rt.FunctionCall(
+                response_id="response-1",
+                item_id="item-1",
+                call_id="call-1",
+                name="host_tool",
+                arguments="[]",
+            ),
+            rt.ResponseFinished(response_id="response-1"),
+        ]
+    )
+
+    result, _audio = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=Audio(),
+            session_factory=lambda _auth: fake,
+            host_execution_attachment=attachment,
+        )
+    ), None
+
+    assert result == 0
+    assert attachment.minted == []
+    assert attachment.executions == []
+    outputs = [
+        command
+        for batch in fake.sent
+        for command in batch
+        if isinstance(command, rt.SubmitToolResult)
+    ]
+    assert len(outputs) == 1
+    assert outputs[0].call_id == "call-1"
+    assert "valid json object" in outputs[0].output.lower()
+    assert attachment.closed
 
 
 def test_fake_provider_tools_stay_fifo_and_continue_exactly_once(monkeypatch):
