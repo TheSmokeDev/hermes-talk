@@ -113,16 +113,12 @@ def _tool_definitions(tools: list[dict]) -> tuple[talk_realtime.ToolDefinition, 
 
     return tuple(
         talk_realtime.ToolDefinition(
-            name=str(tool.get("name") or ""),
-            description=str(tool.get("description") or ""),
-            parameters=(
-                tool.get("parameters")
-                if isinstance(tool.get("parameters"), dict)
-                else {}
-            ),
+            name=tool["name"],
+            description=tool["description"],
+            parameters=tool["parameters"],
         )
         for tool in tools
-        if tool.get("type") == "function"
+        if tool.get("type", "function") == "function"
     )
 
 
@@ -205,6 +201,11 @@ TOOL_SESSION_QUEUE_SIZE = 1
 TOOL_CLEANUP_WAIT_S = 6.0
 MAX_SPEAKER_DISPLAY_NAME_CHARS = 256
 _TOOL_COORDINATOR_STOP = object()
+_HOST_TOOL_BATCH = object()
+
+HOST_TOOL_ARGUMENT_ERROR = (
+    "The tool call arguments were not a valid JSON object, so the tool was not run."
+)
 
 
 class SpeakerPacketLane:
@@ -303,6 +304,10 @@ class ToolResponseCoordinator:
         self.closed = False
         self.failed = False
         self.provider_neutral = provider_neutral
+        self.max_pending = max_pending
+        self.host_batch_mode = callable(getattr(relay, "handle_tool_batch_async", None))
+        self._host_events: list[tuple[int, dict]] = []
+        self._host_batch_id: str | None = None
         self._stop_requested = False
         self._stopped = asyncio.Event()
         self._continuation = self._default_continuation()
@@ -340,6 +345,14 @@ class ToolResponseCoordinator:
             # Mixed/missing attribution in one response can continue talking,
             # but its continuation must carry no authorization binding.
             self._continuation = self._default_continuation()
+        if self.host_batch_mode:
+            if len(self._host_events) >= self.max_pending + 1:
+                self.outputs[position] = self.relay.tool_queue_full_commands(event)
+                return False
+            if self._host_batch_id is None:
+                self._host_batch_id = f"talkbatch{uuid.uuid4().hex}"
+            self._host_events.append((position, event))
+            return True
         try:
             self.queue.put_nowait((position, event))
         except asyncio.QueueFull:
@@ -355,6 +368,13 @@ class ToolResponseCoordinator:
         if not self.outputs:
             return
         self.closed = True
+        if self.host_batch_mode:
+            positioned_events = tuple(self._host_events)
+            self._host_events = []
+            self.queue.put_nowait(
+                (_HOST_TOOL_BATCH, positioned_events, self._host_batch_id)
+            )
+            return
         await self._flush_if_ready()
 
     async def _flush_if_ready(self) -> None:
@@ -383,6 +403,7 @@ class ToolResponseCoordinator:
             self.outputs = []
             self.closed = False
             self._continuation = self._default_continuation()
+            self._host_batch_id = None
 
     async def run(self) -> None:
         try:
@@ -391,6 +412,18 @@ class ToolResponseCoordinator:
                 try:
                     if item is _TOOL_COORDINATOR_STOP:
                         return
+                    if item[0] is _HOST_TOOL_BATCH:
+                        _marker, positioned_events, batch_id = item
+                        results = await self.relay.handle_tool_batch_async(
+                            tuple(event for _position, event in positioned_events),
+                            batch_id,
+                        )
+                        for (position, _event), result in zip(
+                            positioned_events, results, strict=True
+                        ):
+                            self.outputs[position] = result
+                        await self._flush_if_ready()
+                        continue
                     position, event = item
                     self.outputs[position] = await (
                         self.relay.handle_tool_call_async(event)
@@ -440,6 +473,61 @@ class ToolResponseCoordinator:
                             discard(event)
                 finally:
                     self.queue.task_done()
+
+
+class HostExecutionRelay:
+    """Translate one provider response's calls into one canonical host batch."""
+
+    def __init__(self, attachment) -> None:
+        self.attachment = attachment
+
+    @staticmethod
+    def _output(call_id: str, output: str) -> list[talk_realtime.RealtimeCommand]:
+        return [talk_realtime.SubmitToolResult(call_id=call_id, output=output)]
+
+    def tool_queue_full_commands(self, event: dict) -> list[talk_realtime.RealtimeCommand]:
+        return self._output(
+            event["call_id"],
+            "The canonical host tool queue is full, so this tool was not run.",
+        )
+
+    async def handle_tool_batch_async(
+        self, events: tuple[dict, ...], batch_id: str
+    ) -> list[list[talk_realtime.RealtimeCommand]]:
+        outputs: list[list[talk_realtime.RealtimeCommand] | None] = [None] * len(events)
+        permits = []
+        permitted_positions = []
+        for position, event in enumerate(events):
+            try:
+                arguments = json.loads(event["arguments"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                arguments = None
+            response_id = event.get("response_id")
+            item_id = event.get("item_id")
+            if type(arguments) is not dict or not response_id or not item_id:
+                outputs[position] = self._output(
+                    event["call_id"], HOST_TOOL_ARGUMENT_ERROR
+                )
+                continue
+            permits.append(
+                self.attachment.mint_tool_call_permit(
+                    response_id=response_id,
+                    item_id=item_id,
+                    call_id=event["call_id"],
+                    batch_id=batch_id,
+                    tool_name=event["name"],
+                    arguments=arguments,
+                )
+            )
+            permitted_positions.append(position)
+
+        if permits:
+            results = await self.attachment.execute_tool_batch(tuple(permits))
+            by_call_id = {result["call_id"]: result["output"] for result in results}
+            for position in permitted_positions:
+                call_id = events[position]["call_id"]
+                outputs[position] = self._output(call_id, by_call_id[call_id])
+        return [output or [] for output in outputs]
 
 
 async def pump_announcements(
@@ -653,7 +741,10 @@ def _neutral_response_command(message: dict) -> talk_realtime.StartResponse:
 
 
 async def run_talk_session(
-    audio: object | None = None, *, session_factory=None
+    audio: object | None = None,
+    *,
+    session_factory=None,
+    host_execution_attachment=None,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -672,11 +763,24 @@ async def run_talk_session(
         voice = talk_config.talk_voice()
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
         print(f"talk: {exc}", file=sys.stderr)
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
         return 1
 
-    tools = talk_tools.default_talk_tools()
+    try:
+        tools = (
+            host_execution_attachment.tool_definitions()
+            if host_execution_attachment is not None
+            else talk_tools.default_talk_tools()
+        )
+    except Exception as exc:  # noqa: BLE001 - host attachment startup boundary
+        print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
+        host_execution_attachment.close()
+        return 1
     instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections(), tools=tools
+        talk_host.host().identity_sections(),
+        tools=tools,
+        host_execution=host_execution_attachment is not None,
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
@@ -702,6 +806,8 @@ async def run_talk_session(
         audio.start()
     except talk_audio.TalkAudioError as exc:
         print(f"talk: {exc}", file=sys.stderr)
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
         return 1
 
     setup = talk_realtime.SessionSetup(
@@ -761,6 +867,8 @@ async def run_talk_session(
         audio.stop()
         capture.finish()
         talk_transcript.sweep_transcripts(hermes_home)
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
         raise
     except Exception as exc:  # noqa: BLE001 — provider startup is a voice boundary
         print(f"talk: {exc}", file=sys.stderr)
@@ -774,6 +882,8 @@ async def run_talk_session(
         audio.stop()
         capture.finish()
         talk_transcript.sweep_transcripts(hermes_home)
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
         return 1
 
     try:
@@ -843,7 +953,11 @@ async def run_talk_session(
                     return
 
         tool_coordinator = ToolResponseCoordinator(
-            relay,
+            (
+                HostExecutionRelay(host_execution_attachment)
+                if host_execution_attachment is not None
+                else relay
+            ),
             send_outgoing,
             max_pending=TOOL_SESSION_QUEUE_SIZE,
             provider_neutral=True,
@@ -897,6 +1011,7 @@ async def run_talk_session(
                     tool_event = {
                         "call_id": event.call_id,
                         "response_id": event.response_id,
+                        "item_id": event.item_id,
                         "name": event.name,
                         "arguments": event.arguments,
                     }
@@ -1055,6 +1170,8 @@ async def run_talk_session(
             audio.stop()
             capture.finish()
             talk_transcript.sweep_transcripts(hermes_home)
+            if host_execution_attachment is not None:
+                host_execution_attachment.close()
 
     return result
 

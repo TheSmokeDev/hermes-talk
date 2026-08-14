@@ -163,11 +163,13 @@ class FunctionCall(RealtimeEvent):
     name: str
     arguments: str
     response_id: str | None = None
+    item_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.call_id, "call_id")
         _identifier(self.name, "name")
         _identifier(self.response_id, "response_id", optional=True)
+        _identifier(self.item_id, "item_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)

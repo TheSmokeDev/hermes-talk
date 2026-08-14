@@ -247,6 +247,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 name=event.get("name"),
                 arguments=event.get("arguments") if isinstance(event.get("arguments"), str) else "",
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.done":
             response = _mapping(event.get("response"))
