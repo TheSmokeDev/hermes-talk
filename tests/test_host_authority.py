@@ -225,7 +225,49 @@ def test_provider_metadata_cannot_satisfy_authority(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 8. Replayed proof consumed on second use ----------
+# ---------- 8a. discard_tool_event consumes permit ----------
+
+
+def test_discard_consumes_permit_through_host_path(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    event = _make_tool_event(ledger, call_id="call-discard")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    relay.discard_tool_event(event)
+    results = _run_batch(relay, [event])
+
+    assert len(attachment.minted) == 0
+    assert any("not run" in cmd.output for cmd in results[0])
+
+
+# ---------- 8b. tool_queue_full_commands consumes permit ----------
+
+
+def test_queue_full_consumes_permit_through_host_path(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    event = _make_tool_event(ledger, call_id="call-queuefull")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    relay.tool_queue_full_commands(event)
+    results = _run_batch(relay, [event])
+
+    assert len(attachment.minted) == 0
+    assert any("not run" in cmd.output for cmd in results[0])
+
+
+# ---------- 8. Replayed proof denied on second use ----------
 
 
 def test_replayed_proof_denied_through_host_path(monkeypatch):

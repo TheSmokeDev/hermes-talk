@@ -487,10 +487,14 @@ class HostExecutionRelay:
         return [talk_realtime.SubmitToolResult(call_id=call_id, output=output)]
 
     def _consume_tool_attempt(self, event: dict) -> None:
+        """Consume a bound call permit on any terminal non-execution path."""
+
         if self.tool_authorizer is not None:
-            self.tool_authorizer(event.get("name", ""), event)
+            self.tool_authorizer(str(event.get("name") or "tool"), event)
 
     def discard_tool_event(self, event: dict) -> None:
+        """Revoke a queued tool event that session teardown will never execute."""
+
         self._consume_tool_attempt(event)
 
     def tool_queue_full_commands(self, event: dict) -> list[talk_realtime.RealtimeCommand]:
@@ -508,7 +512,7 @@ class HostExecutionRelay:
         permitted_positions = []
         for position, event in enumerate(events):
             if self.tool_authorizer is not None:
-                denial = self.tool_authorizer(event.get("name", ""), event)
+                denial = self.tool_authorizer(str(event.get("name") or ""), event)
                 if denial is not None:
                     outputs[position] = self._output(event["call_id"], denial)
                     continue
