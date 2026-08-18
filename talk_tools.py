@@ -616,6 +616,12 @@ def _compact_toolset(entry: dict) -> dict:
     return compact
 
 
+def _render_catalog(payload: dict) -> str:
+    """Redact and serialize one capabilities payload for spoken output."""
+
+    return json.dumps(talk_doctor.redact_value(payload))
+
+
 def _handle_talk_capabilities(arguments: dict) -> str:
     snapshot = talk_capabilities.status()
     payload = {
@@ -626,7 +632,7 @@ def _handle_talk_capabilities(arguments: dict) -> str:
         "capabilities": snapshot.capabilities,
         "health": snapshot.health,
     }
-    rendered = json.dumps(talk_doctor.redact_value(payload))
+    rendered = _render_catalog(payload)
     if len(rendered) <= MAX_OUTPUT_CHARS:
         return rendered
     # A real install's full catalog does not fit the spoken-output budget, and
@@ -647,12 +653,12 @@ def _handle_talk_capabilities(arguments: dict) -> str:
     payload["detail"] = (
         f"{snapshot.detail} — names only, the full catalog is too long to read out"
     )
-    rendered = json.dumps(talk_doctor.redact_value(payload))
+    rendered = _render_catalog(payload)
     if len(rendered) > MAX_OUTPUT_CHARS:
         payload["capabilities"] = {}
         payload["capabilities_omitted"] = True
         payload["detail"] += ", capabilities omitted"
-        rendered = json.dumps(talk_doctor.redact_value(payload))
+        rendered = _render_catalog(payload)
     return rendered
 
 
