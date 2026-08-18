@@ -200,8 +200,14 @@ def _append_history_strict(record: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if path.stat().st_size > _HISTORY_MAX_BYTES:
-            _compact_history_locked(path)
+        # Compaction is maintenance, not this record's durability contract —
+        # the write above already landed. A compaction failure must never be
+        # mistaken for "this record didn't make it."
+        try:
+            if path.stat().st_size > _HISTORY_MAX_BYTES:
+                _compact_history_locked(path)
+        except Exception as exc:  # noqa: BLE001 — compaction is best-effort
+            _log.warning("talk run history compaction failed: %s", exc)
 
 
 def _compact_history_locked(path) -> None:
@@ -383,6 +389,10 @@ def start_run(
         )
     except Exception as exc:
         # Re-raised, never swallowed: no durable route means no acceptance.
+        _log.warning(
+            "talk run acceptance write failed, refusing dispatch: %s: %s",
+            type(exc).__name__, exc,
+        )
         raise RoutingUnavailable(
             f"the run couldn't be recorded durably: {type(exc).__name__}: {exc}"
         ) from exc
@@ -491,7 +501,10 @@ def mark_delivered(run_id: int) -> bool:
     - A LIVE run is claimed in the registry, which is authoritative for this
       process. Its durable tee stays fail-open like every other non-acceptance
       write — the operator is present and waiting, so a disk hiccup must not
-      swallow a result already in hand.
+      swallow a result already in hand. Residual risk, accepted: if that tee
+      specifically fails AND this process crashes before any later successful
+      write for this run id, the persisted record stays "pending" and a
+      reconnect may re-announce a result that was already spoken live.
     - A HISTORY-ONLY run — the reconnect case, whose process is gone — has no
       registry entry to carry the flag, so the durable record IS the claim and
       the write is fail-CLOSED. An unpersisted claim is not a claim, and
@@ -559,8 +572,23 @@ def list_undelivered_for_session(hermes_session_id: str | None) -> list[dict]:
 
     if not hermes_session_id:
         return []
+    with _RUN_LOCK:
+        live: dict[int, dict] = {}
+        for run_id, run in _RUNS.items():
+            snapshot = dict(run)
+            snapshot["meta"] = dict(run["meta"])
+            snapshot["runId"] = run_id
+            live[run_id] = snapshot
+    # Deliberately NOT list_runs(limit=100, ...): that limit is a UI display
+    # cap applied before session filtering, so a busy install (100+ runs from
+    # any lane since this session's own orphaned run finished) would silently
+    # drop it from the adoption search. Scan the same bound _load_history()
+    # already uses (_HISTORY_TAIL_LINES) instead of layering a second, tighter,
+    # session-blind cap on top of it.
+    merged: dict[int, dict] = dict(_load_history())
+    merged.update(live)
     out: list[dict] = []
-    for run in list_runs(limit=100, include_history=True):
+    for run in merged.values():
         if run.get("status") not in TERMINAL_STATUSES:
             continue
         if run.get("delivery") == DELIVERED:

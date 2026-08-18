@@ -741,6 +741,36 @@ def test_a_reconnect_adopts_an_orphaned_result_exactly_once(history_env: Path):
     assert talk_runs.list_undelivered_for_session("sess-restart") == []
 
 
+def test_claiming_from_history_fails_closed_when_the_write_cannot_land(
+    history_env: Path, monkeypatch
+):
+    """The delivery-claim counterpart to test_acceptance_write_failure_refuses_the_run.
+
+    An unpersisted claim is not a claim (see _claim_delivery_in_history's own
+    docstring) — a disk failure here must leave the run claimable, not silently
+    grant the claim in memory only.
+    """
+
+    _attach_test_owner(hermes_session_id="sess-restart")
+    run_id = talk_runs.start_run("agent", "orphaned", lambda _rid: "the answer")
+    _wait_history_terminal(history_env, run_id)
+
+    # The process that accepted it dies before speaking the result.
+    talk_runs.reset_for_tests()
+    _attach_test_owner(hermes_session_id="sess-restart")
+
+    def _boom(_record):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(talk_runs, "_append_history_strict", _boom)
+
+    assert talk_runs.mark_delivered(run_id) is False
+    # Still owed — a failed claim must not remove the run from the adoption list.
+    assert [
+        r["runId"] for r in talk_runs.list_undelivered_for_session("sess-restart")
+    ] == [run_id]
+
+
 def test_a_reconnect_from_a_different_session_adopts_nothing(history_env: Path):
     _attach_test_owner(hermes_session_id="sess-restart")
     run_id = talk_runs.start_run("agent", "orphaned", lambda _rid: "the answer")

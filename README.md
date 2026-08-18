@@ -243,6 +243,11 @@ Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
+Known limitation: delivery is bound to the exact session that started the
+work. If you disconnect before it lands, reconnecting on the *same* Hermes
+session adopts and speaks what you were owed, exactly once — a different
+session, or one with no durable Hermes context, never receives it.
+
 Delegation walks the [three lanes](#reaching-a-real-agent--the-three-lanes) and
 then one more, and **every fall-through is said out loud** — the plugin never
 silently does less than you asked:

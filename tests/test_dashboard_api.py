@@ -557,3 +557,24 @@ def test_the_browser_ticket_never_carries_the_credential(minted):
     assert EPHEMERAL not in blob
     assert RAW_KEY not in blob
     assert CREDENTIAL_RE.search(blob) is None
+
+
+def test_a_second_mint_does_not_retroactively_reattribute_an_in_flight_run(minted):
+    """The ticket freezes at acceptance even when the OWNER slot is dashboard-wide.
+
+    Two tabs (or one reload) minting in the same process must not change who a
+    run already dispatched under the first mint is attributed to.
+    """
+
+    talk_runs.detach_owner()
+    call(api.create_session, FakeRequest(body={}))
+    first_owner = talk_runs.current_owner()
+
+    run_id = talk_runs.start_run("agent", "already dispatched", lambda _rid: "done")
+
+    call(api.create_session, FakeRequest(body={}))
+    second_owner = talk_runs.current_owner()
+
+    assert second_owner["talkSessionId"] != first_owner["talkSessionId"]
+    ticket = talk_runs.get_run(run_id)["ticket"]
+    assert ticket["talkSessionId"] == first_owner["talkSessionId"]

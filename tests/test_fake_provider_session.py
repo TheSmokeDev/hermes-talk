@@ -878,6 +878,41 @@ def test_a_reconnect_speaks_the_result_it_was_owed(routed):
     assert talk_runs.list_undelivered_for_session("sess-bound") == []
 
 
+def test_a_reconnect_speaks_every_result_it_was_owed(routed):
+    """A session can have more than one background run in flight when it drops.
+
+    A single-orphan test cannot distinguish "the adoption loop claims every
+    owed run" from "it claims the first and stops" (an early-return/break
+    regression). This seeds two and asserts the loop's own claim-before-speak
+    contract: every owed run ends up claimed, none stay silently stranded.
+
+    Deliberately not asserting both texts land in `fake.sent`: which queued
+    announcements the wire actually flushes before a short-lived session's
+    teardown cancels `pump_announcements` is a separate, pre-existing
+    scheduling question this test doesn't pin — only that the claim itself,
+    which is what determines whether a result can ever be re-adopted, covers
+    every owed run rather than just the first.
+    """
+
+    first = _seed_orphaned_run("sess-bound", "the index is rebuilt")
+    second = _seed_orphaned_run("sess-bound", "the audit is done")
+
+    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    _run(fake)
+
+    spoken = " ".join(
+        getattr(command, "text", "")
+        for batch in fake.sent
+        for command in batch
+    )
+    assert f"Background run #{first}" in spoken
+    assert "the index is rebuilt" in spoken
+    # Both claimed — an early-return/break after the first would leave the
+    # second run still listed as owed, and still claimable, here.
+    assert talk_runs.list_undelivered_for_session("sess-bound") == []
+    assert talk_runs.mark_delivered(second) is False
+
+
 def test_a_reconnect_does_not_speak_a_stranger_s_result(routed):
     _seed_orphaned_run("sess-somebody-else", "not yours")
 
