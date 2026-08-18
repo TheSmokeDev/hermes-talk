@@ -486,7 +486,15 @@ class HostExecutionRelay:
     def _output(call_id: str, output: str) -> list[talk_realtime.RealtimeCommand]:
         return [talk_realtime.SubmitToolResult(call_id=call_id, output=output)]
 
+    def _consume_tool_attempt(self, event: dict) -> None:
+        if self.tool_authorizer is not None:
+            self.tool_authorizer(event.get("name", ""), event)
+
+    def discard_tool_event(self, event: dict) -> None:
+        self._consume_tool_attempt(event)
+
     def tool_queue_full_commands(self, event: dict) -> list[talk_realtime.RealtimeCommand]:
+        self._consume_tool_attempt(event)
         return self._output(
             event["call_id"],
             "The canonical host tool queue is full, so this tool was not run.",
@@ -499,6 +507,11 @@ class HostExecutionRelay:
         permits = []
         permitted_positions = []
         for position, event in enumerate(events):
+            if self.tool_authorizer is not None:
+                denial = self.tool_authorizer(event.get("name", ""), event)
+                if denial is not None:
+                    outputs[position] = self._output(event["call_id"], denial)
+                    continue
             try:
                 arguments = json.loads(event["arguments"])
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -510,11 +523,6 @@ class HostExecutionRelay:
                     event["call_id"], HOST_TOOL_ARGUMENT_ERROR
                 )
                 continue
-            if self.tool_authorizer is not None:
-                denial = self.tool_authorizer(event.get("name", ""), event)
-                if denial is not None:
-                    outputs[position] = self._output(event["call_id"], denial)
-                    continue
             permits.append(
                 self.attachment.mint_tool_call_permit(
                     response_id=response_id,
