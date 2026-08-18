@@ -1,0 +1,4 @@
+# Archon workflow engine config
+# https://github.com/dynamous-community/remote-coding-agent
+worktree:
+  baseBranch: main
