@@ -475,19 +475,54 @@ class ToolResponseCoordinator:
                     self.queue.task_done()
 
 
+def local_operator_authorizer(tool_name: str, event: dict) -> None:
+    """Permit every host tool call for a session with no remote speakers.
+
+    A non-Discord Talk session hears exactly one person: the operator at
+    this machine's microphone. Shell access to the box already carries full
+    host authority, so voice adds no privilege the keyboard lacks. Discord
+    (and any future multi-speaker transport) must wire a real authorization
+    ledger instead; HostExecutionRelay refuses to exist without an explicit
+    choice between the two.
+    """
+
+    return None
+
+
 class HostExecutionRelay:
     """Translate one provider response's calls into one canonical host batch."""
 
-    def __init__(self, attachment) -> None:
+    def __init__(self, attachment, *, tool_authorizer) -> None:
+        # Required, never defaulted: a relay silently constructed without an
+        # authorizer is the exact fail-open class #39 exists to close. The
+        # single-speaker case must say so by name (local_operator_authorizer).
+        if not callable(tool_authorizer):
+            raise TypeError(
+                "HostExecutionRelay requires an explicit tool authorizer: pass "
+                "an authorization ledger's authorize_tool, or "
+                "local_operator_authorizer for a single-speaker session"
+            )
         self.attachment = attachment
+        self.tool_authorizer = tool_authorizer
 
     @staticmethod
     def _output(call_id: str, output: str) -> list[talk_realtime.RealtimeCommand]:
         return [talk_realtime.SubmitToolResult(call_id=call_id, output=output)]
 
+    def _consume_tool_attempt(self, event: dict) -> None:
+        """Consume a bound call permit on any terminal non-execution path."""
+
+        self.tool_authorizer(str(event.get("name") or "tool"), event)
+
+    def discard_tool_event(self, event: dict) -> None:
+        """Revoke a queued tool event that session teardown will never execute."""
+
+        self._consume_tool_attempt(event)
+
     def tool_queue_full_commands(self, event: dict) -> list[talk_realtime.RealtimeCommand]:
+        self._consume_tool_attempt(event)
         return self._output(
-            event["call_id"],
+            str(event.get("call_id") or ""),
             "The canonical host tool queue is full, so this tool was not run.",
         )
 
@@ -498,6 +533,24 @@ class HostExecutionRelay:
         permits = []
         permitted_positions = []
         for position, event in enumerate(events):
+            call_id = str(event.get("call_id") or "")
+            if not call_id:
+                # A result cannot even be addressed without a call id; drop
+                # the event instead of letting a malformed provider dict
+                # KeyError the whole batch.
+                continue
+            # Authorization must stay glued to permit minting with no await
+            # between them: ledger.clear() (reconnect/teardown) can only
+            # interleave at await boundaries, so this synchronous span is what
+            # makes authorize-then-mint atomic on the loop. The authorizer
+            # sees the raw event; execution parses the same
+            # event["arguments"] string read below — nothing rewrites the
+            # dict in between, so the authorized and executed arguments
+            # cannot diverge.
+            denial = self.tool_authorizer(str(event.get("name") or ""), event)
+            if denial is not None:
+                outputs[position] = self._output(call_id, denial)
+                continue
             try:
                 arguments = json.loads(event["arguments"])
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -505,15 +558,13 @@ class HostExecutionRelay:
             response_id = event.get("response_id")
             item_id = event.get("item_id")
             if type(arguments) is not dict or not response_id or not item_id:
-                outputs[position] = self._output(
-                    event["call_id"], HOST_TOOL_ARGUMENT_ERROR
-                )
+                outputs[position] = self._output(call_id, HOST_TOOL_ARGUMENT_ERROR)
                 continue
             permits.append(
                 self.attachment.mint_tool_call_permit(
                     response_id=response_id,
                     item_id=item_id,
-                    call_id=event["call_id"],
+                    call_id=call_id,
                     batch_id=batch_id,
                     tool_name=event["name"],
                     arguments=arguments,
@@ -954,7 +1005,18 @@ async def run_talk_session(
 
         tool_coordinator = ToolResponseCoordinator(
             (
-                HostExecutionRelay(host_execution_attachment)
+                HostExecutionRelay(
+                    host_execution_attachment,
+                    tool_authorizer=(
+                        authorization_ledger.authorize_tool
+                        if authorization_ledger is not None
+                        # No ledger means the transport declared no remote
+                        # speakers (audio.discord_speaker_authorization is
+                        # False): the local operator is the only voice, so
+                        # the allow-all is named, not accidental.
+                        else local_operator_authorizer
+                    ),
+                )
                 if host_execution_attachment is not None
                 else relay
             ),
