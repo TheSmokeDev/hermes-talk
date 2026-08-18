@@ -56,6 +56,15 @@ def clean(monkeypatch):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
     talk_apiserver.reset_for_tests()
+    # Runs are refused without a bound return route (hermes-talk#35), so the
+    # suite attaches one. Tests that assert the REFUSAL detach it explicitly.
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
     monkeypatch.delenv("TALK_API_SERVER_KEY", raising=False)
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
@@ -636,3 +645,73 @@ def test_talk_status_reports_the_same_lane(monkeypatch, lane_on):
     assert status["agent_lane"] == "api-server"
     # The older boolean answers a narrower question and must keep answering it.
     assert status["attached_to_hermes"] is False
+
+
+# --- the tool surface refuses an unrouted dispatch (hermes-talk#35) ----------
+
+
+def test_the_api_server_lane_refuses_before_running_when_unrouted(monkeypatch, lane_on):
+    """Tier 2 must not consume the request when nothing can receive it."""
+
+    _set_lane(monkeypatch, UP)
+    ran = []
+    monkeypatch.setattr(
+        talk_apiserver, "run_to_completion", lambda *a, **k: ran.append(a) or "audit done"
+    )
+    talk_runs.detach_owner()
+
+    out = talk_tools.execute_talk_tool("delegate_task", {"task": "audit the auth module"})
+
+    assert out.startswith("I can't start that yet")
+    assert "WORK_STARTED" not in out
+    assert ran == []
+
+
+def test_an_unrouted_memory_lookup_says_lookup_not_work(monkeypatch, lane_on):
+    """The refusal names what was refused; a lookup is not a delegated task."""
+
+    _set_lane(monkeypatch, UP)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "found it")
+    talk_runs.detach_owner()
+
+    out = talk_tools.execute_talk_tool("search_memory", {"query": "retry policy"})
+
+    assert out.startswith("I can't look that up yet")
+    assert "WORK_STARTED" not in out
+
+
+def test_check_work_still_reads_a_run_started_by_this_session(monkeypatch, lane_on):
+    """The ticket is additive: the existing tool surface is unchanged."""
+
+    _set_lane(monkeypatch, UP)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "audit done")
+
+    out = talk_tools.execute_talk_tool("delegate_task", {"task": "audit the auth module"})
+    run_id = int(out.split("WORK_STARTED #")[1].split()[0])
+    _wait_terminal(run_id)
+
+    spoken = talk_tools.execute_talk_tool("check_work", {"run_id": run_id})
+
+    assert "audit done" in spoken
+    # Routing metadata stays out of anything the operator hears.
+    assert "ts-test" not in spoken
+    assert "sess-test" not in spoken
+
+
+def test_no_lane_at_all_still_names_the_lanes_not_the_routing(monkeypatch, lane_on):
+    """The routing refusal must not shadow the pre-existing tier-4 refusal.
+
+    With no agent reachable by ANY lane, "there is nothing to run this on" is
+    the useful answer; "there is nowhere to send the result" would be true but
+    would hide the actionable half.
+    """
+
+    _set_lane(monkeypatch, DOWN)
+    talk_runs.detach_owner()
+
+    out = talk_tools.execute_talk_tool("delegate_task", {"task": "audit"})
+
+    assert "no Hermes agent" in out
+    assert "api server isn't reachable" in out
+    assert "PATH" in out
+    assert "I can't start that yet" not in out

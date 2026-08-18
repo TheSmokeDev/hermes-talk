@@ -32,6 +32,15 @@ def _clean(monkeypatch, tmp_path):
     talk_runs.reset_for_tests()
     talk_steer.reset_for_tests()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    # Runs are refused without a bound return route (hermes-talk#35), so the
+    # suite attaches one. Tests that assert the REFUSAL detach it explicitly.
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
     yield
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()

@@ -13,10 +13,13 @@ Two behaviours are worth stating because they are easy to get wrong:
   told to truncate at the millisecond the operator actually heard. Skipping
   the truncate leaves the model believing it said sentences nobody heard.
 - A tool result carrying a WORK_STARTED sentinel spawns a watcher task that
-  polls the run registry and injects the result as a user turn when it lands,
-  so the model speaks it unprompted. Watchers die with the session; the work
-  itself is detached and does not, which is why the run history keeps the
-  record and a later ``check_work`` reports such runs as ``lost``.
+  polls the run registry and, when it lands, injects the result as a CONTAINED
+  SYSTEM item — never a user turn, because background output is untrusted data
+  that must not be able to wear the operator's voice. Watchers die with the
+  session; the work itself is detached and does not. Every run is accepted
+  against a durable ticket (:mod:`talk_runs`), so a session that reconnects
+  behind the same Hermes session adopts and speaks the results it was owed,
+  exactly once, instead of leaving them to surface as ``lost``.
 """
 
 from __future__ import annotations
@@ -1034,7 +1037,11 @@ async def run_talk_session(
                 if run is None:
                     return
                 if run["status"] in talk_runs.TERMINAL_STATUSES:
-                    await announce_queue.put(run_finished_commands(run))
+                    # Claim first: losing means a reconnect adoption already
+                    # spoke this result, and saying it twice is worse than
+                    # not saying it at all.
+                    if talk_runs.mark_delivered(run_id):
+                        await announce_queue.put(run_finished_commands(run))
                     return
 
         tool_coordinator = ToolResponseCoordinator(
@@ -1163,6 +1170,35 @@ async def run_talk_session(
         # expose the property; None suppresses announcements instead of guessing.
         owner_session_id = _active_parent_session_id()
         talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
+        # This connection's own identity (hermes-talk#35), minted BEFORE any
+        # tool can dispatch work. Independent of whether a Hermes ctx happens
+        # to be bound, so tier-2/3 work has an exact destination off tier 1
+        # too. The generation is per-attach: a reconnect is a new generation
+        # of the same session, and the ticket records which one accepted a run.
+        talk_session_id = uuid.uuid4().hex
+        generation_id = uuid.uuid4().hex[:12]
+        talk_runs.attach_owner(
+            talk_session_id=talk_session_id,
+            generation_id=generation_id,
+            hermes_session_id=owner_session_id,
+            operator=auth.source,
+            profile=talk_config.agent_profile(),
+        )
+        # Results this session is OWED — accepted under a durable Hermes
+        # session that is still ours, finished while nothing was listening.
+        # Claim each one before queueing it: mark_delivered is the exact-once
+        # gate, so a result whose claim is lost belongs to another route and
+        # speaking it anyway is the duplicate this whole mechanism prevents.
+        for orphaned in talk_runs.list_undelivered_for_session(owner_session_id):
+            try:
+                orphan_id = int(orphaned["runId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not talk_runs.mark_delivered(orphan_id):
+                continue
+            commands = run_finished_commands(orphaned)
+            if commands:
+                announce_queue.put_nowait(commands)
         # The notifier fires on host drain threads; marshal back onto this loop.
         talk_steer.set_landed_notifier(
             lambda sid: loop.call_soon_threadsafe(on_note_landed, sid)
@@ -1214,6 +1250,9 @@ async def run_talk_session(
         finally:
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
+            # Unbound again: with no live connection there is no destination,
+            # so further dispatch is refused rather than accepted into a void.
+            talk_runs.detach_owner()
             sender.cancel()
             pump.cancel()
             receiver.cancel()

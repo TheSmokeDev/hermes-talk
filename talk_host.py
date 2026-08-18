@@ -291,9 +291,12 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 session_id=session_id,
                 # The remote id is stop_work's only address for this run —
                 # without it the lane is stop-capable in theory and
-                # unstoppable in practice.
+                # unstoppable in practice. Teed durably (hermes-talk#35): it
+                # is also the ONLY handle a reconnect could resume tracking
+                # by, and in memory alone it died with the process that is,
+                # by definition, the one that is gone.
                 on_start=lambda api_run_id: talk_runs.annotate_run(
-                    run_id, api_run_id=api_run_id
+                    run_id, tee=True, api_run_id=api_run_id
                 ),
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
@@ -683,6 +686,10 @@ class HostAdapter:
             run_id = talk_runs.start_run(
                 "agent", label, _api_server_worker(prompt, session_id=None)
             )
+        except talk_runs.RoutingUnavailable as exc:
+            # Refused BEFORE anything ran, so say that rather than implying a
+            # started-then-broken lookup: nothing is in flight to check on.
+            return f"I can't look that up yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that lookup: {type(exc).__name__}: {exc}"
         return (
@@ -747,6 +754,8 @@ class HostAdapter:
             run_id = talk_runs.start_run(
                 "agent", label, _api_server_worker(prompt, session_id=None)
             )
+        except talk_runs.RoutingUnavailable as exc:
+            return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that work: {type(exc).__name__}: {exc}"
         return (
@@ -769,6 +778,8 @@ class HostAdapter:
             run_id = talk_runs.start_run(
                 "agent", label, _detached_agent_worker(prompt, binary)
             )
+        except talk_runs.RoutingUnavailable as exc:
+            return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that work: {type(exc).__name__}: {exc}"
         return (

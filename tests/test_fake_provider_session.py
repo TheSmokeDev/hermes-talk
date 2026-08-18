@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import types
 from typing import ClassVar
 
@@ -14,6 +15,7 @@ import talk_openai_realtime as openai_rt
 import talk_operator_auth
 import talk_realtime as rt
 import talk_relay
+import talk_runs
 
 
 class FakeProviderSession:
@@ -797,3 +799,97 @@ def test_provider_factory_failure_still_tears_down_local_resources(capsys):
 def test_fake_provider_cannot_construct_a_malformed_tool_identifier():
     with pytest.raises(ValueError, match="call_id"):
         rt.FunctionCall(call_id="", response_id="response-1", name="tool", arguments="{}")
+
+
+# --- the connection's return route (hermes-talk#35) --------------------------
+
+
+@pytest.fixture
+def routed(monkeypatch, tmp_path):
+    """A session whose bound Hermes session id and run history are ours."""
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(talk_runs, "_history_path", lambda: state / "talk-runs.jsonl")
+    monkeypatch.setattr(talk_runs, "_history_enabled", lambda: True)
+    monkeypatch.setattr(talk_cli, "_active_parent_session_id", lambda: "sess-bound")
+    talk_runs.reset_for_tests()
+    yield state
+    talk_runs.reset_for_tests()
+
+
+def _seed_orphaned_run(session_id: str, output: str) -> int:
+    """One terminal, unclaimed run left behind by a process that is now gone."""
+
+    talk_runs.attach_owner(
+        talk_session_id="ts-dead",
+        generation_id="gen-dead",
+        hermes_session_id=session_id,
+        operator="test",
+        profile=None,
+    )
+    run_id = talk_runs.start_run("agent", "orphaned", lambda _rid: output)
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        run = talk_runs.get_run(run_id)
+        if run and run["status"] in talk_runs.TERMINAL_STATUSES:
+            break
+        time.sleep(0.02)
+    # The process that accepted it dies without ever speaking the result.
+    talk_runs.reset_for_tests()
+    return run_id
+
+
+def test_the_session_binds_and_releases_its_return_route(routed, monkeypatch):
+    seen: list[dict] = []
+    real_attach = talk_runs.attach_owner
+    monkeypatch.setattr(
+        talk_runs,
+        "attach_owner",
+        lambda **kw: (seen.append(dict(kw)), real_attach(**kw))[1],
+    )
+
+    _run(FakeProviderSession([rt.SessionReady(session_id="session-1")]))
+
+    assert len(seen) == 1
+    assert seen[0]["hermes_session_id"] == "sess-bound"
+    assert seen[0]["operator"] == "fake-auth"
+    assert seen[0]["talk_session_id"]
+    assert seen[0]["generation_id"]
+    # Released at teardown: with no live connection, later work is refused
+    # rather than accepted into a void.
+    assert talk_runs.current_owner() is None
+
+
+def test_a_reconnect_speaks_the_result_it_was_owed(routed):
+    run_id = _seed_orphaned_run("sess-bound", "the index is rebuilt")
+
+    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    _run(fake)
+
+    spoken = " ".join(
+        getattr(command, "text", "")
+        for batch in fake.sent
+        for command in batch
+    )
+    assert f"Background run #{run_id}" in spoken
+    assert "the index is rebuilt" in spoken
+    # Claimed, so the next reconnect does not say it again.
+    assert talk_runs.list_undelivered_for_session("sess-bound") == []
+
+
+def test_a_reconnect_does_not_speak_a_stranger_s_result(routed):
+    _seed_orphaned_run("sess-somebody-else", "not yours")
+
+    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    _run(fake)
+
+    spoken = " ".join(
+        getattr(command, "text", "")
+        for batch in fake.sent
+        for command in batch
+    )
+    assert "not yours" not in spoken
+    assert "Background run #" not in spoken
+    # Still owed to its real owner rather than silently consumed.
+    assert talk_runs.list_undelivered_for_session("sess-somebody-else")

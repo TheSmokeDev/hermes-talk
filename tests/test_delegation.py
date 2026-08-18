@@ -30,6 +30,15 @@ _FAKE_HERMES = "/usr/local/bin/hermes"
 def _clean(monkeypatch, tmp_path):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
+    # Runs are refused without a bound return route (hermes-talk#35), so the
+    # suite attaches one. Tests that assert the REFUSAL detach it explicitly.
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
     monkeypatch.delenv("TALK_AGENT_TIMEOUT_S", raising=False)
     monkeypatch.delenv("TALK_AGENT_PROFILE", raising=False)
     # Point HERMES_HOME at an EMPTY tmp dir and block the host resolver: no
@@ -490,3 +499,130 @@ def test_agent_timeout_default_and_override(monkeypatch):
     for junk in ("nonsense", "0", "-5", ""):
         monkeypatch.setenv("TALK_AGENT_TIMEOUT_S", junk)
         assert talk_config.agent_timeout_s() == talk_config.DEFAULT_AGENT_TIMEOUT_S
+
+
+# --- refusal before execution (hermes-talk#35) -------------------------------
+
+
+def test_the_detached_lane_refuses_before_spawning_when_unrouted(monkeypatch):
+    """No return route means no subprocess — the refusal precedes execution."""
+
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
+    spawned = []
+    monkeypatch.setattr(
+        talk_host.subprocess,
+        "Popen",
+        lambda *a, **k: spawned.append(a) or _fake_completed(stdout="ok"),
+    )
+    talk_runs.detach_owner()
+
+    result = talk_host.host().run_agent("go")
+
+    assert result.startswith("I can't start that yet")
+    assert "WORK_STARTED" not in result
+    assert spawned == []
+
+
+def test_an_unrouted_refusal_is_worded_apart_from_a_broken_lane(monkeypatch):
+    """"Never accepted" and "accepted then broke" must not sound the same.
+
+    The operator can act on the difference: one has nothing in flight to check
+    on, the other does.
+    """
+
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
+    monkeypatch.setattr(
+        talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="ok")
+    )
+
+    talk_runs.detach_owner()
+    unrouted = talk_host.host().run_agent("go")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("the registry exploded")
+
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
+    monkeypatch.setattr(talk_runs, "start_run", _boom)
+    broken = talk_host.host().run_agent("go")
+
+    assert unrouted.startswith("I can't start that yet")
+    assert broken.startswith("I couldn't start that work")
+    assert unrouted != broken
+
+
+def test_a_refused_dispatch_leaves_no_run_behind(monkeypatch):
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
+    talk_runs.detach_owner()
+
+    talk_host.host().run_agent("go")
+
+    assert talk_runs.list_runs(50) == []
+
+
+# --- the tier-2 remote handle must outlive the process -----------------------
+
+
+def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp_path):
+    """``api_run_id`` is the only handle a reconnect could resume tracking by.
+
+    It has to be on DISK before the run ends, because the process a reconnect
+    is recovering from died mid-run by definition (hermes-talk#35). Asserting
+    after termination proves nothing: the terminal tee carries ``meta``
+    anyway, which is precisely how the untee'd write hid for so long.
+    """
+
+    import json as _json
+    import threading as _threading
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    history = state / "talk-runs.jsonl"
+    monkeypatch.setattr(talk_runs, "_history_path", lambda: history)
+    monkeypatch.setattr(talk_runs, "_history_enabled", lambda: True)
+
+    started = _threading.Event()
+    release = _threading.Event()
+
+    def fake_run_to_completion(_task, *, session_id=None, on_start=None):
+        if on_start is not None:
+            on_start("run_remote_42")
+        started.set()
+        release.wait(timeout=3.0)
+        return "the answer"
+
+    monkeypatch.setattr(
+        talk_host.talk_apiserver, "run_to_completion", fake_run_to_completion
+    )
+
+    run_id = talk_runs.start_run(
+        "agent", "tier 2", talk_host._api_server_worker("go", session_id=None)
+    )
+    assert started.wait(timeout=3.0)
+
+    # Read the file exactly as a restarted process would, mid-run.
+    deadline = time.time() + 3.0
+    persisted = None
+    while time.time() < deadline:
+        rows = [
+            _json.loads(line)
+            for line in history.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        mine = [r for r in rows if r["runId"] == run_id and r.get("meta", {}).get("api_run_id")]
+        if mine:
+            persisted = mine[-1]
+            break
+        time.sleep(0.02)
+
+    release.set()
+    _wait_terminal(run_id)
+
+    assert persisted is not None, "the remote handle never reached disk before the run ended"
+    assert persisted["meta"]["api_run_id"] == "run_remote_42"
+    assert persisted["status"] == "running"
