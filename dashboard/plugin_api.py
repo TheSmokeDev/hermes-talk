@@ -46,6 +46,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 import talk_apiserver  # noqa: E402
 import talk_auth  # noqa: E402
+import talk_capabilities  # noqa: E402
 import talk_config  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
@@ -182,6 +183,10 @@ def _warm_agent_lane() -> str:
     """Resolve the agent lane, paying for a cold probe. Worker thread only."""
 
     talk_apiserver.warm()
+    # The catalog rides the same paid-for wait: it is the only place in the
+    # codebase that warms a lane at session start, and the alternative is the
+    # session's first "what can you do?" answering "still checking".
+    talk_capabilities.warm()
     return talk_host.host().agent_lane()
 
 

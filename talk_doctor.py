@@ -56,7 +56,7 @@ HOST_CAPABILITIES = (
     "register_realtime_voice_provider",
     "dispatch_tool",
 )
-_SECRET_PATTERNS = (
+SECRET_PATTERNS = (
     re.compile(r"(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}"),
     re.compile(r"(?i)(?<![A-Za-z0-9])(?:github_pat_|gh[pousr]_)[A-Za-z0-9_-]{8,}"),
     re.compile(r"(?i)(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{8,}"),
@@ -64,23 +64,31 @@ _SECRET_PATTERNS = (
 )
 
 
-def _redact_text(value: str) -> str:
-    for pattern in _SECRET_PATTERNS:
+def redact_text(value: str) -> str:
+    """Scrub secret-shaped substrings out of one string.
+
+    Public because the capability catalog reports upstream-supplied skill and
+    toolset payloads, which is the same class of "text this process did not
+    write, about to be emitted" problem doctor already solved. One pattern
+    list beats two that drift apart.
+    """
+
+    for pattern in SECRET_PATTERNS:
         value = pattern.sub("<redacted-secret>", value)
     return value
 
 
-def _redact_value(value: Any) -> Any:
+def redact_value(value: Any) -> Any:
     """Recursively scrub secret-shaped strings at the report boundary."""
 
     if isinstance(value, str):
-        return _redact_text(value)
+        return redact_text(value)
     if isinstance(value, dict):
-        return {key: _redact_value(item) for key, item in value.items()}
+        return {key: redact_value(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_redact_value(item) for item in value]
+        return [redact_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_value(item) for item in value)
+        return tuple(redact_value(item) for item in value)
     return value
 
 
@@ -96,9 +104,9 @@ def _check(
     return {
         "id": check_id,
         "status": status,
-        "summary": _redact_text(summary),
-        "details": _redact_value(details),
-        "remediation": [_redact_text(action) for action in remediation],
+        "summary": redact_text(summary),
+        "details": redact_value(details),
+        "remediation": [redact_text(action) for action in remediation],
     }
 
 
@@ -504,7 +512,7 @@ def collect_report() -> dict[str, Any]:
 def render_human(report: dict[str, Any]) -> str:
     """Render the same receipt for a person without adding hidden probes."""
 
-    report = _redact_value(report)
+    report = redact_value(report)
     lines = ["Hermes Talk doctor (read-only)"]
     for check in report["checks"]:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
@@ -553,7 +561,7 @@ def render_human(report: dict[str, Any]) -> str:
 def cli_entry(*, json_output: bool = False) -> int:
     """Print one doctor report and return nonzero only for failing checks."""
 
-    report = _redact_value(collect_report())
+    report = redact_value(collect_report())
     if json_output:
         print(json.dumps(report, sort_keys=True))
     else:
@@ -565,7 +573,10 @@ __all__ = [
     "CHECK_ORDER",
     "COMMAND",
     "SCHEMA_VERSION",
+    "SECRET_PATTERNS",
     "cli_entry",
     "collect_report",
+    "redact_text",
+    "redact_value",
     "render_human",
 ]

@@ -29,7 +29,14 @@ TRUSTED_BINDING_EVENT_KEY = "_talk_speaker_binding"
 TRUSTED_CONTINUATION_EVENT_KEY = "_talk_continuation"
 
 READ_ONLY_TALK_TOOLS = frozenset(
-    {"search_memory", "search_vault", "check_work", "list_agents", "talk_status"}
+    {
+        "search_memory",
+        "search_vault",
+        "check_work",
+        "list_agents",
+        "talk_status",
+        "talk_capabilities",
+    }
 )
 MUTATING_TALK_TOOLS = frozenset(
     {"delegate_task", "steer_agent", "redirect_agent", "stop_work"}

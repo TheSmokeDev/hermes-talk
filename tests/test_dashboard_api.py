@@ -160,6 +160,7 @@ def test_mint_advertises_the_full_tool_surface(minted, monkeypatch):
         "redirect_agent",
         "stop_work",
         "talk_status",
+        "talk_capabilities",
     ]
     assert minted["session"]["tool_choice"] == "auto"
 

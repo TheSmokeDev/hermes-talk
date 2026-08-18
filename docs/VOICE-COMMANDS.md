@@ -20,6 +20,7 @@ delivery; "landed" only ever follows a real delivery artifact.
 | "stop — wrong repo, use the ship branch" | `redirect_agent` | "redirect accepted — it takes the correction at its current step, or its very next one" | the stronger verb: interrupts current thinking where the host supports it (0.20+), degrades to the steer queue mid-tool or on older hosts — and says which |
 | "kill the audit" / "stop run 7" | `stop_work` | "sent the stop — winding down" then a death receipt ("it's down", exit code) when confirmed | stopping drops unread steering notes (their receipts flip to `superseded`); every stop offered is real on that lane |
 | "what are you running on?" / "status report" | `talk_status` | version, model, voice, auth lane, agent lane, audio, identity sections | the verification command — field-by-field meaning in [OPERATING.md](OPERATING.md#2-talk_status--the-one-command) |
+| "what can you do right now?" / "which tools do you have?" | `talk_capabilities` | installed skills, resolved toolsets with their enabled/configured flags, gateway feature flags, live run counts | live evidence, not the prompt — read in-process off the attached agent, or over the api server when detached; a toolset listed `enabled: false` is reported as installed but NOT usable |
 
 Things you'll hear without asking (v0.6+): a background agent finishing
 ("Background agent sa-… finished…"), and a steering note landing ("the

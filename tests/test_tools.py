@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+import talk_capabilities
 import talk_host
 import talk_operator_auth
 import talk_runs
@@ -57,6 +58,7 @@ _BASE_TOOLS = [
     "redirect_agent",
     "stop_work",
     "talk_status",
+    "talk_capabilities",
 ]
 
 
@@ -178,6 +180,130 @@ def test_talk_status_reports_state(monkeypatch):
     assert isinstance(status["core_realtime"]["provider_available"], bool)
     assert status["core_realtime"]["registration"] == "unsupported-optional"
     assert "registration_failures" not in status
+
+
+def _snapshot(**overrides) -> talk_capabilities.CatalogSnapshot:
+    fields = {
+        "source": talk_capabilities.SOURCE_IN_PROCESS,
+        "skills": ({"name": "web_search"},),
+        "toolsets": (
+            {"name": "browser", "enabled": True, "configured": True, "tools": ["open"]},
+        ),
+        "capabilities": {"run_approval": True},
+        "health": {"active_runs": 1},
+        "detail": "the Hermes agent I'm attached to",
+    }
+    fields.update(overrides)
+    return talk_capabilities.CatalogSnapshot(**fields)
+
+
+def test_talk_capabilities_reports_the_snapshot(monkeypatch):
+    monkeypatch.setattr(talk_capabilities, "status", lambda: _snapshot())
+
+    catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+    assert catalog["source"] == talk_capabilities.SOURCE_IN_PROCESS
+    assert catalog["skills"] == [{"name": "web_search"}]
+    assert catalog["capabilities"] == {"run_approval": True}
+    assert catalog["health"] == {"active_runs": 1}
+
+
+def test_talk_capabilities_passes_disabled_toolsets_through(monkeypatch):
+    """A disabled toolset is REPORTED, not filtered: the model has to be able
+    to say "installed but not usable", and it cannot say what it never saw."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            toolsets=({"name": "email", "enabled": False, "configured": False},)
+        ),
+    )
+
+    catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+    assert catalog["toolsets"] == [
+        {"name": "email", "enabled": False, "configured": False}
+    ]
+
+
+def test_talk_capabilities_redacts_secret_shaped_values(monkeypatch):
+    """Upstream payloads are not this process's text, and this one is spoken
+    aloud and lands in a transcript."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            toolsets=(
+                {"name": "email", "config": {"token": "sk-abcdefgh12345678"}},
+            ),
+            capabilities={"webhook": "https://x.test/xoxb-abcdefgh12345678"},
+        ),
+    )
+
+    rendered = talk_tools.execute_talk_tool("talk_capabilities", {})
+
+    assert "sk-abcdefgh12345678" not in rendered
+    assert "xoxb-abcdefgh12345678" not in rendered
+    assert rendered.count("<redacted-secret>") == 2
+
+
+def test_talk_capabilities_stays_parseable_when_the_catalog_is_huge(monkeypatch):
+    """execute_talk_tool bounds by TAIL TRUNCATION, so an oversized payload
+    would otherwise reach the model as JSON cut off mid-object."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            skills=tuple(
+                {"name": f"skill_{index}", "description": "x" * 200}
+                for index in range(200)
+            ),
+            toolsets=tuple(
+                {"name": f"toolset_{index}", "enabled": True, "configured": False}
+                for index in range(60)
+            ),
+        ),
+    )
+
+    rendered = talk_tools.execute_talk_tool("talk_capabilities", {})
+    catalog = json.loads(rendered)  # the assertion that matters: still parses
+
+    assert len(rendered) <= talk_tools.MAX_OUTPUT_CHARS
+    assert catalog["skills"][0] == "skill_0"
+    assert len(catalog["skills"]) == talk_tools.MAX_CATALOG_ENTRIES
+    assert catalog["skills_omitted"] == 200 - talk_tools.MAX_CATALOG_ENTRIES
+    assert catalog["toolsets_omitted"] == 60 - talk_tools.MAX_CATALOG_ENTRIES
+    # The flags that decide usability survive the compaction; the prose does not.
+    assert catalog["toolsets"][0] == {
+        "name": "toolset_0",
+        "enabled": True,
+        "configured": False,
+    }
+
+
+def test_talk_capabilities_says_when_it_could_not_read_the_catalog(monkeypatch):
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: talk_capabilities._empty(talk_capabilities.CHECKING_DETAIL),
+    )
+
+    catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+    assert catalog["source"] == talk_capabilities.SOURCE_NONE
+    assert catalog["detail"] == talk_capabilities.CHECKING_DETAIL
+    assert catalog["skills"] == []
+
+
+def test_talk_capabilities_is_read_only():
+    """The authority boundary, stated at the tool rather than only in the
+    generic classification sweep: a catalog read must never be a way to act."""
+
+    assert "talk_capabilities" in talk_operator_auth.READ_ONLY_TALK_TOOLS
+    assert "talk_capabilities" not in talk_operator_auth.MUTATING_TALK_TOOLS
 
 
 def test_talk_status_surfaces_registration_failures():

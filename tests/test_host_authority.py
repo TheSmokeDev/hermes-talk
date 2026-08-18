@@ -375,3 +375,64 @@ def test_missing_call_id_is_dropped_not_crashed(monkeypatch):
 
     assert len(attachment.minted) == 0
     assert results == [[]]
+
+
+# ---------- 13. Reading the capability catalog grants no authority ----------
+
+
+def test_capability_catalog_is_readable_by_a_non_operator(monkeypatch):
+    """The catalog is evidence, not permission. Gating it behind operator
+    authority would make the plugin unable to say what it is, to the very
+    people most likely to be asking why something is missing."""
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
+    _bind_response(ledger)
+    event = _make_tool_event(
+        ledger,
+        tool_name="talk_capabilities",
+        arguments="{}",
+        call_id="call-catalog",
+    )
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    results = _run_batch(relay, [event])
+
+    assert len(attachment.minted) == 1
+    assert attachment.minted[0][0]["tool_name"] == "talk_capabilities"
+    assert any("exact host output" in cmd.output for cmd in results[0])
+
+
+def test_a_catalog_read_cannot_be_replayed_as_a_mutating_call(monkeypatch):
+    """The property that makes "read-only" mean something under #39's ledger:
+    a catalog read CONSUMES its call permit, so the same proven-attributed
+    event cannot come back a second time wearing delegate_task. The speaker
+    here is a real operator, so only permit consumption can deny this — if the
+    read left its permit live, this would be a way to launder one authorized
+    question into one unauthorized action."""
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    event = _make_tool_event(
+        ledger,
+        tool_name="talk_capabilities",
+        arguments="{}",
+        call_id="call-catalog",
+    )
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("talk_capabilities", event) is None
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    results = _run_batch(relay, [dict(event, name="delegate_task")])
+
+    assert len(attachment.minted) == 0
+    assert any("not run" in cmd.output for cmd in results[0])

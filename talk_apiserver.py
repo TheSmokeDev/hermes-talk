@@ -50,6 +50,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -62,6 +63,12 @@ _log = logging.getLogger(__name__)
 
 CAPABILITIES_PATH = "/v1/capabilities"
 RUNS_PATH = "/v1/runs"
+#: Read-only catalog surfaces. These answer "what does this install HAVE",
+#: which is a different question from :data:`CAPABILITIES_PATH`'s "may I submit
+#: a run" — see :func:`capabilities_payload` on why both read the same path.
+SKILLS_PATH = "/v1/skills"
+TOOLSETS_PATH = "/v1/toolsets"
+HEALTH_DETAILED_PATH = "/health/detailed"
 
 #: api_server run statuses that will never change again (api_server.py:4377-4404).
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -334,6 +341,96 @@ def get_run(run_id: str) -> dict:
     return payload
 
 
+def _get_json(path: str, what: str) -> Any:
+    """GET ``path`` and return its decoded JSON. Raises on anything else.
+
+    Factored out because four catalog reads want byte-identical failure
+    handling; ``what`` is the noun that lands in the spoken error, so an
+    operator hears which read failed rather than a bare path.
+    """
+
+    try:
+        response = httpx.get(
+            f"{talk_config.api_server_url()}{path}",
+            headers=_auth_headers(),
+            timeout=talk_config.api_server_probe_timeout_s() * 4,
+        )
+    except httpx.HTTPError as exc:
+        raise TalkApiServerError(
+            f"I lost contact with the Hermes api server ({type(exc).__name__})"
+        ) from exc
+    if response.status_code != 200:
+        raise TalkApiServerError(
+            f"the Hermes api server answered {response.status_code} when I asked "
+            f"about {what}"
+        )
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise TalkApiServerError(
+            f"the Hermes api server returned a non-JSON {what} list"
+        ) from exc
+
+
+def _listing(path: str, key: str, what: str) -> list[dict]:
+    """One catalog listing, accepting a bare list or a ``{key: [...]}`` envelope.
+
+    Both shapes are parsed because this repo has no Hermes gateway source to
+    pin the envelope against — only the documented route. Guessing one shape
+    and raising on the other would turn a cosmetic difference into a dead
+    feature; anything that is NEITHER shape still raises, because an
+    unrecognized payload must not read as an empty-but-successful catalog.
+    """
+
+    payload = _get_json(path, what)
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict) and isinstance(payload.get(key), list):
+        entries = payload[key]
+    else:
+        raise TalkApiServerError(
+            f"the Hermes api server returned an unrecognized {what} payload"
+        )
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def list_skills() -> list[dict]:
+    """GET /v1/skills — the skills this Hermes install actually has."""
+
+    return _listing(SKILLS_PATH, "skills", "skills")
+
+
+def list_toolsets() -> list[dict]:
+    """GET /v1/toolsets — resolved toolsets, each with its own enabled/configured state."""
+
+    return _listing(TOOLSETS_PATH, "toolsets", "toolsets")
+
+
+def capabilities_payload() -> dict:
+    """GET /v1/capabilities as the RAW feature document.
+
+    Same path :func:`probe` dials, deliberately kept as a separate function:
+    ``probe`` collapses the whole document into one yes/no the rest of the
+    codebase already depends on, and widening its return type would ripple
+    into ``talk_host.agent_lane`` and ``talk_status``. This one answers the
+    other question — what the flags actually say.
+    """
+
+    payload = _get_json(CAPABILITIES_PATH, "capabilities")
+    if not isinstance(payload, dict):
+        raise TalkApiServerError("the Hermes api server returned invalid capabilities")
+    return payload
+
+
+def health_detailed() -> dict:
+    """GET /health/detailed — live run/delegation counters."""
+
+    payload = _get_json(HEALTH_DETAILED_PATH, "health")
+    if not isinstance(payload, dict):
+        raise TalkApiServerError("the Hermes api server returned invalid health")
+    return payload
+
+
 def run_to_completion(
     prompt: str,
     *,
@@ -412,6 +509,7 @@ def reset_for_tests() -> None:
 __all__ = [
     "CAPABILITIES_PATH",
     "CHECKING_DETAIL",
+    "HEALTH_DETAILED_PATH",
     "INERT_DETAIL",
     "MAX_OUTPUT_CHARS",
     "REASON_ABSENT",
@@ -419,11 +517,17 @@ __all__ = [
     "REASON_OK",
     "REASON_UNAUTHORIZED",
     "RUNS_PATH",
+    "SKILLS_PATH",
     "TERMINAL_RUN_STATUSES",
+    "TOOLSETS_PATH",
     "ApiServerStatus",
     "TalkApiServerError",
+    "capabilities_payload",
     "get_run",
+    "health_detailed",
     "is_available",
+    "list_skills",
+    "list_toolsets",
     "probe",
     "reset_for_tests",
     "run_to_completion",

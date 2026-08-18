@@ -14,6 +14,22 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- A live capability catalog: the new `talk_capabilities` tool answers "what can
+  you do right now?" from evidence instead of from the system prompt — installed
+  skills, resolved toolsets with their `enabled`/`configured` flags, the
+  gateway's feature flags, and bounded run/delegation counts. `talk_capabilities.py`
+  reads it in-process off the committed host attachment when a Hermes agent is
+  attached, and falls back to the api server (`/v1/skills`, `/v1/toolsets`,
+  `/v1/capabilities`, `/health/detailed`) when it is not — the same two-tier
+  doctrine `agent_lane()` already uses. A host that does not expose the
+  in-process tool degrades to REST rather than failing. The snapshot is
+  TTL-cached (`TALK_CAPABILITY_CATALOG_TTL_S`, default 30s) and warmed at the
+  dashboard's session mint, so a tool handler never waits on the network.
+  Disabled toolsets are reported rather than hidden, so the model can say
+  "installed but not usable" instead of quietly offering something that would
+  fail. The tool is classified read-only: reading the catalog grants no
+  execution authority, and a catalog read consumes its call permit so it cannot
+  be replayed as a mutating call.
 - A typed provider-neutral Realtime session boundary: `talk_realtime.py` owns
   setup, events, commands, lifecycle states, and the adapter protocol, while
   `talk_openai_realtime.py` owns OpenAI ephemeral minting, WebSocket lifecycle,

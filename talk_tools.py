@@ -21,12 +21,19 @@ import logging
 import time
 from pathlib import Path
 
+# ``talk_doctor`` imports this module back (for its registration receipts),
+# so this pair is a cycle. It resolves because NEITHER module touches the
+# other at import time — every cross-reference is inside a function body. Keep
+# it that way: a module-level ``talk_doctor.SECRET_PATTERNS`` here would break
+# the import on whichever module loads second.
 try:
     from . import (
         talk_audio,
         talk_auth,
+        talk_capabilities,
         talk_config,
         talk_core_realtime,
+        talk_doctor,
         talk_host,
         talk_identity,
         talk_runs,
@@ -36,8 +43,10 @@ try:
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
     import talk_auth
+    import talk_capabilities
     import talk_config
     import talk_core_realtime
+    import talk_doctor
     import talk_host
     import talk_identity
     import talk_runs
@@ -288,6 +297,27 @@ _TOOL_TALK_STATUS: dict = {
 }
 
 
+_TOOL_TALK_CAPABILITIES: dict = {
+    "type": "function",
+    "name": "talk_capabilities",
+    "description": (
+        "Report what this Hermes session can ACTUALLY do right now: installed "
+        "skills, resolved toolsets with whether each one is enabled and "
+        "configured, the gateway's feature flags, and how much work is in "
+        "flight. Use when asked what you can do, which tools or skills are "
+        "available, or why something seems missing. A toolset listed here "
+        "with enabled or configured false is NOT usable — say so rather than "
+        "offering it. If the source is 'unavailable', say you could not read "
+        "the catalog; never answer from memory instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+
 class TalkToolError(Exception):
     """Unknown tool name or otherwise malformed tool call."""
 
@@ -329,6 +359,7 @@ def default_talk_tools() -> list[dict]:
         _TOOL_REDIRECT_AGENT,
         _TOOL_STOP_WORK,
         _TOOL_TALK_STATUS,
+        _TOOL_TALK_CAPABILITIES,
     ]
     try:
         if talk_vault.available():
@@ -559,6 +590,64 @@ def _handle_talk_status(arguments: dict) -> str:
     return json.dumps(status)
 
 
+#: How many catalog entries survive the fallback rendering below. Reached only
+#: after the full payload already failed to fit, so the choice is not "40 or
+#: everything", it is "40 named entries or a torn JSON document".
+MAX_CATALOG_ENTRIES = 40
+
+
+def _catalog_name(entry: dict) -> str:
+    """The speakable name of one skill or toolset, whatever the host called it."""
+
+    for key in ("name", "id", "slug"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unnamed"
+
+
+def _compact_toolset(entry: dict) -> dict:
+    """A toolset as name plus the two flags that decide whether it is usable."""
+
+    compact: dict = {"name": _catalog_name(entry)}
+    for key in ("enabled", "configured"):
+        if isinstance(entry.get(key), bool):
+            compact[key] = entry[key]
+    return compact
+
+
+def _handle_talk_capabilities(arguments: dict) -> str:
+    snapshot = talk_capabilities.status()
+    payload = {
+        "source": snapshot.source,
+        "detail": snapshot.detail,
+        "skills": list(snapshot.skills),
+        "toolsets": list(snapshot.toolsets),
+        "capabilities": snapshot.capabilities,
+        "health": snapshot.health,
+    }
+    rendered = json.dumps(talk_doctor.redact_value(payload))
+    if len(rendered) <= MAX_OUTPUT_CHARS:
+        return rendered
+    # A real install's full catalog does not fit the spoken-output budget, and
+    # execute_talk_tool bounds by TAIL TRUNCATION — which would hand the model
+    # a JSON document cut off mid-object. Re-render as names plus the flags
+    # that decide usability instead: less detail, still parseable, and still
+    # honest about what it dropped.
+    skills = list(snapshot.skills)
+    toolsets = list(snapshot.toolsets)
+    payload["skills"] = [_catalog_name(entry) for entry in skills[:MAX_CATALOG_ENTRIES]]
+    payload["toolsets"] = [
+        _compact_toolset(entry) for entry in toolsets[:MAX_CATALOG_ENTRIES]
+    ]
+    payload["skills_omitted"] = max(0, len(skills) - MAX_CATALOG_ENTRIES)
+    payload["toolsets_omitted"] = max(0, len(toolsets) - MAX_CATALOG_ENTRIES)
+    payload["detail"] = (
+        f"{snapshot.detail} — names only, the full catalog is too long to read out"
+    )
+    return json.dumps(talk_doctor.redact_value(payload))
+
+
 _HANDLERS = {
     "search_memory": _handle_search_memory,
     "search_vault": _handle_search_vault,
@@ -569,10 +658,12 @@ _HANDLERS = {
     "redirect_agent": _handle_redirect_agent,
     "stop_work": _handle_stop_work,
     "talk_status": _handle_talk_status,
+    "talk_capabilities": _handle_talk_capabilities,
 }
 
 
 __all__ = [
+    "MAX_CATALOG_ENTRIES",
     "MAX_OUTPUT_CHARS",
     "REGISTRATION_FAILURES",
     "REGISTRATION_RECEIPTS",
