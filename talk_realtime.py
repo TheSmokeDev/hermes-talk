@@ -136,9 +136,13 @@ class ResponseStarted(RealtimeEvent):
 class OutputAudio(RealtimeEvent):
     data: bytes
     item_id: str | None = None
+    #: Which response produced this audio. A cancelled response keeps emitting
+    #: deltas, so playback has to be able to tell whose audio it is holding.
+    response_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.item_id, "item_id", optional=True)
+        _identifier(self.response_id, "response_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +151,9 @@ class Transcript(RealtimeEvent):
     text: str
     final: bool
     provenance: TranscriptProvenance
+    #: Which response produced this transcript. Always None for input audio —
+    #: the operator's own speech belongs to no response.
+    response_id: str | None = None
 
     def __post_init__(self) -> None:
         expected_role = {
@@ -155,6 +162,7 @@ class Transcript(RealtimeEvent):
         }.get(self.provenance)
         if self.role is not expected_role:
             raise ValueError("Transcript role must match its audio provenance")
+        _identifier(self.response_id, "response_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)

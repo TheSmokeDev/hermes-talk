@@ -212,7 +212,11 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 pcm = base64.b64decode(delta, validate=True)
             except (binascii.Error, ValueError, TypeError):
                 return rt.ProviderFailure(detail="Provider sent a malformed audio payload")
-            return rt.OutputAudio(data=pcm, item_id=event.get("item_id"))
+            return rt.OutputAudio(
+                data=pcm,
+                item_id=event.get("item_id"),
+                response_id=event.get("response_id"),
+            )
         if event_type == "response.output_audio_transcript.delta":
             delta = event.get("delta")
             if not isinstance(delta, str) or not delta:
@@ -222,6 +226,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 text=delta,
                 final=False,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id=event.get("response_id"),
             )
         if event_type == "response.output_audio_transcript.done":
             completed = event.get("transcript")
@@ -230,6 +235,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 text=completed if isinstance(completed, str) else "",
                 final=True,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id=event.get("response_id"),
             )
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript")
