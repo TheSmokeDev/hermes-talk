@@ -309,3 +309,69 @@ def test_reconnect_invalidates_old_proofs(monkeypatch):
 
     assert len(attachment.minted) == 0
     assert any("not run" in cmd.output for cmd in results[0])
+
+
+# ---------- 10. Relay refuses to exist without an explicit authorizer ----------
+
+
+def test_relay_requires_explicit_authorizer():
+    attachment = HostExecutionAttachment()
+    try:
+        talk_cli.HostExecutionRelay(attachment)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("bare construction must raise")
+    try:
+        talk_cli.HostExecutionRelay(attachment, tool_authorizer=None)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("tool_authorizer=None must raise")
+
+
+# ---------- 11. Named single-speaker authorizer permits the host path ----------
+
+
+def test_local_operator_authorizer_permits_host_path():
+    event = {
+        "response_id": "resp-1",
+        "item_id": "item-1",
+        "call_id": "call-local",
+        "name": "delegate_task",
+        "arguments": '{"task":"ship it"}',
+    }
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=talk_cli.local_operator_authorizer
+    )
+    results = _run_batch(relay, [event])
+
+    assert len(attachment.minted) == 1
+    assert attachment.minted[0][0]["tool_name"] == "delegate_task"
+    assert any("exact host output" in cmd.output for cmd in results[0])
+
+
+# ---------- 12. Malformed event without call_id cannot crash the batch ----------
+
+
+def test_missing_call_id_is_dropped_not_crashed(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    malformed = {
+        "response_id": "resp-1",
+        "item_id": "item-1",
+        "name": "delegate_task",
+        "arguments": '{"task":"ship it"}',
+    }
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    results = _run_batch(relay, [malformed])
+
+    assert len(attachment.minted) == 0
+    assert results == [[]]
