@@ -478,8 +478,9 @@ class ToolResponseCoordinator:
 class HostExecutionRelay:
     """Translate one provider response's calls into one canonical host batch."""
 
-    def __init__(self, attachment) -> None:
+    def __init__(self, attachment, *, tool_authorizer=None) -> None:
         self.attachment = attachment
+        self.tool_authorizer = tool_authorizer
 
     @staticmethod
     def _output(call_id: str, output: str) -> list[talk_realtime.RealtimeCommand]:
@@ -509,6 +510,11 @@ class HostExecutionRelay:
                     event["call_id"], HOST_TOOL_ARGUMENT_ERROR
                 )
                 continue
+            if self.tool_authorizer is not None:
+                denial = self.tool_authorizer(event.get("name", ""), event)
+                if denial is not None:
+                    outputs[position] = self._output(event["call_id"], denial)
+                    continue
             permits.append(
                 self.attachment.mint_tool_call_permit(
                     response_id=response_id,
@@ -954,7 +960,14 @@ async def run_talk_session(
 
         tool_coordinator = ToolResponseCoordinator(
             (
-                HostExecutionRelay(host_execution_attachment)
+                HostExecutionRelay(
+                    host_execution_attachment,
+                    tool_authorizer=(
+                        authorization_ledger.authorize_tool
+                        if authorization_ledger is not None
+                        else None
+                    ),
+                )
                 if host_execution_attachment is not None
                 else relay
             ),
