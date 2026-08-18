@@ -61,6 +61,41 @@ UNREACHABLE_DETAIL = "I'm running outside a Hermes agent, and {reason}"
 #: on an operator's behalf after the fact.
 HEALTH_COUNTERS = ("active_runs", "active_delegations")
 
+#: The only ``/v1/capabilities`` fields this feature surfaces — the same
+#: discipline, for the same reason: a future gateway field must not silently
+#: start riding a voice transcript just because it appeared in the document.
+#: ``CAPABILITY_FIELDS`` are speakable strings; ``CAPABILITY_FEATURES`` are the
+#: documented boolean feature flags (the chat/responses/runs/approval/session
+#: surface the gateway advertises). Everything else — endpoints, auth config,
+#: runtime prose, whatever ships next — is dropped, not spoken.
+CAPABILITY_FIELDS = ("platform", "model")
+CAPABILITY_FEATURES = (
+    "chat_completions",
+    "chat_completions_streaming",
+    "responses_api",
+    "responses_streaming",
+    "run_submission",
+    "run_status",
+    "run_events_sse",
+    "run_stop",
+    "run_steer",
+    "run_approval_response",
+    "tool_progress_events",
+    "approval_events",
+    "session_resources",
+    "session_chat",
+    "session_chat_streaming",
+    "session_fork",
+    "session_model_lock",
+    "model_options",
+    "skills_api",
+    "audio_api",
+    "realtime_voice",
+    "memory_write_api",
+    "admin_config_rw",
+    "jobs_admin",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogSnapshot:
@@ -76,10 +111,15 @@ class CatalogSnapshot:
 
 #: Cached snapshot + when it was taken. Guarded for the same reason
 #: ``talk_apiserver._STATUS_LOCK`` is: reads arrive from the event loop, from
-#: run workers, and from the dashboard's thread pool.
+#: run workers, and from the dashboard's thread pool. ``_STORE_SEQ`` counts
+#: stores: every read captures it before it starts, and :func:`_store` refuses
+#: a snapshot whose read started before the currently-stored one landed —
+#: last-writer-wins would otherwise let an old slow failure clobber a newer
+#: healthy snapshot.
 _LOCK = threading.Lock()
 _SNAPSHOT: CatalogSnapshot | None = None
 _SNAPSHOT_AT: float = 0.0
+_STORE_SEQ = 0
 _REFRESHING = False
 
 
@@ -128,6 +168,48 @@ def _bounded_health(raw: dict) -> dict:
     }
 
 
+def _bounded_capabilities(raw: dict) -> dict:
+    """Only the fields in :data:`CAPABILITY_FIELDS` / :data:`CAPABILITY_FEATURES`.
+
+    The whole document is upstream text headed for a transcript, so it gets the
+    :func:`_bounded_health` treatment: named keys with the right types survive,
+    everything else is dropped rather than spoken.
+    """
+
+    bounded: dict = {
+        key: raw[key] for key in CAPABILITY_FIELDS if isinstance(raw.get(key), str)
+    }
+    features = raw.get("features")
+    if isinstance(features, dict):
+        kept = {
+            key: features[key]
+            for key in CAPABILITY_FEATURES
+            if isinstance(features.get(key), bool)
+        }
+        if kept:
+            bounded["features"] = kept
+    return bounded
+
+
+def _looks_like_catalog(payload: dict) -> bool:
+    """True only for a dict that is recognizably a capability catalog.
+
+    The in-process tool name is a GUESS (:data:`talk_host.CAPABILITY_CATALOG_TOOL_NAME`),
+    so a dict answer proves only that SOME tool answered — a real-but-different
+    tool registered under that name, an error envelope whose text dodges the
+    ``_agent_loop_absent`` markers, or a prose-shaped reply must all read as
+    "no answer here" and fall through, never be stored as an empty catalog.
+    """
+
+    if "error" in payload:
+        return False
+    return (
+        isinstance(payload.get("skills"), list)
+        or isinstance(payload.get("toolsets"), list)
+        or isinstance(payload.get("capabilities"), dict)
+    )
+
+
 def _from_in_process() -> CatalogSnapshot | None:
     """Tier 1. ``None`` means "no answer here", never "nothing installed"."""
 
@@ -142,7 +224,7 @@ def _from_in_process() -> CatalogSnapshot | None:
         payload = json.loads(raw)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not _looks_like_catalog(payload):
         return None
     capabilities = payload.get("capabilities")
     health = payload.get("health")
@@ -150,7 +232,9 @@ def _from_in_process() -> CatalogSnapshot | None:
         source=SOURCE_IN_PROCESS,
         skills=_entries(payload.get("skills")),
         toolsets=_entries(payload.get("toolsets")),
-        capabilities=capabilities if isinstance(capabilities, dict) else {},
+        capabilities=_bounded_capabilities(
+            capabilities if isinstance(capabilities, dict) else {}
+        ),
         health=_bounded_health(health if isinstance(health, dict) else {}),
         detail="the Hermes agent I'm attached to",
     )
@@ -180,7 +264,7 @@ def _from_api_server() -> CatalogSnapshot:
         source=SOURCE_API_SERVER,
         skills=tuple(skills),
         toolsets=tuple(toolsets),
-        capabilities=capabilities,
+        capabilities=_bounded_capabilities(capabilities),
         health=_bounded_health(health),
         detail="the Hermes api server",
     )
@@ -205,9 +289,25 @@ def _resolve_or_explain() -> CatalogSnapshot:
         return _empty(f"I couldn't read the capability catalog ({type(exc).__name__})")
 
 
-def _store(snapshot: CatalogSnapshot) -> None:
-    global _SNAPSHOT, _SNAPSHOT_AT
+def _read_seq() -> int:
     with _LOCK:
+        return _STORE_SEQ
+
+
+def _store(snapshot: CatalogSnapshot, started_seq: int) -> None:
+    """Store one resolved snapshot — unless a newer one landed first.
+
+    ``started_seq`` is :data:`_STORE_SEQ` as it was when this snapshot's READ
+    began. If it no longer matches, some other read that started later has
+    already stored, and what this thread is holding is older evidence wearing
+    a newer arrival time — dropped, not stored.
+    """
+
+    global _SNAPSHOT, _SNAPSHOT_AT, _STORE_SEQ
+    with _LOCK:
+        if started_seq != _STORE_SEQ:
+            return
+        _STORE_SEQ += 1
         _SNAPSHOT = snapshot
         _SNAPSHOT_AT = time.monotonic()
 
@@ -220,6 +320,7 @@ def _refresh_in_background() -> None:
         if _REFRESHING:
             return
         _REFRESHING = True
+        started_seq = _STORE_SEQ
 
     def worker() -> None:
         global _REFRESHING
@@ -230,7 +331,7 @@ def _refresh_in_background() -> None:
                 _REFRESHING = False
         # Stored even when it failed, for the reason talk_apiserver stores a
         # failed probe: a cache that never fills re-reads on every single turn.
-        _store(snapshot)
+        _store(snapshot, started_seq)
 
     threading.Thread(
         target=worker, name="talk-capabilities-resolve", daemon=True
@@ -245,8 +346,9 @@ def warm() -> CatalogSnapshot:
     runs on the loop carrying the audio. That handler wants :func:`status`.
     """
 
+    started_seq = _read_seq()
     snapshot = _resolve_or_explain()
-    _store(snapshot)
+    _store(snapshot, started_seq)
     return snapshot
 
 
@@ -270,16 +372,23 @@ def status() -> CatalogSnapshot:
 
 
 def reset_for_tests() -> None:
-    """Clear the cached snapshot between tests (never called in production)."""
+    """Clear the cached snapshot between tests (never called in production).
 
-    global _SNAPSHOT, _SNAPSHOT_AT, _REFRESHING
+    Bumps :data:`_STORE_SEQ` so a read still in flight from before the reset
+    can no longer store into the cleaned cache.
+    """
+
+    global _SNAPSHOT, _SNAPSHOT_AT, _STORE_SEQ, _REFRESHING
     with _LOCK:
         _SNAPSHOT = None
         _SNAPSHOT_AT = 0.0
+        _STORE_SEQ += 1
         _REFRESHING = False
 
 
 __all__ = [
+    "CAPABILITY_FEATURES",
+    "CAPABILITY_FIELDS",
     "CHECKING_DETAIL",
     "HEALTH_COUNTERS",
     "INERT_DETAIL",

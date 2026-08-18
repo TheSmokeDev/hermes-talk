@@ -272,7 +272,7 @@ def test_talk_capabilities_stays_parseable_when_the_catalog_is_huge(monkeypatch)
     catalog = json.loads(rendered)  # the assertion that matters: still parses
 
     assert len(rendered) <= talk_tools.MAX_OUTPUT_CHARS
-    assert catalog["skills"][0] == "skill_0"
+    assert catalog["skills"][0] == {"name": "skill_0"}
     assert len(catalog["skills"]) == talk_tools.MAX_CATALOG_ENTRIES
     assert catalog["skills_omitted"] == 200 - talk_tools.MAX_CATALOG_ENTRIES
     assert catalog["toolsets_omitted"] == 60 - talk_tools.MAX_CATALOG_ENTRIES
@@ -282,6 +282,58 @@ def test_talk_capabilities_stays_parseable_when_the_catalog_is_huge(monkeypatch)
         "enabled": True,
         "configured": False,
     }
+
+
+def test_a_disabled_skill_is_not_presented_as_available_after_compaction(monkeypatch):
+    """Skills compact like toolsets: name PLUS usability flags. A disabled
+    skill flattened to a bare name would read as plainly available, breaking
+    "missing/disabled tools are not advertised"."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            skills=tuple(
+                {
+                    "name": f"skill_{index}",
+                    "description": "x" * 200,
+                    "enabled": index != 0,
+                }
+                for index in range(200)
+            ),
+        ),
+    )
+
+    catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+    assert catalog["skills"][0] == {"name": "skill_0", "enabled": False}
+    assert catalog["skills"][1] == {"name": "skill_1", "enabled": True}
+
+
+def test_absurdly_long_names_still_yield_parseable_json_under_the_bound(monkeypatch):
+    """Upstream-controlled names can blow past MAX_OUTPUT_CHARS even at the
+    deepest compaction tier — the handler must degrade to a minimal summary
+    rather than let execute_talk_tool's tail truncation tear the JSON."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            skills=tuple({"name": "s" * 5_000} for _ in range(50)),
+            toolsets=tuple(
+                {"name": "t" * 5_000, "enabled": True} for _ in range(10)
+            ),
+        ),
+    )
+
+    rendered = talk_tools.execute_talk_tool("talk_capabilities", {})
+    catalog = json.loads(rendered)  # the assertion that matters: still parses
+
+    assert len(rendered) <= talk_tools.MAX_OUTPUT_CHARS
+    assert catalog["source"] == talk_capabilities.SOURCE_IN_PROCESS
+    assert catalog["skills_count"] == 50
+    assert catalog["toolsets_count"] == 10
+    assert "too large" in catalog["detail"]
 
 
 def test_catalog_entries_without_a_name_shaped_key_compact_to_unnamed(monkeypatch):
@@ -297,7 +349,7 @@ def test_catalog_entries_without_a_name_shaped_key_compact_to_unnamed(monkeypatc
 
     catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
 
-    assert catalog["skills"][0] == "unnamed"
+    assert catalog["skills"][0] == {"name": "unnamed"}
 
 
 def test_talk_capabilities_omits_capabilities_when_still_oversized_after_compaction(

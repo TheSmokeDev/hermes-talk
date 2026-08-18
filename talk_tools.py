@@ -606,11 +606,18 @@ def _catalog_name(entry: dict) -> str:
     return "unnamed"
 
 
-def _compact_toolset(entry: dict) -> dict:
-    """A toolset as name plus the two flags that decide whether it is usable."""
+#: The boolean flags that decide whether a catalog entry is usable. They
+#: survive compaction for skills and toolsets ALIKE: a disabled skill that
+#: compacts to a bare name would read as plainly available, which is exactly
+#: the "missing/disabled tools are not advertised" promise broken.
+USABILITY_FLAGS = ("enabled", "configured", "installed", "disabled")
+
+
+def _compact_entry(entry: dict) -> dict:
+    """A skill or toolset as its name plus the flags that decide usability."""
 
     compact: dict = {"name": _catalog_name(entry)}
-    for key in ("enabled", "configured"):
+    for key in USABILITY_FLAGS:
         if isinstance(entry.get(key), bool):
             compact[key] = entry[key]
     return compact
@@ -644,9 +651,9 @@ def _handle_talk_capabilities(arguments: dict) -> str:
     # than let tail truncation tear it mid-object.
     skills = list(snapshot.skills)
     toolsets = list(snapshot.toolsets)
-    payload["skills"] = [_catalog_name(entry) for entry in skills[:MAX_CATALOG_ENTRIES]]
+    payload["skills"] = [_compact_entry(entry) for entry in skills[:MAX_CATALOG_ENTRIES]]
     payload["toolsets"] = [
-        _compact_toolset(entry) for entry in toolsets[:MAX_CATALOG_ENTRIES]
+        _compact_entry(entry) for entry in toolsets[:MAX_CATALOG_ENTRIES]
     ]
     payload["skills_omitted"] = max(0, len(skills) - MAX_CATALOG_ENTRIES)
     payload["toolsets_omitted"] = max(0, len(toolsets) - MAX_CATALOG_ENTRIES)
@@ -659,6 +666,22 @@ def _handle_talk_capabilities(arguments: dict) -> str:
         payload["capabilities_omitted"] = True
         payload["detail"] += ", capabilities omitted"
         rendered = _render_catalog(payload)
+    if len(rendered) > MAX_OUTPUT_CHARS:
+        # Even the deepest compaction tier can lose to upstream-minted absurdly
+        # long names. Degrade to a minimal, fixed-shape summary rather than
+        # ever handing execute_talk_tool a document its tail truncation would
+        # tear mid-object.
+        rendered = _render_catalog(
+            {
+                "source": snapshot.source,
+                "skills_count": len(skills),
+                "toolsets_count": len(toolsets),
+                "detail": (
+                    "the catalog is too large to read out, even as names — "
+                    "counts only"
+                ),
+            }
+        )
     return rendered
 
 
