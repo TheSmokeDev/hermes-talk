@@ -309,20 +309,46 @@ class RealtimeRelay:
         same "one cancellation per response" idempotency, without an id to
         hang it on. The partial transcript goes with it rather than being
         folded into the next answer.
+
+        A SECOND barge-in on the same already-cancelled response is the one
+        signal that its terminal event is lost: the cancel went out a full
+        user-turn ago, and a terminal that still has not arrived is not
+        coming. Holding the ledger open for that ghost would mute
+        announcements forever, so both already-cancelled branches release the
+        in-flight state before returning False. One cancellation per response
+        still holds — no second cancel is sent — we only stop waiting.
         """
 
         if not self._response_in_flight:
             return False
         if self._active_response_id is not None:
             if self._active_response_id in self._settled_response_ids:
-                return False  # already cancelled: one cancellation per response
+                # Already cancelled: one cancellation per response. The
+                # terminal this ledger was waiting for is lost — recover.
+                self._release_lost_terminal()
+                return False
             self._settle(self._active_response_id)
         elif self._unnamed_response_cancelled:
-            return False  # already cancelled: same guarantee for an unnamed response
+            # Same guarantee, and the same lost-terminal recovery, for an
+            # unnamed response.
+            self._release_lost_terminal()
+            return False
         else:
             self._unnamed_response_cancelled = True
         self._assistant_transcript.clear()
         return True
+
+    def _release_lost_terminal(self) -> None:
+        """Stop waiting for a cancelled response's terminal that never came.
+
+        Clears only the in-flight ledger; a named response's id stays in
+        ``_settled_response_ids``, so its late tail is still fenced. The next
+        ``response.created`` then starts cleanly on a closed ledger.
+        """
+
+        self._response_in_flight = False
+        self._active_response_id = None
+        self._unnamed_response_cancelled = False
 
     def _finish_response(self, response_id: str | None) -> None:
         """Close out a terminal event, ignoring one that lands too late.

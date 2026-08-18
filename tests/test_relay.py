@@ -691,6 +691,66 @@ def test_repeated_barge_in_on_an_unnamed_response_cancels_only_once():
     assert recorder.barge_ins == 3
 
 
+def test_a_second_barge_in_on_a_lost_terminal_recovers_the_ledger():
+    # A response whose terminal event never arrives after its cancel would
+    # hold response_active true forever — announcements defer indefinitely.
+    # A SECOND barge-in on that same settled response proves the terminal is
+    # lost (the cancel went out a full user-turn ago), so the ledger releases
+    # it: still no second cancel, but no more waiting for a ghost.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+
+    fr.play_neutral(
+        relay, recorder, [fr.rt_response_started("resp_A"), fr.rt_speech_started()]
+    )
+    assert recorder.command_types == ["CancelResponse"]
+    assert relay.response_active is True  # cancel sent; terminal still owed
+
+    fr.play_neutral(relay, recorder, [fr.rt_speech_started()])
+    assert recorder.command_types == ["CancelResponse"]  # one cancel per response
+    assert relay.response_active is False  # the ledger recovered
+
+    # The next response starts cleanly, speaks, and the dead response's late
+    # tail stays fenced by its settled id.
+    fr.play_neutral(
+        relay,
+        recorder,
+        [
+            fr.rt_response_started("resp_B"),
+            fr.rt_audio(b"\x01", response_id="resp_A"),
+            fr.rt_audio(b"\x02", response_id="resp_B"),
+        ],
+    )
+    assert relay.response_active is True
+    assert recorder.audio == [b"\x02"]
+
+
+def test_a_second_barge_in_on_a_lost_unnamed_terminal_recovers_the_ledger():
+    # Same lost-terminal recovery for a response the provider never named:
+    # the second barge-in releases the in-flight state without a second
+    # cancel, and a fresh response then starts on a closed ledger.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+
+    fr.play_neutral(
+        relay, recorder, [fr.rt_response_started(None), fr.rt_speech_started()]
+    )
+    assert recorder.command_types == ["CancelResponse"]
+    assert relay.response_active is True
+
+    fr.play_neutral(relay, recorder, [fr.rt_speech_started()])
+    assert recorder.command_types == ["CancelResponse"]
+    assert relay.response_active is False
+
+    fr.play_neutral(
+        relay,
+        recorder,
+        [fr.rt_response_started("resp_B"), fr.rt_audio(b"\x01", response_id="resp_B")],
+    )
+    assert relay.response_active is True
+    assert recorder.audio == [b"\x01"]
+
+
 def test_an_unstamped_terminal_still_closes_a_named_active_response():
     # _finish_response's stated invariant: an unnamed terminal never wedges
     # the session open, even when the response it's closing had a name.

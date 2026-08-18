@@ -1227,6 +1227,50 @@ def test_pump_writes_an_uncontested_announcement_exactly_once():
     assert len(asyncio.run(scenario())) == 1
 
 
+def test_pump_declined_by_a_miswired_busy_predicate_polls_instead_of_spinning(
+    monkeypatch,
+):
+    # Defense in depth: the production busy predicate (talk_cli.py:1169) is a
+    # strict superset of send_outgoing's decline condition, so in-repo a
+    # decline always implies busy and the idle wait absorbs the retry. A
+    # future caller could miswire that — send_batch declining while the
+    # predicate says idle. The pump must degrade to polling between attempts,
+    # not spin the decline-retry cycle flat out.
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        attempts: list[int] = []
+
+        async def send_batch(batch, *, is_announcement=False):
+            assert is_announcement
+            attempts.append(len(attempts))
+            # Yield like the real send path, so a regression to a hot spin
+            # shows up as a huge attempt count rather than a hung test.
+            await asyncio.sleep(0)
+            return False
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),
+                None,
+                send_batch,
+                lambda: False,  # miswired: never busy, yet send_batch declines
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.1)
+        pump.cancel()
+        return len(attempts)
+
+    attempts = asyncio.run(scenario())
+    assert attempts >= 2  # the batch was retried, never dropped
+    # ~0.1s window at a 0.01s poll is ~10 attempts; a hot spin would land in
+    # the thousands. The bound is loose for slow CI, tight against spinning.
+    assert attempts <= 50
+
+
 def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkeypatch):
     # Regression guard for the actual atomic re-check in send_outgoing
     # (talk_cli.py:977), not the pump's retry wrapper — the two tests above

@@ -591,11 +591,14 @@ async def pump_announcements(
     one response seeing two temporary system items, confirmations merged or
     lost, or the server rejecting a second active response. Each batch also
     defers (bounded) until no response is in flight, so an announcement
-    never stomps the model mid-sentence — and that deferral is atomic: the
-    idle check below is only a hint, and ``send_batch`` re-checks inside the
-    lock that owns the wire, handing a raced batch back here to wait again.
-    Legacy direct-socket callers drop a failed batch; provider-session sends
-    surface failure to the supervisor.
+    never stomps the model mid-sentence. For ``send_batch`` callers (the one
+    production call site passes ``send_outgoing``) that deferral is atomic:
+    the idle check below is only a hint, and ``send_batch`` re-checks inside
+    the lock that owns the wire, handing a raced batch back here to wait
+    again. The ``send_batch is None`` direct-socket branch is a legacy path
+    kept for tests — it has no such lock, so it remains check-then-act, and
+    it drops a failed batch; provider-session sends surface failure to the
+    supervisor.
     """
 
     while True:
@@ -615,6 +618,12 @@ async def pump_announcements(
                 # deferred in its original order, never dropped.
                 if await send_batch(batch, is_announcement=True):
                     break
+                # Declined. In-repo the busy predicate is a strict superset of
+                # send_outgoing's decline condition, so the wait loop above
+                # absorbs the retry — but a future caller could miswire the
+                # predicate (send_batch declining while "idle"). Sleep here so
+                # that mistake degrades to polling instead of a hot spin.
+                await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
             except Exception:
                 if send_batch is not None:
                     # Provider-session sends are terminal once rejected. Let the
