@@ -373,20 +373,7 @@ def start_run(
     # ever route. A burned sequence number on refusal is the deliberate cost;
     # ids only have to be unique and monotonic, never gapless.
     try:
-        _append_history_strict(
-            {
-                "runId": run_id,
-                "kind": kind,
-                "label": label,
-                "status": "running",
-                "output": "",
-                "meta": dict(meta or {}),
-                "ticket": dict(ticket),
-                "delivery": DELIVERY_PENDING,
-                "ts": now,
-                "updated": now,
-            }
-        )
+        _append_history_strict({"runId": run_id, **entry})
     except Exception as exc:
         # Re-raised, never swallowed: no durable route means no acceptance.
         _log.warning(
