@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import talk_apiserver
+import talk_capabilities
 import talk_config
 import talk_host
 import talk_runs
@@ -160,6 +161,7 @@ def test_mint_advertises_the_full_tool_surface(minted, monkeypatch):
         "redirect_agent",
         "stop_work",
         "talk_status",
+        "talk_capabilities",
     ]
     assert minted["session"]["tool_choice"] == "auto"
 
@@ -381,6 +383,18 @@ def test_status_serializes_the_attached_lane():
     body = call(api.talk_status, FakeRequest())
 
     assert body["agentLoop"] == talk_host.LANE_ATTACHED
+
+
+def test_status_warms_the_capability_catalog(monkeypatch):
+    """`/status` is the one place a lane is paid for eagerly — proven through
+    the ROUTE, matching how the sibling api_server lane is proven above."""
+
+    calls = []
+    monkeypatch.setattr(talk_capabilities, "warm", lambda: calls.append(1))
+
+    call(api.talk_status, FakeRequest())
+
+    assert calls == [1]
 
 
 def test_status_stays_answerable_when_the_voice_is_unusable(monkeypatch):

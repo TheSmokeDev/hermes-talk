@@ -35,6 +35,10 @@ DEFAULT_API_SERVER_PROBE_TIMEOUT_S = 1.5
 DEFAULT_API_SERVER_PROBE_TTL_S = 30.0
 #: Poll interval while waiting on a /v1/runs run inside a worker thread.
 DEFAULT_API_SERVER_POLL_S = 1.0
+#: How long a resolved capability catalog is trusted. Same 30s class as the
+#: probe verdict above, and for the same reason: what a Hermes install has
+#: installed changes on the timescale of a restart, not of a sentence.
+DEFAULT_CAPABILITY_CATALOG_TTL_S = 30.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -422,6 +426,14 @@ def api_server_poll_s() -> float:
     return _positive_float("TALK_API_SERVER_POLL_S", DEFAULT_API_SERVER_POLL_S)
 
 
+def capability_catalog_ttl_s() -> float:
+    """How long a resolved capability catalog snapshot is trusted."""
+
+    return _positive_float(
+        "TALK_CAPABILITY_CATALOG_TTL_S", DEFAULT_CAPABILITY_CATALOG_TTL_S
+    )
+
+
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
@@ -472,6 +484,7 @@ __all__ = [
     "DEFAULT_API_SERVER_PROBE_TIMEOUT_S",
     "DEFAULT_API_SERVER_PROBE_TTL_S",
     "DEFAULT_API_SERVER_URL",
+    "DEFAULT_CAPABILITY_CATALOG_TTL_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",

@@ -27,7 +27,8 @@ handler table.
   voice `cedar` on this machine).
 - `talk_tools.py` — the curated Talk verbs that remain: `search_memory`,
   `search_vault`, `delegate_task`, `check_work`, `list_agents`,
-  `steer_agent`, `redirect_agent`, `stop_work`, `talk_status`.
+  `steer_agent`, `redirect_agent`, `stop_work`, `talk_status`,
+  `talk_capabilities`.
   (`talk_identity.py` renders the exact schema names into the session prompt
   so the persona knows its real surface.)
 - `talk_discord.py` — Discord `/talk join` runs the SAME `run_talk_session`

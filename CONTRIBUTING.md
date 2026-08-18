@@ -43,12 +43,13 @@ that survives both that loader and `pip install`. Don't restructure it.
 | `talk_relay.py` | Realtime event loop — transport-agnostic, fully testable offline |
 | `talk_audio.py` | Duplex mic/speaker (sounddevice) |
 | `talk_cli.py` | `hermes talk` — transport, lifecycle, the announcement pump |
-| `talk_tools.py` | The 8 model-facing tools and their speakable-error contract |
+| `talk_tools.py` | The 9 model-facing tools and their speakable-error contract |
 | `talk_host.py` | The host adapter — agent lanes, steer/redirect/stop verbs |
 | `talk_runs.py` | Async-run registry with the durable history tail |
 | `talk_steer.py` | The receipt ledger and both delivery-artifact watchers |
 | `talk_lifecycle.py` | subagent start/stop hooks → roster, ledger, announcements |
 | `talk_apiserver.py` | The api-server agent lane |
+| `talk_capabilities.py` | Live capability catalog — in-process probe first, REST fallback, TTL-cached |
 | `talk_providers.py` | Optional REST TTS/STT providers |
 
 ## How changes ship here

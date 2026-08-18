@@ -98,6 +98,15 @@ DELEGATE_TOOL_NAME = "delegate_task"
 #: without it fall back to :func:`_steer_via_registry`.
 STEER_TOOL_NAME = "steer_subagent"
 
+#: Best-effort in-process catalog read. Unlike the ``/v1/*`` routes, this repo
+#: has no visibility into a Hermes host's internal dispatch registry, so the
+#: name is a guess by construction — and safe to guess, because a host that
+#: has no such tool answers with the "unknown tool" marker
+#: :func:`_agent_loop_absent` already generalizes over, and the caller falls
+#: through to the api_server lane. Wrong here costs the fast path, not the
+#: feature.
+CAPABILITY_CATALOG_TOOL_NAME = "list_capabilities"
+
 MAX_TOOL_OUTPUT_CHARS = 2_000
 
 #: Errors that mean "this environment has no agent loop to delegate INTO" —
@@ -603,6 +612,31 @@ class HostAdapter:
         except Exception as exc:  # noqa: BLE001 — a status read is never fatal
             _log.warning("api server lane check failed: %s: %s", type(exc).__name__, exc)
         return LANE_NONE
+
+    def capability_catalog_probe(self) -> str | None:
+        """Read this host's own capability catalog in-process. NEVER raises.
+
+        Returns the raw dispatch result when the attached Hermes exposes
+        :data:`CAPABILITY_CATALOG_TOOL_NAME`, or ``None`` when there is no
+        bound context, the host does not know that tool, or the call failed.
+        ``None`` means "ask the api_server instead", never "this install has
+        no capabilities" — an empty catalog and an unreadable one are
+        different sentences and must not collapse into one.
+        """
+
+        ctx = get_ctx()
+        if ctx is None:
+            return None
+        try:
+            raw = ctx.dispatch_tool(CAPABILITY_CATALOG_TOOL_NAME, {})
+        except Exception as exc:  # noqa: BLE001 — an in-process probe is never fatal
+            _log.warning(
+                "in-process capability probe failed: %s: %s", type(exc).__name__, exc
+            )
+            return None
+        if _agent_loop_absent(raw, CAPABILITY_CATALOG_TOOL_NAME):
+            return None
+        return raw if isinstance(raw, str) else json.dumps(raw, default=str)
 
     def search_memory(self, query: str, limit: int = 5) -> str:
         """Search past Hermes sessions for what was said about ``query``.

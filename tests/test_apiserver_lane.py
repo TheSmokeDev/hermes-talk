@@ -352,6 +352,128 @@ def test_a_failed_run_is_spoken_not_raised(monkeypatch):
     assert "model refused" in out
 
 
+# -- catalog reads ------------------------------------------------------------
+
+
+def _pin_get(monkeypatch, response) -> list[str]:
+    """Answer every GET with ``response``, recording which URL was dialed."""
+
+    urls: list[str] = []
+
+    def fake_get(url, **_kwargs):
+        urls.append(url)
+        return response
+
+    monkeypatch.setattr(talk_apiserver.httpx, "get", fake_get)
+    return urls
+
+
+SKILL = {"name": "web_search", "installed": True}
+TOOLSET = {"name": "browser", "enabled": True, "configured": False, "tools": ["open"]}
+
+
+def test_list_skills_accepts_a_bare_list(monkeypatch):
+    urls = _pin_get(monkeypatch, FakeResponse(200, [SKILL]))
+
+    assert talk_apiserver.list_skills() == [SKILL]
+    assert urls == [talk_config.api_server_url() + talk_apiserver.SKILLS_PATH]
+
+
+def test_list_skills_accepts_an_object_envelope(monkeypatch):
+    """The envelope is unverified against a live gateway, so BOTH documented
+    shapes parse — a cosmetic difference must not become a dead feature."""
+
+    _pin_get(monkeypatch, FakeResponse(200, {"skills": [SKILL], "total": 1}))
+
+    assert talk_apiserver.list_skills() == [SKILL]
+
+
+def test_list_toolsets_accepts_both_shapes(monkeypatch):
+    _pin_get(monkeypatch, FakeResponse(200, [TOOLSET]))
+    assert talk_apiserver.list_toolsets() == [TOOLSET]
+
+    _pin_get(monkeypatch, FakeResponse(200, {"toolsets": [TOOLSET]}))
+    assert talk_apiserver.list_toolsets() == [TOOLSET]
+
+
+def test_a_listing_drops_entries_that_are_not_objects(monkeypatch):
+    _pin_get(monkeypatch, FakeResponse(200, ["bare-string", SKILL, 7]))
+
+    assert talk_apiserver.list_skills() == [SKILL]
+
+
+def test_an_unrecognized_listing_envelope_raises(monkeypatch):
+    """Neither shape. Raising beats returning ``[]``, which would be spoken as
+    "nothing is installed" — a confident answer that happens to be false."""
+
+    _pin_get(monkeypatch, FakeResponse(200, {"data": {"skills": [SKILL]}}))
+
+    with pytest.raises(talk_apiserver.TalkApiServerError, match="unrecognized"):
+        talk_apiserver.list_skills()
+
+
+def test_capabilities_payload_returns_the_raw_document(monkeypatch):
+    """Distinct from probe(), which collapses this same path to a yes/no."""
+
+    payload = {"features": {"run_submission": True}, "run_approval": True}
+    urls = _pin_get(monkeypatch, FakeResponse(200, payload))
+
+    assert talk_apiserver.capabilities_payload() == payload
+    assert urls == [talk_config.api_server_url() + talk_apiserver.CAPABILITIES_PATH]
+
+
+def test_health_detailed_returns_the_raw_document(monkeypatch):
+    payload = {"active_runs": 2, "active_delegations": 0}
+    urls = _pin_get(monkeypatch, FakeResponse(200, payload))
+
+    assert talk_apiserver.health_detailed() == payload
+    assert urls == [talk_config.api_server_url() + talk_apiserver.HEALTH_DETAILED_PATH]
+
+
+@pytest.mark.parametrize(
+    "read",
+    ["list_skills", "list_toolsets", "capabilities_payload", "health_detailed"],
+)
+def test_every_catalog_read_raises_a_speakable_error_on_non_200(monkeypatch, read):
+    _pin_get(monkeypatch, FakeResponse(503, text="gateway draining"))
+
+    with pytest.raises(talk_apiserver.TalkApiServerError, match="503"):
+        getattr(talk_apiserver, read)()
+
+
+@pytest.mark.parametrize(
+    "read",
+    ["list_skills", "list_toolsets", "capabilities_payload", "health_detailed"],
+)
+def test_every_catalog_read_raises_on_a_non_json_body(monkeypatch, read):
+    _pin_get(monkeypatch, FakeResponse(200, None, text="<html>nope</html>"))
+
+    with pytest.raises(talk_apiserver.TalkApiServerError):
+        getattr(talk_apiserver, read)()
+
+
+@pytest.mark.parametrize(
+    "read",
+    ["list_skills", "list_toolsets", "capabilities_payload", "health_detailed"],
+)
+def test_every_catalog_read_raises_when_the_server_is_unreachable(monkeypatch, read):
+    def boom(*_args, **_kwargs):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(talk_apiserver.httpx, "get", boom)
+
+    with pytest.raises(talk_apiserver.TalkApiServerError, match="ConnectError"):
+        getattr(talk_apiserver, read)()
+
+
+@pytest.mark.parametrize("read", ["capabilities_payload", "health_detailed"])
+def test_a_document_read_raises_when_the_body_is_not_an_object(monkeypatch, read):
+    _pin_get(monkeypatch, FakeResponse(200, ["not", "a", "document"]))
+
+    with pytest.raises(talk_apiserver.TalkApiServerError, match="invalid"):
+        getattr(talk_apiserver, read)()
+
+
 # -- tier selection -----------------------------------------------------------
 
 

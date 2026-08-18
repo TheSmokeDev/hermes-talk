@@ -234,7 +234,8 @@ SSRC alone, model arguments, and "last speaker" state are never authority.
 Configured IDs may run the four state-changing tools: `delegate_task`,
 `steer_agent`, `redirect_agent`, and `stop_work`. Other speakers retain normal
 conversation and the read-only tools (`search_memory`, `search_vault`,
-`check_work`, `list_agents`, and `talk_status`). Missing response correlation,
+`check_work`, `list_agents`, `talk_status`, and `talk_capabilities`). Missing
+response correlation,
 an unresolved speaker, two speakers in one VAD turn, or a speaker outside the
 allowlist returns a non-sensitive spoken denial without running the handler.
 
@@ -260,6 +261,12 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_API_SERVER_PROBE_TIMEOUT_S` | `1.5` | Budget for one availability probe — tight on purpose; it runs on the mic's event loop. |
 | `TALK_API_SERVER_PROBE_TTL_S` | `30.0` | How long a probe verdict is trusted before an off-hot-path refresh. |
 | `TALK_API_SERVER_POLL_S` | `1.0` | Poll interval while waiting on a run. |
+
+### Capability catalog
+
+| Variable | Default | Effect / failure mode |
+|---|---|---|
+| `TALK_CAPABILITY_CATALOG_TTL_S` | `30.0` | How long a resolved `talk_capabilities` snapshot (skills, toolsets, capabilities, health) is trusted before a background refresh, whichever source answered it. Junk or ≤0 silently takes the default. |
 
 ### Dashboard
 
