@@ -706,7 +706,10 @@ def test_output_events_carry_the_response_that_produced_them():
 
 def test_output_events_without_a_response_id_decode_to_none():
     # A provider build that omits the field degrades to "unattributed", which
-    # the relay treats as speakable rather than raising or muting.
+    # the relay treats as speakable rather than raising or muting. Covers all
+    # three call sites sharing this `.get("response_id")` pattern, not just
+    # audio — Transcript's __post_init__ does extra role validation that
+    # audio's does not, so a future edit could raise a KeyError undetected.
     audio = openai_rt.decode_event(
         {
             "type": "response.output_audio.delta",
@@ -714,5 +717,13 @@ def test_output_events_without_a_response_id_decode_to_none():
             "delta": base64.b64encode(b"pcm").decode("ascii"),
         }
     )
+    delta = openai_rt.decode_event(
+        {"type": "response.output_audio_transcript.delta", "delta": "hi"}
+    )
+    done = openai_rt.decode_event(
+        {"type": "response.output_audio_transcript.done", "transcript": "hi there"}
+    )
 
     assert audio.response_id is None
+    assert delta.response_id is None
+    assert done.response_id is None

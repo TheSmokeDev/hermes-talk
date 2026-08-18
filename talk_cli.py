@@ -963,9 +963,12 @@ async def run_talk_session(
         async def send_outgoing(outgoing, *, is_announcement: bool = False) -> bool:
             """Serialize every provider write; keep multi-command batches contiguous.
 
-            False means one thing only: an announcement reached the front of
-            the lock after a response had already started, so it was not
-            written. The caller defers it instead of speaking over the model.
+            False means an announcement reached the front of the lock while a
+            response was open or about to be (``relay.response_active``) or a
+            ``StartResponse`` was sent but not yet confirmed
+            (``continuation_pending``), so it was not written. The caller
+            defers it instead of speaking over the model or racing an
+            in-flight continuation.
             """
 
             nonlocal continuation_pending

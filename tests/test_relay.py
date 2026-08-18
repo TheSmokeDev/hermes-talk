@@ -186,8 +186,11 @@ def test_barge_in_cancels_and_drains():
     assert recorder.barge_ins == 1
     assert recorder.sent == [{"type": "response.cancel"}]
     # The callback fires so the caller can drop queued audio; the relay itself
-    # never owns the playback buffer.
-    assert recorder.audio == [b"\x01\x02", b"\x03\x04"]
+    # never owns the playback buffer. The cancelled response's own tail
+    # (even unnamed) is fenced, so only what played before the barge-in reaches
+    # the speaker — see test_cancelled_unnamed_response_tail_audio_never_
+    # reaches_the_speaker for the dedicated regression test.
+    assert recorder.audio == [b"\x01\x02"]
 
 
 def test_speech_while_idle_drains_but_cancels_nothing():
@@ -633,3 +636,114 @@ def test_dict_dispatch_fences_stale_events_like_the_live_path():
     assert recorder.sent_types == ["response.cancel"]
     assert recorder.turns == []
     assert relay.response_active is False
+
+
+def test_cancelled_unnamed_response_tail_audio_never_reaches_the_speaker():
+    # Same bug as test_cancelled_response_tail_audio_never_reaches_the_speaker,
+    # for a response the provider never named on the wire (a documented, real
+    # OpenAI behaviour, not a hypothetical).
+    recorder = fr.run_neutral_transcript(
+        [
+            fr.rt_response_started(None),
+            fr.rt_audio(b"\x01", response_id=None),
+            fr.rt_speech_started(),
+            fr.rt_audio(b"\x02", response_id=None),
+            fr.rt_audio(b"\x03", response_id=None),
+        ]
+    )
+
+    assert recorder.audio == [b"\x01"]
+    assert recorder.command_types == ["CancelResponse"]
+
+
+def test_an_unnamed_start_cannot_un_name_an_already_identified_response():
+    # A degraded/duplicate response.created with no id must not blind the
+    # ledger to a named response that is still open — that would silently
+    # disable both fencing and settle-on-cancel for it.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+
+    fr.play_neutral(
+        relay,
+        recorder,
+        [
+            fr.rt_response_started("resp_A"),
+            fr.rt_response_started(None),  # spurious unnamed start, mid-turn
+            fr.rt_speech_started(),
+            fr.rt_audio(b"\x01", response_id="resp_A"),  # tail after cancel
+        ],
+    )
+
+    assert recorder.audio == []
+
+
+def test_repeated_barge_in_on_an_unnamed_response_cancels_only_once():
+    recorder = fr.run_neutral_transcript(
+        [
+            fr.rt_response_started(None),
+            fr.rt_speech_started(),
+            fr.rt_speech_started(),
+            fr.rt_speech_started(),
+        ]
+    )
+
+    assert recorder.command_types == ["CancelResponse"]
+    assert recorder.barge_ins == 3
+
+
+def test_an_unstamped_terminal_still_closes_a_named_active_response():
+    # _finish_response's stated invariant: an unnamed terminal never wedges
+    # the session open, even when the response it's closing had a name.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+
+    fr.play_neutral(relay, recorder, [fr.rt_response_started("resp_A")])
+    assert relay.response_active is True
+
+    fr.play_neutral(relay, recorder, [fr.rt_response_finished(None)])
+
+    assert relay.response_active is False
+    assert relay._active_response_id is None
+    assert relay.last_audio_item_id is None
+
+
+def test_dict_dispatch_replayed_start_cannot_hand_back_a_settled_response():
+    # Neutral-path equivalent: test_a_replayed_start_cannot_hand_the_speaker_
+    # back_to_a_settled_response. The dict path extracts response ids from raw
+    # keys (_nested_response_id/_event_response_id) instead of typed events, so
+    # it needs its own coverage of the same scenario.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+
+    for event in [
+        fr.response_created("resp_A"),
+        fr.response_done("resp_A"),
+        fr.response_created("resp_B"),
+        fr.response_created("resp_A"),  # replayed start
+        fr.audio_delta(b"\x01", response_id="resp_B"),
+        fr.audio_delta(b"\x02", response_id="resp_A"),
+    ]:
+        recorder.sent.extend(relay.handle_event(event))
+
+    assert recorder.audio == [b"\x01"]
+
+
+def test_dict_dispatch_settled_ledger_stays_bounded_over_a_long_call():
+    # Neutral-path equivalent: test_the_settled_ledger_stays_bounded_over_a_
+    # long_call, driven through handle_event instead of handle_realtime_event.
+    recorder = fr.Recorder()
+    relay = fr.build_relay(recorder)
+    turns = talk_relay.MAX_SETTLED_RESPONSES * 3
+
+    for index in range(turns):
+        for event in [
+            fr.response_created(f"resp_{index}"),
+            fr.response_done(f"resp_{index}"),
+        ]:
+            recorder.sent.extend(relay.handle_event(event))
+
+    assert len(relay._settled_response_ids) == talk_relay.MAX_SETTLED_RESPONSES
+    recorder.sent.extend(
+        relay.handle_event(fr.audio_delta(b"\x01", response_id=f"resp_{turns - 1}"))
+    )
+    assert recorder.audio == []

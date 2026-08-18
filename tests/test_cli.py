@@ -1227,6 +1227,110 @@ def test_pump_writes_an_uncontested_announcement_exactly_once():
     assert len(asyncio.run(scenario())) == 1
 
 
+def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkeypatch):
+    # Regression guard for the actual atomic re-check in send_outgoing
+    # (talk_cli.py:977), not the pump's retry wrapper — the two tests above
+    # only prove pump_announcements retries when told "no" via a hand-rolled
+    # send_batch stub. This drives the real send_outgoing through the real
+    # send_lock and the real relay, the same run_talk_session harness as
+    # test_concurrent_announcement_cannot_split_speaker_context_from_pcm.
+    class _Audio:
+        played_ms = 0
+
+        def __init__(self):
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+        def read_input_packet(self):
+            return None
+
+        def queue_playback(self, _pcm):
+            pass
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _WS:
+        def __init__(self):
+            self.sent: list[dict] = []
+            self.done = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+            await asyncio.sleep(0)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.done.wait()
+            raise StopAsyncIteration
+
+    ws = _WS()
+    declined = []
+
+    async def racing_pump(_queue, relay, _ws, send_batch, _response_busy):
+        # Simulate: pump_announcements saw idle and queued for send_lock, but
+        # a response actually started before send_batch acquired the lock.
+        relay._start_response("resp_1")
+        ok = await send_batch(
+            [talk_cli.talk_realtime.AddContext(item_id="ann-1", text="hi")],
+            is_announcement=True,
+        )
+        declined.append(ok)
+        ws.done.set()
+        await asyncio.Event().wait()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    host = types.SimpleNamespace(
+        resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
+        identity_sections=lambda: {},
+    )
+    monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
+    monkeypatch.setattr(talk_cli.talk_apiserver, "warm_in_background", lambda: None)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+    monkeypatch.setattr(talk_cli, "pump_announcements", racing_pump)
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT="text"),
+        ),
+    )
+
+    assert asyncio.run(asyncio.wait_for(talk_cli.run_talk_session(audio=_Audio()), 3.0)) == 0
+    assert declined == [False]  # the real in-lock check said no
+    assert not any(message.get("item", {}).get("id") == "ann-1" for message in ws.sent)
+
+
 def test_subagent_stop_messages_cap_the_summary_tail():
     long_summary = "x" * (talk_cli.WATCH_OUTPUT_TAIL_CHARS + 500)
     text = talk_cli.subagent_stop_messages(

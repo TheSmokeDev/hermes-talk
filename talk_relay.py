@@ -231,6 +231,10 @@ class RealtimeRelay:
         #: recognised as a tail and dropped instead of played over the next
         #: answer. Bounded; oldest evicted.
         self._settled_response_ids: OrderedDict[str, None] = OrderedDict()
+        #: Mirrors ``_settled_response_ids`` for the unnamed case: an unnamed
+        #: response has no id to remember, so its "already settled" state is
+        #: this one flag instead of a ledger entry. Cleared on the next start.
+        self._unnamed_response_cancelled: bool = False
         self._assistant_transcript: list[str] = []
 
     @property
@@ -252,10 +256,13 @@ class RealtimeRelay:
         arrives before any response was named, is played rather than dropped:
         muting real speech is the worse failure, and the fence only has to be
         exact about the case it exists for — a response known to be settled.
+        An unnamed response can still be settled, though: once a barge-in has
+        cancelled it, ``_unnamed_response_cancelled`` closes that same fence
+        for its own tail, the same way a named response's id closes it.
         """
 
         if response_id is None:
-            return True
+            return not self._unnamed_response_cancelled
         if response_id in self._settled_response_ids:
             return False
         return self._active_response_id is None or response_id == self._active_response_id
@@ -273,11 +280,21 @@ class RealtimeRelay:
         """Open a response, ignoring a start that replays a settled one.
 
         A replayed response.created must not be allowed to hand the microphone
-        back to a response that was cancelled two turns ago.
+        back to a response that was cancelled two turns ago. Nor may an
+        unnamed start overwrite the identity of a response that is already
+        known and still open — that would blind the ledger to a live
+        response's own id and disable its fencing.
         """
 
         if response_id is not None and response_id in self._settled_response_ids:
             return
+        if (
+            response_id is None
+            and self._response_in_flight
+            and self._active_response_id is not None
+        ):
+            return  # an unnamed start cannot un-name an already-identified response
+        self._unnamed_response_cancelled = False
         self._response_in_flight = True
         self._active_response_id = response_id
 
@@ -285,9 +302,13 @@ class RealtimeRelay:
         """Settle the response a barge-in interrupts; False if there is none.
 
         The response stays *in flight* — the server has not acknowledged the
-        cancel, and announcing over it would still collide — but it is settled,
-        so nothing it emits from here on is played or transcribed. The partial
-        transcript goes with it rather than being folded into the next answer.
+        cancel, and announcing over it would still collide. If the response
+        was named, it is settled, so nothing it emits from here on is played
+        or transcribed. An unnamed response has no id to settle, so this sets
+        ``_unnamed_response_cancelled`` instead — the same guarantee, and the
+        same "one cancellation per response" idempotency, without an id to
+        hang it on. The partial transcript goes with it rather than being
+        folded into the next answer.
         """
 
         if not self._response_in_flight:
@@ -296,6 +317,10 @@ class RealtimeRelay:
             if self._active_response_id in self._settled_response_ids:
                 return False  # already cancelled: one cancellation per response
             self._settle(self._active_response_id)
+        elif self._unnamed_response_cancelled:
+            return False  # already cancelled: same guarantee for an unnamed response
+        else:
+            self._unnamed_response_cancelled = True
         self._assistant_transcript.clear()
         return True
 
@@ -318,6 +343,7 @@ class RealtimeRelay:
             return
         self._response_in_flight = False
         self._active_response_id = None
+        self._unnamed_response_cancelled = False
         self.last_audio_item_id = None
         self._assistant_transcript.clear()
 
