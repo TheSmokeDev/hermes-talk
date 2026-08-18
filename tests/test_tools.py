@@ -284,6 +284,48 @@ def test_talk_capabilities_stays_parseable_when_the_catalog_is_huge(monkeypatch)
     }
 
 
+def test_catalog_entries_without_a_name_shaped_key_compact_to_unnamed(monkeypatch):
+    """An upstream entry missing name/id/slug still renders, not KeyErrors."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            skills=tuple({"description": "x" * 200} for _ in range(60)),
+        ),
+    )
+
+    catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+    assert catalog["skills"][0] == "unnamed"
+
+
+def test_talk_capabilities_omits_capabilities_when_still_oversized_after_compaction(
+    monkeypatch,
+):
+    """A huge `capabilities` document alone can push the payload back over
+    budget even after skills/toolsets are compacted — must not silently
+    reach execute_talk_tool's tail truncation and come out torn mid-object."""
+
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _snapshot(
+            capabilities={
+                "features": {f"flag_{index}": "x" * 200 for index in range(50)}
+            },
+        ),
+    )
+
+    rendered = talk_tools.execute_talk_tool("talk_capabilities", {})
+    catalog = json.loads(rendered)  # the assertion that matters: still parses
+
+    assert len(rendered) <= talk_tools.MAX_OUTPUT_CHARS
+    assert catalog["capabilities"] == {}
+    assert catalog["capabilities_omitted"] is True
+    assert catalog["detail"].endswith("capabilities omitted")
+
+
 def test_talk_capabilities_says_when_it_could_not_read_the_catalog(monkeypatch):
     monkeypatch.setattr(
         talk_capabilities,

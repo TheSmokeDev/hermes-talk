@@ -262,6 +262,12 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_API_SERVER_PROBE_TTL_S` | `30.0` | How long a probe verdict is trusted before an off-hot-path refresh. |
 | `TALK_API_SERVER_POLL_S` | `1.0` | Poll interval while waiting on a run. |
 
+### Capability catalog
+
+| Variable | Default | Effect / failure mode |
+|---|---|---|
+| `TALK_CAPABILITY_CATALOG_TTL_S` | `30.0` | How long a resolved `talk_capabilities` snapshot (skills, toolsets, capabilities, health) is trusted before a background refresh, whichever source answered it. Junk or ≤0 silently takes the default. |
+
 ### Dashboard
 
 | Variable | Default | Effect / failure mode |

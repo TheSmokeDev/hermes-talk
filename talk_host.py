@@ -630,7 +630,7 @@ class HostAdapter:
         try:
             raw = ctx.dispatch_tool(CAPABILITY_CATALOG_TOOL_NAME, {})
         except Exception as exc:  # noqa: BLE001 — an in-process probe is never fatal
-            _log.debug(
+            _log.warning(
                 "in-process capability probe failed: %s: %s", type(exc).__name__, exc
             )
             return None

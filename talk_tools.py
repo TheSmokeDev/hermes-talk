@@ -631,9 +631,11 @@ def _handle_talk_capabilities(arguments: dict) -> str:
         return rendered
     # A real install's full catalog does not fit the spoken-output budget, and
     # execute_talk_tool bounds by TAIL TRUNCATION — which would hand the model
-    # a JSON document cut off mid-object. Re-render as names plus the flags
-    # that decide usability instead: less detail, still parseable, and still
-    # honest about what it dropped.
+    # a JSON document cut off mid-object. Re-render skills/toolsets as names
+    # plus the flags that decide usability: less detail, still honest about
+    # what it dropped. `health` is already bounded by HEALTH_COUNTERS. If
+    # `capabilities` alone is still too large after that, drop it too rather
+    # than let tail truncation tear it mid-object.
     skills = list(snapshot.skills)
     toolsets = list(snapshot.toolsets)
     payload["skills"] = [_catalog_name(entry) for entry in skills[:MAX_CATALOG_ENTRIES]]
@@ -645,7 +647,13 @@ def _handle_talk_capabilities(arguments: dict) -> str:
     payload["detail"] = (
         f"{snapshot.detail} — names only, the full catalog is too long to read out"
     )
-    return json.dumps(talk_doctor.redact_value(payload))
+    rendered = json.dumps(talk_doctor.redact_value(payload))
+    if len(rendered) > MAX_OUTPUT_CHARS:
+        payload["capabilities"] = {}
+        payload["capabilities_omitted"] = True
+        payload["detail"] += ", capabilities omitted"
+        rendered = json.dumps(talk_doctor.redact_value(payload))
+    return rendered
 
 
 _HANDLERS = {

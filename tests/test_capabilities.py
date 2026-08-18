@@ -148,6 +148,26 @@ def test_the_attached_host_is_preferred_over_the_api_server(monkeypatch, rest_la
     assert snapshot.toolsets == tuple(FAKE_TOOLSETS)
 
 
+def test_a_host_returning_a_native_dict_is_accepted(monkeypatch, rest_lane_on):
+    """dispatch_tool is not contractually required to pre-serialize — the
+    in-process tier must accept a native dict the same as a JSON string."""
+
+    ctx = StubCtx(
+        {
+            "skills": FAKE_SKILLS,
+            "toolsets": FAKE_TOOLSETS,
+            "capabilities": FAKE_CAPABILITIES,
+            "health": FAKE_HEALTH,
+        }
+    )
+    talk_host.bind_ctx(ctx)
+
+    snapshot = talk_capabilities.warm()
+
+    assert snapshot.source == talk_capabilities.SOURCE_IN_PROCESS
+    assert snapshot.skills == tuple(FAKE_SKILLS)
+
+
 def test_no_bound_host_falls_through_to_the_api_server(monkeypatch, rest_lane_on):
     _rest_up(monkeypatch)
 

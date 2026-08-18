@@ -37,8 +37,10 @@ schedules a background refresh, and the ONE function that waits for the
 network says so in its name: :func:`warm`, which belongs at session start,
 never in a turn.
 
-Every failure returns speakable text or a False verdict. Nothing here raises
-at a tool handler.
+Probe/status/warm never raise — a bad lane answers False, not an exception.
+The run and catalog reads (start_run, get_run, stop_run, list_skills,
+list_toolsets, capabilities_payload, health_detailed) DO raise
+TalkApiServerError with speakable text; callers on a tool handler must catch it.
 """
 
 from __future__ import annotations
@@ -368,7 +370,7 @@ def _get_json(path: str, what: str) -> Any:
         return response.json()
     except ValueError as exc:
         raise TalkApiServerError(
-            f"the Hermes api server returned a non-JSON {what} list"
+            f"the Hermes api server returned a non-JSON {what} response"
         ) from exc
 
 
