@@ -348,10 +348,19 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
             {
                 "type": "response.output_audio.delta",
                 "item_id": "out-1",
+                "response_id": "resp-1",
                 "delta": base64.b64encode(pcm).decode("ascii"),
             },
-            {"type": "response.output_audio_transcript.delta", "delta": "hi"},
-            {"type": "response.output_audio_transcript.done", "transcript": "hi there"},
+            {
+                "type": "response.output_audio_transcript.delta",
+                "response_id": "resp-1",
+                "delta": "hi",
+            },
+            {
+                "type": "response.output_audio_transcript.done",
+                "response_id": "resp-1",
+                "transcript": "hi there",
+            },
             {
                 "type": "response.function_call_arguments.done",
                 "call_id": "call-1",
@@ -381,10 +390,12 @@ def test_server_events_map_to_neutral_events_with_transcript_provenance():
         provenance=rt.TranscriptProvenance.INPUT_AUDIO,
     )
     assert events[5].metadata == {"speaker": "opaque"}
-    assert events[6] == rt.OutputAudio(data=pcm, item_id="out-1")
+    assert events[6] == rt.OutputAudio(data=pcm, item_id="out-1", response_id="resp-1")
     assert events[7].provenance is rt.TranscriptProvenance.OUTPUT_AUDIO
     assert events[7].final is False
+    assert events[7].response_id == "resp-1"
     assert events[8].final is True
+    assert events[8].response_id == "resp-1"
     assert events[9] == rt.FunctionCall(
         call_id="call-1",
         item_id="item-1",
@@ -658,3 +669,50 @@ def test_cancelled_sole_close_waiter_retains_late_cleanup_failure_for_retry():
     assert wire._closed is True
     assert wire._close_task is None
     assert wire._close_failure is None
+
+
+def test_output_events_carry_the_response_that_produced_them():
+    # A cancelled response keeps emitting deltas. The relay can only fence them
+    # if the decoder stops throwing the id away.
+    audio = openai_rt.decode_event(
+        {
+            "type": "response.output_audio.delta",
+            "item_id": "out-1",
+            "response_id": "resp-9",
+            "delta": base64.b64encode(b"pcm").decode("ascii"),
+        }
+    )
+    delta = openai_rt.decode_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "resp-9",
+            "delta": "hi",
+        }
+    )
+    done = openai_rt.decode_event(
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": "resp-9",
+            "transcript": "hi there",
+        }
+    )
+
+    assert (audio.response_id, delta.response_id, done.response_id) == (
+        "resp-9",
+        "resp-9",
+        "resp-9",
+    )
+
+
+def test_output_events_without_a_response_id_decode_to_none():
+    # A provider build that omits the field degrades to "unattributed", which
+    # the relay treats as speakable rather than raising or muting.
+    audio = openai_rt.decode_event(
+        {
+            "type": "response.output_audio.delta",
+            "item_id": "out-1",
+            "delta": base64.b64encode(b"pcm").decode("ascii"),
+        }
+    )
+
+    assert audio.response_id is None

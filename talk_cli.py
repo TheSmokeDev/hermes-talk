@@ -591,25 +591,36 @@ async def pump_announcements(
     one response seeing two temporary system items, confirmations merged or
     lost, or the server rejecting a second active response. Each batch also
     defers (bounded) until no response is in flight, so an announcement
-    never stomps the model mid-sentence. Legacy direct-socket callers drop a
-    failed batch; provider-session sends surface failure to the supervisor.
+    never stomps the model mid-sentence — and that deferral is atomic: the
+    idle check below is only a hint, and ``send_batch`` re-checks inside the
+    lock that owns the wire, handing a raced batch back here to wait again.
+    Legacy direct-socket callers drop a failed batch; provider-session sends
+    surface failure to the supervisor.
     """
 
     while True:
         batch = await announce_queue.get()
-        while response_busy() if response_busy is not None else relay.response_active:
-            await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
-        try:
-            if send_batch is not None:
-                await send_batch(batch)
-            else:
-                for out in batch:
-                    await ws.send_json(out)
-        except Exception:
-            if send_batch is not None:
-                # Provider-session sends are terminal once rejected. Let the
-                # monitored pump fail so the supervisor tears down the call.
-                raise
+        while True:
+            while response_busy() if response_busy is not None else relay.response_active:
+                await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
+            try:
+                if send_batch is None:
+                    for out in batch:
+                        await ws.send_json(out)
+                    break
+                # The poll above is check-then-act: a response can start while
+                # this batch waits for the send lock. send_batch re-checks
+                # inside that lock and declines rather than writing into a live
+                # response, so a declined batch waits for idle and goes again —
+                # deferred in its original order, never dropped.
+                if await send_batch(batch, is_announcement=True):
+                    break
+            except Exception:
+                if send_batch is not None:
+                    # Provider-session sends are terminal once rejected. Let the
+                    # monitored pump fail so the supervisor tears down the call.
+                    raise
+                break
 
 
 def landed_note_messages(subagent_id: str) -> list[dict]:
@@ -949,12 +960,22 @@ async def run_talk_session(
                 watched.add(run_id)
                 watchers.append(asyncio.create_task(watch_run(run_id)))
 
-        async def send_outgoing(outgoing) -> None:
-            """Serialize every provider write; keep multi-command batches contiguous."""
+        async def send_outgoing(outgoing, *, is_announcement: bool = False) -> bool:
+            """Serialize every provider write; keep multi-command batches contiguous.
+
+            False means one thing only: an announcement reached the front of
+            the lock after a response had already started, so it was not
+            written. The caller defers it instead of speaking over the model.
+            """
 
             nonlocal continuation_pending
             commands = tuple(outgoing)
             async with send_lock:
+                # pump_announcements decides "the model is idle" BEFORE queuing
+                # for this lock, and a response can start while it waits there.
+                # Re-check at the point the write actually happens.
+                if is_announcement and (relay.response_active or continuation_pending):
+                    return False
                 if any(
                     isinstance(command, talk_realtime.StartResponse)
                     for command in commands
@@ -962,6 +983,7 @@ async def run_talk_session(
                     continuation_pending = True
                 await session.send(commands)
             start_watchers(commands)
+            return True
 
         print(
             f"talk: connected ({model}, voice {voice}, auth {auth.source}). "

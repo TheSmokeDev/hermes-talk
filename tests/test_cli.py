@@ -1150,6 +1150,83 @@ def test_pump_survives_a_dying_socket():
     assert "sa-1-bbbb" in sent[0]["item"]["content"][0]["text"]
 
 
+def test_pump_retries_an_announcement_that_lost_the_race_for_the_send_lock(monkeypatch):
+    # The busy poll is check-then-act: a response can start while the batch
+    # waits for the send lock. send_outgoing re-checks inside that lock and
+    # declines; the batch has to wait for idle and go again, not be dropped.
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        busy = {"value": False}
+        attempts: list[tuple[str, ...]] = []
+
+        async def send_batch(batch, *, is_announcement=False):
+            assert is_announcement
+            attempts.append(tuple(message["type"] for message in batch))
+            if len(attempts) == 1:
+                busy["value"] = True  # a response won the lock first
+                return False
+            return True
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),
+                None,
+                send_batch,
+                lambda: busy["value"],
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.05)
+        declined = list(attempts)
+        busy["value"] = False
+        for _ in range(300):
+            if len(attempts) > 1:
+                break
+            await asyncio.sleep(0.01)
+        pump.cancel()
+        return declined, attempts
+
+    declined, attempts = asyncio.run(scenario())
+
+    assert len(declined) == 1  # nothing rewritten while the response ran
+    assert len(attempts) == 2
+    assert attempts[0] == attempts[1]  # the same batch, not a fresh one
+    assert attempts[1] == (
+        "conversation.item.create",
+        "response.create",
+        "conversation.item.delete",
+    )
+
+
+def test_pump_writes_an_uncontested_announcement_exactly_once():
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        attempts: list[tuple] = []
+
+        async def send_batch(batch, *, is_announcement=False):
+            attempts.append(tuple(batch))
+            return True
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue, _StubRelay(), None, send_batch, lambda: False
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        for _ in range(300):
+            if attempts:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        pump.cancel()
+        return attempts
+
+    assert len(asyncio.run(scenario())) == 1
+
+
 def test_subagent_stop_messages_cap_the_summary_tail():
     long_summary = "x" * (talk_cli.WATCH_OUTPUT_TAIL_CHARS + 500)
     text = talk_cli.subagent_stop_messages(

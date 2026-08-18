@@ -23,6 +23,7 @@ import contextvars
 import json
 import queue
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -47,9 +48,30 @@ TOOL_EXECUTION_WAIT_S = 5.0
 TOOL_WORKERS = 2
 TOOL_PENDING_JOBS = 4
 
+#: How many settled response ids the relay remembers. Late deltas arrive within
+#: seconds of a cancel, so a short memory is enough — and a long call must not
+#: grow the ledger without bound.
+MAX_SETTLED_RESPONSES = 32
+
 
 def _noop(*_args) -> None:
     """Default callback: the relay works with no consumers attached."""
+
+
+def _event_response_id(event: dict) -> str | None:
+    """The response id an audio or transcript delta carries, if any."""
+
+    response_id = event.get("response_id")
+    return str(response_id) if response_id else None
+
+
+def _nested_response_id(event: dict) -> str | None:
+    """The response id on a lifecycle event, which nests it under ``response``."""
+
+    response = event.get("response")
+    if isinstance(response, dict) and response.get("id"):
+        return str(response["id"])
+    return None
 
 
 class ToolWorkerBusy(RuntimeError):
@@ -188,13 +210,116 @@ class RealtimeRelay:
         self.session_id: str | None = None
         #: Item the model is currently speaking — the CLI needs it to truncate
         #: the server-side transcript at the point playback actually reached.
+        #: Only a response allowed to speak may write it, so a cancelled
+        #: response's tail audio can no longer redirect the next truncate.
         self.last_audio_item_id: str | None = None
-        #: Whether a response is in flight. Gates the barge-in cancel: sending
+        # Response identity, as three named states rather than one boolean.
+        # A cancelled response keeps emitting audio and transcript deltas —
+        # OpenAI documents this — so "is anything in flight" cannot decide
+        # whether a given delta may be spoken. Only its response_id can.
+        #: The server has a response open. Gates the barge-in cancel: sending
         #: response.cancel while the model is idle earns a "Cancellation
         #: failed: no active response found" error on EVERY operator turn
-        #: (live-session finding).
-        self.response_active: bool = False
+        #: (live-session finding). Stays true from response.created until the
+        #: matching terminal event, cancelled or not — the server is not done
+        #: with a response merely because we asked it to stop.
+        self._response_in_flight: bool = False
+        #: Which response may speak. None means the provider did not name one,
+        #: which is treated as "anything may speak" rather than silence.
+        self._active_response_id: str | None = None
+        #: Responses already cancelled or finished. Their late deltas are
+        #: recognised as a tail and dropped instead of played over the next
+        #: answer. Bounded; oldest evicted.
+        self._settled_response_ids: OrderedDict[str, None] = OrderedDict()
         self._assistant_transcript: list[str] = []
+
+    @property
+    def response_active(self) -> bool:
+        """Whether the server still has a response open.
+
+        Read-only: the CLI polls this to gate announcements and the barge-in
+        cancel, and the ledger below is the only thing allowed to move it.
+        """
+
+        return self._response_in_flight
+
+    # -- response identity ----------------------------------------------------
+
+    def _belongs_to_active(self, response_id: str | None) -> bool:
+        """Whether events carrying ``response_id`` may still be spoken.
+
+        Ambiguity fails open. An event the provider did not stamp, or one that
+        arrives before any response was named, is played rather than dropped:
+        muting real speech is the worse failure, and the fence only has to be
+        exact about the case it exists for — a response known to be settled.
+        """
+
+        if response_id is None:
+            return True
+        if response_id in self._settled_response_ids:
+            return False
+        return self._active_response_id is None or response_id == self._active_response_id
+
+    def _settle(self, response_id: str) -> None:
+        """Retire a response so its late deltas stop counting as new speech."""
+
+        if response_id in self._settled_response_ids:
+            return
+        self._settled_response_ids[response_id] = None
+        if len(self._settled_response_ids) > MAX_SETTLED_RESPONSES:
+            self._settled_response_ids.popitem(last=False)
+
+    def _start_response(self, response_id: str | None) -> None:
+        """Open a response, ignoring a start that replays a settled one.
+
+        A replayed response.created must not be allowed to hand the microphone
+        back to a response that was cancelled two turns ago.
+        """
+
+        if response_id is not None and response_id in self._settled_response_ids:
+            return
+        self._response_in_flight = True
+        self._active_response_id = response_id
+
+    def _cancel_active_response(self) -> bool:
+        """Settle the response a barge-in interrupts; False if there is none.
+
+        The response stays *in flight* — the server has not acknowledged the
+        cancel, and announcing over it would still collide — but it is settled,
+        so nothing it emits from here on is played or transcribed. The partial
+        transcript goes with it rather than being folded into the next answer.
+        """
+
+        if not self._response_in_flight:
+            return False
+        if self._active_response_id is not None:
+            if self._active_response_id in self._settled_response_ids:
+                return False  # already cancelled: one cancellation per response
+            self._settle(self._active_response_id)
+        self._assistant_transcript.clear()
+        return True
+
+    def _finish_response(self, response_id: str | None) -> None:
+        """Close out a terminal event, ignoring one that lands too late.
+
+        A terminal replayed after the next response has started names a
+        response that is no longer active; it must close nothing. Anything the
+        relay cannot positively attribute to some *other* response closes the
+        current one, so an unnamed terminal never wedges the session open.
+        """
+
+        if response_id is not None:
+            self._settle(response_id)
+        if (
+            response_id is not None
+            and self._active_response_id is not None
+            and response_id != self._active_response_id
+        ):
+            return
+        self._response_in_flight = False
+        self._active_response_id = None
+        self.last_audio_item_id = None
+        self._assistant_transcript.clear()
 
     def handle_event(self, event: dict) -> list[dict]:
         """Handle one server event; return messages to send back."""
@@ -266,12 +391,14 @@ class RealtimeRelay:
         if isinstance(event, rt.SessionReady):
             self.session_id = event.session_id
         elif isinstance(event, rt.ResponseStarted):
-            self.response_active = True
+            self._start_response(event.response_id)
         elif isinstance(event, rt.SpeechStarted):
             self.on_barge_in()
-            if self.response_active:
+            if self._cancel_active_response():
                 return [rt.CancelResponse()]
         elif isinstance(event, rt.OutputAudio):
+            if not self._belongs_to_active(event.response_id):
+                return []  # tail audio from a cancelled or superseded response
             if event.item_id is not None:
                 self.last_audio_item_id = event.item_id
             self.on_audio(event.data)
@@ -279,6 +406,8 @@ class RealtimeRelay:
             if event.provenance is rt.TranscriptProvenance.INPUT_AUDIO:
                 if event.final and event.text.strip():
                     self.on_transcript_turn(rt.TranscriptRole.USER.value, event.text.strip())
+            elif not self._belongs_to_active(event.response_id):
+                pass  # interrupted text, arriving after its response was settled
             elif event.final:
                 transcript = event.text or "".join(self._assistant_transcript)
                 self._assistant_transcript.clear()
@@ -290,8 +419,7 @@ class RealtimeRelay:
                 self._assistant_transcript.append(event.text)
                 self.on_caption(event.text)
         elif isinstance(event, rt.ResponseFinished):
-            self.last_audio_item_id = None
-            self.response_active = False
+            self._finish_response(event.response_id)
         elif isinstance(event, rt.ProviderFailure):
             self._report_error(event.detail)
         return []
@@ -385,20 +513,23 @@ class RealtimeRelay:
             self.session_id = str(session["id"])
         return []
 
-    def _on_response_created(self, _event: dict) -> list[dict]:
-        self.response_active = True
+    def _on_response_created(self, event: dict) -> list[dict]:
+        self._start_response(_nested_response_id(event))
         return []
 
     def _on_speech_started(self, _event: dict) -> list[dict]:
         # Barge-in. The callback drains whatever is still queued locally
         # (always safe); the cancel goes out only when a response is actually
-        # in flight — the model idling needs nothing cancelled.
+        # in flight and not already cancelled — the model idling needs nothing
+        # cancelled, and a second cancel for the same response is noise.
         self.on_barge_in()
-        if not self.response_active:
+        if not self._cancel_active_response():
             return []
         return [dict(BARGE_IN_MESSAGE)]
 
     def _on_audio_delta(self, event: dict) -> list[dict]:
+        if not self._belongs_to_active(_event_response_id(event)):
+            return []  # tail audio from a cancelled or superseded response
         item_id = event.get("item_id")
         if item_id:
             self.last_audio_item_id = str(item_id)
@@ -413,6 +544,8 @@ class RealtimeRelay:
         return []
 
     def _on_transcript_delta(self, event: dict) -> list[dict]:
+        if not self._belongs_to_active(_event_response_id(event)):
+            return []  # interrupted text, arriving after its response settled
         delta = event.get("delta")
         if isinstance(delta, str) and delta:
             self._assistant_transcript.append(delta)
@@ -426,6 +559,8 @@ class RealtimeRelay:
         return []
 
     def _on_output_transcript_done(self, event: dict) -> list[dict]:
+        if not self._belongs_to_active(_event_response_id(event)):
+            return []  # interrupted text, arriving after its response settled
         completed = event.get("transcript")
         transcript = (
             completed
@@ -488,9 +623,8 @@ class RealtimeRelay:
             else "Something went wrong on the call."
         )
 
-    def _on_response_done(self, _event: dict) -> list[dict]:
-        self.last_audio_item_id = None
-        self.response_active = False
+    def _on_response_done(self, event: dict) -> list[dict]:
+        self._finish_response(_nested_response_id(event))
         return []
 
     @staticmethod
@@ -539,6 +673,7 @@ class RealtimeRelay:
 
 __all__ = [
     "BARGE_IN_MESSAGE",
+    "MAX_SETTLED_RESPONSES",
     "TOOL_EXECUTION_WAIT_S",
     "UNPARSEABLE_ARGS_TEXT",
     "RealtimeRelay",

@@ -126,6 +126,17 @@ def test_setup_events_and_commands_cover_one_ordinary_turn():
             "call_id",
         ),
         (lambda: rt.SubmitToolResult(call_id="\t", output="no"), "call_id"),
+        (lambda: rt.OutputAudio(data=b"pcm", response_id=" padded "), "response_id"),
+        (
+            lambda: rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text="hi",
+                final=False,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id="",
+            ),
+            "response_id",
+        ),
     ],
 )
 def test_malformed_provider_identifiers_fail_at_the_contract_boundary(factory, match):
@@ -269,3 +280,30 @@ def test_optional_core_surfaces_are_detected_independently_and_stay_unadvertised
     assert complete["explicit"] is True
     assert complete["cancellation"] is True
     assert "response_cancellation" not in complete["capabilities"]
+
+
+def test_output_events_carry_optional_response_identity():
+    # Audio and transcript deltas name the response that produced them so a
+    # cancelled response's tail can be told apart from the next answer's head.
+    unattributed = rt.OutputAudio(data=b"pcm", item_id="output-1")
+    attributed = rt.OutputAudio(data=b"pcm", item_id="output-1", response_id="response-1")
+    user_speech = rt.Transcript(
+        role=rt.TranscriptRole.USER,
+        text="hello",
+        final=True,
+        provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+    )
+    answer = rt.Transcript(
+        role=rt.TranscriptRole.ASSISTANT,
+        text="hi",
+        final=False,
+        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        response_id="response-1",
+    )
+
+    assert unattributed.response_id is None
+    assert attributed.response_id == "response-1"
+    assert unattributed != attributed
+    # The operator's own speech belongs to no response.
+    assert user_speech.response_id is None
+    assert answer.response_id == "response-1"
