@@ -39,10 +39,10 @@ DEFAULT_API_SERVER_POLL_S = 1.0
 #: probe verdict above, and for the same reason: what a Hermes install has
 #: installed changes on the timescale of a restart, not of a sentence.
 DEFAULT_CAPABILITY_CATALOG_TTL_S = 30.0
-#: How long a minted call permit stays valid before the operator must
-#: approve again. Sized to one spoken exchange: long enough to say yes to
-#: what was just summarized, short enough that a permit cannot fire from
-#: a moment the conversation has already moved past.
+#: How long a spoken approval stays live. The window runs from the moment
+#: the operator's approving speech ended — never from permit mint — sized
+#: to one spoken exchange: long enough to act on a fresh yes, short enough
+#: that a stale yes cannot fire into a conversation that has moved on.
 DEFAULT_APPROVAL_PERMIT_TTL_S = 30.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
@@ -484,9 +484,9 @@ def discord_operator_user_ids() -> frozenset[int]:
 
 
 def approval_permit_ttl_s() -> float:
-    """Wall-clock window a minted call permit stays valid before it must be
-    approved again. Junk or non-positive overrides take the default; a
-    permit is never valid forever.
+    """How long a spoken approval stays live, measured on the monotonic
+    clock from the moment the approving speech ended. Junk or non-positive
+    overrides take the default; a permit is never valid forever.
     """
 
     return _positive_float("TALK_APPROVAL_PERMIT_TTL_S", DEFAULT_APPROVAL_PERMIT_TTL_S)

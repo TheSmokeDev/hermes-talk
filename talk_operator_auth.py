@@ -31,6 +31,10 @@ _log = logging.getLogger(__name__)
 BINDING_METADATA_KEY = "talk_speaker_binding"
 TRUSTED_BINDING_EVENT_KEY = "_talk_speaker_binding"
 TRUSTED_CONTINUATION_EVENT_KEY = "_talk_continuation"
+#: Why bind_tool_event refused to mint a permit, when the speaker binding
+#: alone would not explain the denial. Written only by bind_tool_event
+#: (cleared from inbound events first), read only for the denial log line.
+_PERMIT_REFUSAL_EVENT_KEY = "_talk_permit_refusal"
 
 READ_ONLY_TALK_TOOLS = frozenset(
     {
@@ -59,6 +63,10 @@ _DEFAULT_MAX_SEEN_ITEM_IDS = 4_096
 _DEFAULT_MAX_SEEN_RESPONSE_IDS = 4_096
 _DEFAULT_MAX_SEEN_CALL_IDS = 4_096
 _MAX_PROTOCOL_ID_CHARS = 512
+#: How many finished spoken turns the target cross-check searches. Old turns
+#: age out, so a target mentioned long ago cannot keep authorizing forever.
+_MAX_SPOKEN_TURNS = 32
+_MAX_SPOKEN_CHARS_PER_TURN = 4_096
 
 
 def _valid_protocol_id(value: Any) -> bool:
@@ -77,6 +85,11 @@ class SpeakerBinding:
     token: str
     user_id: int | None
     reason: str
+    #: Monotonic instant the operator's authorizing speech ended. Set only on
+    #: the resolved-speaker path (continuations inherit it); every unresolved
+    #: or tainted binding carries None, so no permit can exist without a real
+    #: approval moment behind it.
+    authorized_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,14 +133,45 @@ _TARGET_ARGUMENT_KEYS = {
 }
 
 
+def _normalize_json_numbers(value: Any) -> Any:
+    """Collapse integral floats to ints before hashing.
+
+    ``1`` and ``1.0`` are the same argument value; a provider re-serializing
+    one as the other must not read as a changed request. Bools are ints in
+    Python and must keep their own identity.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _normalize_json_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_json_numbers(item) for item in value]
+    return value
+
+
+def _normalized_spoken_form(text: str) -> str:
+    """Case-folded, alphanumeric-only form for spoken-target matching.
+
+    Transcripts render an id like ``sa-0-a1b2c3d4`` with whatever spacing and
+    punctuation the speech model chose; the comparison has to survive that,
+    not the exact serialization.
+    """
+
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
 def _canonical_call(name: Any, arguments: Any) -> tuple[str, str | None]:
     """Hash normalized arguments and read the target this tool acts on.
 
     Malformed or non-JSON arguments still hash deterministically instead of
     raising: a tampered or truncated payload should change the hash, which
     denies the permit, rather than throw out of the mint or authorize path.
-    Keys are sorted and separators fixed so the same arguments always hash
-    the same way regardless of the order the provider serialized them in.
+    Keys are sorted, separators fixed, and integral floats collapsed to ints
+    so the same arguments always hash the same way regardless of how the
+    provider serialized them.
     """
 
     parsed: Any = None
@@ -137,7 +181,9 @@ def _canonical_call(name: Any, arguments: Any) -> tuple[str, str | None]:
         except (TypeError, ValueError):
             parsed = None
     canonical = (
-        json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            _normalize_json_numbers(parsed), sort_keys=True, separators=(",", ":")
+        )
         if isinstance(parsed, dict)
         # repr, not str: repr(None) and repr("None") differ, so a missing
         # arguments value never collides with the literal string.
@@ -158,10 +204,24 @@ def _canonical_call(name: Any, arguments: Any) -> tuple[str, str | None]:
 class _CallPermit:
     """Single-use execution permit for one accepted call ID.
 
-    Bound at mint time to the exact action, a hash of its normalized
-    arguments, the target it acts on, the Talk session that minted it, and a
-    wall-clock expiry — so execution must match what was actually approved,
-    and an approval cannot fire long after the moment it was given.
+    Each field covers one named threat, and no field claims more than its
+    check can see:
+
+    - ``expires_at`` runs from the moment the operator's authorizing speech
+      ended (monotonic clock), never from this mint — a model that sits on
+      an approved action cannot present a fresh permit for a stale yes.
+    - ``target`` was cross-checked against the spoken exchange before this
+      permit existed: a mutating tool whose canonical target never appeared
+      in what was actually said gets no permit at all. That cross-check is
+      the only mechanism here that can see summary-vs-emitted divergence,
+      and only for tools that name a target — free-text arguments (a
+      delegated task's wording, a steering note's text) are not covered.
+    - ``action`` must equal the tool name presented at execution time.
+    - ``args_hash`` is a relay-integrity tripwire, nothing more: minted from
+      the model-emitted arguments, it detects this process rewriting the
+      bound event between bind and authorize, and cannot tell whether those
+      arguments match anything the operator heard or approved.
+    - ``talk_session_id`` is recorded for the audit trail only.
     """
 
     authority: _ResponseAuthority
@@ -206,6 +266,11 @@ class DiscordToolAuthorizationLedger:
         self._seen_call_ids: set[str] = set()
         self._poisoned = False
         self._talk_session_id: str | None = None
+        # The spoken exchange as this connection heard it: finished turns
+        # (operator and assistant), plus per-response buffers for assistant
+        # transcript deltas still streaming. Bounded on every axis.
+        self._spoken: deque[str] = deque(maxlen=_MAX_SPOKEN_TURNS)
+        self._transcript_buffers: OrderedDict[str, str] = OrderedDict()
 
     def bind_session(self, talk_session_id: str) -> None:
         """Attach this ledger to the exact Talk connection minting permits.
@@ -213,7 +278,10 @@ class DiscordToolAuthorizationLedger:
         Recorded on every permit minted from here on, for the audit trail
         only. Cross-session reuse is already structurally impossible: a
         fresh ledger is built per connection, so one ledger's permit is
-        never checked by another's authorize_tool.
+        never checked by another's authorize_tool. Invariant a refactor must
+        keep: the ledger is per-connection state, never pooled or shared —
+        pooling would let one connection's permit satisfy another's
+        authorize_tool, and this audit field would start lying about it.
         """
 
         with self._lock:
@@ -269,8 +337,13 @@ class DiscordToolAuthorizationLedger:
         self._responses.clear()
         self._bindings.clear()
 
-    def _new_binding(self, user_id: int | None, reason: str) -> SpeakerBinding:
-        return SpeakerBinding(secrets.token_urlsafe(18), user_id, reason)
+    def _new_binding(
+        self,
+        user_id: int | None,
+        reason: str,
+        authorized_at: float | None = None,
+    ) -> SpeakerBinding:
+        return SpeakerBinding(secrets.token_urlsafe(18), user_id, reason, authorized_at)
 
     def _reserve_item(self, item_id: str, phase: str) -> bool:
         """Reserve one VAD item ID without ever reopening a replay tombstone."""
@@ -342,7 +415,14 @@ class DiscordToolAuthorizationLedger:
         if len(user_ids) != 1:
             reason = "ambiguous speakers" if user_ids else "no resolved speaker"
             return self._new_binding(None, reason)
-        return self._new_binding(next(iter(user_ids)), "resolved immutable Discord user ID")
+        # The approval moment: this binding is frozen when the speech-stop
+        # event lands, so "now" is when the operator's authorizing speech
+        # ended. Permit expiry runs from here, never from permit mint.
+        return self._new_binding(
+            next(iter(user_ids)),
+            "resolved immutable Discord user ID",
+            authorized_at=time.monotonic(),
+        )
 
     def note_speech_started(self, event: dict[str, Any]) -> None:
         """Record the production VAD start timestamp for one future item."""
@@ -386,6 +466,55 @@ class DiscordToolAuthorizationLedger:
             self._items[item_id] = binding
             while len(self._items) > self._max_responses:
                 self._items.popitem(last=False)
+
+    def note_transcript(self, event: dict[str, Any]) -> None:
+        """Fold one transcript fragment into the spoken-exchange window.
+
+        The transport feeds every transcript here: the operator's own final
+        turns and the assistant's streaming deltas and finals. The window is
+        what the permit target cross-check searches — a mutating tool's
+        target must have appeared somewhere in the spoken exchange before a
+        permit is minted for it. Deltas buffer per response so an id split
+        across fragments still matches; text is taken as emitted, which can
+        lead what a barge-in let the operator finish hearing.
+        """
+
+        text = event.get("text")
+        fragment = text if isinstance(text, str) else ""
+        response_id = event.get("response_id")
+        key = response_id if _valid_protocol_id(response_id) else ""
+        with self._lock:
+            if not event.get("final"):
+                if not fragment:
+                    return
+                buffered = self._transcript_buffers.get(key, "")
+                if len(buffered) < _MAX_SPOKEN_CHARS_PER_TURN:
+                    self._transcript_buffers[key] = buffered + fragment
+                    self._transcript_buffers.move_to_end(key)
+                while len(self._transcript_buffers) > self._max_responses:
+                    self._transcript_buffers.popitem(last=False)
+                return
+            buffered = self._transcript_buffers.pop(key, "")
+            turn = fragment.strip() or buffered.strip()
+            if turn:
+                self._spoken.append(turn[:_MAX_SPOKEN_CHARS_PER_TURN])
+
+    def _target_was_spoken(self, target: str) -> bool:
+        """Whether the spoken exchange ever contained this canonical target.
+
+        Caller holds the lock. A target that normalizes to nothing cannot be
+        verified against speech at all, so it fails closed.
+        """
+
+        needle = _normalized_spoken_form(target)
+        if not needle:
+            return False
+        if any(needle in _normalized_spoken_form(turn) for turn in self._spoken):
+            return True
+        return any(
+            needle in _normalized_spoken_form(buffered)
+            for buffered in self._transcript_buffers.values()
+        )
 
     @staticmethod
     def _response_create(binding: SpeakerBinding | None) -> dict[str, Any]:
@@ -482,6 +611,9 @@ class DiscordToolAuthorizationLedger:
         """Overwrite model/server data with trusted response-bound context."""
 
         bound = dict(event)
+        # Only this method may explain a refused permit; an inbound event
+        # claiming a refusal reason is model/server data, not ours.
+        bound.pop(_PERMIT_REFUSAL_EVENT_KEY, None)
         response_id = bound.get("response_id")
         with self._lock:
             authority = (
@@ -509,14 +641,35 @@ class DiscordToolAuthorizationLedger:
             permit = None
             if call_once and authority is not None:
                 args_hash, target = _canonical_call(bound.get("name"), bound.get("arguments"))
-                permit = _CallPermit(
-                    authority,
-                    str(bound.get("name") or ""),
-                    args_hash,
-                    target,
-                    self._talk_session_id,
-                    time.monotonic() + talk_config.approval_permit_ttl_s(),
-                )
+                # Expiry runs from the operator's approval moment, never from
+                # this mint: a model that sits on an approved action must not
+                # get a fresh window for a stale yes. No approval instant →
+                # no permit; the binding's own reason already names why.
+                authorized_at = authority.binding.authorized_at
+                if authorized_at is not None:
+                    if target is not None and not self._target_was_spoken(target):
+                        # The operator can only have approved what the
+                        # exchange actually said. An emitted target that was
+                        # never spoken is the summary-vs-emitted divergence
+                        # #37 exists to stop.
+                        bound[_PERMIT_REFUSAL_EVENT_KEY] = (
+                            "target was never spoken to the operator"
+                        )
+                        _log.warning(
+                            "refused call permit for %s: target %r was never "
+                            "spoken to the operator",
+                            str(bound.get("name") or "tool"),
+                            target,
+                        )
+                    else:
+                        permit = _CallPermit(
+                            authority,
+                            str(bound.get("name") or ""),
+                            args_hash,
+                            target,
+                            self._talk_session_id,
+                            authorized_at + talk_config.approval_permit_ttl_s(),
+                        )
             binding = authority.binding if authority is not None else None
             continuation = None
             if authority is not None:
@@ -524,6 +677,9 @@ class DiscordToolAuthorizationLedger:
                     authority.continuation = self._new_binding(
                         authority.binding.user_id,
                         "fresh continuation of response-bound speaker",
+                        # A continuation extends the same spoken approval; it
+                        # must not restart the approval clock.
+                        authorized_at=authority.binding.authorized_at,
                     )
                     self._expect_binding(authority.continuation, authority.chain)
                 if not self._poisoned:
@@ -542,15 +698,19 @@ class DiscordToolAuthorizationLedger:
         permit = event.get("_talk_call_permit")
         operator_ids = talk_config.discord_operator_user_ids()
         now = time.monotonic()
-        # Hashed from this same event dict, never a re-fetched copy: the relay
-        # documents that nothing rewrites it between authorize and execute, so
-        # a mismatch here means the arguments genuinely changed after approval.
+        # Relay-integrity tripwire, not an approval check: this hash and the
+        # minted one both come from the model-emitted event dict, so a
+        # mismatch can only mean this process rewrote the bound event between
+        # bind and authorize — never that the model diverged from what it
+        # said out loud. That divergence is caught (for target-bearing tools
+        # only) by the spoken-target cross-check at mint time.
         args_hash, _target = _canonical_call(name, event.get("arguments"))
         with self._lock:
             expired = isinstance(permit, _CallPermit) and permit.expires_at < now
             rewritten = isinstance(permit, _CallPermit) and not hmac.compare_digest(
                 permit.args_hash, args_hash
             )
+            renamed = isinstance(permit, _CallPermit) and permit.action != name
             trusted = (
                 not self._poisoned
                 and isinstance(authority, _ResponseAuthority)
@@ -562,6 +722,7 @@ class DiscordToolAuthorizationLedger:
                 and binding is authority.binding
                 and not expired
                 and not rewritten
+                and not renamed
             )
             # Every terminal handling attempt consumes its call permit, even
             # for read-only, unclassified, malformed, queue-rejected, or
@@ -590,9 +751,17 @@ class DiscordToolAuthorizationLedger:
         if expired:
             reason = "approval permit expired"
         elif rewritten:
-            reason = "arguments changed since approval"
+            reason = "bound arguments were rewritten after mint (relay integrity)"
+        elif renamed:
+            reason = "action does not match approved permit"
         else:
-            reason = binding.reason if isinstance(binding, SpeakerBinding) else "unbound response"
+            refusal = event.get(_PERMIT_REFUSAL_EVENT_KEY)
+            if isinstance(refusal, str) and refusal:
+                reason = refusal
+            elif isinstance(binding, SpeakerBinding):
+                reason = binding.reason
+            else:
+                reason = "unbound response"
         _log.warning("denied Discord mutating Talk tool %s: %s", name, reason)
         return MUTATION_DENIAL.format(tool=name)
 
@@ -624,6 +793,8 @@ class DiscordToolAuthorizationLedger:
             self._responses.clear()
             self._seen_responses.clear()
             self._seen_call_ids.clear()
+            self._spoken.clear()
+            self._transcript_buffers.clear()
             self._poisoned = False
             self._sample_cursor = 0
 

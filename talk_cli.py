@@ -1130,6 +1130,18 @@ async def run_talk_session(
                         authorization_ledger.note_speech_stopped(
                             {"item_id": event.input_id, "audio_end_ms": event.offset_ms}
                         )
+                    elif isinstance(event, talk_realtime.Transcript):
+                        # The spoken-exchange window behind the permit target
+                        # cross-check: operator turns and assistant deltas and
+                        # finals alike, so a target is checkable against what
+                        # was actually said by the time a tool call binds.
+                        authorization_ledger.note_transcript(
+                            {
+                                "text": event.text,
+                                "final": event.final,
+                                "response_id": event.response_id,
+                            }
+                        )
                     elif isinstance(event, talk_realtime.ResponseStarted):
                         authorization_ledger.note_response_created(
                             {
