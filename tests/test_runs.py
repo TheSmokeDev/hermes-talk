@@ -48,6 +48,14 @@ def _attach_test_owner(**overrides) -> None:
     )
 
 
+def _owed(session_id: str, **overrides) -> list[dict]:
+    """List adoptable runs under the suite's default ticket binding."""
+
+    return talk_runs.list_undelivered_for_session(
+        session_id, **{"operator": "test", "profile": None, **overrides}
+    )
+
+
 def _wait_terminal(run_id: int, timeout: float = 3.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -631,20 +639,53 @@ def test_the_ticket_is_frozen_at_acceptance():
     ticket = talk_runs.get_run(run_id)["ticket"]
     assert ticket["hermesSessionId"] == "sess-first"
     assert ticket["generationId"] == "gen-1"
-    assert talk_runs.list_undelivered_for_session("sess-second") == []
+    assert _owed("sess-second") == []
 
 
-def test_mark_delivered_is_exact_once():
+def test_delivery_is_a_two_phase_exact_once_claim():
+    """Claim at enqueue, flip only post-send — and only by the claim holder."""
+
     run_id = talk_runs.start_run("agent", "once", lambda _rid: "done")
     _wait_terminal(run_id)
 
-    assert talk_runs.mark_delivered(run_id) is True
-    assert talk_runs.mark_delivered(run_id) is False
+    assert talk_runs.claim_delivery(run_id, claimant="ts-test") is True
+    assert talk_runs.claim_delivery(run_id, claimant="ts-test") is False
+    assert talk_runs.get_run(run_id)["delivery"] == talk_runs.DELIVERY_CLAIMED
+
+    # A caller that never claimed cannot consume the result (denial-of-
+    # delivery closed): the flip asserts the claimant against the claim.
+    assert talk_runs.mark_delivered(run_id, claimant="ts-stranger") is False
+    assert talk_runs.get_run(run_id)["delivery"] == talk_runs.DELIVERY_CLAIMED
+
+    assert talk_runs.mark_delivered(run_id, claimant="ts-test") is True
+    assert talk_runs.mark_delivered(run_id, claimant="ts-test") is False
     assert talk_runs.get_run(run_id)["delivery"] == talk_runs.DELIVERED
 
 
-def test_mark_delivered_ignores_an_unknown_run():
-    assert talk_runs.mark_delivered(987654) is False
+def test_an_unclaimed_result_cannot_be_flipped_delivered():
+    """Phase two without phase one is a protocol violation, not a delivery."""
+
+    run_id = talk_runs.start_run("agent", "unclaimed", lambda _rid: "done")
+    _wait_terminal(run_id)
+
+    assert talk_runs.mark_delivered(run_id, claimant="ts-test") is False
+    assert talk_runs.get_run(run_id)["delivery"] == talk_runs.DELIVERY_PENDING
+
+
+def test_a_live_claim_by_another_route_is_not_stolen():
+    """Within one process a claim holder is alive and about to speak."""
+
+    run_id = talk_runs.start_run("agent", "contended", lambda _rid: "done")
+    _wait_terminal(run_id)
+
+    assert talk_runs.claim_delivery(run_id, claimant="ts-a") is True
+    assert talk_runs.claim_delivery(run_id, claimant="ts-b") is False
+    assert talk_runs.get_run(run_id)["deliveryClaim"]["claimant"] == "ts-a"
+
+
+def test_delivery_calls_ignore_an_unknown_run():
+    assert talk_runs.claim_delivery(987654, claimant="ts-test") is False
+    assert talk_runs.mark_delivered(987654, claimant="ts-test") is False
 
 
 def test_undelivered_excludes_foreign_sessions_and_claimed_results():
@@ -656,22 +697,23 @@ def test_undelivered_excludes_foreign_sessions_and_claimed_results():
     theirs = talk_runs.start_run("agent", "theirs", lambda _rid: "done")
     _wait_terminal(theirs)
 
-    assert [r["runId"] for r in talk_runs.list_undelivered_for_session("sess-mine")] == [mine]
-    assert [r["runId"] for r in talk_runs.list_undelivered_for_session("sess-theirs")] == [theirs]
+    assert [r["runId"] for r in _owed("sess-mine")] == [mine]
+    assert [r["runId"] for r in _owed("sess-theirs")] == [theirs]
 
-    talk_runs.mark_delivered(mine)
-    assert talk_runs.list_undelivered_for_session("sess-mine") == []
+    assert talk_runs.claim_delivery(mine, claimant="ts-mine")
+    assert talk_runs.mark_delivered(mine, claimant="ts-mine")
+    assert _owed("sess-mine") == []
 
 
 def test_undelivered_skips_runs_that_have_not_landed():
     release = threading.Event()
     run_id = talk_runs.start_run("agent", "still going", lambda _rid: release.wait(timeout=3.0))
 
-    assert talk_runs.list_undelivered_for_session("sess-test") == []
+    assert _owed("sess-test") == []
 
     release.set()
     _wait_terminal(run_id)
-    assert [r["runId"] for r in talk_runs.list_undelivered_for_session("sess-test")] == [run_id]
+    assert [r["runId"] for r in _owed("sess-test")] == [run_id]
 
 
 def test_undelivered_without_a_session_id_claims_nothing():
@@ -679,8 +721,8 @@ def test_undelivered_without_a_session_id_claims_nothing():
 
     _wait_terminal(talk_runs.start_run("agent", "landed", lambda _rid: "done"))
 
-    assert talk_runs.list_undelivered_for_session(None) == []
-    assert talk_runs.list_undelivered_for_session("") == []
+    assert talk_runs.list_undelivered_for_session(None, operator="test", profile=None) == []
+    assert talk_runs.list_undelivered_for_session("", operator="test", profile=None) == []
 
 
 def test_pre_fix_history_is_never_adopted(history_env: Path):
@@ -696,7 +738,7 @@ def test_pre_fix_history_is_never_adopted(history_env: Path):
 
     assert merged[11]["ticket"] == {}
     assert merged[11]["delivery"] == talk_runs.DELIVERY_PENDING
-    assert talk_runs.list_undelivered_for_session("sess-test") == []
+    assert _owed("sess-test") == []
 
 
 def test_the_terminal_tee_carries_the_ticket_and_delivery(history_env: Path):
@@ -727,18 +769,23 @@ def test_a_reconnect_adopts_an_orphaned_result_exactly_once(history_env: Path):
     talk_runs.reset_for_tests()
     _attach_test_owner(hermes_session_id="sess-restart", generation_id="gen-after")
 
-    owed = talk_runs.list_undelivered_for_session("sess-restart")
+    owed = _owed("sess-restart")
     assert [r["runId"] for r in owed] == [run_id]
     assert owed[0]["output"] == "the answer"
 
-    assert talk_runs.mark_delivered(run_id) is True
-    assert talk_runs.mark_delivered(run_id) is False
-    assert talk_runs.list_undelivered_for_session("sess-restart") == []
+    assert talk_runs.claim_delivery(run_id, claimant="ts-after") is True
+    assert talk_runs.claim_delivery(run_id, claimant="ts-after") is False
+    # Claimed but not yet spoken: invisible to the CLAIMANT's own listing,
+    # still collectable by a future session (see the stale-claim test).
+    assert _owed("sess-restart", claimant="ts-after") == []
+    assert talk_runs.mark_delivered(run_id, claimant="ts-after") is True
+    assert talk_runs.mark_delivered(run_id, claimant="ts-after") is False
+    assert _owed("sess-restart") == []
 
-    # And it stays claimed through the NEXT restart, which is the whole point.
+    # And it stays delivered through the NEXT restart, which is the whole point.
     talk_runs.reset_for_tests()
     _attach_test_owner(hermes_session_id="sess-restart")
-    assert talk_runs.list_undelivered_for_session("sess-restart") == []
+    assert _owed("sess-restart") == []
 
 
 def test_claiming_from_history_fails_closed_when_the_write_cannot_land(
@@ -746,7 +793,7 @@ def test_claiming_from_history_fails_closed_when_the_write_cannot_land(
 ):
     """The delivery-claim counterpart to test_acceptance_write_failure_refuses_the_run.
 
-    An unpersisted claim is not a claim (see _claim_delivery_in_history's own
+    An unpersisted claim is not a claim (see _claim_in_history's own
     docstring) — a disk failure here must leave the run claimable, not silently
     grant the claim in memory only.
     """
@@ -759,16 +806,14 @@ def test_claiming_from_history_fails_closed_when_the_write_cannot_land(
     talk_runs.reset_for_tests()
     _attach_test_owner(hermes_session_id="sess-restart")
 
-    def _boom(_record):
+    def _boom(_path, _record):
         raise OSError("disk gone")
 
-    monkeypatch.setattr(talk_runs, "_append_history_strict", _boom)
+    monkeypatch.setattr(talk_runs, "_append_line_locked", _boom)
 
-    assert talk_runs.mark_delivered(run_id) is False
+    assert talk_runs.claim_delivery(run_id, claimant="ts-after") is False
     # Still owed — a failed claim must not remove the run from the adoption list.
-    assert [
-        r["runId"] for r in talk_runs.list_undelivered_for_session("sess-restart")
-    ] == [run_id]
+    assert [r["runId"] for r in _owed("sess-restart")] == [run_id]
 
 
 def test_a_reconnect_from_a_different_session_adopts_nothing(history_env: Path):
@@ -779,9 +824,9 @@ def test_a_reconnect_from_a_different_session_adopts_nothing(history_env: Path):
     talk_runs.reset_for_tests()
     _attach_test_owner(hermes_session_id="sess-stranger")
 
-    assert talk_runs.list_undelivered_for_session("sess-stranger") == []
+    assert _owed("sess-stranger") == []
     # Still owed to its real owner, not silently consumed by the stranger.
-    assert [r["runId"] for r in talk_runs.list_undelivered_for_session("sess-restart")] == [run_id]
+    assert [r["runId"] for r in _owed("sess-restart")] == [run_id]
 
 
 def test_a_run_that_has_not_landed_cannot_be_claimed():
@@ -790,14 +835,14 @@ def test_a_run_that_has_not_landed_cannot_be_claimed():
     release = threading.Event()
     run_id = talk_runs.start_run("agent", "in flight", lambda _rid: release.wait(timeout=3.0))
 
-    assert talk_runs.mark_delivered(run_id) is False
+    assert talk_runs.claim_delivery(run_id, claimant="ts-test") is False
 
     release.set()
     _wait_terminal(run_id)
 
     # Still claimable — and still owed — once it actually lands.
-    assert [r["runId"] for r in talk_runs.list_undelivered_for_session("sess-test")] == [run_id]
-    assert talk_runs.mark_delivered(run_id) is True
+    assert [r["runId"] for r in _owed("sess-test")] == [run_id]
+    assert talk_runs.claim_delivery(run_id, claimant="ts-test") is True
 
 
 def test_a_lost_history_run_is_not_claimable(history_env: Path):
@@ -812,5 +857,262 @@ def test_a_lost_history_run_is_not_claimable(history_env: Path):
 
     merged = {r["runId"]: r for r in talk_runs.list_runs(50, include_history=True)}
     assert merged[21]["status"] == "lost"
-    assert talk_runs.mark_delivered(21) is False
-    assert talk_runs.list_undelivered_for_session("sess-test") == []
+    assert talk_runs.claim_delivery(21, claimant="ts-test") is False
+    assert _owed("sess-test") == []
+
+
+# --- the cross-process file lock (review F1) ---------------------------------
+
+
+def test_run_ids_skip_past_a_sibling_process_acceptance(history_env: Path):
+    """Two processes share this file; ids are floored on it AT EVERY acceptance.
+
+    A once-per-process seed cannot see a sibling's later acceptance: the CLI
+    lane and the dashboard lane would both continue from the same floor and
+    mint the same id, and the newest-per-runId merge/compaction would then
+    let one process's terminal record destroy the other's. Simulated here by
+    appending the sibling's acceptance record directly to the shared file
+    between this process's own runs.
+    """
+
+    first = talk_runs.start_run("agent", "ours", lambda _rid: "ok")
+    _wait_history_terminal(history_env, first)
+
+    sibling = json.dumps(
+        {"runId": 50, "kind": "agent", "label": "sibling process", "status": "running",
+         "ts": 1.0, "updated": 1.0}
+    )
+    with (history_env / talk_runs._HISTORY_FILENAME).open("a", encoding="utf-8") as fh:
+        fh.write(sibling + "\n")
+
+    second = talk_runs.start_run("agent", "ours again", lambda _rid: "ok")
+    _wait_terminal(second)
+
+    assert second == 51
+
+
+def test_the_history_file_lock_serializes_writers(history_env: Path):
+    """An append cannot land while another holder owns the OS lock.
+
+    The second fd is opened by the appending thread itself, so this exercises
+    the real msvcrt/fcntl lock on both platforms (same-process, different
+    file descriptors contend exactly like two processes do).
+    """
+
+    path = history_env / talk_runs._HISTORY_FILENAME
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with talk_runs._history_file_lock(path):
+            held.set()
+            release.wait(timeout=5.0)
+
+    blocked = threading.Thread(target=holder, daemon=True)
+    blocked.start()
+    assert held.wait(timeout=5.0)
+
+    writer = threading.Thread(
+        target=lambda: talk_runs._append_history(
+            {"runId": 77, "kind": "agent", "label": "waits", "status": "done",
+             "ts": 1.0, "updated": 1.0}
+        ),
+        daemon=True,
+    )
+    writer.start()
+    # While the lock is held the append CANNOT land — this is the OS lock's
+    # guarantee, not a timing accident; the window only bounds how long we
+    # bother checking it.
+    deadline = time.time() + 0.3
+    while time.time() < deadline:
+        assert all(r["runId"] != 77 for r in _history_records(history_env))
+        time.sleep(0.02)
+
+    release.set()
+    writer.join(timeout=5.0)
+    blocked.join(timeout=5.0)
+    assert any(r["runId"] == 77 for r in _history_records(history_env))
+
+
+def test_a_wedged_lock_refuses_acceptance_rather_than_writing_unlocked(
+    history_env: Path, monkeypatch
+):
+    monkeypatch.setattr(talk_runs, "_HISTORY_LOCK_TIMEOUT_S", 0.2)
+    path = history_env / talk_runs._HISTORY_FILENAME
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with talk_runs._history_file_lock(path):
+            held.set()
+            release.wait(timeout=5.0)
+
+    blocked = threading.Thread(target=holder, daemon=True)
+    blocked.start()
+    assert held.wait(timeout=5.0)
+    try:
+        with pytest.raises(talk_runs.RoutingUnavailable, match="durably"):
+            talk_runs.start_run("agent", "never accepted", lambda _rid: "unreachable")
+        assert talk_runs.list_runs(50) == []
+    finally:
+        release.set()
+        blocked.join(timeout=5.0)
+
+
+# --- ephemeral acceptance is an explicit opt-in (review F3) ------------------
+
+
+def test_start_run_refuses_when_the_tee_is_disabled_without_the_optin(monkeypatch):
+    """A disabled tee must be a loud no, not a quietly non-durable yes."""
+
+    monkeypatch.delenv(talk_runs.ALLOW_EPHEMERAL_ENV, raising=False)
+
+    with pytest.raises(talk_runs.RoutingUnavailable) as caught:
+        talk_runs.start_run("agent", "not durable", lambda _rid: "unreachable")
+
+    assert talk_runs.ALLOW_EPHEMERAL_ENV in str(caught.value)
+    assert talk_runs.list_runs(50) == []
+
+
+def test_the_ephemeral_optin_accepts_in_memory_only_runs(tmp_path: Path, monkeypatch):
+    """With the opt-in named, the in-process registry is the whole contract."""
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(talk_runs, "_history_path", lambda: state / "talk-runs.jsonl")
+    monkeypatch.setenv(talk_runs.ALLOW_EPHEMERAL_ENV, "1")
+
+    run = _wait_terminal(talk_runs.start_run("skill", "ephemeral", lambda _rid: "x"))
+
+    assert run["status"] == "done"
+    assert _history_records(state) == []
+
+
+# --- ownership is enforced at adoption, not just recorded (review F4) --------
+
+
+def test_a_ticket_bound_to_a_different_operator_is_not_adopted(history_env: Path):
+    """Same Hermes session id, different operator binding — not yours."""
+
+    _attach_test_owner(hermes_session_id="sess-shared", operator="codex-oauth")
+    run_id = talk_runs.start_run("agent", "theirs", lambda _rid: "done")
+    _wait_history_terminal(history_env, run_id)
+    talk_runs.reset_for_tests()
+    _attach_test_owner(hermes_session_id="sess-shared")
+
+    assert _owed("sess-shared", operator="test") == []
+    assert [r["runId"] for r in _owed("sess-shared", operator="codex-oauth")] == [run_id]
+
+
+def test_a_ticket_bound_to_a_different_profile_is_not_adopted(history_env: Path):
+    _attach_test_owner(hermes_session_id="sess-shared", profile="research")
+    run_id = talk_runs.start_run("agent", "profiled", lambda _rid: "done")
+    _wait_history_terminal(history_env, run_id)
+    talk_runs.reset_for_tests()
+    _attach_test_owner(hermes_session_id="sess-shared")
+
+    assert _owed("sess-shared", profile=None) == []
+    assert [r["runId"] for r in _owed("sess-shared", profile="research")] == [run_id]
+
+
+# --- stale claims are re-adoptable; delivered is final (review F2/F7) --------
+
+
+def test_a_claim_by_a_dead_session_is_readoptable(history_env: Path):
+    """Claimed-but-never-spoken must not be lost to the claimant's death.
+
+    The old single-phase flip consumed the result durably at ENQUEUE; a
+    teardown before the announcement was actually sent then destroyed it
+    forever. Under the two-phase claim, a record still ``claimed`` by a
+    session that is not the current one reads as undelivered.
+    """
+
+    _attach_test_owner(hermes_session_id="sess-restart")
+    run_id = talk_runs.start_run("agent", "orphaned", lambda _rid: "the answer")
+    _wait_history_terminal(history_env, run_id)
+    talk_runs.reset_for_tests()
+    _attach_test_owner(hermes_session_id="sess-restart")
+
+    # First reconnect claims durably... and dies before the pump speaks it.
+    assert talk_runs.claim_delivery(run_id, claimant="ts-dead") is True
+    talk_runs.reset_for_tests()
+    _attach_test_owner(hermes_session_id="sess-restart")
+
+    # Invisible to the dead claimant's own listing, visible to the next one.
+    assert _owed("sess-restart", claimant="ts-dead") == []
+    assert [r["runId"] for r in _owed("sess-restart", claimant="ts-new")] == [run_id]
+
+    # The next session steals the stale claim; only IT can flip afterwards.
+    assert talk_runs.claim_delivery(run_id, claimant="ts-new") is True
+    assert talk_runs.mark_delivered(run_id, claimant="ts-dead") is False
+    assert talk_runs.mark_delivered(run_id, claimant="ts-new") is True
+
+    # Delivered is final for every claimant, current or future.
+    assert talk_runs.claim_delivery(run_id, claimant="ts-third") is False
+    assert _owed("sess-restart", claimant="ts-third") == []
+
+
+# --- the durable annotate escalates instead of degrading (review F5) ---------
+
+
+def test_durable_annotate_escalates_when_the_write_cannot_land(
+    history_env: Path, monkeypatch, caplog
+):
+    """The api_run_id is a resume handle: its loss is an ERROR, not telemetry."""
+
+    import logging as _logging
+
+    run_id = talk_runs.start_run("agent", "tier 2", lambda _rid: "done")
+    # Wait on the FILE, not the registry: the worker's terminal tee runs a
+    # beat after the registry flips, and it must not race the monkeypatch.
+    _wait_history_terminal(history_env, run_id)
+
+    attempts = []
+
+    def _boom(_path, _record):
+        attempts.append(1)
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(talk_runs, "_append_line_locked", _boom)
+    with caplog.at_level(_logging.ERROR, logger="talk_runs"):
+        talk_runs.annotate_run(run_id, durable=True, api_run_id="run_remote_9")
+
+    assert len(attempts) == 2  # one retry, then escalate
+    assert any("could not be persisted" in r.message for r in caplog.records)
+    # The run itself is unharmed; the handle survives in memory.
+    assert talk_runs.get_run(run_id)["meta"]["api_run_id"] == "run_remote_9"
+
+
+# --- fall-off visibility for the adoption tail (review F6) -------------------
+
+
+def test_orphans_beyond_the_adoption_tail_are_reported(
+    history_env: Path, monkeypatch, caplog
+):
+    """The tail bound is the design; falling off it must not be silent."""
+
+    import logging as _logging
+
+    monkeypatch.setattr(talk_runs, "_HISTORY_TAIL_LINES", 3)
+    orphan = json.dumps(
+        {"runId": 5, "kind": "agent", "label": "owed", "status": "done",
+         "output": "lost to the tail", "delivery": "pending",
+         "ticket": {"hermesSessionId": "sess-test", "operator": "test", "profile": None},
+         "ts": 1.0, "updated": 1.0}
+    )
+    filler = [
+        json.dumps(
+            {"runId": 100 + n, "kind": "skill", "label": f"f{n}", "status": "done",
+             "ts": 2.0, "updated": 2.0}
+        )
+        for n in range(3)
+    ]
+    (history_env / talk_runs._HISTORY_FILENAME).write_text(
+        "\n".join([orphan, *filler]) + "\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(_logging.WARNING, logger="talk_runs"):
+        owed = _owed("sess-test")
+
+    assert owed == []  # the tail cannot see it — that part is the design
+    assert any("fell off" in r.message and "[5]" in r.message for r in caplog.records)

@@ -11,6 +11,7 @@ from typing import ClassVar
 import pytest
 
 import talk_cli
+import talk_config
 import talk_openai_realtime as openai_rt
 import talk_operator_auth
 import talk_realtime as rt
@@ -818,15 +819,21 @@ def routed(monkeypatch, tmp_path):
     talk_runs.reset_for_tests()
 
 
-def _seed_orphaned_run(session_id: str, output: str) -> int:
-    """One terminal, unclaimed run left behind by a process that is now gone."""
+def _seed_orphaned_run(session_id: str, output: str, *, operator: str = "fake-auth") -> int:
+    """One terminal, unclaimed run left behind by a process that is now gone.
+
+    Seeded under the SAME operator/profile binding the reconnecting session
+    will attach with (the ``_offline_policy`` host resolves auth source
+    "fake-auth"): adoption now ENFORCES the recorded binding, so a mismatch
+    is the not-adopted case, not the default.
+    """
 
     talk_runs.attach_owner(
         talk_session_id="ts-dead",
         generation_id="gen-dead",
         hermes_session_id=session_id,
-        operator="test",
-        profile=None,
+        operator=operator,
+        profile=talk_config.agent_profile(),
     )
     run_id = talk_runs.start_run("agent", "orphaned", lambda _rid: output)
     deadline = time.time() + 3.0
@@ -838,6 +845,55 @@ def _seed_orphaned_run(session_id: str, output: str) -> int:
     # The process that accepted it dies without ever speaking the result.
     talk_runs.reset_for_tests()
     return run_id
+
+
+def _owed_to(session_id: str) -> list[dict]:
+    """Adoptable runs under the binding a ``_run`` session attaches with."""
+
+    return talk_runs.list_undelivered_for_session(
+        session_id, operator="fake-auth", profile=talk_config.agent_profile()
+    )
+
+
+def _delivered_in_history(run_id: int) -> bool:
+    """Read the durable delivery state the way the next process would."""
+
+    return talk_runs._load_history().get(run_id, {}).get("delivery") == talk_runs.DELIVERED
+
+
+class AnnouncementAnsweringProvider(FakeProviderSession):
+    """A fake that RESPONDS to announcements and stays open until they land.
+
+    Each announcement batch carries a ``response.create``; a real model then
+    emits ResponseStarted/ResponseFinished, which is what clears
+    ``continuation_pending`` so the NEXT queued announcement can flush. The
+    base fake never answers, so only the first batch could ever be sent —
+    which is exactly the scheduling hole the old multi-orphan test declined
+    to assert through. Termination additionally waits (bounded) for
+    ``until()`` so the post-send delivery flips are on disk before teardown.
+    """
+
+    def __init__(self, events, *, until):
+        super().__init__(events)
+        self._until = until
+        self._responses = 0
+
+    async def send(self, commands):
+        await super().send(commands)
+        for command in commands:
+            if isinstance(command, rt.StartResponse):
+                self._responses += 1
+                response_id = f"resp-announce-{self._responses}"
+                self.events.append(rt.ResponseStarted(response_id=response_id))
+                self.events.append(rt.ResponseFinished(response_id=response_id))
+
+    async def __anext__(self):
+        if not self.events and not self._terminal_emitted and not self._until():
+            for _ in range(500):  # bounded: ~5s, then terminate and let asserts speak
+                await asyncio.sleep(0.01)
+                if self.events or self._until():
+                    break
+        return await super().__anext__()
 
 
 def test_the_session_binds_and_releases_its_return_route(routed, monkeypatch):
@@ -864,7 +920,10 @@ def test_the_session_binds_and_releases_its_return_route(routed, monkeypatch):
 def test_a_reconnect_speaks_the_result_it_was_owed(routed):
     run_id = _seed_orphaned_run("sess-bound", "the index is rebuilt")
 
-    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    fake = AnnouncementAnsweringProvider(
+        [rt.SessionReady(session_id="session-1")],
+        until=lambda: _delivered_in_history(run_id),
+    )
     _run(fake)
 
     spoken = " ".join(
@@ -874,8 +933,9 @@ def test_a_reconnect_speaks_the_result_it_was_owed(routed):
     )
     assert f"Background run #{run_id}" in spoken
     assert "the index is rebuilt" in spoken
-    # Claimed, so the next reconnect does not say it again.
-    assert talk_runs.list_undelivered_for_session("sess-bound") == []
+    # Delivered (post-send flip), so the next reconnect does not say it again.
+    assert _delivered_in_history(run_id)
+    assert _owed_to("sess-bound") == []
 
 
 def test_a_reconnect_speaks_every_result_it_was_owed(routed):
@@ -883,21 +943,21 @@ def test_a_reconnect_speaks_every_result_it_was_owed(routed):
 
     A single-orphan test cannot distinguish "the adoption loop claims every
     owed run" from "it claims the first and stops" (an early-return/break
-    regression). This seeds two and asserts the loop's own claim-before-speak
-    contract: every owed run ends up claimed, none stay silently stranded.
-
-    Deliberately not asserting both texts land in `fake.sent`: which queued
-    announcements the wire actually flushes before a short-lived session's
-    teardown cancels `pump_announcements` is a separate, pre-existing
-    scheduling question this test doesn't pin — only that the claim itself,
-    which is what determines whether a result can ever be re-adopted, covers
-    every owed run rather than just the first.
+    regression). This seeds two and asserts the FULL contract: both
+    announcements actually flush to the wire, and both results end up
+    durably delivered — none stay silently stranded, none stay claimed
+    forever. The provider answers each announcement's ``response.create``
+    like a real model would (clearing ``continuation_pending``), which is
+    what lets the second batch flush at all.
     """
 
     first = _seed_orphaned_run("sess-bound", "the index is rebuilt")
     second = _seed_orphaned_run("sess-bound", "the audit is done")
 
-    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    fake = AnnouncementAnsweringProvider(
+        [rt.SessionReady(session_id="session-1")],
+        until=lambda: _delivered_in_history(first) and _delivered_in_history(second),
+    )
     _run(fake)
 
     spoken = " ".join(
@@ -907,10 +967,13 @@ def test_a_reconnect_speaks_every_result_it_was_owed(routed):
     )
     assert f"Background run #{first}" in spoken
     assert "the index is rebuilt" in spoken
-    # Both claimed — an early-return/break after the first would leave the
-    # second run still listed as owed, and still claimable, here.
-    assert talk_runs.list_undelivered_for_session("sess-bound") == []
-    assert talk_runs.mark_delivered(second) is False
+    assert f"Background run #{second}" in spoken
+    assert "the audit is done" in spoken
+    # Both durably delivered — an early-return/break after the first would
+    # leave the second still owed (and still claimable) here.
+    assert _delivered_in_history(first) and _delivered_in_history(second)
+    assert _owed_to("sess-bound") == []
+    assert talk_runs.claim_delivery(second, claimant="ts-probe") is False
 
 
 def test_a_reconnect_does_not_speak_a_stranger_s_result(routed):
@@ -927,4 +990,28 @@ def test_a_reconnect_does_not_speak_a_stranger_s_result(routed):
     assert "not yours" not in spoken
     assert "Background run #" not in spoken
     # Still owed to its real owner rather than silently consumed.
-    assert talk_runs.list_undelivered_for_session("sess-somebody-else")
+    assert _owed_to("sess-somebody-else")
+
+
+def test_a_reconnect_does_not_adopt_a_different_operator_binding(routed):
+    """Same Hermes session id, different recorded operator — not adopted."""
+
+    run_id = _seed_orphaned_run("sess-bound", "someone else's answer", operator="codex-oauth")
+
+    fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
+    _run(fake)
+
+    spoken = " ".join(
+        getattr(command, "text", "")
+        for batch in fake.sent
+        for command in batch
+    )
+    assert "someone else's answer" not in spoken
+    assert "Background run #" not in spoken
+    # Still owed under its OWN binding rather than consumed by this one.
+    assert [
+        r["runId"]
+        for r in talk_runs.list_undelivered_for_session(
+            "sess-bound", operator="codex-oauth", profile=talk_config.agent_profile()
+        )
+    ] == [run_id]

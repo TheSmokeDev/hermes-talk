@@ -25,9 +25,17 @@ Hermes session, Talk generation, request id), and persists that acceptance
 record BEFORE the worker thread starts. Nothing can speak ``WORK_STARTED``
 over a destination that was never minted.
 
-The tee is fail-open at every seam EXCEPT the acceptance record, which is
-fail-closed for exactly that reason. History IO must never break the
-registry, and the file is compacted in place when it outgrows its cap.
+The tee is fail-open at every seam EXCEPT the acceptance record and the
+delivery claim, which are fail-closed for exactly that reason. History IO
+must never break the registry, and the file is compacted in place when it
+outgrows its cap.
+
+**The file is SHARED BETWEEN PROCESSES.** The CLI lane and the dashboard lane
+(``dashboard/plugin_api.py`` imports this module into the Hermes web server
+process, and its ``/tool`` route reaches :func:`start_run` through
+``talk_host``) both write the same ``state/talk-runs.jsonl``, so every
+load-modify-append — id allocation, claims, compaction — holds an OS-level
+file lock, not just this process's ``threading.Lock``.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 try:
@@ -66,13 +75,40 @@ _HISTORY_MAX_BYTES = 512_000
 _HISTORY_COMPACT_KEEP = 300
 HISTORY_OUTPUT_CAP = 2_000
 _HISTORY_TAIL_LINES = 600
-# Lock ordering: _HISTORY_LOCK is always taken WITHOUT _RUN_LOCK held (tees
-# happen after the registry mutation completes).
+# Lock ordering: _HISTORY_LOCK (thread-level) is outermost, the cross-process
+# file lock nests inside it, and _RUN_LOCK may nest inside BOTH (run-id
+# allocation only). Never take _HISTORY_LOCK or the file lock while already
+# holding _RUN_LOCK — tees happen after the registry mutation completes.
 _HISTORY_LOCK = threading.Lock()
 
-#: Delivery states. ``pending`` is the mint-time value; ``delivered`` is set
-#: exactly once, by whichever route actually hands the result to the operator.
+#: Cross-process serialization for the shared JSONL file (see the module
+#: docstring: the CLI lane and the dashboard lane are separate PROCESSES).
+#: Same one-byte msvcrt/fcntl mechanism as talk_transcript's writer lease,
+#: but blocking with a bounded retry: a concurrent writer should WAIT for
+#: its sibling, not fail.
+_HISTORY_LOCK_SUFFIX = ".lock"
+_HISTORY_LOCK_TIMEOUT_S = 5.0
+_HISTORY_LOCK_POLL_S = 0.02
+
+#: Explicit opt-in to accept runs while the history tee is disabled. Without
+#: it, :func:`start_run` REFUSES: a disabled tee means no durable return
+#: route can be minted, and inheriting that silently is exactly how results
+#: get lost. The test suite (where the tee is inert by design) is the
+#: intended consumer.
+ALLOW_EPHEMERAL_ENV = "TALK_RUNS_ALLOW_EPHEMERAL"
+
+#: Delivery states — a two-phase claim. ``pending`` is the mint-time value;
+#: ``claimed`` records WHO is about to speak the result (claimant Talk
+#: session + timestamp) without yet consuming it; ``delivered`` is set only
+#: after the announcement batch was actually handed to the wire. A record
+#: still ``claimed`` by a session that is no longer the current one counts
+#: as undelivered and is re-adoptable: the loss window (claimed durably,
+#: then torn down before speaking) is closed, and the duplication window is
+#: bounded to a crash BETWEEN the wire hand-off and the delivered flip —
+#: saying a result twice across a crash is the correct trade against never
+#: saying it at all.
 DELIVERY_PENDING = "pending"
+DELIVERY_CLAIMED = "claimed"
 DELIVERED = "delivered"
 
 
@@ -163,6 +199,107 @@ def _history_enabled() -> bool:
     return "PYTEST_CURRENT_TEST" not in os.environ
 
 
+def _history_lock_path(path):
+    """The sidecar lock path, tolerant of test doubles that stub _history_path."""
+
+    parent = getattr(path, "parent", None)
+    name = getattr(path, "name", None)
+    if parent is None or not isinstance(name, str):
+        return None
+    return parent / (name + _HISTORY_LOCK_SUFFIX)
+
+
+def _lock_fd(fd: int) -> None:
+    """Take the one-byte exclusive lock, non-blocking. Raises OSError when held."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_fd(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _history_file_lock(path):
+    """Hold the OS-level exclusive lock for one load-modify-append.
+
+    The caller holds ``_HISTORY_LOCK`` already, so at most one thread per
+    process is ever inside; the OS lock arbitrates BETWEEN processes (the
+    dashboard lane's web server and the CLI lane share the file). Raises
+    ``TimeoutError`` when a sibling holds it past the bound — strict callers
+    turn that into a refusal, fail-open callers into a logged drop. A path
+    whose lock sidecar cannot even be resolved (test doubles stubbing
+    ``_history_path``) degrades to thread-level locking only, which is the
+    pre-lock behaviour.
+    """
+
+    lock_path = _history_lock_path(path)
+    if lock_path is None:
+        yield
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + _HISTORY_LOCK_TIMEOUT_S
+        while True:
+            try:
+                _lock_fd(fd)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"the talk run history lock ({lock_path}) stayed held "
+                        f"for over {_HISTORY_LOCK_TIMEOUT_S:g}s"
+                    ) from None
+                time.sleep(_HISTORY_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            try:
+                _unlock_fd(fd)
+            except OSError as exc:  # pragma: no cover - release is best-effort
+                _log.warning("talk run history lock release failed: %s", exc)
+    finally:
+        os.close(fd)
+
+
+def _append_line_locked(path, record: dict) -> None:
+    """Append one record and maybe compact. Caller holds BOTH history locks.
+
+    Raises on append failure. Compaction stays best-effort: it is
+    maintenance, not this record's durability contract — the write above
+    already landed, and a compaction failure must never be mistaken for
+    "this record didn't make it."
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:
+        if path.stat().st_size > _HISTORY_MAX_BYTES:
+            _compact_history_locked(path)
+    except Exception as exc:  # noqa: BLE001 — compaction is best-effort
+        _log.warning("talk run history compaction failed: %s", exc)
+
+
 def _append_history(record: dict) -> None:
     """Fail-open tee. History IO must never break the registry."""
 
@@ -171,43 +308,38 @@ def _append_history(record: dict) -> None:
     try:
         with _HISTORY_LOCK:
             path = _history_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if path.stat().st_size > _HISTORY_MAX_BYTES:
-                _compact_history_locked(path)
+            with _history_file_lock(path):
+                _append_line_locked(path, record)
     except Exception as exc:  # noqa: BLE001 — telemetry, not truth
         _log.warning("talk run history append failed: %s", exc)
 
 
 def _append_history_strict(record: dict) -> None:
-    """Fail-CLOSED tee, for the acceptance record only (hermes-talk#35).
+    """Fail-CLOSED tee, for records that ARE a durable contract (hermes-talk#35).
 
     Everything else about this file is telemetry and degrades quietly. The
-    acceptance record is not: losing it means no durable destination was ever
-    minted, so the caller must refuse the work rather than speak WORK_STARTED
-    over nothing. Raises whatever the IO raised, deliberately unwrapped.
+    acceptance record and the durable resume handle are not: losing them
+    means no durable destination or handle was ever minted, so the caller
+    must refuse (or escalate) rather than pretend. Raises whatever the IO
+    raised, deliberately unwrapped.
 
-    A disabled tee is not a failure — it is a configuration where history is
-    inert by design (see :func:`_history_enabled`), and the in-process
-    registry remains a valid destination for the life of the connection.
+    A disabled tee REFUSES here instead of silently succeeding: a strict
+    caller is asking for durability, and a configuration where nothing can
+    be durable must surface as a loud no, not a quiet yes. Callers that
+    legitimately run without durability opt in by name (see
+    ``ALLOW_EPHEMERAL_ENV``) and are expected to gate BEFORE calling this.
     """
 
     if not _history_enabled():
-        return
+        raise RuntimeError(
+            "the run history tee is disabled, so this record cannot be made "
+            f"durable (set {ALLOW_EPHEMERAL_ENV}=1 to explicitly accept "
+            "in-memory-only runs)"
+        )
     with _HISTORY_LOCK:
         path = _history_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        # Compaction is maintenance, not this record's durability contract —
-        # the write above already landed. A compaction failure must never be
-        # mistaken for "this record didn't make it."
-        try:
-            if path.stat().st_size > _HISTORY_MAX_BYTES:
-                _compact_history_locked(path)
-        except Exception as exc:  # noqa: BLE001 — compaction is best-effort
-            _log.warning("talk run history compaction failed: %s", exc)
+        with _history_file_lock(path):
+            _append_line_locked(path, record)
 
 
 def _compact_history_locked(path) -> None:
@@ -236,34 +368,49 @@ def _compact_history_locked(path) -> None:
     os.replace(tmp, path)
 
 
-def _history_seed_floor() -> int:
+def _seed_floor_locked(path) -> int:
     """Highest persisted run id, distinguishing 'no history' from 'unreadable'.
 
-    An absent file (or a disabled tee) seeds from zero. A file that EXISTS but
-    cannot be read must NOT — seeding from zero would mint ids that collide
-    with the persisted history the merge and compactor key on. Wall-clock
-    seconds is a floor no plausible sequence has reached, so the restarted
-    process stays collision-free at the cost of a big id.
+    Caller holds BOTH history locks. An absent file floors at zero. A file
+    that EXISTS but cannot be read must NOT — seeding from zero would mint
+    ids that collide with the persisted history the merge and compactor key
+    on. Wall-clock seconds is a floor no plausible sequence has reached, so
+    the process stays collision-free at the cost of a big id.
     """
 
-    if not _history_enabled():
-        return 0
     try:
-        with _HISTORY_LOCK:
-            path = _history_path()
-            if not path.exists():
-                return 0
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        ids = []
-        for line in lines:
-            try:
-                ids.append(int(json.loads(line)["runId"]))
-            except Exception:  # noqa: BLE001 — a torn line costs itself only
-                continue
-        return max(ids, default=0)
+        if not path.exists():
+            return 0
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as exc:  # noqa: BLE001 — unreadable-but-present history
         _log.warning("talk run history unreadable at seed time: %s", exc)
         return int(time.time())
+    ids = []
+    for line in lines:
+        try:
+            ids.append(int(json.loads(line)["runId"]))
+        except Exception:  # noqa: BLE001 — a torn line costs itself only
+            continue
+    return max(ids, default=0)
+
+
+def _tail_records_from_path(path) -> dict[int, dict]:
+    """Newest record per run from the JSONL tail. Caller holds the locks.
+
+    ``errors="replace"``: a torn byte must cost one line, not the file.
+    """
+
+    if not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    records: dict[int, dict] = {}
+    for line in lines[-_HISTORY_TAIL_LINES:]:
+        try:
+            rec = json.loads(line)
+            records[int(rec["runId"])] = rec
+        except Exception:  # noqa: BLE001 — a torn line costs itself only
+            continue
+    return records
 
 
 def _load_history() -> dict[int, dict]:
@@ -274,18 +421,8 @@ def _load_history() -> dict[int, dict]:
     try:
         with _HISTORY_LOCK:
             path = _history_path()
-            if not path.exists():
-                return {}
-            # errors="replace": a torn byte must cost one line, not the file.
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        records: dict[int, dict] = {}
-        for line in lines[-_HISTORY_TAIL_LINES:]:
-            try:
-                rec = json.loads(line)
-                records[int(rec["runId"])] = rec
-            except Exception:  # noqa: BLE001 — a torn line costs itself only
-                continue
-        return records
+            with _history_file_lock(path):
+                return _tail_records_from_path(path)
     except Exception as exc:  # noqa: BLE001 — history is telemetry, not truth
         _log.warning("talk run history read failed: %s", exc)
         return {}
@@ -326,9 +463,11 @@ def start_run(
     ``failed`` with the exception text — the registry always terminates.
 
     Raises :class:`RoutingUnavailable` — BEFORE any work starts — when no Talk
-    connection is bound, or when the acceptance record cannot be persisted.
-    Both mean the same thing: there is no exact place to send the result, so
-    accepting the job would be a promise this process cannot keep.
+    connection is bound, when the acceptance record cannot be persisted, or
+    when the history tee is disabled without the explicit
+    ``ALLOW_EPHEMERAL_ENV`` opt-in. All three mean the same thing: there is
+    no exact place to send the result, so accepting the job would be a
+    promise this process cannot keep.
     """
 
     if kind not in RUN_KINDS:
@@ -343,46 +482,23 @@ def start_run(
     # at acceptance, so a later attach cannot retroactively claim this run.
     ticket = {**owner, "requestId": f"req-{uuid.uuid4().hex[:12]}"}
 
-    global _RUN_SEQ
-    # Seed the sequence past the persisted history once per process so run ids
-    # stay monotonic across restarts — the history merge keys on runId, and a
-    # restarted process must not mint colliding ids.
-    if _RUN_SEQ == 0:
-        floor = _history_seed_floor()
-        with _RUN_LOCK:
-            if _RUN_SEQ == 0:
-                _RUN_SEQ = floor
-    with _RUN_LOCK:
-        _RUN_SEQ += 1
-        run_id = _RUN_SEQ
-        now = time.time()
-        entry = {
-            "kind": kind,
-            "label": label,
-            "status": "running",
-            "output": "",
-            "meta": dict(meta or {}),
-            "ticket": dict(ticket),
-            "delivery": DELIVERY_PENDING,
-            "ts": now,
-            "updated": now,
-        }
+    now = time.time()
+    entry = {
+        "kind": kind,
+        "label": label,
+        "status": "running",
+        "output": "",
+        "meta": dict(meta or {}),
+        "ticket": dict(ticket),
+        "delivery": DELIVERY_PENDING,
+        "ts": now,
+        "updated": now,
+    }
     # Durability FIRST, then the registry, then the worker. The old order wrote
     # history last and fail-open, so a failed write still returned a run id and
     # the caller still spoke WORK_STARTED — a receipt for a run nothing could
-    # ever route. A burned sequence number on refusal is the deliberate cost;
-    # ids only have to be unique and monotonic, never gapless.
-    try:
-        _append_history_strict({"runId": run_id, **entry})
-    except Exception as exc:
-        # Re-raised, never swallowed: no durable route means no acceptance.
-        _log.warning(
-            "talk run acceptance write failed, refusing dispatch: %s: %s",
-            type(exc).__name__, exc,
-        )
-        raise RoutingUnavailable(
-            f"the run couldn't be recorded durably: {type(exc).__name__}: {exc}"
-        ) from exc
+    # ever route.
+    run_id = _accept_run(entry)
     with _RUN_LOCK:
         _RUNS[run_id] = entry
         # Evict AFTER inserting so the cap holds for the registry as it now
@@ -396,6 +512,60 @@ def start_run(
     )
     thread.start()
     return run_id
+
+
+def _ephemeral_runs_allowed() -> bool:
+    """The explicit opt-in to non-durable acceptance, resolved at call time."""
+
+    return (os.environ.get(ALLOW_EPHEMERAL_ENV) or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _accept_run(entry: dict) -> int:
+    """Allocate a collision-free run id and persist the acceptance record.
+
+    The id is allocated INSIDE the cross-process file lock, floored on the
+    file's own highest persisted id at THAT moment, so two processes sharing
+    the file (the CLI lane and the dashboard lane) can never mint the same
+    id — the history merge and the compactor key on ``runId``, and a
+    collision would let one process's terminal record overwrite the other's.
+    A burned sequence number on refusal is the deliberate cost; ids only
+    have to be unique and monotonic, never gapless.
+
+    A disabled tee refuses unless the caller opted into ephemeral routing by
+    name — silence here is exactly how a "durable" acceptance quietly stops
+    being durable.
+    """
+
+    global _RUN_SEQ
+    if not _history_enabled():
+        if not _ephemeral_runs_allowed():
+            raise RoutingUnavailable(
+                "the run history tee is disabled, so no durable return route "
+                f"can be minted — set {ALLOW_EPHEMERAL_ENV}=1 to explicitly "
+                "accept in-memory-only routing"
+            )
+        with _RUN_LOCK:
+            _RUN_SEQ += 1
+            return _RUN_SEQ
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            with _history_file_lock(path):
+                floor = _seed_floor_locked(path)
+                with _RUN_LOCK:
+                    _RUN_SEQ = max(_RUN_SEQ, floor) + 1
+                    run_id = _RUN_SEQ
+                _append_line_locked(path, {"runId": run_id, **entry})
+        return run_id
+    except Exception as exc:
+        # Re-raised, never swallowed: no durable route means no acceptance.
+        _log.warning(
+            "talk run acceptance write failed, refusing dispatch: %s: %s",
+            type(exc).__name__, exc,
+        )
+        raise RoutingUnavailable(
+            f"the run couldn't be recorded durably: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _run_worker(run_id: int, worker: Callable[[int], str]) -> None:
@@ -448,19 +618,31 @@ def _terminal_tee_locked(run_id: int, run: dict) -> dict:
         "meta": dict(run["meta"]),
         "ticket": dict(run.get("ticket") or {}),
         "delivery": run.get("delivery") or DELIVERY_PENDING,
+        "deliveryClaim": dict(run.get("deliveryClaim") or {}),
         "ts": run["ts"],
         "updated": run["updated"],
     }
 
 
-def annotate_run(run_id: int, *, tee: bool = False, **fields: Any) -> None:
+def annotate_run(
+    run_id: int, *, tee: bool = False, durable: bool = False, **fields: Any
+) -> None:
     """Merge worker-observed facts (pid, phase) into the entry.
 
     ``tee=True`` also persists a full snapshot to the JSONL history — for
     facts that must SURVIVE this process, like a stop receipt promised to
     the operator (Codex v0.6.1 finding 1: a daemon thread's receipt
     otherwise died with the session, and history reloads rebuilt
-    ``meta={}``, leaving the promise unkeepable).
+    ``meta={}``, leaving the promise unkeepable). Fail-open: a disk hiccup
+    costs the receipt, never the run.
+
+    ``durable=True`` (implies tee) is for the one fact that is a RESUME
+    HANDLE rather than a receipt: the api-server lane's remote run id. It
+    rides the strict, cross-process-locked append with one retry; if the
+    write still cannot land, the failure is ESCALATED to an error log naming
+    the run — the run itself keeps going (its live watcher still delivers),
+    but a reconnect would not be able to resume tracking it, and that must
+    be visible rather than swallowed as telemetry.
     """
 
     with _RUN_LOCK:
@@ -469,44 +651,154 @@ def annotate_run(run_id: int, *, tee: bool = False, **fields: Any) -> None:
             return
         run["meta"].update(fields)
         run["updated"] = time.time()
-        record = _terminal_tee_locked(run_id, run) if tee else None
-    if record is not None:
+        record = _terminal_tee_locked(run_id, run) if (tee or durable) else None
+    if record is None:
+        return
+    if not durable:
         _append_history(record)
+        return
+    if not _history_enabled():
+        # The ephemeral opt-in (or an explicit history test fixture) already
+        # declared in-memory-only routing acceptable; there is nothing to
+        # escalate about a tee that is inert by configuration.
+        return
+    for attempt in (1, 2):
+        try:
+            _append_history_strict(record)
+            return
+        except Exception as exc:  # noqa: BLE001 — retry once, then escalate
+            if attempt == 2:
+                _log.error(
+                    "talk run %s: the durable annotate (%s) could not be "
+                    "persisted after a retry — a reconnect cannot resume this "
+                    "run: %s: %s",
+                    run_id,
+                    ", ".join(sorted(fields)),
+                    type(exc).__name__,
+                    exc,
+                )
 
 
-def mark_delivered(run_id: int) -> bool:
-    """Claim a run's result for delivery. True iff THIS call won the claim.
+def claim_delivery(run_id: int, *, claimant: str) -> bool:
+    """Phase one: stake this session's claim on a terminal result.
 
-    Exact-once, compare-and-set, in the same first-writer-wins shape as
-    :func:`finish_run`. Callers must claim BEFORE they speak: losing the claim
-    means another route already owns this result, and speaking it anyway is
-    the duplicate-announcement bug this exists to prevent.
+    True iff THIS call staked the claim. Claim BEFORE queueing the
+    announcement — losing means another route already owns this result, and
+    speaking it anyway is the duplicate-announcement bug this exists to
+    prevent. Flip with :func:`mark_delivered` only after the batch is
+    actually handed to the wire: a claim alone never consumes the result, so
+    a teardown between the two leaves it re-adoptable instead of lost.
 
     Two substrates, because a result can be claimed from either side of a
     restart:
 
     - A LIVE run is claimed in the registry, which is authoritative for this
-      process. Its durable tee stays fail-open like every other non-acceptance
-      write — the operator is present and waiting, so a disk hiccup must not
-      swallow a result already in hand. Residual risk, accepted: if that tee
-      specifically fails AND this process crashes before any later successful
-      write for this run id, the persisted record stays "pending" and a
-      reconnect may re-announce a result that was already spoken live.
-    - A HISTORY-ONLY run — the reconnect case, whose process is gone — has no
-      registry entry to carry the flag, so the durable record IS the claim and
-      the write is fail-CLOSED. An unpersisted claim is not a claim, and
-      speaking on one would re-announce the same result at every reconnect.
+      process, and only from ``pending`` — a live claim held by another
+      route means someone in this process is already about to speak it. The
+      durable tee of the claim stays fail-open like every other
+      non-acceptance write (the operator is present and waiting; a disk
+      hiccup must not swallow a result already in hand).
+    - A HISTORY-ONLY run — the reconnect case, whose process is gone — has
+      no registry entry to carry the flag, so the durable record IS the
+      claim and the write is fail-CLOSED, atomically under the
+      cross-process file lock. A stale claim by a DIFFERENT session is
+      stolen here on purpose: its claimant died with its process, and
+      honouring it forever would strand the result.
     """
 
+    claimant = str(claimant or "")
+    if not claimant:
+        return False
     with _RUN_LOCK:
         run = _RUNS.get(run_id)
         if run is not None:
             # A run that has not landed has no result to claim, and claiming
-            # it early would mark it delivered forever — the reconnect that
-            # was owed the eventual output would then skip right past it.
+            # it early would consume it — the reconnect that was owed the
+            # eventual output would then skip right past it.
             if run["status"] not in TERMINAL_STATUSES:
                 return False
-            if run.get("delivery") == DELIVERED:
+            if run.get("delivery") != DELIVERY_PENDING:
+                return False
+            run["delivery"] = DELIVERY_CLAIMED
+            run["deliveryClaim"] = {"claimant": claimant, "ts": time.time()}
+            run["updated"] = time.time()
+            tee = _terminal_tee_locked(run_id, run)
+        else:
+            tee = None
+    if tee is not None:
+        _append_history(tee)
+        return True
+    return _claim_in_history(run_id, claimant)
+
+
+def _claim_in_history(run_id: int, claimant: str) -> bool:
+    """Stake a durable claim on a history-only run. True iff this call did.
+
+    One atomic load-check-append under the cross-process file lock: without
+    it, the CLI lane and the dashboard lane could both read ``pending`` and
+    both append a claim — the cross-process double-claim this lock exists to
+    prevent. Compaction keeps the newest record per run, so the appended
+    claimed copy supersedes the pending one without losing a field.
+    """
+
+    if not _history_enabled():
+        return False
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            with _history_file_lock(path):
+                record = _tail_records_from_path(path).get(run_id)
+                if record is None or record.get("status") not in TERMINAL_STATUSES:
+                    # A record still marked running belonged to a dead process
+                    # and reads as `lost`; there is no result behind it.
+                    return False
+                if record.get("delivery") == DELIVERED:
+                    return False
+                claim = record.get("deliveryClaim") or {}
+                if (
+                    record.get("delivery") == DELIVERY_CLAIMED
+                    and claim.get("claimant") == claimant
+                ):
+                    # Already ours — queueing it again would duplicate.
+                    return False
+                claimed = dict(record)
+                claimed["delivery"] = DELIVERY_CLAIMED
+                claimed["deliveryClaim"] = {"claimant": claimant, "ts": time.time()}
+                claimed["updated"] = time.time()
+                _append_line_locked(path, claimed)
+        return True
+    except Exception as exc:  # noqa: BLE001 — an unclaimed result is not spoken
+        _log.warning("talk run %s delivery claim failed to persist: %s", run_id, exc)
+        return False
+
+
+def mark_delivered(run_id: int, *, claimant: str) -> bool:
+    """Phase two: flip a claimed result to delivered, post-wire.
+
+    True iff THIS call performed the flip. Only the session that HOLDS the
+    claim may flip it — asserting the claimant closes the any-caller
+    denial-of-delivery hole where a stranger could consume a result it never
+    claimed. Call it at the announcement pump's post-send point, never at
+    enqueue: flipping early re-opens the loss window :func:`claim_delivery`
+    exists to close.
+
+    The flip is fail-open on both substrates — the result has already been
+    handed to the wire, so a disk hiccup here must not matter. A flip that
+    fails to persist leaves the record claimed; a LATER session sees a stale
+    claim and re-adopts, which is the bounded-duplication side of the trade
+    and the right one.
+    """
+
+    claimant = str(claimant or "")
+    if not claimant:
+        return False
+    with _RUN_LOCK:
+        run = _RUNS.get(run_id)
+        if run is not None:
+            if run["status"] not in TERMINAL_STATUSES:
+                return False
+            claim = run.get("deliveryClaim") or {}
+            if run.get("delivery") != DELIVERY_CLAIMED or claim.get("claimant") != claimant:
                 return False
             run["delivery"] = DELIVERED
             run["updated"] = time.time()
@@ -516,39 +808,56 @@ def mark_delivered(run_id: int) -> bool:
     if tee is not None:
         _append_history(tee)
         return True
-    return _claim_delivery_in_history(run_id)
+    return _flip_delivered_in_history(run_id, claimant)
 
 
-def _claim_delivery_in_history(run_id: int) -> bool:
-    """Flip a history-only run to delivered. True iff this call flipped it.
+def _flip_delivered_in_history(run_id: int, claimant: str) -> bool:
+    """Flip a history-only claim this claimant holds. True iff it flipped."""
 
-    Compaction keeps the newest record per run, so appending a delivered copy
-    of the whole record supersedes the pending one without losing a field.
-    """
-
-    record = _load_history().get(run_id)
-    if record is None or record.get("delivery") == DELIVERED:
+    if not _history_enabled():
         return False
-    if record.get("status") not in TERMINAL_STATUSES:
-        # A record still marked running belonged to a dead process and reads
-        # as `lost`; there is no result behind it to hand anyone.
-        return False
-    claimed = dict(record)
-    claimed["delivery"] = DELIVERED
-    claimed["updated"] = time.time()
     try:
-        _append_history_strict(claimed)
-    except Exception as exc:  # noqa: BLE001 — an unclaimed result is not spoken
-        _log.warning("talk run %s delivery claim failed to persist: %s", run_id, exc)
+        with _HISTORY_LOCK:
+            path = _history_path()
+            with _history_file_lock(path):
+                record = _tail_records_from_path(path).get(run_id)
+                if record is None or record.get("delivery") != DELIVERY_CLAIMED:
+                    return False
+                claim = record.get("deliveryClaim") or {}
+                if claim.get("claimant") != claimant:
+                    return False
+                flipped = dict(record)
+                flipped["delivery"] = DELIVERED
+                flipped["updated"] = time.time()
+                _append_line_locked(path, flipped)
+        return True
+    except Exception as exc:  # noqa: BLE001 — the spoken result stands either way
+        _log.warning("talk run %s delivered flip failed to persist: %s", run_id, exc)
         return False
-    return True
 
 
-def list_undelivered_for_session(hermes_session_id: str | None) -> list[dict]:
-    """Terminal, unclaimed runs whose ticket names this Hermes session.
+def list_undelivered_for_session(
+    hermes_session_id: str | None,
+    *,
+    operator: str | None,
+    profile: str | None,
+    claimant: str | None = None,
+) -> list[dict]:
+    """Terminal, undelivered runs whose ticket names this exact binding.
 
     The reconnect-adoption source: a resumed Talk connection standing on the
-    same durable Hermes session owns these results and nobody else does.
+    same durable Hermes session — under the SAME operator and profile
+    binding — owns these results and nobody else does. The ticket's
+    ``operator`` and ``profile`` are ENFORCED, not just recorded: a ticket
+    accepted under a different binding is not adopted even behind the same
+    Hermes session id; the mismatch is logged and skipped.
+
+    Delivery-state filter, per the two-phase claim: ``delivered`` never
+    surfaces; ``claimed`` by ``claimant`` (this caller's own in-flight
+    announcements) never surfaces; ``claimed`` by anyone ELSE surfaces —
+    that claimant's process is gone by definition on this path, and a claim
+    whose announcement was never handed to the wire must stay collectable
+    (see :func:`claim_delivery`).
 
     Fails closed in both directions. A run with no ticket (every record
     predating hermes-talk#35) and a ticket with no ``hermesSessionId`` never
@@ -578,15 +887,86 @@ def list_undelivered_for_session(hermes_session_id: str | None) -> list[dict]:
     for run in merged.values():
         if run.get("status") not in TERMINAL_STATUSES:
             continue
-        if run.get("delivery") == DELIVERED:
+        delivery = run.get("delivery")
+        if delivery == DELIVERED:
+            continue
+        claim = run.get("deliveryClaim") or {}
+        if delivery == DELIVERY_CLAIMED and claimant and claim.get("claimant") == claimant:
             continue
         ticket = run.get("ticket")
         if not isinstance(ticket, dict):
             continue
         if ticket.get("hermesSessionId") != hermes_session_id:
             continue
+        if ticket.get("operator") != operator or ticket.get("profile") != profile:
+            _log.info(
+                "talk run %s not adopted: its ticket is bound to operator=%r "
+                "profile=%r, not this session's operator=%r profile=%r",
+                run.get("runId"),
+                ticket.get("operator"),
+                ticket.get("profile"),
+                operator,
+                profile,
+            )
+            continue
         out.append(run)
+    _report_adoption_tail_falloff(hermes_session_id)
     return out
+
+
+def _report_adoption_tail_falloff(hermes_session_id: str) -> None:
+    """Visibility only: count owed results the adoption tail can no longer see.
+
+    The adoption scan is bounded to the newest ``_HISTORY_TAIL_LINES`` lines.
+    A terminal, undelivered record for this session sitting BEYOND that bound
+    will never be adopted; the bound is the design, but falling off it must
+    be reported, not silent. Fail-open at every seam — a visibility check
+    must never break adoption itself.
+    """
+
+    if not _history_enabled():
+        return
+    try:
+        with _HISTORY_LOCK:
+            path = _history_path()
+            if not path.exists():
+                return
+            with _history_file_lock(path):
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) <= _HISTORY_TAIL_LINES:
+            return
+        tail_ids: set[int] = set()
+        for line in lines[-_HISTORY_TAIL_LINES:]:
+            try:
+                tail_ids.add(int(json.loads(line)["runId"]))
+            except Exception:  # noqa: BLE001 — a torn line costs itself only
+                continue
+        dropped: dict[int, dict] = {}
+        for line in lines[:-_HISTORY_TAIL_LINES]:
+            try:
+                rec = json.loads(line)
+                dropped[int(rec["runId"])] = rec
+            except Exception:  # noqa: BLE001 — a torn line costs itself only
+                continue
+        lost = sorted(
+            rid
+            for rid, rec in dropped.items()
+            if rid not in tail_ids
+            and rec.get("status") in TERMINAL_STATUSES
+            and rec.get("delivery") != DELIVERED
+            and isinstance(rec.get("ticket"), dict)
+            and rec["ticket"].get("hermesSessionId") == hermes_session_id
+        )
+        if lost:
+            _log.warning(
+                "talk run adoption: %d owed result(s) for this session fell off "
+                "the %d-line history tail and will not be adopted: runs %s",
+                len(lost),
+                _HISTORY_TAIL_LINES,
+                lost,
+            )
+    except Exception as exc:  # noqa: BLE001 — visibility must never break adoption
+        _log.debug("talk run adoption tail check failed: %s", exc)
 
 
 def get_run(run_id: int) -> dict | None:
@@ -641,6 +1021,7 @@ def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
             # neither, and an absent ticket is what makes it unadoptable.
             "ticket": dict(rec.get("ticket") or {}),
             "delivery": rec.get("delivery") or DELIVERY_PENDING,
+            "deliveryClaim": dict(rec.get("deliveryClaim") or {}),
             "ts": rec.get("ts"),
             "updated": rec.get("updated"),
             "fromHistory": True,
@@ -750,7 +1131,9 @@ def reset_for_tests() -> None:
 
 
 __all__ = [
+    "ALLOW_EPHEMERAL_ENV",
     "DELIVERED",
+    "DELIVERY_CLAIMED",
     "DELIVERY_PENDING",
     "HISTORY_OUTPUT_CAP",
     "RUN_KINDS",
@@ -758,6 +1141,7 @@ __all__ = [
     "RoutingUnavailable",
     "annotate_run",
     "attach_owner",
+    "claim_delivery",
     "current_owner",
     "detach_owner",
     "finish_run",

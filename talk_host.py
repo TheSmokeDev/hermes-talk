@@ -291,12 +291,14 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 session_id=session_id,
                 # The remote id is stop_work's only address for this run —
                 # without it the lane is stop-capable in theory and
-                # unstoppable in practice. Teed durably (hermes-talk#35): it
-                # is also the ONLY handle a reconnect could resume tracking
-                # by, and in memory alone it died with the process that is,
-                # by definition, the one that is gone.
+                # unstoppable in practice. It is also the ONLY handle a
+                # reconnect could resume tracking by, and in memory alone it
+                # died with the process that is, by definition, the one that
+                # is gone — so it rides the STRICT locked append
+                # (durable=True: retried once, escalated to an error log if
+                # it still cannot land), never the fail-open telemetry tee.
                 on_start=lambda api_run_id: talk_runs.annotate_run(
-                    run_id, tee=True, api_run_id=api_run_id
+                    run_id, durable=True, api_run_id=api_run_id
                 ),
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:

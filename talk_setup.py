@@ -17,7 +17,7 @@ import tempfile
 from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Literal
 
 try:
     from . import talk_config, talk_doctor
@@ -266,10 +266,10 @@ def _windows_current_user_sid() -> str:
     close_handle.restype = wintypes.BOOL
 
     class SidAndAttributes(ctypes.Structure):
-        _fields_: ClassVar[list] = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
 
     class TokenUser(ctypes.Structure):
-        _fields_: ClassVar[list] = [("user", SidAndAttributes)]
+        _fields_ = [("user", SidAndAttributes)]
 
     token = wintypes.HANDLE()
     if not open_process_token(get_current_process(), 0x0008, ctypes.byref(token)):
@@ -529,21 +529,21 @@ def _windows_dacl_grants_only_full_control(sddl: str, principal_sid: str) -> boo
     equal_sid.restype = wintypes.BOOL
 
     class AclSizeInformation(ctypes.Structure):
-        _fields_: ClassVar[list] = [
+        _fields_ = [
             ("ace_count", wintypes.DWORD),
             ("acl_bytes_in_use", wintypes.DWORD),
             ("acl_bytes_free", wintypes.DWORD),
         ]
 
     class AceHeader(ctypes.Structure):
-        _fields_: ClassVar[list] = [
+        _fields_ = [
             ("ace_type", ctypes.c_ubyte),
             ("ace_flags", ctypes.c_ubyte),
             ("ace_size", wintypes.WORD),
         ]
 
     class AccessAllowedAce(ctypes.Structure):
-        _fields_: ClassVar[list] = [
+        _fields_ = [
             ("header", AceHeader),
             ("mask", wintypes.DWORD),
             ("sid_start", wintypes.DWORD),

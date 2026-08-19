@@ -584,6 +584,34 @@ class HostExecutionRelay:
         return [output or [] for output in outputs]
 
 
+class QueuedAnnouncement:
+    """An announcement batch plus the delivery flip owed once it is SENT.
+
+    Two-phase delivery: a run's result is CLAIMED at enqueue
+    (``talk_runs.claim_delivery``) and flipped to delivered only at the
+    pump's post-send point, so a session torn down while the batch is still
+    queued leaves the result re-adoptable instead of permanently consumed.
+    The residual window is a crash BETWEEN the wire hand-off and the flip,
+    which re-announces the result once on the next reconnect — the correct
+    trade against never saying it at all.
+    """
+
+    __slots__ = ("commands", "on_sent")
+
+    def __init__(self, commands, on_sent=None) -> None:
+        self.commands = commands
+        self.on_sent = on_sent
+
+
+def _announcement_sent(on_sent) -> None:
+    """Run the post-send delivery flip; it must never take down the pump."""
+
+    if on_sent is None:
+        return
+    with suppress(Exception):
+        on_sent()
+
+
 async def pump_announcements(
     announce_queue, relay, ws, send_batch=None, response_busy=None
 ) -> None:
@@ -605,7 +633,11 @@ async def pump_announcements(
     """
 
     while True:
-        batch = await announce_queue.get()
+        queued = await announce_queue.get()
+        if isinstance(queued, QueuedAnnouncement):
+            batch, on_sent = queued.commands, queued.on_sent
+        else:
+            batch, on_sent = queued, None
         while True:
             while response_busy() if response_busy is not None else relay.response_active:
                 await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
@@ -613,6 +645,7 @@ async def pump_announcements(
                 if send_batch is None:
                     for out in batch:
                         await ws.send_json(out)
+                    _announcement_sent(on_sent)
                     break
                 # The poll above is check-then-act: a response can start while
                 # this batch waits for the send lock. send_batch re-checks
@@ -620,6 +653,9 @@ async def pump_announcements(
                 # response, so a declined batch waits for idle and goes again —
                 # deferred in its original order, never dropped.
                 if await send_batch(batch, is_announcement=True):
+                    # The batch is on the wire — NOW the result counts as
+                    # delivered (two-phase claim; see QueuedAnnouncement).
+                    _announcement_sent(on_sent)
                     break
                 # Declined. In-repo the busy predicate is a strict superset of
                 # send_outgoing's decline condition, so the wait loop above
@@ -1037,11 +1073,21 @@ async def run_talk_session(
                 if run is None:
                     return
                 if run["status"] in talk_runs.TERMINAL_STATUSES:
-                    # Claim first: losing means a reconnect adoption already
-                    # spoke this result, and saying it twice is worse than
-                    # not saying it at all.
-                    if talk_runs.mark_delivered(run_id):
-                        await announce_queue.put(run_finished_commands(run))
+                    # Two-phase: CLAIM first — losing means another route
+                    # already owns this result, and saying it twice is worse
+                    # than not saying it at all. The delivered flip happens
+                    # at the pump's post-send point, so a teardown while the
+                    # batch is still queued leaves the result re-adoptable
+                    # instead of consumed-but-unspoken.
+                    if talk_runs.claim_delivery(run_id, claimant=talk_session_id):
+                        await announce_queue.put(
+                            QueuedAnnouncement(
+                                run_finished_commands(run),
+                                lambda: talk_runs.mark_delivered(
+                                    run_id, claimant=talk_session_id
+                                ),
+                            )
+                        )
                     return
 
         tool_coordinator = ToolResponseCoordinator(
@@ -1177,28 +1223,46 @@ async def run_talk_session(
         # of the same session, and the ticket records which one accepted a run.
         talk_session_id = uuid.uuid4().hex
         generation_id = uuid.uuid4().hex[:12]
+        talk_profile = talk_config.agent_profile()
         talk_runs.attach_owner(
             talk_session_id=talk_session_id,
             generation_id=generation_id,
             hermes_session_id=owner_session_id,
             operator=auth.source,
-            profile=talk_config.agent_profile(),
+            profile=talk_profile,
         )
         # Results this session is OWED — accepted under a durable Hermes
-        # session that is still ours, finished while nothing was listening.
-        # Claim each one before queueing it: mark_delivered is the exact-once
-        # gate, so a result whose claim is lost belongs to another route and
-        # speaking it anyway is the duplicate this whole mechanism prevents.
-        for orphaned in talk_runs.list_undelivered_for_session(owner_session_id):
+        # session that is still ours, by this SAME operator/profile binding
+        # (a ticket bound to a different binding is never adopted), finished
+        # while nothing was listening. Two-phase: claim_delivery stakes the
+        # exact-once claim before queueing; the delivered flip happens at the
+        # pump's post-send point, so a teardown between claim and speak loses
+        # nothing. A record still claimed by a PREVIOUS session surfaces here
+        # as undelivered — its claimant died with its process — and the
+        # duplication window is bounded to a crash between the wire hand-off
+        # and the flip (see QueuedAnnouncement).
+        for orphaned in talk_runs.list_undelivered_for_session(
+            owner_session_id,
+            operator=auth.source,
+            profile=talk_profile,
+            claimant=talk_session_id,
+        ):
             try:
                 orphan_id = int(orphaned["runId"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if not talk_runs.mark_delivered(orphan_id):
+            if not talk_runs.claim_delivery(orphan_id, claimant=talk_session_id):
                 continue
             commands = run_finished_commands(orphaned)
             if commands:
-                announce_queue.put_nowait(commands)
+                announce_queue.put_nowait(
+                    QueuedAnnouncement(
+                        commands,
+                        lambda rid=orphan_id: talk_runs.mark_delivered(
+                            rid, claimant=talk_session_id
+                        ),
+                    )
+                )
         # The notifier fires on host drain threads; marshal back onto this loop.
         talk_steer.set_landed_notifier(
             lambda sid: loop.call_soon_threadsafe(on_note_landed, sid)
@@ -1367,6 +1431,7 @@ __all__ = [
     "WATCH_OUTPUT_TAIL_CHARS",
     "WATCH_POLL_S",
     "WORK_STARTED_RE",
+    "QueuedAnnouncement",
     "SpeakerPacketLane",
     "build_session_update",
     "cli_entry",
