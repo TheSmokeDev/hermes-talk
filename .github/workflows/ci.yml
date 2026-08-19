@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual escape hatch: GitHub occasionally drops pull_request event delivery
+  # for a branch (observed 2026-08-19 — three pushes, a close/reopen, zero runs
+  # created). This lets an operator run the suite against any ref by hand.
+  workflow_dispatch:
 
 jobs:
   test:
