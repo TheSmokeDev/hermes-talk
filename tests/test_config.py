@@ -155,6 +155,32 @@ def test_unset_discord_operator_config_authorizes_nobody(monkeypatch):
     assert talk_config.discord_operator_user_ids() == frozenset()
 
 
+# --- approval_permit_ttl_s ----------------------------------------------------
+
+
+def test_approval_permit_ttl_s_defaults_when_unset(monkeypatch):
+    monkeypatch.delenv("TALK_APPROVAL_PERMIT_TTL_S", raising=False)
+
+    assert talk_config.approval_permit_ttl_s() == talk_config.DEFAULT_APPROVAL_PERMIT_TTL_S
+
+
+def test_approval_permit_ttl_s_honors_a_positive_override(monkeypatch):
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "5")
+
+    assert talk_config.approval_permit_ttl_s() == 5.0
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "not-a-number", "  "])
+def test_approval_permit_ttl_s_falls_back_on_junk_or_non_positive(monkeypatch, raw):
+    """A permit window is never zero, negative, or unparseable: any of those
+    would either deny every mutation or leave the permit valid forever.
+    """
+
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", raw)
+
+    assert talk_config.approval_permit_ttl_s() == talk_config.DEFAULT_APPROVAL_PERMIT_TTL_S
+
+
 # --- identity_char_limit ------------------------------------------------------
 
 

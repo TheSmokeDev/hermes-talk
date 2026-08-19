@@ -77,6 +77,34 @@ named rather than smoothed.
   preamble's damage-based confirmation policy governs every other
   consequential action here — not by a mechanism that can refuse.
 
+- A spoken approval now binds to the exact action it approved, so a mutating
+  request takes one summary-then-yes exchange instead of a draft → confirm →
+  restate → confirm loop (hermes-talk#37). The single-use call permit minted
+  in `bind_tool_event` already bound *who* approved and *which* response; it
+  now also binds *what*, with each check honest about which threat it
+  covers. The permit's expiry (`TALK_APPROVAL_PERMIT_TTL_S`, default 30s,
+  monotonic clock) runs from the moment the operator's approving speech
+  ended — never from permit mint — so a model that sits on an approved
+  action cannot fire a stale yes into a conversation that has moved on; a
+  binding with no approval moment mints no permit at all. For tools that
+  name a target (`steer_agent`, `redirect_agent`, `stop_work`), the emitted
+  target is cross-checked against a bounded window of the spoken exchange
+  (operator and assistant transcripts) before the permit exists: a target
+  that was never spoken to the operator is refused outright, which is the
+  check that catches the model saying "steer agent A" and emitting agent B.
+  Free-text arguments (a delegated task's wording) are not covered by that
+  cross-check. The tool name presented at execution must match the permit's
+  action, and the argument hash is a relay-integrity tripwire only — it
+  detects the bound event being rewritten inside this process between bind
+  and authorize, and cannot see model-side divergence from the spoken
+  summary. Arguments are compared by value rather than by serialization, so
+  a provider re-emitting the same arguments in a different key order, or
+  `1` as `1.0`, is not mistaken for a changed request. Approvals of mutating
+  tools are now logged alongside denials (operator id, tool, target — never
+  raw audio); previously only refusals were recorded, which left the audit
+  trail unable to show what was actually authorized. The voice preamble now
+  tells the model to state its plan once and act on a clear yes.
+
 ### Fixed
 - Delegated work and memory lookups are now bound to the exact Talk session
   that asked for them (hermes-talk#35). Previously the `WORK_STARTED` receipt

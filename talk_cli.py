@@ -1130,6 +1130,18 @@ async def run_talk_session(
                         authorization_ledger.note_speech_stopped(
                             {"item_id": event.input_id, "audio_end_ms": event.offset_ms}
                         )
+                    elif isinstance(event, talk_realtime.Transcript):
+                        # The spoken-exchange window behind the permit target
+                        # cross-check: operator turns and assistant deltas and
+                        # finals alike, so a target is checkable against what
+                        # was actually said by the time a tool call binds.
+                        authorization_ledger.note_transcript(
+                            {
+                                "text": event.text,
+                                "final": event.final,
+                                "response_id": event.response_id,
+                            }
+                        )
                     elif isinstance(event, talk_realtime.ResponseStarted):
                         authorization_ledger.note_response_created(
                             {
@@ -1222,6 +1234,8 @@ async def run_talk_session(
         # too. The generation is per-attach: a reconnect is a new generation
         # of the same session, and the ticket records which one accepted a run.
         talk_session_id = uuid.uuid4().hex
+        if authorization_ledger is not None:
+            authorization_ledger.bind_session(talk_session_id)
         generation_id = uuid.uuid4().hex[:12]
         talk_profile = talk_config.agent_profile()
         talk_runs.attach_owner(
