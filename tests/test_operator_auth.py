@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 
 import pytest
 
@@ -13,6 +15,14 @@ import talk_relay
 
 OPERATOR_ID = 586638048133906576
 OTHER_ID = 123456789012345678
+
+
+def _speak(ledger, text, *, response_id=None, final=True):
+    """Feed one spoken turn (operator or assistant) into the ledger window."""
+
+    ledger.note_transcript(
+        {"text": text, "final": final, "response_id": response_id}
+    )
 
 
 def _speaker(user_id: int | None) -> dict:
@@ -76,7 +86,9 @@ def test_allowlist_is_re_read_when_the_mutating_tool_executes(monkeypatch):
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger)
-    event = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_stop"})
+    event = ledger.bind_tool_event(
+        {"response_id": "resp_1", "call_id": "call_stop", "name": "stop_work"}
+    )
 
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
     assert ledger.authorize_tool("stop_work", event) is None
@@ -222,9 +234,11 @@ def test_response_metadata_token_is_required_not_just_response_order(monkeypatch
     )
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    good = ledger.bind_tool_event({"response_id": "resp_good", "call_id": "call_good"})
+    good = ledger.bind_tool_event(
+        {"response_id": "resp_good", "call_id": "call_good", "name": "redirect_agent"}
+    )
     unbound = ledger.bind_tool_event(
-        {"response_id": "resp_unbound", "call_id": "call_unbound"}
+        {"response_id": "resp_unbound", "call_id": "call_unbound", "name": "redirect_agent"}
     )
 
     assert ledger.authorize_tool("redirect_agent", good) is None
@@ -326,8 +340,12 @@ def test_mutating_call_id_is_consumed_exactly_once(monkeypatch):
     _bind_response(ledger)
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    first = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_once"})
-    replay = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_once"})
+    first = ledger.bind_tool_event(
+        {"response_id": "resp_1", "call_id": "call_once", "name": "stop_work"}
+    )
+    replay = ledger.bind_tool_event(
+        {"response_id": "resp_1", "call_id": "call_once", "name": "stop_work"}
+    )
 
     assert ledger.authorize_tool("stop_work", first) is None
     assert "not run" in ledger.authorize_tool("stop_work", replay)
@@ -338,7 +356,9 @@ def test_same_bound_call_permit_cannot_authorize_mutation_twice(monkeypatch):
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger)
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
-    event = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_once"})
+    event = ledger.bind_tool_event(
+        {"response_id": "resp_1", "call_id": "call_once", "name": "stop_work"}
+    )
 
     assert ledger.authorize_tool("stop_work", event) is None
     assert "not run" in ledger.authorize_tool("stop_work", event)
@@ -356,8 +376,12 @@ def test_call_id_reused_across_response_ids_cannot_mutate(monkeypatch):
     )
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    first = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_shared"})
-    replay = ledger.bind_tool_event({"response_id": "resp_2", "call_id": "call_shared"})
+    first = ledger.bind_tool_event(
+        {"response_id": "resp_1", "call_id": "call_shared", "name": "steer_agent"}
+    )
+    replay = ledger.bind_tool_event(
+        {"response_id": "resp_2", "call_id": "call_shared", "name": "steer_agent"}
+    )
 
     assert ledger.authorize_tool("steer_agent", first) is None
     assert "not run" in ledger.authorize_tool("steer_agent", replay)
@@ -394,8 +418,12 @@ def test_continuation_token_is_fresh_shared_and_single_use(monkeypatch):
     )
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    good = ledger.bind_tool_event({"response_id": "resp_2", "call_id": "call_3"})
-    forged = ledger.bind_tool_event({"response_id": "resp_forged", "call_id": "call_4"})
+    good = ledger.bind_tool_event(
+        {"response_id": "resp_2", "call_id": "call_3", "name": "redirect_agent"}
+    )
+    forged = ledger.bind_tool_event(
+        {"response_id": "resp_forged", "call_id": "call_4", "name": "redirect_agent"}
+    )
     assert ledger.authorize_tool("redirect_agent", good) is None
     assert "not run" in ledger.authorize_tool("redirect_agent", forged)
 
@@ -611,7 +639,7 @@ def test_clear_resets_response_call_and_poison_tombstones(monkeypatch):
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger, response_id="resp_same")
     first = ledger.bind_tool_event(
-        {"response_id": "resp_same", "call_id": "call_same"}
+        {"response_id": "resp_same", "call_id": "call_same", "name": "stop_work"}
     )
     assert ledger.authorize_tool("stop_work", first) is None
     ledger.bind_tool_event({"response_id": "resp_same", "call_id": "overflow"})
@@ -620,7 +648,7 @@ def test_clear_resets_response_call_and_poison_tombstones(monkeypatch):
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger, response_id="resp_same")
     after_teardown = ledger.bind_tool_event(
-        {"response_id": "resp_same", "call_id": "call_same"}
+        {"response_id": "resp_same", "call_id": "call_same", "name": "stop_work"}
     )
 
     assert ledger.authorize_tool("stop_work", after_teardown) is None
@@ -734,3 +762,360 @@ def test_completion_and_teardown_clear_bounded_response_state():
     assert ledger.response_count == 0
     assert ledger.binding_count == 0
     assert ledger.segment_count == 0
+
+
+def test_unchanged_arguments_still_authorize_within_ttl(monkeypatch):
+    """The permit binds arguments, so the ordinary path — approve, then run
+    exactly what was approved — must still go through on the first attempt.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "stop run 42 — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert ledger.authorize_tool("stop_work", event) is None
+
+
+def test_relay_side_argument_rewrite_trips_the_integrity_tripwire(monkeypatch, caplog):
+    """The args hash is a relay-integrity tripwire and nothing more: both
+    sides of the compare come from the same bound event dict, so the only
+    thing it can catch is this process rewriting the event between bind and
+    authorize — which this test does by hand. Model-side divergence from the
+    spoken summary is the spoken-target cross-check's job, not this hash's.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "stop run 42 — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+    event["arguments"] = '{"target": "43"}'
+
+    with caplog.at_level(logging.WARNING):
+        assert "not run" in ledger.authorize_tool("stop_work", event)
+    assert "bound arguments were rewritten after mint" in caplog.text
+
+
+def test_reordered_argument_keys_are_the_same_approved_action(monkeypatch):
+    """Canonicalization is by value, not by serialization: a provider that
+    re-emits the same arguments in another key order has not changed them.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "steer agent sa-0-a1b2c3d4 to focus on pricing — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "focus on pricing"}',
+        }
+    )
+    event["arguments"] = '{"text": "focus on pricing", "agent_id": "sa-0-a1b2c3d4"}'
+
+    assert ledger.authorize_tool("steer_agent", event) is None
+
+
+def test_expired_permit_denies_execution(monkeypatch):
+    """A permit is not valid forever. Once its window passes, the operator
+    approves again rather than a stale yes firing into a moved-on conversation.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "stop run 42 — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "0.01")
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+    # sleep() guarantees a lower bound on elapsed time, so a 10ms window is
+    # always past after 30ms — the expiry fires deterministically, not by luck.
+    time.sleep(0.03)
+
+    assert "not run" in ledger.authorize_tool("stop_work", event)
+
+
+def test_permit_records_action_target_and_session_for_the_audit_trail():
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.bind_session("talk-session-abc")
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "steer agent sa-0-a1b2c3d4 to focus on pricing — yes?")
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "focus on pricing"}',
+        }
+    )
+
+    permit = event["_talk_call_permit"]
+    assert permit.action == "steer_agent"
+    assert permit.target == "sa-0-a1b2c3d4"
+    assert permit.talk_session_id == "talk-session-abc"
+
+
+def test_ambiguous_speaker_carries_no_permit_and_is_denied(monkeypatch):
+    """An ambiguous binding has no approval moment, so no permit is even
+    minted — and the speaker-trust gate denies regardless. The spoken target
+    is fed here so the transcript cross-check cannot be what denies.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(10))
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(10))
+    _bind_response(ledger, end_ms=20)
+    _speak(ledger, "stop run 42 — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert event["_talk_call_permit"] is None
+    assert "not run" in ledger.authorize_tool("stop_work", event)
+
+
+def test_read_only_tools_are_unaffected_by_argument_binding(monkeypatch):
+    """Read-only tools never carried an approval to begin with; the permit
+    checks must not start gating the half of the surface that stays open.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "0.01")
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "search_memory",
+            "arguments": '{"query": "pricing"}',
+        }
+    )
+    time.sleep(0.03)
+    event["arguments"] = '{"query": "something else"}'
+
+    assert ledger.authorize_tool("search_memory", event) is None
+
+
+def test_permit_expiry_is_anchored_to_the_approval_not_the_mint(monkeypatch, caplog):
+    """#37's stale-yes bug: the model sits on an approved action and only
+    emits the call minutes later. The window runs from the operator's
+    approving speech, so a permit minted after the window is already dead —
+    mint time must never refresh an old approval.
+    """
+
+    clock = [1_000.0]
+    monkeypatch.setattr(talk_operator_auth.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "30")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)  # approval moment frozen at 1000.0
+    _speak(ledger, "stop run 42 — yes?")
+
+    clock[0] = 1_000.0 + 30.0 + 1.0  # the model sat on the approved action
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert "not run" in ledger.authorize_tool("stop_work", event)
+    assert "approval permit expired" in caplog.text
+
+
+def test_emitted_target_never_spoken_gets_no_permit(monkeypatch, caplog):
+    """The summary-vs-emitted divergence itself: the exchange said one agent
+    and the model emitted another. The unspoken target means no permit is
+    minted at all, and the denial names the real reason.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(
+        ledger,
+        "Should I steer agent sa-0-a1b2c3d4 to focus on pricing?",
+        response_id="resp_0",
+    )
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    with caplog.at_level(logging.WARNING):
+        event = ledger.bind_tool_event(
+            {
+                "response_id": "resp_1",
+                "call_id": "call_1",
+                "name": "steer_agent",
+                "arguments": '{"agent_id": "sa-9-ffff9999", "text": "focus on pricing"}',
+            }
+        )
+        denial = ledger.authorize_tool("steer_agent", event)
+
+    assert event["_talk_call_permit"] is None
+    assert "not run" in denial
+    assert "never spoken to the operator" in caplog.text
+
+
+def test_target_spoken_across_streamed_deltas_still_matches(monkeypatch):
+    """Assistant transcripts stream in fragments; an id split across deltas
+    (with an empty final) must still count as spoken.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "I'll steer agent sa-0-a1b", response_id="resp_0", final=False)
+    _speak(ledger, "2c3d4 to pricing now — yes?", response_id="resp_0", final=False)
+    _speak(ledger, "", response_id="resp_0", final=True)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "pricing"}',
+        }
+    )
+
+    assert ledger.authorize_tool("steer_agent", event) is None
+
+
+def test_target_spoken_by_the_operator_counts_as_spoken(monkeypatch):
+    """In the direct-command flow the operator names the target themselves;
+    their own input transcript is part of the spoken exchange.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "stop run 42")  # input transcripts carry no response id
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert ledger.authorize_tool("stop_work", event) is None
+
+
+def test_spoken_target_matching_survives_case_and_punctuation(monkeypatch):
+    """Speech models render ids with whatever spacing and punctuation they
+    like; the match is over a case-folded alphanumeric collapse.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "Steering SA 0, A1B2C3D4 — confirm?", response_id="resp_0")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "go"}',
+        }
+    )
+
+    assert ledger.authorize_tool("steer_agent", event) is None
+
+
+def test_tool_name_swap_after_mint_is_denied(monkeypatch, caplog):
+    """The permit binds the action itself: the same bound event presented
+    under a different mutating tool name must not execute.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "steer agent sa-0-a1b2c3d4 to pricing — yes?")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "go"}',
+        }
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert "not run" in ledger.authorize_tool("redirect_agent", event)
+    assert "action does not match approved permit" in caplog.text
+
+
+def test_integral_float_reserialization_is_not_a_changed_argument(monkeypatch):
+    """``1`` and ``1.0`` are the same value; a provider re-serializing one as
+    the other must not trip the integrity hash and false-deny the action.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "delegate_task",
+            "arguments": '{"task": "ship it", "count": 1}',
+        }
+    )
+    event["arguments"] = '{"count": 1.0, "task": "ship it"}'
+
+    assert ledger.authorize_tool("delegate_task", event) is None

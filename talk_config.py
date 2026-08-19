@@ -39,6 +39,11 @@ DEFAULT_API_SERVER_POLL_S = 1.0
 #: probe verdict above, and for the same reason: what a Hermes install has
 #: installed changes on the timescale of a restart, not of a sentence.
 DEFAULT_CAPABILITY_CATALOG_TTL_S = 30.0
+#: How long a spoken approval stays live. The window runs from the moment
+#: the operator's approving speech ended — never from permit mint — sized
+#: to one spoken exchange: long enough to act on a fresh yes, short enough
+#: that a stale yes cannot fire into a conversation that has moved on.
+DEFAULT_APPROVAL_PERMIT_TTL_S = 30.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -478,12 +483,22 @@ def discord_operator_user_ids() -> frozenset[int]:
     return frozenset(resolved)
 
 
+def approval_permit_ttl_s() -> float:
+    """How long a spoken approval stays live, measured on the monotonic
+    clock from the moment the approving speech ended. Junk or non-positive
+    overrides take the default; a permit is never valid forever.
+    """
+
+    return _positive_float("TALK_APPROVAL_PERMIT_TTL_S", DEFAULT_APPROVAL_PERMIT_TTL_S)
+
+
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
     "DEFAULT_API_SERVER_PROBE_TIMEOUT_S",
     "DEFAULT_API_SERVER_PROBE_TTL_S",
     "DEFAULT_API_SERVER_URL",
+    "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
@@ -499,6 +514,7 @@ __all__ = [
     "api_server_probe_timeout_s",
     "api_server_probe_ttl_s",
     "api_server_url",
+    "approval_permit_ttl_s",
     "audio_input_device",
     "audio_output_device",
     "detect_agent_profile",
