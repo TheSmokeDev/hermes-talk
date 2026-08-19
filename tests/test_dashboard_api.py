@@ -96,6 +96,15 @@ def clean_env(monkeypatch):
     monkeypatch.setenv("TALK_OPENAI_API_KEY", RAW_KEY)
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
+    # Runs are refused without a bound return route (hermes-talk#35), so the
+    # suite attaches one. Tests that assert the REFUSAL detach it explicitly.
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
     yield
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
@@ -512,3 +521,60 @@ def test_route_handlers_covers_every_declared_route():
     decorated = re.findall(r"@router\.(?:get|post|put|patch|delete)\(", source)
 
     assert len(decorated) == len(api.ROUTE_HANDLERS)
+
+
+# -- the browser lane's return route (hermes-talk#35) -------------------------
+
+
+def test_the_mint_binds_a_return_route_for_the_browser_lane(minted):
+    """/tool can start real work, so the mint has to bind a destination.
+
+    Without this the browser lane would refuse every delegation: the CLI
+    attaches at connect, and the web server process never runs that code.
+    """
+
+    talk_runs.detach_owner()
+
+    call(api.create_session, FakeRequest(body={}))
+    owner = talk_runs.current_owner()
+
+    assert owner is not None
+    assert owner["operator"].startswith("dashboard:")
+    assert owner["talkSessionId"]
+    # No plugin context is ever bound in the web server process, so there is
+    # no durable identity to adopt a run BY — and claiming one would be a lie.
+    assert owner["hermesSessionId"] is None
+
+
+def test_the_browser_ticket_never_carries_the_credential(minted):
+    """The ticket is written to disk; the descriptor holds a live secret."""
+
+    talk_runs.detach_owner()
+
+    call(api.create_session, FakeRequest(body={}))
+    blob = serialized(talk_runs.current_owner())
+
+    assert EPHEMERAL not in blob
+    assert RAW_KEY not in blob
+    assert CREDENTIAL_RE.search(blob) is None
+
+
+def test_a_second_mint_does_not_retroactively_reattribute_an_in_flight_run(minted):
+    """The ticket freezes at acceptance even when the OWNER slot is dashboard-wide.
+
+    Two tabs (or one reload) minting in the same process must not change who a
+    run already dispatched under the first mint is attributed to.
+    """
+
+    talk_runs.detach_owner()
+    call(api.create_session, FakeRequest(body={}))
+    first_owner = talk_runs.current_owner()
+
+    run_id = talk_runs.start_run("agent", "already dispatched", lambda _rid: "done")
+
+    call(api.create_session, FakeRequest(body={}))
+    second_owner = talk_runs.current_owner()
+
+    assert second_owner["talkSessionId"] != first_owner["talkSessionId"]
+    ticket = talk_runs.get_run(run_id)["ticket"]
+    assert ticket["talkSessionId"] == first_owner["talkSessionId"]

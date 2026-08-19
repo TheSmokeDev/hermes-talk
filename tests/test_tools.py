@@ -37,6 +37,15 @@ def unbound_ctx(monkeypatch):
 
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
+    # Runs are refused without a bound return route (hermes-talk#35), so the
+    # suite attaches one. Tests that assert the REFUSAL detach it explicitly.
+    talk_runs.attach_owner(
+        talk_session_id="ts-test",
+        generation_id="gen-test",
+        hermes_session_id="sess-test",
+        operator="test",
+        profile=None,
+    )
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
     # Vault availability is a property of the BOX, so leaving it unpinned
     # would make the advertised tool list depend on whether the machine

@@ -291,6 +291,34 @@ async def create_session(request: Request) -> dict:
         )
     except talk_wire.TalkWireError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Bind the browser lane's return route before it can dispatch anything
+    # (hermes-talk#35). The mint IS this lane's connect handshake: /tool is
+    # only reachable after it, and every run started through /tool is owed to
+    # whoever holds this descriptor.
+    #
+    # Three honest differences from the CLI lane, not two. There is no
+    # hermesSessionId — no plugin context is ever bound in the web server
+    # process — so a browser run is never adoptable across a restart, which
+    # is correct: there is no durable identity to adopt it BY. There is no
+    # detach, because a closed tab tells this process nothing; that is safe
+    # here only because this lane's destination is a durable POLL
+    # (GET /runs), not a live announcement that needs someone listening at
+    # the far end. And this owner slot is PROCESS-WIDE, not per-tab — a
+    # second concurrent /session mint silently reassigns the ticket used by
+    # every dashboard run dispatched afterward, including from an
+    # already-open tab. Safe today only because ticket identity here is
+    # audit metadata, never a routing or adoption key: an already-accepted
+    # run's ticket is frozen and cannot be reattributed by a later mint.
+    # Minted here, not taken from the descriptor: the only id the descriptor
+    # carries is the ephemeral CLIENT SECRET, and the ticket is written to
+    # disk. A credential never becomes an identifier.
+    talk_runs.attach_owner(
+        talk_session_id=os.urandom(16).hex(),
+        generation_id=os.urandom(6).hex(),
+        hermes_session_id=None,
+        operator=f"dashboard:{auth.source}",
+        profile=talk_config.agent_profile(),
+    )
     return {"ok": True, **descriptor.to_wire(), "authSource": auth.source}
 
 

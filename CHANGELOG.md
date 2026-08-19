@@ -13,6 +13,61 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Delegated work and memory lookups are now bound to the exact Talk session
+  that asked for them (hermes-talk#35). Previously the `WORK_STARTED` receipt
+  was backed by nothing but an in-process dict with a fail-open history tee:
+  no run recorded who started it or where the answer should go, and the only
+  watcher that would ever speak the result died with the session. A job could
+  finish with nobody listening, and nothing could tell a reconnecting session
+  "this result is yours" apart from "this one is a stranger's". On this box
+  that left three real runs stuck at `running` forever.
+
+  `talk_runs` now mints an immutable ticket at acceptance — operator, profile,
+  durable Hermes session, Talk generation, and a per-request id — and persists
+  it BEFORE the worker thread starts. That one write is fail-closed: if it
+  cannot land, dispatch is refused with `RoutingUnavailable` and the operator
+  hears "I can't start that yet" instead of a receipt for work nothing could
+  route. Everything else about the tee stays fail-open, because once a run is
+  accepted its result is owed. Delivery is a two-phase claim, on disk as well
+  as in memory: a result is CLAIMED exactly once at enqueue and flipped to
+  delivered only after the announcement is actually handed to the wire, so a
+  session torn down mid-queue leaves the result re-adoptable instead of
+  consumed-but-unspoken (the residual duplication window is a crash between
+  the wire hand-off and the flip — said once more on reconnect, never lost).
+  A reconnecting session adopts only tickets recorded under its own Hermes
+  session AND its own operator/profile binding — ownership is enforced at
+  adoption, not just recorded — while a different session adopts nothing,
+  and pre-#35 history, which carries no ticket, is never adopted by anyone.
+  Announcements still ride the existing contained-system-item path, so an
+  adopted result is exactly as untrusted as a fresh one and can never
+  re-enter the conversation as operator speech.
+- The run-history file is now serialized ACROSS PROCESSES, not just across
+  threads: the CLI lane and the dashboard lane (the Hermes web server
+  process) share one `state/talk-runs.jsonl`, so every load-modify-append —
+  delivery claims, compaction, and run-id allocation — holds an OS-level
+  one-byte file lock (the same msvcrt/fcntl mechanism as the transcript
+  writer lease), and run ids are floored on the file's own highest persisted
+  id inside that lock at every acceptance, which makes cross-process id
+  collisions impossible instead of merely unlikely.
+- A disabled history tee now REFUSES dispatch instead of silently accepting
+  a run with no durable route; callers that legitimately want in-memory-only
+  routing opt in by name (`TALK_RUNS_ALLOW_EPHEMERAL=1`).
+- The api-server lane's remote run id is now written through the strict,
+  cross-process-locked append at the moment it is learned — retried once and
+  escalated to an error log if it still cannot land, never dropped as
+  fail-open telemetry. It is the only handle a reconnect could resume
+  tracking a tier-2 run by, and holding it in memory alone meant it died
+  with the process a reconnect exists to recover from. The terminal tee
+  happened to carry it for runs that finished, which is how the gap stayed
+  hidden.
+- An owed result that falls off the bounded adoption tail of the history
+  file is now counted and logged instead of vanishing silently.
+- The dashboard's session mint binds the browser lane's own return route, so
+  `POST /tool` can still start real work under the fail-closed rule. It carries
+  no Hermes session id (none is ever bound in the web server process) and never
+  the ephemeral credential — a secret does not become an identifier.
+
 ### Added
 - A live capability catalog: the new `talk_capabilities` tool answers "what can
   you do right now?" from evidence instead of from the system prompt — installed
