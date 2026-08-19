@@ -39,6 +39,10 @@ DEFAULT_API_SERVER_POLL_S = 1.0
 #: probe verdict above, and for the same reason: what a Hermes install has
 #: installed changes on the timescale of a restart, not of a sentence.
 DEFAULT_CAPABILITY_CATALOG_TTL_S = 30.0
+#: Hard wait bound for one in-process remembered-context (Honcho) lookup.
+#: Long enough for a slow index, short enough that a wedged plugin cannot
+#: hold the serialized tool pipeline for the life of the call.
+DEFAULT_MEMORY_SEARCH_TIMEOUT_S = 10.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -269,6 +273,12 @@ def identity_include() -> tuple[str, ...] | None:
     persona section stops travelling, and the only visible symptom is a voice
     session that has quietly stopped knowing who it is talking to.
 
+    **The upgrade trap is the same trap, aged:** a list pinned before a
+    section existed (e.g. ``MEMORY,PERSONA`` from before ``WORKING``) keeps
+    working verbatim and silently drops the new section forever.
+    ``HostAdapter.identity_sections`` logs one warning per session mint when
+    a pinned list lacks ``WORKING``.
+
     Unknown names are dropped rather than raising: a typo in a knob must
     narrow the prompt, never take the voice surface down with it.
     """
@@ -294,6 +304,17 @@ def session_key() -> str | None:
     Deriving a distinct key per Discord channel or dashboard session is a
     real feature, and a separate one: it needs channel identity plumbed in
     from the surfaces, against a host header contract this repo cannot see.
+
+    **This key is an operator scope, NOT a session boundary — and every
+    voice-channel participant shares it.** In a Discord voice channel any
+    participant can drive a memory lookup, and the run it starts reads and
+    writes under THIS key: the operator-authority ledger gates mutating
+    tools, never memory reads (``talk_operator_auth.READ_ONLY_TALK_TOOLS``),
+    and speaker identity does not reach the dispatch point (the relay's tool
+    executor receives only the tool name and the model's arguments). Do not
+    set this in a multi-user channel unless you accept that everyone present
+    can read from — and via delegated runs, write into — your memory scope;
+    per-speaker scoping is a follow-up, not shipped.
     """
 
     return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
@@ -453,6 +474,20 @@ def capability_catalog_ttl_s() -> float:
     )
 
 
+def memory_search_timeout_s() -> float:
+    """Wait bound for the in-process remembered-context (Honcho) lookup.
+
+    Only the Honcho tier of ``search_memory`` is bounded: it is a
+    network-backed plugin dispatched from inside the serialized tool
+    pipeline, where an unbounded wait holds every later tool call hostage.
+    ``session_search`` stays unbounded — it is a local FTS5 read.
+    """
+
+    return _positive_float(
+        "TALK_MEMORY_SEARCH_TIMEOUT_S", DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+    )
+
+
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
@@ -504,6 +539,7 @@ __all__ = [
     "DEFAULT_API_SERVER_PROBE_TTL_S",
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_VOICE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
@@ -524,6 +560,7 @@ __all__ = [
     "discord_operator_user_ids",
     "get_hermes_home",
     "identity_include",
+    "memory_search_timeout_s",
     "realtime_model_compatibility",
     "realtime_model_valid",
     "resolve_openai_key",

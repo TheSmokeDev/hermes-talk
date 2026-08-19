@@ -361,7 +361,8 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_API_SERVER_KEY` | `API_SERVER_KEY` | Key for the api-server lane (blank = send none) |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
-| `TALK_SESSION_KEY` | unset | Stable scope sent as `X-Hermes-Session-Key` on api-server runs, so host-side memory survives `/clear` (blank = send none) |
+| `TALK_MEMORY_SEARCH_TIMEOUT_S` | `10.0` | Wait bound for the in-process remembered-context (Honcho) lookup |
+| `TALK_SESSION_KEY` | unset | Stable operator scope sent as `X-Hermes-Session-Key` on api-server runs, so host-side memory survives `/clear` (blank = send none). **Not a session boundary: every voice-channel participant shares this scope** — memory reads are not gated by the operator ledger, so do not set it in multi-user channels until per-speaker scoping lands |
 | `TALK_DASHBOARD_TOKEN` | unset | Token for the dashboard tab's routes (unset = loopback only) |
 | `TALK_DISCORD_OPERATOR_USER_IDS` | none | Comma-separated immutable Discord IDs allowed to run mutating tools; malformed = nobody |
 
@@ -382,15 +383,20 @@ optional:
   delimiter Hermes uses for `MEMORY.md`, and each is threat-scanned
   independently — one bad entry costs that entry, not your whole table. When
   a host is attached, one sentence is appended pointing at `search_memory`
-  for names *not* in the file, and telling the model to ask which one you
-  meant rather than take the closest match.
+  for names *not* in the file. The rule to ASK when a spoken name could match
+  more than one thing rides the voice preamble itself, on every lane — it
+  depends on no file, no tool, and no include list, so nothing can drop it.
 
 A broken or missing provider costs that section and nothing else — the call
 still starts. `talk_status` reports which sections resolved and how many
 characters each contributes, never their content.
 
 `WORKING.md` is what stops a voice session asking who you are every call.
-Keep it short — it is re-read on every turn:
+Nothing fills it for you — no producer writes installed plugins or recent
+work into it; what you curate by hand is all a session gets. It is read once
+at session mint and stays frozen for the call: an edit lands on the NEXT
+session, never the live one. Keep it short — the resolved prompt is resident
+and paid for on every turn:
 
 ```markdown
 Pedro, solo operator. Ships at night, prefers blunt answers.
@@ -410,6 +416,10 @@ REPLACES the default rather than extending it** — `TALK_IDENTITY_INCLUDE=MEMOR
 means memory *and nothing else*, and the only symptom is a session that has
 quietly stopped knowing who it's talking to. Unknown names are dropped
 silently, so a typo narrows the prompt instead of taking voice down.
+**The upgrade trap is the same trap, aged:** a list pinned before `WORKING`
+existed (e.g. `MEMORY,PERSONA`) keeps working verbatim and silently drops
+your curated context after upgrading — the session logs one warning at mint
+when a pinned list lacks `WORKING`.
 
 Sections are capped (`PERSONA` 4,000 chars, `MEMORY` 6,000, `WORKING` 2,000).
 A Realtime session's instructions are resident for the whole call and paid on

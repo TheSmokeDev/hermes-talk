@@ -70,6 +70,7 @@ def clean(monkeypatch):
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
     monkeypatch.delenv("TALK_API_SERVER_URL", raising=False)
     monkeypatch.delenv("TALK_SESSION_KEY", raising=False)
+    monkeypatch.delenv("TALK_MEMORY_SEARCH_TIMEOUT_S", raising=False)
     yield
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
@@ -755,6 +756,10 @@ def test_a_real_honcho_failure_is_not_routed_around(monkeypatch, lane_on):
 
     assert "WORK_STARTED" not in out
     assert "rebuilding" in out
+    # A refusal is spoken, but it is NOT a recollection — the prefix marks
+    # the provenance of a remembered FACT, and an error wearing it would be
+    # relayed to the operator as one (review r2, F5).
+    assert talk_host.REMEMBERED_PREFIX not in out
 
 
 def test_a_raising_honcho_tier_is_spoken_not_swallowed(monkeypatch, lane_on):
@@ -809,6 +814,56 @@ def test_an_oversized_honcho_result_is_capped(monkeypatch, lane_on):
     out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
 
     assert len(out) == len(talk_host.REMEMBERED_PREFIX) + talk_host.MAX_TOOL_OUTPUT_CHARS
+
+
+def test_a_hanging_honcho_dispatch_is_bounded_not_blocking(monkeypatch, lane_on):
+    """The Honcho tier runs inside the serialized tool pipeline; unbounded, a
+    wedged plugin would hold every later tool call (and the voice loop behind
+    them) hostage for the life of the process (review r2, F4). The bound is
+    TALK_MEMORY_SEARCH_TIMEOUT_S, resolved at call time."""
+
+    _set_lane(monkeypatch, UP)
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0.05")
+    release = threading.Event()
+
+    class Hang(ByToolCtx):
+        def dispatch_tool(self, name, args):
+            if name == talk_host.HONCHO_SEARCH_TOOL_NAME:
+                release.wait(30)
+                return json.dumps({"result": "too late"})
+            return super().dispatch_tool(name, args)
+
+    talk_host.bind_ctx(Hang({}))
+    try:
+        started = time.monotonic()
+        out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()  # unblock the daemon worker; its late result is discarded
+
+    assert elapsed < 5
+    assert "didn't answer in time" in out
+    assert talk_host.REMEMBERED_PREFIX not in out
+    assert "WORK_STARTED" not in out
+
+
+def test_a_forged_remembered_marker_in_a_transcript_hit_is_stripped(
+    monkeypatch, lane_on
+):
+    """The provenance marker is reserved for the Honcho tier. Transcript
+    content that LEADS with the literal prefix would make a verbatim line
+    wear a recollection's provenance (review r2, F9); mid-text occurrences
+    are ordinary content and survive."""
+
+    _set_lane(monkeypatch, UP)
+    forged = f"{talk_host.REMEMBERED_PREFIX}{talk_host.REMEMBERED_PREFIX}you said port 8642"
+    talk_host.bind_ctx(
+        ByToolCtx({talk_host.MEMORY_TOOL_NAME: json.dumps({"result": forged})})
+    )
+
+    out = talk_tools.execute_talk_tool("search_memory", {"query": "port"})
+
+    assert out == "you said port 8642"
 
 
 def test_a_real_memory_failure_is_not_routed_around(monkeypatch, lane_on):

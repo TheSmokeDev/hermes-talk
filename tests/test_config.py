@@ -240,3 +240,17 @@ def test_session_key_blank_means_none(monkeypatch):
     monkeypatch.setenv("TALK_SESSION_KEY", "   ")
 
     assert talk_config.session_key() is None
+
+
+def test_memory_search_timeout_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("TALK_MEMORY_SEARCH_TIMEOUT_S", raising=False)
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "2.5")
+    assert talk_config.memory_search_timeout_s() == 2.5
+
+    # Junk and non-positive values take the default, like every float knob here.
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "soon")
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0")
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S

@@ -413,7 +413,10 @@ def _handle_search_vault(arguments: dict) -> str:
         # Distinct sentence from the failure above, deliberately: "nothing
         # written down" and "the lookup broke" must never sound the same.
         return f"nothing in the notes about {query}."
-    return found
+    # Vault notes are untrusted text; the leading provenance marker is
+    # reserved for search_memory's Honcho tier and must not be forgeable
+    # from note content.
+    return talk_host.strip_reserved_marker(found)
 
 
 def _handle_delegate_task(arguments: dict) -> str:

@@ -735,14 +735,15 @@ def test_the_operator_pointer_only_appears_with_a_bound_ctx(_hermetic):
 
 def test_the_pointer_alone_is_enough_to_render_the_section(_hermetic):
     """An operator who has written no WORKING.md still gets the lookup
-    sentence — the tool is there whether or not they curated anything."""
+    sentence — the tool is there whether or not they curated anything. The
+    ask-before-acting rule is NOT here: it rides the preamble, unconditionally
+    (see the anti-guess rule tests below)."""
 
     talk_host.bind_ctx(types.SimpleNamespace())
 
     working = talk_host.host().identity_sections()["WORKING"]
 
     assert "search_memory" in working
-    assert "ask which one" in working
 
 
 def test_curated_facts_outrank_the_lookup_pointer(_hermetic):
@@ -815,7 +816,7 @@ def test_conflicting_aliases_both_survive_rather_than_one_winning(_hermetic):
     """The stale-alias / conflicting-repo case. Two entries claim the same
     spoken name. This plugin must NOT resolve that itself — picking by file
     order would silently bind the operator's words to whichever line was
-    written first, with no symptom. Both travel, and the pointer tells the
+    written first, with no symptom. Both travel, and the preamble tells the
     model to ask."""
 
     _write_identity_file(
@@ -830,7 +831,86 @@ def test_conflicting_aliases_both_survive_rather_than_one_winning(_hermetic):
 
     assert "TheSmokeDev/hermes-talk" in working
     assert "TheSmokeDev/taskchad-talk" in working
-    assert "ask which one before acting on it" in working
+    instructions = talk_identity.build_instructions({"WORKING": working})
+    assert "ask which one before acting on it" in instructions
+
+
+# --- the anti-guess rule (review r2, F1) ---------------------------------------
+#
+# The rule used to live inside the ctx-gated pointer sentence, so it vanished
+# on exactly the lanes with no bound context (gateway, dashboard) — the ones
+# where nobody is watching a silent wrong pick go by. It now rides the
+# preamble, which is the only carrier a ctx gate, a pinned
+# TALK_IDENTITY_INCLUDE, or a failed identity scan can never drop.
+
+
+def test_with_a_bound_ctx_both_halves_of_the_split_sentence_are_present(_hermetic):
+    talk_host.bind_ctx(types.SimpleNamespace())
+
+    instructions = talk_identity.build_instructions(
+        talk_host.host().identity_sections()
+    )
+
+    assert "ask which one before acting on it" in instructions
+    assert "never pick the closest match" in instructions
+    assert "search_memory can also look up" in instructions
+
+
+def test_without_a_ctx_the_rule_ships_and_only_the_pointer_is_gated(_hermetic):
+    talk_host.bind_ctx(None)
+
+    instructions = talk_identity.build_instructions(
+        talk_host.host().identity_sections()
+    )
+
+    assert "ask which one before acting on it" in instructions
+    assert "never pick the closest match" in instructions
+    assert "search_memory can also look up" not in instructions
+
+
+def test_the_rule_survives_a_pinned_include_list(_hermetic, monkeypatch):
+    """The stronger property a section-borne rule could not deliver: a
+    TALK_IDENTITY_INCLUDE pinned before WORKING existed drops the section,
+    and must not take the rule down with it."""
+
+    monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "MEMORY,PERSONA")
+    talk_host.bind_ctx(None)
+
+    instructions = talk_identity.build_instructions(
+        talk_host.host().identity_sections()
+    )
+
+    assert "never pick the closest match" in instructions
+
+
+def test_a_pinned_include_without_working_warns_at_mint(_hermetic, monkeypatch, caplog):
+    """The F8 upgrade trap gets its one symptom: a list pinned before WORKING
+    existed keeps working verbatim and silently drops the curated context."""
+
+    monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "MEMORY,PERSONA")
+
+    with caplog.at_level("WARNING", logger="talk_host"):
+        talk_host.host().identity_sections()
+
+    assert any("WORKING" in record.message for record in caplog.records)
+
+
+def test_an_include_list_naming_working_does_not_warn(_hermetic, monkeypatch, caplog):
+    monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "MEMORY,WORKING")
+
+    with caplog.at_level("WARNING", logger="talk_host"):
+        talk_host.host().identity_sections()
+
+    assert not any("WORKING" in record.message for record in caplog.records)
+
+
+def test_an_unpinned_include_does_not_warn(_hermetic, monkeypatch, caplog):
+    monkeypatch.delenv("TALK_IDENTITY_INCLUDE", raising=False)
+
+    with caplog.at_level("WARNING", logger="talk_host"):
+        talk_host.host().identity_sections()
+
+    assert not any("WORKING" in record.message for record in caplog.records)
 
 
 def test_the_working_host_budget_is_honored(_hermetic, monkeypatch):

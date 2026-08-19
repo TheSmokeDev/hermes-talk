@@ -82,13 +82,13 @@ STOP_CONFIRM_WAIT_S = 1.5
 STOP_LATE_CONFIRM_S = 30.0
 
 
-def _spawn_daemon(fn, *args) -> None:
-    """Fire-and-forget worker. DAEMON by design: a stop confirmation still
-    in flight when the operator hangs up must never stall process exit
-    (ThreadPoolExecutor threads are non-daemon and joined at shutdown —
-    exactly the wrong contract for this)."""
+def _spawn_daemon(fn, *args, name: str = "talk-stop") -> None:
+    """Fire-and-forget worker. DAEMON by design: a stop confirmation (or a
+    wedged memory dispatch) still in flight when the operator hangs up must
+    never stall process exit (ThreadPoolExecutor threads are non-daemon and
+    joined at shutdown — exactly the wrong contract for this)."""
 
-    threading.Thread(target=fn, args=args, daemon=True, name="talk-stop").start()
+    threading.Thread(target=fn, args=args, daemon=True, name=name).start()
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -129,15 +129,66 @@ REMEMBERED_PREFIX = "from remembered context: "
 
 MAX_TOOL_OUTPUT_CHARS = 2_000
 
+
+def strip_reserved_marker(text: str) -> str:
+    """Remove a forged leading provenance marker from a non-Honcho result.
+
+    :data:`REMEMBERED_PREFIX` is attached by exactly one call site — the
+    Honcho tier of :meth:`HostAdapter.search_memory` — and the session
+    instructions tell the model an answer that begins with it is a remembered
+    profile fact. Transcript and vault content is untrusted text; a line that
+    LEADS with the literal marker would wear that provenance without having
+    it. Only leading occurrences carry the claim, so only those are stripped
+    (repeatedly — a single pass would leave a doubled marker still wearing
+    it); one appearing mid-text is ordinary content and stays.
+    """
+
+    marker = REMEMBERED_PREFIX.strip()  # match with or without the space
+    out = text.lstrip()
+    while out.lower().startswith(marker):
+        out = out[len(marker) :].lstrip()
+    return out
+
+
+def _dispatch_bounded(ctx: Any, tool: str, args: dict, timeout_s: float) -> tuple[str, Any]:
+    """One ``dispatch_tool`` call with a hard wait bound.
+
+    Returns ``("ok", result)``, ``("err", exception)``, or
+    ``("timeout", None)``. A dispatch cannot be cancelled, so after a timeout
+    the call keeps running on its throwaway daemon worker — what the bound
+    buys is the caller's thread back, and the caller is the relay's FIXED
+    tool pool: a worker held by a wedged network-backed plugin is a worker
+    the pool never gets back, and with the pipeline serialized that is every
+    later tool call (and the voice loop behind them) held hostage.
+    """
+
+    outcomes: queue.Queue = queue.Queue(maxsize=1)
+
+    def _call() -> None:
+        try:
+            outcomes.put(("ok", ctx.dispatch_tool(tool, args)))
+        except Exception as exc:  # noqa: BLE001 — the outcome IS the record
+            outcomes.put(("err", exc))
+
+    _spawn_daemon(_call, name="talk-memory-dispatch")
+    try:
+        return outcomes.get(timeout=timeout_s)
+    except queue.Empty:
+        return ("timeout", None)
+
 #: Errors that mean "this environment has no agent loop to delegate INTO" —
-#: the only two the run_agent chain is allowed to fall through on. Hermes's
-#: own text is ``tool_error("delegate_task requires a parent agent context.")``
-#: (tools/delegate_tool.py:2365); a `hermes talk` CLI session has no
-#: ``_cli_ref``, so ``dispatch_tool`` cannot attach a parent agent and every
-#: delegation lands here. Any OTHER error — spawning paused, depth exceeded, a
-#: real failure — is the host's decision and must NOT be routed around.
+#: the only two the run_agent chain is allowed to fall through on. Both are
+#: the COMPLETE ``tool_error`` message the host mints, not fragments: the
+#: registry's unknown-tool refusal is exactly ``Unknown tool: {name}``
+#: (hermes-agent tools/registry.py:1120 via tool_error at :1291), and the
+#: no-parent refusal is exactly ``delegate_task requires a parent agent
+#: context.`` (tools/delegate_tool.py:3463); a `hermes talk` CLI session has
+#: no ``_cli_ref``, so ``dispatch_tool`` cannot attach a parent agent and
+#: every delegation lands there. Any OTHER error — spawning paused, depth
+#: exceeded, a real failure — is the host's decision and must NOT be routed
+#: around, even when its free text happens to QUOTE one of these markers.
 AGENT_LOOP_ABSENT_MARKERS = (
-    "requires a parent agent context",
+    "delegate_task requires a parent agent context.",
     f"unknown tool: {DELEGATE_TOOL_NAME}",
 )
 
@@ -198,6 +249,12 @@ def _agent_loop_absent(raw: Any, tool_name: str = DELEGATE_TOOL_NAME) -> bool:
     generic failure would route around an operator's paused delegation or a
     depth limit, which is the host's call, not this plugin's.
 
+    The match is the WHOLE error string (case-insensitive, outer whitespace
+    ignored), never a substring: both marker shapes are complete
+    ``tool_error`` messages the host mints verbatim (see
+    :data:`AGENT_LOOP_ABSENT_MARKERS`), and a substring match misread a real
+    refusal that merely QUOTED a marker in its free text as "no loop here".
+
     ``tool_name`` adds that tool's own "unknown tool" marker, so a host with no
     ``session_search`` falls through to the api_server lane for the same reason
     a host with no ``delegate_task`` does. The default reproduces
@@ -214,9 +271,9 @@ def _agent_loop_absent(raw: Any, tool_name: str = DELEGATE_TOOL_NAME) -> bool:
     error = parsed.get("error")
     if not isinstance(error, str):
         return False
-    lowered = error.lower()
+    lowered = error.strip().lower()
     markers = (*AGENT_LOOP_ABSENT_MARKERS, f"unknown tool: {tool_name}")
-    return any(marker in lowered for marker in markers)
+    return any(lowered == marker for marker in markers)
 
 
 def hermes_binary() -> str | None:
@@ -544,18 +601,20 @@ def _resolve_operator_pointer() -> str:
     because :mod:`talk_capabilities` caches its result behind a TTL; this
     sentence has no such cache, so ctx presence is the signal.
 
-    The ask-before-acting clause is the whole point of the second half: a
-    homophone or a stale alias resolves to the WRONG repo silently otherwise,
-    and this plugin has no code-level binding for arbitrary spoken entities
-    the way it does for session identity.
+    The TOOL POINTER is all that lives behind this gate. The
+    ask-before-acting rule that used to trail it depends on no tool and now
+    rides :data:`talk_identity.ANTI_GUESS_RULE` in the preamble, which ships
+    on every lane — this gate used to take the rule down with the pointer on
+    exactly the ctx-less lanes (gateway, dashboard) where nobody is watching
+    a silent wrong pick go by, and a pinned ``TALK_IDENTITY_INCLUDE`` or a
+    failed scan would have dropped a section-borne rule the same way.
     """
 
     if get_ctx() is None:
         return ""
     return (
         "search_memory can also look up people, repos, and aliases that are "
-        "not listed above. If more than one thing could match what you heard, "
-        "ask which one before acting on it — never pick the closest match."
+        "not listed above."
     )
 
 
@@ -661,6 +720,18 @@ class HostAdapter:
         include = talk_config.identity_include()
         if include is None:
             return sections
+        if "WORKING" not in include:
+            # The upgrade trap: an include list pinned before WORKING existed
+            # keeps working verbatim — and silently drops the operator's
+            # curated context on every session from then on. The list
+            # REPLACES the default by contract, so this cannot be repaired
+            # here; it can only be said out loud, once per session mint.
+            _log.warning(
+                "TALK_IDENTITY_INCLUDE=%s does not name WORKING — the curated "
+                "operator context (memories/WORKING.md) will not ride this "
+                "session; add WORKING to the list if that is not intentional",
+                ",".join(include),
+            )
         return {name: body for name, body in sections.items() if name in include}
 
     def resolve_openai_key(self) -> str:
@@ -759,19 +830,44 @@ class HostAdapter:
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
                 return f"the memory lookup failed: {type(exc).__name__}: {exc}"
             if not _agent_loop_absent(raw, MEMORY_TOOL_NAME):
-                return _speakable(raw)
+                # Transcript content is untrusted text and the provenance
+                # marker belongs to the Honcho tier alone — a line that
+                # forges it as a leading prefix must not reach the model
+                # wearing a recollection's provenance.
+                return strip_reserved_marker(_speakable(raw))
 
-            try:
-                raw = ctx.dispatch_tool(
-                    HONCHO_SEARCH_TOOL_NAME, {"query": query, "limit": limit}
+            # Bounded, unlike session_search above: Honcho is a
+            # network-backed plugin, session_search is a local FTS5 read. An
+            # unbounded wait here wedges a fixed relay tool-pool worker for
+            # the life of the process.
+            kind, value = _dispatch_bounded(
+                ctx,
+                HONCHO_SEARCH_TOOL_NAME,
+                {"query": query, "limit": limit},
+                talk_config.memory_search_timeout_s(),
+            )
+            if kind == "timeout":
+                # A Honcho that is here but not answering made no decision to
+                # route around — same rule as a refusal below, minus a reason
+                # to quote.
+                return (
+                    "the remembered-context lookup didn't answer in time — "
+                    "ask me again in a moment."
                 )
-            except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-                return f"the memory lookup failed: {type(exc).__name__}: {exc}"
+            if kind == "err":
+                return f"the memory lookup failed: {type(value).__name__}: {value}"
+            raw = value
             # Only "Honcho isn't here" falls through. A Honcho that IS here
             # and said no — reindexing, rate limited — made a decision that
             # belongs to it, exactly as for session_search above.
             if not _agent_loop_absent(raw, HONCHO_SEARCH_TOOL_NAME):
-                return f"{REMEMBERED_PREFIX}{_speakable(raw)}"
+                spoken = _speakable(raw)
+                if spoken.startswith("that failed"):
+                    # A refusal is spoken, but it is not a recollection: the
+                    # prefix marks the provenance of a FACT, and an error has
+                    # none to mark.
+                    return spoken
+                return f"{REMEMBERED_PREFIX}{spoken}"
 
         return self._search_memory_via_api_server(query, limit)
 
@@ -1536,4 +1632,5 @@ __all__ = [
     "get_ctx",
     "hermes_binary",
     "host",
+    "strip_reserved_marker",
 ]

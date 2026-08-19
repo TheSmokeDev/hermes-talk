@@ -200,11 +200,16 @@ agent, so they work on all three lanes. The gateway and the dashboard have no
 agent and no plugin context, and those are the lanes most likely to be asked
 "what do you know about X".
 
-`WORKING.md` is the only one of the three you write by hand. It is scanned
-per entry anyway: the scan is about who can WRITE to the path, not who was
-supposed to. Conflicting entries — two lines claiming the same alias — are
-deliberately BOTH kept, so the model asks which you meant instead of binding
-your words to whichever line came first. Format and examples: see the
+`WORKING.md` is the only one of the three you write by hand — nothing fills
+it for you (no producer writes installed plugins or recent work into it). It
+is scanned per entry anyway: the scan is about who can WRITE to the path, not
+who was supposed to. Conflicting entries — two lines claiming the same alias —
+are deliberately BOTH kept, so the model asks which you meant instead of
+binding your words to whichever line came first; the ask-before-acting rule
+itself rides the voice preamble on every lane, not any section. All identity
+sections are resolved once at session mint and stay frozen for the call — an
+edit lands on the next session, never the live one. Format and examples: see
+the
 [README](../README.md#talk_identity_include--what-the-session-starts-knowing).
 
 Two budgets apply in order: the host's own `memory.user_char_limit` /
@@ -251,7 +256,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--what-the-session-starts-knowing). Unknown names are dropped silently. |
+| `TALK_IDENTITY_INCLUDE` | all sections | Comma-separated section list. **REPLACES the default set, does not extend it** — the trap and the budgets are documented in the [README](../README.md#talk_identity_include--what-the-session-starts-knowing). Unknown names are dropped silently. **Upgrade trap:** a list pinned before `WORKING` existed silently drops the curated operator context; one warning is logged at session mint when a pinned list lacks `WORKING`. |
 | `TALK_DISCORD_OPERATOR_USER_IDS` | nobody | Comma-separated immutable decimal Discord user IDs authorized for mutating tools in Discord voice. Unset/blank = nobody. **Any** blank or malformed entry invalidates the whole list and authorizes nobody; valid entries are never partially accepted. Example: `TALK_DISCORD_OPERATOR_USER_IDS=<your-user-id>,<another-user-id>`. |
 
 ### Agent lanes
@@ -260,6 +265,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 |---|---|---|
 | `TALK_AGENT_PROFILE` | auto-detect | Hermes profile for the detached spawn. **Set-but-blank = explicit opt-out** (never pass `--profile`). Full story: [README](../README.md#talk_agent_profile--which-profile-the-background-agent-runs-under). |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Wall-clock budget for one background run and its watcher. Junk or ≤0 silently takes the default. |
+| `TALK_MEMORY_SEARCH_TIMEOUT_S` | `10.0` | Wait bound for the in-process remembered-context (Honcho) tier of `search_memory`. On timeout the model speaks a retryable failure instead of the tool pipeline blocking; the transcript tier (`session_search`, a local FTS5 read) is not bounded. Junk or ≤0 silently takes the default. |
 
 ### api-server lane
 
@@ -268,7 +274,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Gateway base URL; trailing slash stripped. |
 | `TALK_API_SERVER_KEY` | falls back to `API_SERVER_KEY` | Bearer key for the lane. **Set-but-blank = send no Authorization header.** |
 | `API_SERVER_KEY` | unset | The gateway's own variable, reused as fallback so you configure the key once. |
-| `TALK_SESSION_KEY` | unset | Sent as `X-Hermes-Session-Key` on run submission (`POST /v1/runs`) only — never on the read/control routes, which address a run that already exists. Scopes the memory a run may read and write, so it survives the `/clear` that ends a `session_id`. **Set-but-blank = send no header**, which is the pre-0.9 behaviour exactly. One static operator-set value: nothing derives a default, because a key that changed between runs would silently lose the one property this knob exists for, with no symptom to read it off. Per-Discord-channel and per-dashboard-session keys are not derived yet. |
+| `TALK_SESSION_KEY` | unset | Sent as `X-Hermes-Session-Key` on run submission (`POST /v1/runs`) only — never on the read/control routes, which address a run that already exists. Scopes the memory a run may read and write, so it survives the `/clear` that ends a `session_id`. **Set-but-blank = send no header**, which is the pre-0.9 behaviour exactly. One static operator-set value: nothing derives a default, because a key that changed between runs would silently lose the one property this knob exists for, with no symptom to read it off. **This is an operator scope, not a session boundary: every voice-channel participant shares it.** The authority ledger gates mutating tools, never memory reads, and speaker identity does not reach the memory dispatch — so in a Discord channel anyone present can drive lookups (and delegated runs) that read from and write into this scope. Do not set it in multi-user channels until per-speaker scoping lands; per-Discord-channel and per-dashboard-session keys are not derived yet. |
 | `TALK_API_SERVER_PROBE_TIMEOUT_S` | `1.5` | Budget for one availability probe — tight on purpose; it runs on the mic's event loop. |
 | `TALK_API_SERVER_PROBE_TTL_S` | `30.0` | How long a probe verdict is trusted before an off-hot-path refresh. |
 | `TALK_API_SERVER_POLL_S` | `1.0` | Poll interval while waiting on a run. |
