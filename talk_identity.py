@@ -38,7 +38,7 @@ IDENTITY_HEADERS: dict[str, str] = {
     "PERSONA": "Your standing identity and behavior rules",
     "USER": "Who you are talking to",
     "MEMORY": "What you already know (durable memory — do not ask for these)",
-    "WORKING": "What is currently open",
+    "WORKING": "Operator identity, known repos/aliases, and what is currently open",
 }
 
 VOICE_PREAMBLE = (

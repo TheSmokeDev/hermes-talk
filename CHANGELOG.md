@@ -13,6 +13,49 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- A voice session can now start already knowing who you are, which repos you
+  mean by name, and what your aliases map to (hermes-talk#36). Dogfooding on
+  2026-08-16 kept hitting the same two failures: the session asked who the
+  operator was every call, and when a spoken name could mean two things it
+  picked one silently. Nothing on a voice surface shows you it guessed.
+
+  Three parts, each an extension of a mechanism that already existed rather
+  than a new one:
+
+  `memories/WORKING.md` is a new identity section, and the only one YOU write
+  instead of the model. It rides the same durable-file pipeline as `USER.md`
+  and `MEMORY.md`, so it is threat-scanned per entry, capped (2,000 chars),
+  and filtered by `TALK_IDENTITY_INCLUDE` without any of that being written
+  twice — hand-authored is not the same as trusted, and anything that can
+  write to your Hermes home can append an entry. Two entries claiming the
+  same alias BOTH travel: resolving that by file order would bind your words
+  to whichever line you wrote first, with no symptom, so the model is told to
+  ask instead. When a host is attached, one sentence naming `search_memory`
+  is appended for anything not in the file.
+
+  `search_memory` grew a middle tier. Between the transcript read
+  (`session_search`) and the api-server fallback it now tries Hermes's Honcho
+  memory plugin, and prefixes that answer with `from remembered context:`.
+  The prefix is the point: a remembered profile fact can be stale in a way a
+  verbatim transcript line cannot, and collapsing the two would make a guess
+  and a quote sound identical out loud. A Honcho that is simply absent falls
+  through; a Honcho that is present and refuses is spoken, not routed around.
+
+  `TALK_SESSION_KEY` sends `X-Hermes-Session-Key` on run submission, so the
+  memory an api-server run reads and writes is scoped to you and survives the
+  `/clear` that ends a `session_id`. Unset — the default — sends no header
+  and changes nothing. It is deliberately static and operator-set: a key
+  derived from the hostname or the clock would change between runs, and the
+  one property the knob exists for would be silently missing.
+
+  Not built, and named here so the gap is not mistaken for coverage: a
+  session-mint profile pre-fetch (`honcho_context`), per-Discord-channel and
+  per-dashboard-session key derivation, and code-enforced binding for spoken
+  entities. Ambiguity is handled by prompt copy, the same way the preamble's
+  damage-based confirmation policy governs every other consequential action
+  here — not by a mechanism that can refuse.
+
 ### Fixed
 - Delegated work and memory lookups are now bound to the exact Talk session
   that asked for them (hermes-talk#35). Previously the `WORK_STARTED` receipt

@@ -139,7 +139,11 @@ configuration asks no questions and performs no writes. Doctor never delegates
 to setup.
 
 or `/talk` inside an interactive Hermes session, which additionally reaches the
-agent-loop-only tools (`memory`, `session_search`, `delegate_task`).
+agent-loop-only tools (`memory`, `session_search`, `honcho_search`,
+`delegate_task`). A spoken memory lookup tries the transcript first
+(`session_search`) and remembered profile facts second (`honcho_search`), and
+says which of the two it answered from — a recollection can be stale in a way
+a verbatim line cannot, and nothing is on screen to check it against.
 
 **In Discord**, `/talk join` runs the call in the voice channel Hermes is
 already in — same conversation, same tools, same steering, in a room other
@@ -357,12 +361,13 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_API_SERVER_KEY` | `API_SERVER_KEY` | Key for the api-server lane (blank = send none) |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
+| `TALK_SESSION_KEY` | unset | Stable scope sent as `X-Hermes-Session-Key` on api-server runs, so host-side memory survives `/clear` (blank = send none) |
 | `TALK_DASHBOARD_TOKEN` | unset | Token for the dashboard tab's routes (unset = loopback only) |
 | `TALK_DISCORD_OPERATOR_USER_IDS` | none | Comma-separated immutable Discord IDs allowed to run mutating tools; malformed = nobody |
 
 ### `TALK_IDENTITY_INCLUDE` — what the session starts knowing
 
-Two sections are resolved at session start, each independently and each
+Three sections are resolved at session start, each independently and each
 optional:
 
 - **`PERSONA`** — your `SOUL.md`, read through Hermes's own loader (so it gets
@@ -371,10 +376,34 @@ optional:
   contributes. Inside `/talk` this is the live agent's already-assembled
   block; standalone, Talk loads the configured provider itself, reads the
   block, and shuts it down again.
+- **`WORKING`** — `memories/WORKING.md`, the one identity file **you** write
+  rather than the model: who you are, which repos and plugins you mean by
+  name, what an alias maps to. Entries are separated by `\n§\n`, the same
+  delimiter Hermes uses for `MEMORY.md`, and each is threat-scanned
+  independently — one bad entry costs that entry, not your whole table. When
+  a host is attached, one sentence is appended pointing at `search_memory`
+  for names *not* in the file, and telling the model to ask which one you
+  meant rather than take the closest match.
 
 A broken or missing provider costs that section and nothing else — the call
 still starts. `talk_status` reports which sections resolved and how many
 characters each contributes, never their content.
+
+`WORKING.md` is what stops a voice session asking who you are every call.
+Keep it short — it is re-read on every turn:
+
+```markdown
+Pedro, solo operator. Ships at night, prefers blunt answers.
+§
+"Talk" or "hermes-talk" means TheSmokeDev/hermes-talk (this plugin).
+§
+"Dograh" (often heard as "Dobra" or "Dog Bras") is the voice stack.
+```
+
+Conflicting entries are left alone on purpose. Two lines claiming the same
+alias both travel, because resolving that by file order would silently bind
+your words to whichever line you happened to write first — the model is told
+to ask instead.
 
 Set `TALK_IDENTITY_INCLUDE=MEMORY,PERSONA` to pin the list. **The trap: this
 REPLACES the default rather than extending it** — `TALK_IDENTITY_INCLUDE=MEMORY`
@@ -382,9 +411,11 @@ means memory *and nothing else*, and the only symptom is a session that has
 quietly stopped knowing who it's talking to. Unknown names are dropped
 silently, so a typo narrows the prompt instead of taking voice down.
 
-Sections are capped (`PERSONA` 4,000 chars, `MEMORY` 6,000). A Realtime
-session's instructions are resident for the whole call and paid on every turn,
-so these are a budget, not a nicety.
+Sections are capped (`PERSONA` 4,000 chars, `MEMORY` 6,000, `WORKING` 2,000).
+A Realtime session's instructions are resident for the whole call and paid on
+every turn, so these are a budget, not a nicety. Caps trim from the tail, and
+each section puts what is KNOWN before what can be looked up — so an oversized
+file loses its lookup pointer before it loses your facts.
 
 ## Design rules
 

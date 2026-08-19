@@ -14,7 +14,12 @@ method:
 Reaching a real agent is a three-tier chain, tried in order, and **every
 fall-through is announced in the returned text**:
 
-1. the bound plugin context's own agent loop (interactive ``/talk``)
+1. the bound plugin context's own agent loop (interactive ``/talk``). For a
+   memory READ this is two tools, not one: ``session_search`` for what was
+   actually said, then the Honcho memory plugin for what was remembered
+   about the operator — the second answers with its provenance said out
+   loud, because a remembered fact can be stale in a way a transcript
+   line cannot
 2. a real Hermes agent over the api_server gateway platform
    (:mod:`talk_apiserver`) — the lane that makes the dashboard tab and a
    standalone ``hermes talk`` more than a fallback
@@ -106,6 +111,21 @@ STEER_TOOL_NAME = "steer_subagent"
 #: through to the api_server lane. Wrong here costs the fast path, not the
 #: feature.
 CAPABILITY_CATALOG_TOOL_NAME = "list_capabilities"
+
+#: Hermes's Honcho memory plugin's query-shaped read surface. A guess by the
+#: same construction as :data:`CAPABILITY_CATALOG_TOOL_NAME` and safe for the
+#: same reason: a host without it answers with the "unknown tool" marker
+#: :func:`_agent_loop_absent` generalizes over, and the caller falls through
+#: to the api_server lane. Wrong here costs the fast path, not the feature.
+#:
+#: What it returns is a REMEMBERED profile fact, not a verbatim transcript
+#: line the way ``session_search`` is — so its answer ships with a provenance
+#: prefix and ``session_search``'s does not.
+HONCHO_SEARCH_TOOL_NAME = "honcho_search"
+
+#: Said in front of a Honcho hit, and nothing else. Short because it is read
+#: aloud on every such answer.
+REMEMBERED_PREFIX = "from remembered context: "
 
 MAX_TOOL_OUTPUT_CHARS = 2_000
 
@@ -281,7 +301,16 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
     allowed — see :mod:`talk_apiserver`. Failures are marked failed with
     speakable text rather than raised, so the registry never puts an exception
     type in front of a sentence meant to be said out loud.
+
+    The scoping key is read HERE rather than passed in by each caller. Every
+    api_server run this plugin starts belongs to the same operator scope, so
+    a parameter would only add a way to forget it at a call site added later
+    — and a run that silently lost its scope reads as working, right up until
+    the operator notices the host remembers nothing across a ``/clear``. Read
+    at dispatch time, so a knob set after import is honoured by the next run.
     """
+
+    session_key = talk_config.session_key()
 
     def worker(run_id: int) -> str:
         talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
@@ -289,6 +318,7 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
             return talk_apiserver.run_to_completion(
                 task,
                 session_id=session_id,
+                session_key=session_key,
                 # The remote id is stop_work's only address for this run —
                 # without it the lane is stop-capable in theory and
                 # unstoppable in practice. It is also the ONLY handle a
@@ -335,6 +365,14 @@ def _resolve_persona() -> str:
 _IDENTITY_FILES = {
     "USER": ("memories/USER.md", "user_char_limit"),
     "MEMORY": ("memories/MEMORY.md", "memory_char_limit"),
+    # Curated by the OPERATOR, not written by the model: who they are, which
+    # repos and plugins they mean by name, what an alias maps to. Registered
+    # here rather than read specially, so it inherits the same per-entry scan
+    # and host budget as the two above — a hand-written file is still a file
+    # anything with disk access can append to. ``working_char_limit`` need not
+    # exist in a host's config.yaml: an absent key reads as 0 ("no host
+    # opinion") and the plugin's own cap applies.
+    "WORKING": ("memories/WORKING.md", "working_char_limit"),
 }
 
 #: How Hermes separates memory entries on disk (``tools/memory_tool.py:59``).
@@ -492,6 +530,46 @@ def _vault_pointer() -> str:
     )
 
 
+def _resolve_operator_pointer() -> str:
+    """The one true sentence about looking up a spoken name, authored here.
+
+    Same contract as :func:`_vault_pointer`: names a capability the session
+    really has, only when it has one, and never inlines the content itself.
+
+    Gated on a bound context rather than on a probe. There is no cheap
+    ``available()`` for a remote tool the way :mod:`talk_vault` has one, and
+    the alternative — a speculative ``dispatch_tool`` at every session mint —
+    would pay a real round trip before the operator has said anything.
+    :meth:`HostAdapter.capability_catalog_probe` may spend that call only
+    because :mod:`talk_capabilities` caches its result behind a TTL; this
+    sentence has no such cache, so ctx presence is the signal.
+
+    The ask-before-acting clause is the whole point of the second half: a
+    homophone or a stale alias resolves to the WRONG repo silently otherwise,
+    and this plugin has no code-level binding for arbitrary spoken entities
+    the way it does for session identity.
+    """
+
+    if get_ctx() is None:
+        return ""
+    return (
+        "search_memory can also look up people, repos, and aliases that are "
+        "not listed above. If more than one thing could match what you heard, "
+        "ask which one before acting on it — never pick the closest match."
+    )
+
+
+def _resolve_working_block() -> str:
+    """The trailing half of the working section: what can be LOOKED UP.
+
+    Ordered after the curated file in :meth:`HostAdapter.identity_sections`
+    for the reason :func:`_resolve_memory_block` gives — the cap trims from
+    the tail, and a known alias outranks the sentence about finding one.
+    """
+
+    return _resolve_operator_pointer()
+
+
 def _resolve_memory_block() -> str:
     """The trailing half of the memory section: what can be LOOKED UP.
 
@@ -521,6 +599,9 @@ class HostAdapter:
             "PERSONA": ("SOUL.md", None),
             "USER": ("memories/USER.md", "user_char_limit"),
             "MEMORY": ("memories/MEMORY.md", "memory_char_limit"),
+            # File only, no pointer: diagnostics report what is ON DISK, and
+            # the pointer is a property of the live session, not of the box.
+            "WORKING": ("memories/WORKING.md", "working_char_limit"),
         }
         for name, (relative, limit_key) in files.items():
             try:
@@ -568,6 +649,15 @@ class HostAdapter:
         ]
         if memory_parts:
             sections["MEMORY"] = "\n\n".join(memory_parts)
+        # Same two-part shape, same reason for the order: the curated operator
+        # file is what the session KNOWS, the pointer is what it can go find.
+        working_parts = [
+            part
+            for part in (_identity_file("WORKING"), _resolve_working_block())
+            if part
+        ]
+        if working_parts:
+            sections["WORKING"] = "\n\n".join(working_parts)
         include = talk_config.identity_include()
         if include is None:
             return sections
@@ -646,9 +736,18 @@ class HostAdapter:
     def search_memory(self, query: str, limit: int = 5) -> str:
         """Search past Hermes sessions for what was said about ``query``.
 
-        Three tiers, each fall-through said out loud (see the module docstring).
-        Tier 2 answers with a receipt rather than the answer — an agent run is
-        seconds of work and outlives the relay's bounded tool courtesy wait.
+        Four tiers, each fall-through said out loud (see the module
+        docstring). The last one answers with a receipt rather than the
+        answer — an agent run is seconds of work and outlives the relay's
+        bounded tool courtesy wait.
+
+        The two in-process tiers answer DIFFERENT questions and say so.
+        ``session_search`` returns what was actually said, verbatim, and is
+        tried first. Honcho returns what was inferred and remembered about
+        the operator, which can be stale in a way a transcript line cannot,
+        so its answer carries :data:`REMEMBERED_PREFIX` and the transcript's
+        does not. Collapsing the two would make a guess indistinguishable
+        from a quote on a surface with nothing on screen to check.
         """
 
         ctx = get_ctx()
@@ -661,6 +760,18 @@ class HostAdapter:
                 return f"the memory lookup failed: {type(exc).__name__}: {exc}"
             if not _agent_loop_absent(raw, MEMORY_TOOL_NAME):
                 return _speakable(raw)
+
+            try:
+                raw = ctx.dispatch_tool(
+                    HONCHO_SEARCH_TOOL_NAME, {"query": query, "limit": limit}
+                )
+            except Exception as exc:  # noqa: BLE001 — the model speaks the failure
+                return f"the memory lookup failed: {type(exc).__name__}: {exc}"
+            # Only "Honcho isn't here" falls through. A Honcho that IS here
+            # and said no — reindexing, rate limited — made a decision that
+            # belongs to it, exactly as for session_search above.
+            if not _agent_loop_absent(raw, HONCHO_SEARCH_TOOL_NAME):
+                return f"{REMEMBERED_PREFIX}{_speakable(raw)}"
 
         return self._search_memory_via_api_server(query, limit)
 

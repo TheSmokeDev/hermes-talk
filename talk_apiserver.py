@@ -122,9 +122,22 @@ def _lane_enabled() -> bool:
     return "PYTEST_CURRENT_TEST" not in os.environ
 
 
-def _auth_headers() -> dict:
+def _auth_headers(session_key: str | None = None) -> dict:
+    """Bearer credential, plus the optional memory-scoping key.
+
+    ``session_key`` is threaded only by the run-SUBMISSION call site: the
+    read and control routes (``probe``, ``get_run``, ``stop_run``) address a
+    run that already exists and have nothing to scope. Defaulting it to
+    ``None`` keeps all four of those call sites byte-identical to before.
+    """
+
+    headers: dict = {}
     key = talk_config.api_server_key()
-    return {"Authorization": f"Bearer {key}"} if key else {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if session_key:
+        headers["X-Hermes-Session-Key"] = session_key
+    return headers
 
 
 def probe() -> ApiServerStatus:
@@ -283,8 +296,15 @@ def is_available() -> bool:
     return status().available
 
 
-def start_run(prompt: str, *, session_id: str | None = None) -> str:
-    """POST /v1/runs. Returns the run id; raises on anything else."""
+def start_run(
+    prompt: str, *, session_id: str | None = None, session_key: str | None = None
+) -> str:
+    """POST /v1/runs. Returns the run id; raises on anything else.
+
+    ``session_id`` names an EXISTING remote conversation to continue;
+    ``session_key`` is the operator's stable scope for the memory a run may
+    read and write, and survives the ``/clear`` that ends a session_id.
+    """
 
     body: dict = {"input": prompt}
     if session_id:
@@ -293,7 +313,7 @@ def start_run(prompt: str, *, session_id: str | None = None) -> str:
         response = httpx.post(
             talk_config.api_server_url() + RUNS_PATH,
             json=body,
-            headers=_auth_headers(),
+            headers=_auth_headers(session_key),
             timeout=talk_config.api_server_probe_timeout_s() * 4,
         )
     except httpx.HTTPError as exc:
@@ -437,6 +457,7 @@ def run_to_completion(
     prompt: str,
     *,
     session_id: str | None = None,
+    session_key: str | None = None,
     on_start=None,
 ) -> str:
     """Run one agent turn and return its answer as speakable text.
@@ -447,7 +468,7 @@ def run_to_completion(
     for "how long may work run", whichever lane carries it.
     """
 
-    run_id = start_run(prompt, session_id=session_id)
+    run_id = start_run(prompt, session_id=session_id, session_key=session_key)
     if on_start is not None:
         with contextlib.suppress(Exception):  # a bookkeeping hook is never fatal
             on_start(run_id)

@@ -97,6 +97,34 @@ def test_sections_are_capped_per_name():
     assert len(rendered) == talk_identity.IDENTITY_CAPS["WORKING"]
 
 
+def test_all_four_sections_render_in_priority_order():
+    """WORKING last on purpose: curated operator context is the section that
+    can be skimmed without losing the behavioural contract or who is on the
+    call. Its header must also describe what now lives there — the slot was
+    reserved for open-thread state and carries operator identity too."""
+
+    instructions = talk_identity.build_instructions(
+        {
+            "WORKING": "Dograh is the voice stack",
+            "MEMORY": "ships at night",
+            "PERSONA": "be terse",
+            "USER": "calls you Hermes",
+        }
+    )
+
+    positions = [
+        instructions.index(body)
+        for body in (
+            "be terse",
+            "calls you Hermes",
+            "ships at night",
+            "Dograh is the voice stack",
+        )
+    ]
+    assert positions == sorted(positions)
+    assert "Operator identity" in instructions
+
+
 def test_a_case_variant_known_section_is_not_dropped():
     """The obvious spelling of the render loop (exact match for known names,
     ``.upper() not in`` for unknown) drops a lowercase known key from BOTH

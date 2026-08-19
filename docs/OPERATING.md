@@ -193,18 +193,28 @@ What a session knows before you say anything, and where each part comes from:
 | `PERSONA` | `SOUL.md`, through Hermes's own loader (which injection-scans it) | hermes-agent is not importable, or SOUL.md is empty |
 | `USER` | `<hermes_home>/memories/USER.md`, read directly | the file is missing or blank |
 | `MEMORY` | `<hermes_home>/memories/MEMORY.md`, then a one-line pointer at `search_vault` | no file **and** no usable memory provider |
-| `WORKING` | nothing yet — declared, no producer | always |
+| `WORKING` | `<hermes_home>/memories/WORKING.md` — operator-curated identity, repos, aliases — then a one-line pointer at `search_memory` | no file **and** no bound plugin context |
 
-`USER` and `MEMORY` are read from disk rather than through an agent, so they
-work on all three lanes. The gateway and the dashboard have no agent and no
-plugin context, and those are the lanes most likely to be asked "what do you
-know about X".
+`USER`, `MEMORY` and `WORKING` are read from disk rather than through an
+agent, so they work on all three lanes. The gateway and the dashboard have no
+agent and no plugin context, and those are the lanes most likely to be asked
+"what do you know about X".
+
+`WORKING.md` is the only one of the three you write by hand. It is scanned
+per entry anyway: the scan is about who can WRITE to the path, not who was
+supposed to. Conflicting entries — two lines claiming the same alias — are
+deliberately BOTH kept, so the model asks which you meant instead of binding
+your words to whichever line came first. Format and examples: see the
+[README](../README.md#talk_identity_include--what-the-session-starts-knowing).
 
 Two budgets apply in order: the host's own `memory.user_char_limit` /
-`memory.memory_char_limit` from `config.yaml` (its WRITE budget, reused here
-as a read cap), then this plugin's per-section cap. A section that resolves
-empty is omitted entirely rather than rendering a header with nothing under
-it. `talk_status` reports character COUNTS per section and never content.
+`memory.memory_char_limit` / `memory.working_char_limit` from `config.yaml`
+(its WRITE budget, reused here as a read cap), then this plugin's per-section
+cap. A key your `config.yaml` does not declare reads as "no host opinion", not
+as zero — `working_char_limit` needs no host-side change to work. A section
+that resolves empty is omitted entirely rather than rendering a header with
+nothing under it. `talk_status` reports character COUNTS per section and never
+content.
 
 The session instructions also carry the current date and time, built per
 session — a voice assistant that cannot say what day it is fails the first
@@ -258,6 +268,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Gateway base URL; trailing slash stripped. |
 | `TALK_API_SERVER_KEY` | falls back to `API_SERVER_KEY` | Bearer key for the lane. **Set-but-blank = send no Authorization header.** |
 | `API_SERVER_KEY` | unset | The gateway's own variable, reused as fallback so you configure the key once. |
+| `TALK_SESSION_KEY` | unset | Sent as `X-Hermes-Session-Key` on run submission (`POST /v1/runs`) only — never on the read/control routes, which address a run that already exists. Scopes the memory a run may read and write, so it survives the `/clear` that ends a `session_id`. **Set-but-blank = send no header**, which is the pre-0.9 behaviour exactly. One static operator-set value: nothing derives a default, because a key that changed between runs would silently lose the one property this knob exists for, with no symptom to read it off. Per-Discord-channel and per-dashboard-session keys are not derived yet. |
 | `TALK_API_SERVER_PROBE_TIMEOUT_S` | `1.5` | Budget for one availability probe — tight on purpose; it runs on the mic's event loop. |
 | `TALK_API_SERVER_PROBE_TTL_S` | `30.0` | How long a probe verdict is trusted before an off-hot-path refresh. |
 | `TALK_API_SERVER_POLL_S` | `1.0` | Poll interval while waiting on a run. |

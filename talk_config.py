@@ -280,6 +280,25 @@ def identity_include() -> tuple[str, ...] | None:
     return names or None
 
 
+def session_key() -> str | None:
+    """Stable key scoping api-server runs across ``/clear``, or ``None``.
+
+    ``TALK_SESSION_KEY`` is operator-set and static, the same shape as
+    ``TALK_AGENT_PROFILE``; unset or blank sends no header at all, which is
+    exactly today's behaviour.
+
+    **Never derive a default.** A key computed from the hostname, the PID, or
+    the clock would change between runs, so the one property the knob exists
+    to provide — the same scope before and after a ``/clear`` — would be
+    silently absent, and the operator would have no symptom to read it off.
+    Deriving a distinct key per Discord channel or dashboard session is a
+    real feature, and a separate one: it needs channel identity plumbed in
+    from the surfaces, against a host header contract this repo cannot see.
+    """
+
+    return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
+
+
 def talk_model() -> str:
     """Realtime model, resolved at call time."""
 
