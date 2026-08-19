@@ -77,10 +77,14 @@ _TOOL_SEARCH_MEMORY: dict = {
     "type": "function",
     "name": "search_memory",
     "description": (
-        "Look up what was said or decided in past Hermes sessions. Use this "
-        "whenever you are asked about earlier work, prior decisions, people, "
-        "or anything you would only know from a previous conversation. "
-        "Returns matching excerpts to summarize aloud."
+        "Look up what was said or decided in past Hermes sessions, and who or "
+        "what a name refers to. Use this whenever you are asked about earlier "
+        "work, prior decisions, people, repos, or anything you would only "
+        "know from a previous conversation. Returns matching excerpts to "
+        "summarize aloud. An answer that begins 'from remembered context' is "
+        "a remembered profile fact, not a verbatim quote — say so when you "
+        "pass it on. If what comes back could match more than one thing, ask "
+        "which one before acting on it rather than taking the closest match."
     ),
     "parameters": {
         "type": "object",
@@ -409,7 +413,10 @@ def _handle_search_vault(arguments: dict) -> str:
         # Distinct sentence from the failure above, deliberately: "nothing
         # written down" and "the lookup broke" must never sound the same.
         return f"nothing in the notes about {query}."
-    return found
+    # Vault notes are untrusted text; the leading provenance marker is
+    # reserved for search_memory's Honcho tier and must not be forgeable
+    # from note content.
+    return talk_host.strip_reserved_marker(found)
 
 
 def _handle_delegate_task(arguments: dict) -> str:

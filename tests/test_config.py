@@ -236,3 +236,47 @@ def test_identity_char_limit_survives_a_missing_config(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nowhere"))
 
     assert talk_config.identity_char_limit("memory_char_limit") == 0
+
+
+def test_identity_char_limit_is_zero_for_a_key_no_host_declares(monkeypatch, tmp_path):
+    """What makes ``working_char_limit`` shippable with no host-side change:
+    an unknown key reads as "no host opinion", so the plugin cap applies and
+    the section still travels."""
+
+    _home_with_config(monkeypatch, tmp_path, "memory:\n  memory_char_limit: 6000\n")
+
+    assert talk_config.identity_char_limit("working_char_limit") == 0
+
+
+def test_session_key_is_none_when_unset(monkeypatch):
+    monkeypatch.delenv("TALK_SESSION_KEY", raising=False)
+
+    assert talk_config.session_key() is None
+
+
+def test_session_key_returns_the_configured_value(monkeypatch):
+    monkeypatch.setenv("TALK_SESSION_KEY", "  operator-pedro  ")
+
+    assert talk_config.session_key() == "operator-pedro"
+
+
+def test_session_key_blank_means_none(monkeypatch):
+    # Set-but-blank sends no header, the same reading TALK_API_SERVER_KEY and
+    # TALK_AGENT_PROFILE give it. There is nothing else to fall back to here.
+    monkeypatch.setenv("TALK_SESSION_KEY", "   ")
+
+    assert talk_config.session_key() is None
+
+
+def test_memory_search_timeout_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("TALK_MEMORY_SEARCH_TIMEOUT_S", raising=False)
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "2.5")
+    assert talk_config.memory_search_timeout_s() == 2.5
+
+    # Junk and non-positive values take the default, like every float knob here.
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "soon")
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0")
+    assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S

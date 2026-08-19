@@ -38,8 +38,20 @@ IDENTITY_HEADERS: dict[str, str] = {
     "PERSONA": "Your standing identity and behavior rules",
     "USER": "Who you are talking to",
     "MEMORY": "What you already know (durable memory — do not ask for these)",
-    "WORKING": "What is currently open",
+    "WORKING": "Operator identity, known repos/aliases, and what is currently open",
 }
+
+#: The anti-guess rule for spoken entities. It lives in the PREAMBLE, not in
+#: a host identity section: a section can be ctx-gated, pinned away by
+#: ``TALK_IDENTITY_INCLUDE``, or dropped by a failing scanner — and the lanes
+#: that lose sections (gateway, dashboard) are exactly the ones where nobody
+#: is watching a silent wrong pick go by. The preamble is the one carrier
+#: that always ships. The rule depends on no tool, so nothing gates it.
+ANTI_GUESS_RULE = (
+    "If a name, repo, or alias you heard could match more than one thing you "
+    "know of, ask which one before acting on it — never pick the closest "
+    "match. "
+)
 
 VOICE_PREAMBLE = (
     "You are Hermes, speaking live over a voice call. Reply conversationally: "
@@ -47,7 +59,8 @@ VOICE_PREAMBLE = (
     "depth. Everything you say is read aloud, so no markdown, no bullet "
     "lists, no emoji, no code blocks, and no spelling out long file paths or "
     "URLs. If you do not know something, say so plainly. "
-    "Use only the function tools explicitly listed for this session. After a tool result, answer "
+    + ANTI_GUESS_RULE
+    + "Use only the function tools explicitly listed for this session. After a tool result, answer "
     "in one to three spoken sentences; never read raw output verbatim. "
     "Judge how much permission an action needs by what it can DAMAGE, not by "
     "how big it feels. Work that only costs tokens and lands somewhere "
@@ -178,6 +191,7 @@ def build_instructions(
 
 
 __all__ = [
+    "ANTI_GUESS_RULE",
     "DEFAULT_SECTION_CAP",
     "IDENTITY_CAPS",
     "IDENTITY_HEADERS",

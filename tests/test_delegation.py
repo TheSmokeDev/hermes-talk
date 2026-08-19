@@ -146,6 +146,17 @@ def test_agent_loop_absent_is_recognised(raw):
         # a deliberate setting.
         json.dumps({"error": "Delegation spawning is paused. Clear the pause via the TUI"}),
         json.dumps({"error": "max_spawn_depth exceeded"}),
+        # A real refusal that merely QUOTES a marker in its free text. Both
+        # marker shapes are complete tool_error messages the host mints
+        # verbatim (registry.py:1120, delegate_tool.py:3463), so the match is
+        # the whole error string — substring matching classified these as
+        # "no agent loop" and routed around the host's decision (review r2, F7).
+        json.dumps(
+            {"error": "Delegation refused: the brief names unknown tool: delegate_task"}
+        ),
+        json.dumps(
+            {"error": "Rejected — delegate_task requires a parent agent context. See docs."}
+        ),
         "not json at all",
         json.dumps(["a", "list"]),
     ],
@@ -589,7 +600,7 @@ def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp
     started = _threading.Event()
     release = _threading.Event()
 
-    def fake_run_to_completion(_task, *, session_id=None, on_start=None):
+    def fake_run_to_completion(_task, *, session_id=None, session_key=None, on_start=None):
         if on_start is not None:
             on_start("run_remote_42")
         started.set()

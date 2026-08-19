@@ -14,6 +14,69 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- A voice session can now start already knowing who you are, which repos you
+  mean by name, and what your aliases map to — provided you curate the file
+  that carries it (hermes-talk#36). Dogfooding on 2026-08-16 kept hitting the
+  same two failures: the session asked who the operator was every call, and
+  when a spoken name could mean two things it picked one silently. Nothing on
+  a voice surface shows you it guessed.
+
+  Three parts, each an extension of a mechanism that already existed rather
+  than a new one:
+
+  `memories/WORKING.md` is a new identity section, and the only one YOU write
+  instead of the model — nothing fills it for you, and it is read once at
+  session mint and stays frozen for the call (an edit lands on the next
+  session). It rides the same durable-file pipeline as `USER.md`
+  and `MEMORY.md`, so it is threat-scanned per entry, capped (2,000 chars),
+  and filtered by `TALK_IDENTITY_INCLUDE` without any of that being written
+  twice — hand-authored is not the same as trusted, and anything that can
+  write to your Hermes home can append an entry. Two entries claiming the
+  same alias BOTH travel: resolving that by file order would bind your words
+  to whichever line you wrote first, with no symptom, so the model is told to
+  ask instead — a rule that rides the voice preamble on EVERY lane, gated on
+  nothing, because the lanes that lose identity sections (a ctx-less gateway
+  or dashboard, a pinned include list, a failed scan) are exactly the ones
+  where nobody watches a silent guess go by. When a host is attached, one
+  sentence naming `search_memory` is appended for anything not in the file.
+  An include list pinned before `WORKING` existed silently drops the section
+  after upgrade; the session logs one warning at mint when that happens.
+
+  `search_memory` grew a middle tier. Between the transcript read
+  (`session_search`) and the api-server fallback it now tries Hermes's Honcho
+  memory plugin, and prefixes that answer with `from remembered context:`.
+  The prefix is the point: a remembered profile fact can be stale in a way a
+  verbatim transcript line cannot, and collapsing the two would make a guess
+  and a quote sound identical out loud. The prefix marks FACTS only — an
+  error-shaped Honcho answer is spoken without it — and it is reserved:
+  transcript or vault content that leads with the literal marker has it
+  stripped, so a quote can never dress itself as a recollection. A Honcho
+  that is simply absent falls through; a Honcho that is present and refuses
+  is spoken, not routed around; and the Honcho dispatch is bounded by
+  `TALK_MEMORY_SEARCH_TIMEOUT_S` (default 10s) so a wedged plugin costs one
+  spoken failure, never the serialized tool pipeline.
+
+  `TALK_SESSION_KEY` sends `X-Hermes-Session-Key` on run submission, so the
+  memory an api-server run reads and writes is scoped to you and survives the
+  `/clear` that ends a `session_id`. Unset — the default — sends no header
+  and changes nothing. It is deliberately static and operator-set: a key
+  derived from the hostname or the clock would change between runs, and the
+  one property the knob exists for would be silently missing. It is an
+  OPERATOR scope, not a session boundary: every voice-channel participant
+  shares it, because the authority ledger gates mutating tools and never
+  memory reads — do not set it in a multi-user channel until per-speaker
+  scoping lands.
+
+  Not built, and named here so the gap is not mistaken for coverage: a
+  session-mint profile pre-fetch (`honcho_context`), per-Discord-channel and
+  per-dashboard-session key derivation, per-speaker memory scoping,
+  code-enforced binding for spoken entities, homophone detection, any
+  producer that fills `WORKING.md` (installed plugins, recent work), and
+  mid-call refresh of identity sections. Ambiguity and mishears are handled
+  by prompt copy plus the aliases you write yourself, the same way the
+  preamble's damage-based confirmation policy governs every other
+  consequential action here — not by a mechanism that can refuse.
+
 - A spoken approval now binds to the exact action it approved, so a mutating
   request takes one summary-then-yes exchange instead of a draft → confirm →
   restate → confirm loop (hermes-talk#37). The single-use call permit minted
