@@ -10,9 +10,13 @@ available.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import secrets
 import threading
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any
@@ -106,11 +110,66 @@ class _ResponseAuthority:
     continuation: SpeakerBinding | None = None
 
 
+#: Mutating tools name their subject differently. The permit records what a
+#: spoken approval actually covered, so the audit trail says which agent or
+#: run was approved, not merely that something was.
+_TARGET_ARGUMENT_KEYS = {
+    "steer_agent": "agent_id",
+    "redirect_agent": "agent_id",
+    "stop_work": "target",
+}
+
+
+def _canonical_call(name: Any, arguments: Any) -> tuple[str, str | None]:
+    """Hash normalized arguments and read the target this tool acts on.
+
+    Malformed or non-JSON arguments still hash deterministically instead of
+    raising: a tampered or truncated payload should change the hash, which
+    denies the permit, rather than throw out of the mint or authorize path.
+    Keys are sorted and separators fixed so the same arguments always hash
+    the same way regardless of the order the provider serialized them in.
+    """
+
+    parsed: Any = None
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed = None
+    canonical = (
+        json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        if isinstance(parsed, dict)
+        # repr, not str: repr(None) and repr("None") differ, so a missing
+        # arguments value never collides with the literal string.
+        else repr(arguments)
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    target: str | None = None
+    if isinstance(parsed, dict) and isinstance(name, str):
+        key = _TARGET_ARGUMENT_KEYS.get(name)
+        if key is not None:
+            candidate = parsed.get(key)
+            if isinstance(candidate, str) and candidate:
+                target = candidate
+    return digest, target
+
+
 @dataclass(slots=True)
 class _CallPermit:
-    """Single-use execution permit for one accepted call ID."""
+    """Single-use execution permit for one accepted call ID.
+
+    Bound at mint time to the exact action, a hash of its normalized
+    arguments, the target it acts on, the Talk session that minted it, and a
+    wall-clock expiry — so execution must match what was actually approved,
+    and an approval cannot fire long after the moment it was given.
+    """
 
     authority: _ResponseAuthority
+    action: str
+    args_hash: str
+    target: str | None
+    talk_session_id: str | None
+    expires_at: float
     consumed: bool = False
 
 
@@ -146,6 +205,19 @@ class DiscordToolAuthorizationLedger:
         self._seen_responses: OrderedDict[str, _ResponseAuthority | None] = OrderedDict()
         self._seen_call_ids: set[str] = set()
         self._poisoned = False
+        self._talk_session_id: str | None = None
+
+    def bind_session(self, talk_session_id: str) -> None:
+        """Attach this ledger to the exact Talk connection minting permits.
+
+        Recorded on every permit minted from here on, for the audit trail
+        only. Cross-session reuse is already structurally impossible: a
+        fresh ledger is built per connection, so one ledger's permit is
+        never checked by another's authorize_tool.
+        """
+
+        with self._lock:
+            self._talk_session_id = talk_session_id
 
     @property
     def segment_count(self) -> int:
@@ -434,7 +506,17 @@ class DiscordToolAuthorizationLedger:
                 or self._poisoned
             ):
                 authority = None
-            permit = _CallPermit(authority) if call_once and authority is not None else None
+            permit = None
+            if call_once and authority is not None:
+                args_hash, target = _canonical_call(bound.get("name"), bound.get("arguments"))
+                permit = _CallPermit(
+                    authority,
+                    str(bound.get("name") or ""),
+                    args_hash,
+                    target,
+                    self._talk_session_id,
+                    time.monotonic() + talk_config.approval_permit_ttl_s(),
+                )
             binding = authority.binding if authority is not None else None
             continuation = None
             if authority is not None:
@@ -459,7 +541,16 @@ class DiscordToolAuthorizationLedger:
         authority = event.get("_talk_response_authority")
         permit = event.get("_talk_call_permit")
         operator_ids = talk_config.discord_operator_user_ids()
+        now = time.monotonic()
+        # Hashed from this same event dict, never a re-fetched copy: the relay
+        # documents that nothing rewrites it between authorize and execute, so
+        # a mismatch here means the arguments genuinely changed after approval.
+        args_hash, _target = _canonical_call(name, event.get("arguments"))
         with self._lock:
+            expired = isinstance(permit, _CallPermit) and permit.expires_at < now
+            rewritten = isinstance(permit, _CallPermit) and not hmac.compare_digest(
+                permit.args_hash, args_hash
+            )
             trusted = (
                 not self._poisoned
                 and isinstance(authority, _ResponseAuthority)
@@ -469,6 +560,8 @@ class DiscordToolAuthorizationLedger:
                 and not authority.tainted
                 and not authority.chain.tainted
                 and binding is authority.binding
+                and not expired
+                and not rewritten
             )
             # Every terminal handling attempt consumes its call permit, even
             # for read-only, unclassified, malformed, queue-rejected, or
@@ -483,8 +576,23 @@ class DiscordToolAuthorizationLedger:
             _log.error("denied unclassified Discord Talk tool %s", name)
             return MUTATION_DENIAL.format(tool=name)
         if trusted and binding.user_id is not None and binding.user_id in operator_ids:
+            # Approvals are logged as well as denials: an audit trail that only
+            # records refusals cannot show what was actually authorized. Never
+            # the audio, only who approved what.
+            _log.info(
+                "approved Discord mutating Talk tool %s for operator %s (session %s, target %s)",
+                name,
+                binding.user_id,
+                permit.talk_session_id,
+                permit.target,
+            )
             return None
-        reason = binding.reason if isinstance(binding, SpeakerBinding) else "unbound response"
+        if expired:
+            reason = "approval permit expired"
+        elif rewritten:
+            reason = "arguments changed since approval"
+        else:
+            reason = binding.reason if isinstance(binding, SpeakerBinding) else "unbound response"
         _log.warning("denied Discord mutating Talk tool %s: %s", name, reason)
         return MUTATION_DENIAL.format(tool=name)
 

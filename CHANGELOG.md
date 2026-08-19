@@ -13,6 +13,26 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- A spoken approval now binds to the exact action it approved, so a mutating
+  request takes one summary-then-yes exchange instead of a draft → confirm →
+  restate → confirm loop (hermes-talk#37). The single-use call permit minted
+  in `bind_tool_event` already bound *who* approved and *which* response; it
+  now also binds *what* — the action, a hash of its normalized arguments, the
+  target it acts on, the Talk session that minted it, and a wall-clock expiry
+  (`TALK_APPROVAL_PERMIT_TTL_S`, default 30s). `authorize_tool` denies a
+  permit whose arguments changed since approval, or that has expired, on top
+  of the existing speaker-attribution and one-use checks: a genuinely
+  different follow-up still needs its own approval, and a stale yes can no
+  longer fire into a conversation that has moved on. Arguments are compared
+  by value rather than by serialization, so a provider re-emitting the same
+  arguments in a different key order is not mistaken for a changed request.
+  Approvals of mutating tools are now logged alongside denials (operator id,
+  tool, target — never raw audio); previously only refusals were recorded,
+  which left the audit trail unable to show what was actually authorized. The
+  voice preamble now tells the model to state its plan once and act on a
+  clear yes.
+
 ### Fixed
 - Delegated work and memory lookups are now bound to the exact Talk session
   that asked for them (hermes-talk#35). Previously the `WORK_STARTED` receipt

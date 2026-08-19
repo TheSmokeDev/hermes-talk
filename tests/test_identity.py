@@ -46,6 +46,17 @@ def test_preamble_states_the_load_bearing_rules():
         assert leaked not in text
 
 
+def test_preamble_collapses_repeated_confirmation_into_one_approval():
+    """The permit binds what was approved; the preamble is what stops the model
+    re-asking for it. Without this the operator confirms the same action twice.
+    """
+
+    text = talk_identity.VOICE_PREAMBLE
+    assert "say the plan once" in text
+    assert "do not restate the plan or ask a second time" in text
+    assert "summarize the new version and ask again" in text
+
+
 def test_legacy_capability_claims_are_derived_from_the_advertised_tool_schemas():
     tools = talk_tools.default_talk_tools()
     instructions = talk_identity.build_instructions(None, tools=tools)

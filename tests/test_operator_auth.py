@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -734,3 +735,165 @@ def test_completion_and_teardown_clear_bounded_response_state():
     assert ledger.response_count == 0
     assert ledger.binding_count == 0
     assert ledger.segment_count == 0
+
+
+def test_unchanged_arguments_still_authorize_within_ttl(monkeypatch):
+    """The permit binds arguments, so the ordinary path — approve, then run
+    exactly what was approved — must still go through on the first attempt.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert ledger.authorize_tool("stop_work", event) is None
+
+
+def test_changed_arguments_after_mint_deny_execution(monkeypatch):
+    """An approval covers one exact action. Arguments rewritten between the
+    approved summary and execution are a different action, not the same one.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+    event["arguments"] = '{"target": "43"}'
+
+    assert "not run" in ledger.authorize_tool("stop_work", event)
+
+
+def test_reordered_argument_keys_are_the_same_approved_action(monkeypatch):
+    """Canonicalization is by value, not by serialization: a provider that
+    re-emits the same arguments in another key order has not changed them.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "focus on pricing"}',
+        }
+    )
+    event["arguments"] = '{"text": "focus on pricing", "agent_id": "sa-0-a1b2c3d4"}'
+
+    assert ledger.authorize_tool("steer_agent", event) is None
+
+
+def test_expired_permit_denies_execution(monkeypatch):
+    """A permit is not valid forever. Once its window passes, the operator
+    approves again rather than a stale yes firing into a moved-on conversation.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "0.01")
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+    # sleep() guarantees a lower bound on elapsed time, so a 10ms window is
+    # always past after 30ms — the expiry fires deterministically, not by luck.
+    time.sleep(0.03)
+
+    assert "not run" in ledger.authorize_tool("stop_work", event)
+
+
+def test_permit_records_action_target_and_session_for_the_audit_trail():
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.bind_session("talk-session-abc")
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": '{"agent_id": "sa-0-a1b2c3d4", "text": "focus on pricing"}',
+        }
+    )
+
+    permit = event["_talk_call_permit"]
+    assert permit.action == "steer_agent"
+    assert permit.target == "sa-0-a1b2c3d4"
+    assert permit.talk_session_id == "talk-session-abc"
+
+
+def test_ambiguous_speaker_still_denies_even_with_a_minted_permit(monkeypatch):
+    """The new argument and expiry checks are additive. A permit that is
+    structurally valid must not become a way past the speaker-trust gate.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(10))
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(10))
+    _bind_response(ledger, end_ms=20)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert "not run" in ledger.authorize_tool("stop_work", event)
+
+
+def test_read_only_tools_are_unaffected_by_argument_binding(monkeypatch):
+    """Read-only tools never carried an approval to begin with; the permit
+    checks must not start gating the half of the surface that stays open.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_APPROVAL_PERMIT_TTL_S", "0.01")
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "search_memory",
+            "arguments": '{"query": "pricing"}',
+        }
+    )
+    time.sleep(0.03)
+    event["arguments"] = '{"query": "something else"}'
+
+    assert ledger.authorize_tool("search_memory", event) is None

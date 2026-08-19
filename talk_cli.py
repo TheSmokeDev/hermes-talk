@@ -1222,6 +1222,8 @@ async def run_talk_session(
         # too. The generation is per-attach: a reconnect is a new generation
         # of the same session, and the ticket records which one accepted a run.
         talk_session_id = uuid.uuid4().hex
+        if authorization_ledger is not None:
+            authorization_ledger.bind_session(talk_session_id)
         generation_id = uuid.uuid4().hex[:12]
         talk_profile = talk_config.agent_profile()
         talk_runs.attach_owner(
