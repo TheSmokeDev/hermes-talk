@@ -14,6 +14,11 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- A capability-kernel port plan maps TaskChad OS v1.7.0's strict discovery,
+  immutable artifact, authority-separation, atomic publication, reverse
+  disposal, journaled recovery, and lane-truth lessons onto Hermes-owned host
+  APIs. This is documentation and an acceptance contract, not a claim that
+  `hermes-talk` already supports hot plugin lifecycle changes.
 - A voice session can now start already knowing who you are, which repos you
   mean by name, and what your aliases map to — provided you curate the file
   that carries it (hermes-talk#36). Dogfooding on 2026-08-16 kept hitting the
