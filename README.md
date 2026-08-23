@@ -86,6 +86,11 @@ hermes talk doctor --json  # → the same versioned receipt for scripts/issues
 gateway**: a running process keeps executing the old code until you do.
 Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify--the-receipts).
 
+Contributors adapting The Homie's v1.7.0 capability-plugin lessons to Hermes
+should use the [capability-kernel port plan](docs/CAPABILITY-KERNEL-PORT.md).
+It maps the reusable safety and lifecycle contracts onto Hermes-owned APIs;
+it does not claim that hot lifecycle support already exists here.
+
 ## Auth — no API key needed if you have ChatGPT
 
 Signed into the [Codex CLI](https://github.com/openai/codex) (`codex login`)?
