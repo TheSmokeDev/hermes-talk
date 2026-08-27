@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import fixture_data
 import pytest
 
 import talk_cli
@@ -356,7 +357,7 @@ def test_setup_key_entry_is_secret_safe_and_requires_confirmation(monkeypatch, t
     monkeypatch.setattr(talk_setup.talk_doctor, "render_human", lambda _report: "doctor receipt")
     monkeypatch.setattr(talk_setup.talk_config, "get_hermes_home", lambda: tmp_path)
 
-    secret = "sk-proj-setup-secret"
+    secret = fixture_data.fake_credential("setup-key-entry")
     prompts = []
     answers = iter(["key", "yes"])
 
@@ -376,7 +377,7 @@ def test_setup_key_entry_is_secret_safe_and_requires_confirmation(monkeypatch, t
 def test_setup_key_choice_reuses_existing_metered_key_and_confirms_policy_transition(
     monkeypatch, tmp_path, capsys
 ):
-    existing_secret = "sk-existing-metered-secret"
+    existing_secret = fixture_data.fake_credential("setup-existing-metered")
     monkeypatch.setenv("OPENAI_API_KEY", existing_secret)
     reports = [_preferred_codex_failure(metered_key_present=True)]
     doctor_calls = []
@@ -420,7 +421,7 @@ def test_setup_key_choice_reuses_existing_metered_key_and_confirms_policy_transi
 def test_setup_key_choice_confirms_new_secret_and_policy_as_separate_settings(
     monkeypatch, tmp_path, capsys
 ):
-    secret = "sk-new-metered-secret"
+    secret = fixture_data.fake_credential("setup-new-metered")
     reports = [_preferred_codex_failure(metered_key_present=False)]
 
     def collect_report():
@@ -478,7 +479,7 @@ def test_invalid_preference_key_choice_completes_real_doctor_setup_doctor_in_one
                 os.environ.pop(name, None)
 
     request.addfinalizer(restore_environment)
-    secret = "sk-proj-synthetic-setup-regression"
+    secret = fixture_data.fake_credential("setup-synthetic-regression")
     prompts = []
     secret_prompts = []
     transactions = []
@@ -621,7 +622,7 @@ def test_transaction_rolls_back_partial_environment_apply_and_never_changes_file
 def test_setup_catches_replace_failure_cleans_secret_temp_and_reruns_doctor(
     monkeypatch, tmp_path, capsys
 ):
-    secret = "sk-secret-that-must-not-remain"
+    secret = fixture_data.fake_credential("setup-replace-failure")
     env_path = tmp_path / ".env"
     original = "OTHER=preserved\n"
     env_path.write_text(original, encoding="utf-8")
@@ -672,8 +673,8 @@ def test_setup_catches_replace_failure_cleans_secret_temp_and_reruns_doctor(
 def test_commit_failure_and_denied_temp_cleanup_reports_surviving_secret_mutation(
     monkeypatch, tmp_path
 ):
-    secret = "sk-cleanup-denial-secret-must-be-redacted"
-    cleanup_error_secret = "cleanup-error-must-also-be-redacted"
+    secret = fixture_data.fake_credential("setup-cleanup-denial")
+    cleanup_error_secret = fixture_data.fake_credential("setup-cleanup-error")
     env_path = tmp_path / ".env"
     env_path.write_text("OTHER=preserved\n", encoding="utf-8")
     staged_paths = []

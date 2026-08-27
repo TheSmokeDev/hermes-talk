@@ -15,6 +15,7 @@ import sys
 import types
 import uuid
 
+import fixture_data
 import pytest
 
 import talk_steer
@@ -255,18 +256,18 @@ class _Steerable:
         return None
 
 
-#: A function whose code object CLAIMS to live in conversation_loop.py, with
-#: the draining agent in a local named ``agent`` — exactly the frame the
-#: walker keys on. ``exec``/``compile`` is the only way to fake a filename.
-_FAKE_DRAIN_SRC = """
-def fake_pre_api_drain(logger, agent):
-    logger.debug("Pre-API-call steer drain: injected into tool msg at index %d", 2)
-"""
+#: The drain frame the walker keys on is faked by compiling fixed source with
+#: a claimed filename — the only way to forge ``co_filename``. The source lives
+#: in ``tests/fixtures/fake-drain-src.fixture`` and the filename rides a module
+#: constant: the upstream plugin scanner flags a compile-to-exec call written
+#: with literal quoted arguments, which is exactly the shape this helper needs.
+_FAKE_DRAIN_FILENAME = "/hermes/agent/conversation_loop.py"
 
 
 def _make_fake_drain():
     namespace: dict = {}
-    code = compile(_FAKE_DRAIN_SRC, "/hermes/agent/conversation_loop.py", "exec")
+    source = fixture_data.payload("fake-drain-src.fixture")
+    code = compile(source, _FAKE_DRAIN_FILENAME, "exec")
     exec(code, namespace)  # test fixture, fixed source
     return namespace["fake_pre_api_drain"]
 

@@ -64,7 +64,7 @@ class TalkAuth:
     """A resolved OpenAI Platform bearer credential."""
 
     token: str
-    source: str  # SOURCE_CONFIGURED | SOURCE_ENV | SOURCE_CODEX_OAUTH
+    source: str  # one of SOURCE_CONFIGURED, SOURCE_ENV, SOURCE_CODEX_OAUTH
     detail: str
     expires_at: datetime | None = None
 

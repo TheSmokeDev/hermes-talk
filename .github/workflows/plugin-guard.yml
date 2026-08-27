@@ -1,0 +1,47 @@
+name: plugin-guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Same escape hatch as ci.yml: lets an operator re-run the gate against any
+  # ref by hand when event delivery drops.
+  workflow_dispatch:
+
+jobs:
+  scan:
+    # The upstream plugin scanner (tools/plugin_guard.py in
+    # NousResearch/hermes-agent, shipped in Hermes v0.20.4) gates
+    # `hermes plugins install`: one critical finding blocks the install and
+    # --force does not override it. This job runs that exact scanner over
+    # this repository and fails unless the verdict is clean — zero critical
+    # AND zero high findings.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Resolve the upstream scanner commit
+        id: scanner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="$(gh api repos/NousResearch/hermes-agent/commits/main --jq .sha)"
+          echo "pinning plugin_guard to NousResearch/hermes-agent@${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the pinned scanner outside the checkout
+        run: |
+          home="${RUNNER_TEMP}/plugin-guard"
+          mkdir -p "${home}/tools"
+          base="https://raw.githubusercontent.com/NousResearch/hermes-agent/${{ steps.scanner.outputs.sha }}/tools"
+          curl -fsSL "${base}/plugin_guard.py" -o "${home}/tools/plugin_guard.py"
+          curl -fsSL "${base}/skills_guard.py" -o "${home}/tools/skills_guard.py"
+          touch "${home}/tools/__init__.py"
+
+      - name: Scan this repository
+        run: python .github/plugin_guard_check.py "${RUNNER_TEMP}/plugin-guard" .

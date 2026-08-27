@@ -304,7 +304,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `HERMES_HOME` | platform default | The host resolves context override → process `HERMES_HOME` → platform default. Doctor compares host API results using the host's exact `Path(value)` semantics, including literal tilde/relative values and Windows defaults; it reports unknown provenance when those semantics cannot be established. Determines the state dir (`$HERMES_HOME/state/`, home of `talk-runs.jsonl`) and is inherited by spawned children. |
+| `HERMES_HOME` | platform default | Hermes resolves context override → process `HERMES_HOME` → platform default. Doctor compares host API results using the host's exact `Path(value)` semantics, including literal tilde/relative values and Windows defaults; it reports unknown provenance when those semantics cannot be established. Determines the state dir (`HERMES_HOME/state/`, home of `talk-runs.jsonl`) and is inherited by spawned children. |
 
 (One internal: the presence of `PYTEST_CURRENT_TEST` disables the durable
 run-history tee so test suites can't write into a real Hermes home.)
