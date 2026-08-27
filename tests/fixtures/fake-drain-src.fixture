@@ -1,0 +1,3 @@
+
+def fake_pre_api_drain(logger, agent):
+    logger.debug("Pre-API-call steer drain: injected into tool msg at index %d", 2)

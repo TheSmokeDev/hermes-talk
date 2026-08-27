@@ -10,6 +10,7 @@ import time
 import types
 from pathlib import Path
 
+import fixture_data
 import pytest
 
 import talk_auth
@@ -419,7 +420,7 @@ def test_discord_receipt_counts_operators_without_ids(monkeypatch):
 
 
 def test_human_and_json_output_redact_all_sensitive_values(monkeypatch, tmp_path, capsys):
-    api_secret = "sk-super-private-doctor-test"
+    api_secret = fixture_data.fake_credential("doctor-api")
     identity_secret = "the operator keeps this private"
     discord_secret = "586638048133906576"
     monkeypatch.setenv("TALK_OPENAI_API_KEY", api_secret)
@@ -443,8 +444,8 @@ def test_human_and_json_output_redact_all_sensitive_values(monkeypatch, tmp_path
 
 
 def test_secret_shaped_malformed_config_is_redacted_from_report_and_human(monkeypatch):
-    model_secret = "sk-proj-THIS-MUST-NOT-LEAK"
-    voice_secret = "github_pat_THIS-MUST-NOT-LEAK-EITHER"
+    model_secret = fixture_data.fake_credential("doctor-model")
+    voice_secret = fixture_data.fake_credential("doctor-voice")
     monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
     monkeypatch.setenv("TALK_MODEL", model_secret)
     monkeypatch.setenv("TALK_VOICE", voice_secret)
