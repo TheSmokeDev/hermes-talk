@@ -37,8 +37,9 @@ from collections.abc import Callable
 from typing import Any
 
 try:
-    from . import talk_steer
+    from . import talk_progress, talk_steer
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_progress
     import talk_steer
 
 _log = logging.getLogger(__name__)
@@ -88,6 +89,9 @@ def on_subagent_start(**kwargs: Any) -> None:
             _ROSTER[str(child_session_id)] = entry
             while len(_ROSTER) > _MAX_ROSTER:
                 _ROSTER.pop(next(iter(_ROSTER)))
+        # Progress projection (hermes-talk#33) keys on the same correlators
+        # and applies its own owner gate, so it gets the raw event verbatim.
+        talk_progress.note_subagent_start(**kwargs)
     except Exception:  # noqa: BLE001 — a hook must never raise into the host
         _log.debug("subagent_start hook handling failed", exc_info=True)
 
@@ -103,6 +107,10 @@ def on_subagent_stop(**kwargs: Any) -> None:
 
     try:
         child_session_id = kwargs.get("child_session_id")
+        # The progress subject (hermes-talk#33) dies with the stop event
+        # regardless of roster state — a dead child's session id must stop
+        # resolving even for a stop that rostered nothing.
+        talk_progress.note_subagent_stop(**kwargs)
         entry = None
         if child_session_id:
             with _LOCK:

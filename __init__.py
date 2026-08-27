@@ -25,6 +25,7 @@ try:
         talk_discord,
         talk_host,
         talk_lifecycle,
+        talk_progress,
         talk_providers,
         talk_tools,
         talk_transcript,
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_discord
     import talk_host
     import talk_lifecycle
+    import talk_progress
     import talk_providers
     import talk_tools
     import talk_transcript
@@ -267,6 +269,30 @@ def register(ctx) -> None:
         "subagent_stop_hook",
         "subagent_stop",
         talk_lifecycle.on_subagent_stop,
+    )
+
+    # Progress projection (hermes-talk#33): the per-tool-call and approval
+    # hooks are the attached lane's only evidence of executing/blocked work.
+    # The host's hook registry is process-scoped, so these register once here
+    # and stay inert until a Talk session attaches (talk_progress gates on
+    # its own attach state) — registration-time activity would project work
+    # belonging to sessions nobody is listening to.
+    _attempt_registration(
+        ctx,
+        "register_hook",
+        "post-tool-call hook",
+        "post_tool_call_hook",
+        "post_tool_call",
+        talk_progress.on_post_tool_call,
+    )
+
+    _attempt_registration(
+        ctx,
+        "register_hook",
+        "pre-approval hook",
+        "pre_approval_request_hook",
+        "pre_approval_request",
+        talk_progress.on_pre_approval_request,
     )
 
     if talk_providers.providers_available():

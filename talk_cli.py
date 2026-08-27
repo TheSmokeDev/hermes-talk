@@ -45,6 +45,7 @@ try:
         talk_lifecycle,
         talk_openai_realtime,
         talk_operator_auth,
+        talk_progress,
         talk_realtime,
         talk_runs,
         talk_setup,
@@ -65,6 +66,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_lifecycle
     import talk_openai_realtime
     import talk_operator_auth
+    import talk_progress
     import talk_realtime
     import talk_runs
     import talk_setup
@@ -760,6 +762,93 @@ def subagent_stop_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     return _announcement_commands(headline, tail)
 
 
+#: Progress milestones (hermes-talk#33) ride the same contained announcement
+#: shape as results but carry NO report at all: the headline is composed of
+#: plugin-owned words, the run's own label, and a safe tool label from
+#: talk_progress's mapping table. There is no field for args, paths, URLs,
+#: output text, or approval commands to ride in on — redaction here is
+#: positional, not textual.
+_PROGRESS_LABEL_CHARS = 60
+
+
+def run_phase_messages(run: dict, kind: str) -> list[dict]:
+    """The wire messages that make the model SPEAK a run's milestone."""
+
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in run_phase_commands(run, kind)
+    ]
+
+
+def run_phase_commands(run: dict, kind: str) -> list[talk_realtime.RealtimeCommand]:
+    """Contained milestone speech for one run's phase change or heartbeat.
+
+    ``kind`` is a non-terminal phase name or ``"heartbeat"``. Terminal phases
+    build nothing: the watcher's terminal branch speaks the outcome off the
+    registry's authoritative status, and a phase-path copy would be a
+    completion claim built from telemetry. Announcements NEVER claim
+    delivery — a milestone is ephemeral speech, re-sayable on every attach,
+    unlike the result, which is exactly-once.
+    """
+
+    run_id = run.get("runId")
+    if run_id is None:
+        return []
+    label = str(run.get("label") or "").strip()[:_PROGRESS_LABEL_CHARS]
+    label_part = f" ({label})" if label else ""
+    if kind == "heartbeat":
+        headline = f"Background run #{run_id}{label_part} is still working."
+    elif kind == talk_progress.PHASE_ACCEPTED:
+        headline = f"Background run #{run_id}{label_part} was accepted."
+    elif kind == talk_progress.PHASE_EXECUTING:
+        meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+        detail = str(meta.get("phase_detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
+        headline = f"Background run #{run_id}{label_part} is executing"
+        headline += f" — {detail}." if detail else "."
+    elif kind == talk_progress.PHASE_BLOCKED:
+        headline = f"Background run #{run_id}{label_part} is waiting on an approval."
+    else:
+        return []
+    return _announcement_commands(headline, "")
+
+
+def subagent_phase_messages(event: dict) -> list[dict]:
+    """The wire messages that make the model SPEAK a child's phase change."""
+
+    return [
+        talk_openai_realtime.encode_command(command)
+        for command in subagent_phase_commands(event)
+    ]
+
+
+def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """Contained milestone speech for an attached child's phase change.
+
+    Same containment as :func:`subagent_stop_commands` minus the quoted
+    summary — a milestone carries no child-authored text at all.
+    """
+
+    subagent_id = str(event.get("subagent_id") or "")
+    if not subagent_id:
+        return []
+    phase = str(event.get("phase") or "")
+    role = str(event.get("role") or "").strip()
+    role_part = f" ({role})" if role else ""
+    if phase == talk_progress.PHASE_ACCEPTED:
+        headline = f"Background agent {subagent_id}{role_part} was accepted."
+    elif phase == talk_progress.PHASE_EXECUTING:
+        detail = str(event.get("detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
+        headline = f"Background agent {subagent_id}{role_part} is executing"
+        headline += f" — {detail}." if detail else "."
+    elif phase == talk_progress.PHASE_BLOCKED:
+        headline = (
+            f"Background agent {subagent_id}{role_part} is waiting on an approval."
+        )
+    else:
+        return []
+    return _announcement_commands(headline, "")
+
+
 def _active_parent_session_id() -> str | None:
     """Snapshot the bound Hermes session id, or fail closed on older hosts."""
 
@@ -972,6 +1061,7 @@ async def run_talk_session(
                 await session.close()
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
+        talk_progress.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -987,6 +1077,7 @@ async def run_talk_session(
                 await session.close()
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
+        talk_progress.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -1059,14 +1150,17 @@ async def run_talk_session(
                 await send_outgoing(packet_lane.commands(speaker, chunk))
 
         async def watch_run(run_id: int) -> None:
-            """Poll one background run and speak its result when it lands.
+            """Poll one background run; speak its milestones and its result.
 
             Sends through the provider session directly rather than waiting
             for inbound activity: if the operator has gone quiet, a completed
-            result still needs to be spoken without another prompt.
+            result still needs to be spoken without another prompt. Between
+            the receipt and the landing, bounded progress milestones
+            (hermes-talk#33) ride the same poll tick off ``meta.phase``.
             """
 
             deadline = time.monotonic() + talk_config.agent_timeout_s()
+            progress = talk_progress.RunProgressWatch()
             while time.monotonic() < deadline:
                 await asyncio.sleep(WATCH_POLL_S)
                 run = talk_runs.get_run(run_id)
@@ -1089,6 +1183,17 @@ async def run_talk_session(
                             )
                         )
                     return
+                # Progress milestones (hermes-talk#33) are checked AFTER the
+                # terminal branch on purpose: the outcome sentence belongs to
+                # the authoritative terminal artifact above, and a phase built
+                # from the same host event must not pre-empt or duplicate it.
+                # Milestones carry no delivery claim — they are ephemeral
+                # speech, not the result.
+                milestone = progress.poll(run)
+                if milestone is not None:
+                    commands = run_phase_commands(run, milestone)
+                    if commands:
+                        await announce_queue.put(QueuedAnnouncement(commands))
 
         tool_coordinator = ToolResponseCoordinator(
             (
@@ -1210,9 +1315,20 @@ async def run_talk_session(
         announce_queue: asyncio.Queue = asyncio.Queue()
 
         def on_subagent_event(event: dict) -> None:
-            """Queue a finished child's announcement on the session loop."""
+            """Queue a child's terminal (or progress) announcement on the loop.
 
-            commands = subagent_stop_commands(event)
+            Two kinds arrive here: talk_lifecycle's ``subagent_stop`` (the
+            terminal announcement, which that module alone owns) and
+            talk_progress's ``subagent_phase`` milestones. Both enqueue plain
+            command batches — never a QueuedAnnouncement with a delivery
+            claim, because progress and even a spoken stop are re-sayable
+            speech, not a result hand-off.
+            """
+
+            if event.get("kind") == talk_progress.EVENT_SUBAGENT_PHASE:
+                commands = subagent_phase_commands(event)
+            else:
+                commands = subagent_stop_commands(event)
             if commands:
                 announce_queue.put_nowait(commands)
 
@@ -1228,6 +1344,10 @@ async def run_talk_session(
         # expose the property; None suppresses announcements instead of guessing.
         owner_session_id = _active_parent_session_id()
         talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
+        # Progress milestones (hermes-talk#33) share the target and the owner
+        # gate: the hook registrations are process-scoped, so attach is what
+        # makes them live for THIS session and nothing else.
+        talk_progress.attach_session(loop, on_subagent_event, owner_session_id)
         # This connection's own identity (hermes-talk#35), minted BEFORE any
         # tool can dispatch work. Independent of whether a Hermes ctx happens
         # to be bound, so tier-2/3 work has an exact destination off tier 1
@@ -1328,6 +1448,7 @@ async def run_talk_session(
         finally:
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
+            talk_progress.detach_session()
             # Unbound again: with no live connection there is no destination,
             # so further dispatch is refused rather than accepted into a void.
             talk_runs.detach_owner()
@@ -1372,6 +1493,7 @@ async def run_talk_session(
         # hook bus or ledger holding a callback into a dead session.
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
+        talk_progress.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         try:
@@ -1452,8 +1574,10 @@ __all__ = [
     "landed_note_messages",
     "pump_announcements",
     "run_finished_messages",
+    "run_phase_messages",
     "run_talk_session",
     "setup_cli",
     "started_run_ids",
+    "subagent_phase_messages",
     "subagent_stop_messages",
 ]

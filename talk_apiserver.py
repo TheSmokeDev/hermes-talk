@@ -459,6 +459,7 @@ def run_to_completion(
     session_id: str | None = None,
     session_key: str | None = None,
     on_start=None,
+    on_event=None,
 ) -> str:
     """Run one agent turn and return its answer as speakable text.
 
@@ -466,6 +467,13 @@ def run_to_completion(
     a :mod:`talk_runs` worker thread and nowhere else. The deadline is the
     same ``TALK_AGENT_TIMEOUT_S`` that bounds a detached spawn — one budget
     for "how long may work run", whichever lane carries it.
+
+    ``on_event`` is the progress tap (hermes-talk#33): it is handed each
+    poll's raw status payload — which carries the host-stamped ``last_event``
+    — so the caller can project bounded phases onto its own bookkeeping. Like
+    ``on_start``, it is pure telemetry: suppressed on error, never consulted
+    for the answer, and never evidence the run finished. The payload arrives
+    BEFORE the terminal branch, so the terminal ``last_event`` is seen too.
     """
 
     run_id = start_run(prompt, session_id=session_id, session_key=session_key)
@@ -477,6 +485,11 @@ def run_to_completion(
     while time.monotonic() < deadline:
         time.sleep(poll)
         run = get_run(run_id)
+        if on_event is not None:
+            try:
+                on_event(run)
+            except Exception:  # noqa: BLE001 — telemetry, never the run's fate
+                _log.debug("on_event progress tap failed", exc_info=True)
         state = str(run.get("status") or "")
         if state not in TERMINAL_RUN_STATUSES:
             continue

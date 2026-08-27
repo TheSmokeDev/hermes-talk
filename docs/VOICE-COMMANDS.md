@@ -23,8 +23,13 @@ delivery; "landed" only ever follows a real delivery artifact.
 | "what can you do right now?" / "which tools do you have?" | `talk_capabilities` | installed skills, resolved toolsets with their enabled/configured flags, gateway feature flags, live run counts | live evidence, not the prompt — read in-process off the attached agent, or over the api server when detached; a toolset listed `enabled: false` is reported as installed but NOT usable |
 
 Things you'll hear without asking (v0.6+): a background agent finishing
-("Background agent sa-… finished…"), and a steering note landing ("the
-note just landed"). Both arrive the moment the host reports them.
+("Background agent sa-… finished…"), a steering note landing ("the
+note just landed"), and (v0.8+) bounded progress milestones ("Background
+run #7 was accepted", "…is executing — Reading files", "…is waiting on
+an approval", "…is still working"). Milestones fire on phase changes only
+— not every poll tick — and the tool label is the only job detail that
+can surface (never arguments, paths, or output). All arrive the moment
+the host reports them.
 
 ## Steer vs redirect vs stop — three sentences
 

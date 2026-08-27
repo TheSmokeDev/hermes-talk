@@ -55,6 +55,7 @@ try:
         talk_apiserver,
         talk_auth,
         talk_config,
+        talk_progress,
         talk_runs,
         talk_steer,
         talk_vault,
@@ -63,6 +64,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_apiserver
     import talk_auth
     import talk_config
+    import talk_progress
     import talk_runs
     import talk_steer
     import talk_vault
@@ -386,6 +388,14 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 # it still cannot land), never the fail-open telemetry tee.
                 on_start=lambda api_run_id: talk_runs.annotate_run(
                     run_id, durable=True, api_run_id=api_run_id
+                ),
+                # Progress tap (hermes-talk#33): each poll's status payload is
+                # THIS run's own — the per-run addressing is what makes the
+                # projection incapable of cross-routing. The payload's
+                # last_event maps to a bounded phase; its session id is the
+                # correlator the same-process hook projection keys on.
+                on_event=lambda payload: talk_progress.project_api_poll(
+                    run_id, payload
                 ),
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
