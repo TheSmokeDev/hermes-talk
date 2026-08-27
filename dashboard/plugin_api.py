@@ -199,7 +199,7 @@ def _mint(auth_token: str, voice: str):
         model=talk_config.talk_model(),
         voice=voice,
         instructions=talk_identity.build_instructions(
-            talk_host.host().identity_sections(), tools=tools
+            talk_host.host().identity_sections(), tools=tools, lane="dashboard"
         ),
         tools=tools,
     )

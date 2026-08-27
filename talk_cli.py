@@ -38,6 +38,7 @@ try:
         talk_apiserver,
         talk_audio,
         talk_auth,
+        talk_capabilities,
         talk_config,
         talk_doctor,
         talk_host,
@@ -59,6 +60,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_apiserver
     import talk_audio
     import talk_auth
+    import talk_capabilities
     import talk_config
     import talk_doctor
     import talk_host
@@ -939,11 +941,46 @@ def _neutral_response_command(message: dict) -> talk_realtime.StartResponse:
     )
 
 
+def _host_summary_line() -> str | None:
+    """One mint-time line about the attached host, or ``None`` when unknown.
+
+    Best-effort and NEVER blocking: it reads only the capability catalog's
+    current snapshot through :func:`talk_capabilities.status`, which never
+    waits on the network. A cold, failed, or absent catalog buys no line —
+    session start must never stall or fail for a nicety (hermes-talk#64).
+    """
+
+    try:
+        snapshot = talk_capabilities.status()
+    except Exception:  # noqa: BLE001 — a summary line is never worth a session
+        return None
+    if snapshot.source == talk_capabilities.SOURCE_NONE:
+        return None
+
+    def usable(entry: dict) -> bool:
+        # A catalog flag disqualifies only when present AND negative; an
+        # entry carrying no flag is not accused of one.
+        return not (
+            entry.get("enabled") is False
+            or entry.get("disabled") is True
+            or entry.get("installed") is False
+            or entry.get("configured") is False
+        )
+
+    skills = sum(1 for entry in snapshot.skills if usable(entry))
+    toolsets = sum(1 for entry in snapshot.toolsets if usable(entry))
+    return (
+        f"Hermes host attached: {skills} skills enabled, "
+        f"{toolsets} toolsets active."
+    )
+
+
 async def run_talk_session(
     audio: object | None = None,
     *,
     session_factory=None,
     host_execution_attachment=None,
+    lane: str = "cli",
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -951,6 +988,11 @@ async def run_talk_session(
     the terminal's microphone by default, or a Discord voice channel
     (:class:`talk_discord.DiscordAudio`). Everything above this line is the
     same session either way: the same tools, ledger, and announcements.
+
+    ``lane`` names the transport for the prompt's where-am-I line. Only the
+    CLI lane composes a host summary: it is the lane whose session setup may
+    spend an in-process read, and even there a cold or failed catalog yields
+    no line rather than a stalled start.
     """
 
     hermes_home = talk_config.get_hermes_home()
@@ -980,6 +1022,8 @@ async def run_talk_session(
         talk_host.host().identity_sections(),
         tools=tools,
         host_execution=host_execution_attachment is not None,
+        lane=lane,
+        host_summary=_host_summary_line() if lane == "cli" else None,
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by

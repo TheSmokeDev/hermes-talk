@@ -489,9 +489,9 @@ def test_an_oversized_memory_section_is_capped_in_the_prompt(_hermetic, monkeypa
     instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
 
     # Measure the rendered body only — the preamble has its own "m"s, and the
-    # clock line trails every prompt.
+    # lane line and the clock trail every prompt.
     body = instructions.split(talk_identity.IDENTITY_HEADERS["MEMORY"] + ":\n\n", 1)[1]
-    body = body.split("\n\n" + talk_identity.current_moment())[0]
+    body = body.split("\n\n" + talk_identity.lane_line(None))[0]
     assert len(body) == talk_identity.IDENTITY_CAPS["MEMORY"]
 
 

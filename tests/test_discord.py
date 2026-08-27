@@ -379,7 +379,7 @@ def test_failure_receipt_falls_back_to_the_adapter_send_path(monkeypatch):
 
         adapter.send = adapter_send
 
-        async def fail_from_bridge(audio):
+        async def fail_from_bridge(audio, **_kwargs):
             audio._bridge_failure = "the Discord voice connection changed"
             return 1
 
@@ -399,7 +399,7 @@ def test_undeliverable_failure_receipt_is_preserved_for_status(monkeypatch):
         _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
         adapter._voice_text_channels = {}  # no linked text room is available
 
-        async def fail_from_bridge(audio):
+        async def fail_from_bridge(audio, **_kwargs):
             audio._bridge_failure = "the Discord voice credentials changed"
             return 1
 
@@ -425,7 +425,7 @@ def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(m
         _wired_host(monkeypatch)
         gate = asyncio.Event()
 
-        async def keep_open(audio):
+        async def keep_open(audio, **_kwargs):
             await gate.wait()
             return 0
 
@@ -440,6 +440,44 @@ def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(m
         assert len(receipt) < 240
         gate.set()
         await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_both_session_call_sites_pass_the_discord_lane(monkeypatch):
+    """The lane line is only true if every path names its own room (#64)."""
+
+    async def scenario():
+        _wired_host(monkeypatch)
+        gate = asyncio.Event()
+        seen: list[dict] = []
+
+        async def keep_open(audio, **kwargs):
+            seen.append(kwargs)
+            await gate.wait()
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", keep_open)
+
+        # Legacy lane: no host execution attachment.
+        talk_discord.start_session(7)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert seen[-1]["lane"] == "discord"
+        assert "host_execution_attachment" not in seen[-1]
+
+        # Let the first session finish so the slot frees for the second.
+        gate.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Host-execution lane: the attachment passes through with the lane.
+        attachment = object()
+        talk_discord.start_session(7, host_execution_attachment=attachment)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert seen[-1]["lane"] == "discord"
+        assert seen[-1]["host_execution_attachment"] is attachment
 
     asyncio.run(scenario())
 

@@ -1453,11 +1453,12 @@ def start_session(
         _SESSION_GENERATION += 1
         generation = _SESSION_GENERATION
         if host_execution_attachment is None:
-            session = talk_cli.run_talk_session(audio=audio)
+            session = talk_cli.run_talk_session(audio=audio, lane="discord")
         else:
             session = talk_cli.run_talk_session(
                 audio=audio,
                 host_execution_attachment=host_execution_attachment,
+                lane="discord",
             )
         task = loop.create_task(session)
         task.add_done_callback(_done)
