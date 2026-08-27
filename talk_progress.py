@@ -202,9 +202,10 @@ def set_run_phase(run_id: int, phase: str, *, detail: str | None = None) -> bool
       annotate→finish gap must not rewrite it back to ``executing``.
     - Same phase, same detail is a no-op, so a poll loop and a hook stream
       can both project without churning ``updated``.
-    - Terminal phases ride the durable annotate (a reconnect reads the
-      outcome off history meta); non-terminal phases are in-memory speech
-      state and stay off the disk.
+
+    Terminal phases ride the durable annotate (a reconnect reads the
+    outcome off history meta); non-terminal phases are in-memory speech
+    state and stay off the disk.
 
     ``detail`` is the safe tool label. On a phase CHANGE the detail is
     replaced (a stale "Reading files" must not survive into ``blocked``);

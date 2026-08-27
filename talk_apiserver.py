@@ -486,8 +486,10 @@ def run_to_completion(
         time.sleep(poll)
         run = get_run(run_id)
         if on_event is not None:
-            with contextlib.suppress(Exception):  # telemetry, never the run's fate
+            try:
                 on_event(run)
+            except Exception:  # noqa: BLE001 — telemetry, never the run's fate
+                _log.debug("on_event progress tap failed", exc_info=True)
         state = str(run.get("status") or "")
         if state not in TERMINAL_RUN_STATUSES:
             continue

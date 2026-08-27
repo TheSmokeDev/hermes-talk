@@ -252,6 +252,12 @@ Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
+Between the receipt and the landing, the session speaks bounded progress
+milestones: "accepted", "executing — Reading files", "waiting on an approval",
+and periodic "still working" heartbeats. The only detail that can name what a
+job is doing is a safe label from a fixed table — never the tool's arguments,
+paths, or output.
+
 Known limitation: delivery is bound to the exact session that started the
 work. If you disconnect before it lands, reconnecting on the *same* Hermes
 session adopts and speaks what you were owed, exactly once — a different

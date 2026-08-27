@@ -14,6 +14,28 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- Background work now speaks bounded progress milestones between the
+  delegation receipt and the terminal result (hermes-talk#33). A live session
+  hears "accepted", "executing — Reading files", "blocked" (waiting on an
+  approval), and periodic "still working" heartbeats — all built from host
+  evidence only, never invented. The only job-specific detail that can leave
+  the module is a safe tool label from a fixed mapping table ("Reading files",
+  "Running commands", "Searching the web"); unknown tools degrade to
+  "Working". Arguments, paths, URLs, output text, and approval commands never
+  enter a milestone.
+
+  Three invariants hold the design together: claims never exceed host
+  evidence (a phase is set only from a real host signal — the api_server's
+  `last_event`, or an in-process `post_tool_call`/`pre_approval_request`
+  hook); telemetry is never authority (writing `complete` into meta is a
+  receipt OF a terminal artifact, never a substitute — `finish_run` and
+  `claim_delivery` remain untouched); and routing keys on correlators, never
+  recency (two concurrent jobs cannot cross-route because neither projection
+  ever consults "the most recent" anything).
+
+  The visual lane reads the same phase off `meta.phase` for free —
+  `list_runs` already surfaces meta, so the dashboard's run list gains
+  progress without a new endpoint.
 - A capability-kernel port plan maps TaskChad OS v1.7.0's strict discovery,
   immutable artifact, authority-separation, atomic publication, reverse
   disposal, journaled recovery, and lane-truth lessons onto Hermes-owned host
