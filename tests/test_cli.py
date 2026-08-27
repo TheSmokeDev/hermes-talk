@@ -13,8 +13,10 @@ import types
 import pytest
 
 import talk_audio
+import talk_capabilities
 import talk_cli
 import talk_host
+import talk_identity
 import talk_operator_auth
 import talk_relay
 
@@ -1558,3 +1560,107 @@ def test_cli_entry_raises_systemexit_on_failure(monkeypatch):
         assert exc.code == 1
     else:  # pragma: no cover - the assertion we are here for
         raise AssertionError("nonzero session code did not raise SystemExit")
+
+
+# -- the mint-time host summary (hermes-talk#64) -------------------------------
+
+
+def _catalog_snapshot(**overrides):
+    base = {
+        "source": talk_capabilities.SOURCE_API_SERVER,
+        "skills": (),
+        "toolsets": (),
+        "capabilities": {},
+        "health": {},
+        "detail": "the Hermes api server",
+    }
+    return talk_capabilities.CatalogSnapshot(**(base | overrides))
+
+
+def test_host_summary_counts_only_usable_entries(monkeypatch):
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _catalog_snapshot(
+            skills=(
+                {"name": "web_search", "installed": True},
+                {"name": "retired", "enabled": False},
+            ),
+            toolsets=(
+                {"name": "browser", "enabled": True, "configured": True},
+                {"name": "email", "enabled": False, "configured": False},
+                {"name": "files"},  # no flags is not an accusation
+            ),
+        ),
+    )
+
+    assert talk_cli._host_summary_line() == (
+        "Hermes host attached: 1 skills enabled, 2 toolsets active."
+    )
+
+
+def test_host_summary_is_none_when_the_catalog_has_no_answer(monkeypatch):
+    monkeypatch.setattr(
+        talk_capabilities,
+        "status",
+        lambda: _catalog_snapshot(
+            source=talk_capabilities.SOURCE_NONE, detail="still checking"
+        ),
+    )
+
+    assert talk_cli._host_summary_line() is None
+
+
+def test_host_summary_swallows_a_raising_catalog(monkeypatch):
+    def boom():
+        raise RuntimeError("catalog exploded")
+
+    monkeypatch.setattr(talk_capabilities, "status", boom)
+
+    assert talk_cli._host_summary_line() is None
+
+
+def _capture_instructions(monkeypatch, tmp_path):
+    """Drive session setup far enough to mint the prompt, then fail on audio."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(talk_cli.talk_transcript, "sweep_transcripts", lambda _home: None)
+    seen: dict = {}
+    real = talk_cli.talk_identity.build_instructions
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        seen["instructions"] = real(*args, **kwargs)
+        return seen["instructions"]
+
+    monkeypatch.setattr(talk_cli.talk_identity, "build_instructions", record)
+
+    def fail(_self):
+        raise talk_audio.TalkAudioError("no mic")
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", fail)
+    return seen
+
+
+def test_the_cli_lane_and_host_summary_ride_the_minted_prompt(monkeypatch, tmp_path):
+    seen = _capture_instructions(monkeypatch, tmp_path)
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+    assert seen["lane"] == "cli"
+    # Under pytest the catalog's REST lane is inert, so the cold cache has no
+    # answer — and no line — rather than a stalled session start.
+    assert seen["host_summary"] is None
+    assert talk_identity.LANE_LINES["cli"] in seen["instructions"]
+
+
+def test_a_caller_named_lane_buys_no_summary(monkeypatch, tmp_path):
+    """Only the CLI lane composes a host summary this slice."""
+
+    seen = _capture_instructions(monkeypatch, tmp_path)
+
+    assert asyncio.run(talk_cli.run_talk_session(lane="discord")) == 1
+    assert seen["lane"] == "discord"
+    assert seen["host_summary"] is None
+    assert talk_identity.LANE_LINES["discord"] in seen["instructions"]

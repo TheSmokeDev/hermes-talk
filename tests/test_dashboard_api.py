@@ -24,6 +24,7 @@ import talk_apiserver
 import talk_capabilities
 import talk_config
 import talk_host
+import talk_identity
 import talk_runs
 import talk_tools
 import talk_vault
@@ -173,6 +174,16 @@ def test_mint_advertises_the_full_tool_surface(minted, monkeypatch):
         "talk_capabilities",
     ]
     assert minted["session"]["tool_choice"] == "auto"
+
+
+def test_mint_prompt_names_the_dashboard_lane(minted):
+    """The browser tab is this lane's room; the prompt must say so (#64)."""
+
+    call(api.create_session, FakeRequest(body={}))
+
+    instructions = minted["session"]["instructions"]
+    assert talk_identity.LANE_LINES["dashboard"] in instructions
+    assert talk_identity.LANE_LINES["cli"] not in instructions
 
 
 def test_mint_honours_a_requested_voice(minted):

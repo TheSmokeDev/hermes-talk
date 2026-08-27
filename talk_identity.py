@@ -62,6 +62,9 @@ VOICE_PREAMBLE = (
     + ANTI_GUESS_RULE
     + "Use only the function tools explicitly listed for this session. After a tool result, answer "
     "in one to three spoken sentences; never read raw output verbatim. "
+    "When you are asked what you or Hermes can do, call the talk_capabilities "
+    "tool and answer from what it returns — never recite capabilities from "
+    "memory. "
     "Judge how much permission an action needs by what it can DAMAGE, not by "
     "how big it feels. Work that only costs tokens and lands somewhere "
     "reversible — a lookup, a draft, or a task handed to delegate_task — you start on "
@@ -77,6 +80,10 @@ VOICE_PREAMBLE = (
     "second time for that same action. That approval covers only what you "
     "just summarized, so if the target or the arguments change at all, "
     "summarize the new version and ask again. "
+    "You cannot click, type, or drive a screen yourself, but agents you "
+    "delegate to run the full Hermes toolset — files, shell, browser, "
+    "computer use, and connected apps. Never answer \"I can't\" when the "
+    "honest answer is \"I can hand that to an agent.\" "
     "When you hand work to delegate_task, the brief you write is the ONLY "
     "thing that agent ever sees. It starts fresh, with no access to this "
     "call, so never pass 'do that', 'what we just discussed', or any other "
@@ -105,6 +112,44 @@ _HOST_TRANSCRIPT_CONTRACT = (
     "a second canonical Hermes inference turn. The temporary live transcript is handed off "
     "after the call closes for durable-memory review."
 )
+
+#: The one true sentence about WHERE this session is running, per lane
+#: (hermes-talk#64). A session asked "where are you running from?" used to
+#: answer "a service in the infrastructure" because nothing in the prompt
+#: said otherwise. Each lane names its own surface and its real hang-up
+#: control; an unknown lane gets the generic line rather than an invented
+#: one. One sentence each: like everything here, it is re-billed per turn.
+LANE_LINES: dict[str, str] = {
+    "cli": (
+        "You are running as a `hermes talk` session in a terminal on the "
+        "operator's own machine — Ctrl+C in that terminal ends the call."
+    ),
+    "discord": (
+        "You are live in a Discord voice channel — `/talk leave` or the "
+        "operator leaving the channel ends the call."
+    ),
+    "dashboard": (
+        "You are live in the Hermes dashboard browser tab — the hang-up "
+        "control or closing the tab ends the call."
+    ),
+}
+
+#: What an unrecognized or absent lane ships: true on every surface, and it
+#: names no control the session cannot vouch for.
+GENERIC_LANE_LINE = (
+    "You are live on a voice call; the operator can end it from the surface "
+    "they joined on."
+)
+
+#: Cap on the mint-time host summary line. It is one line of prompt, never a
+#: section: the producer composes it, this cap is the guarantee it stays one.
+HOST_SUMMARY_CAP = 200
+
+
+def lane_line(lane: str | None) -> str:
+    """The lane sentence for one built prompt. Never falsy, never invented."""
+
+    return LANE_LINES.get(str(lane or "").strip().lower(), GENERIC_LANE_LINE)
 
 
 def _tool_contract(tools: list[dict] | None, *, host_execution: bool = False) -> str:
@@ -155,12 +200,20 @@ def build_instructions(
     *,
     tools: list[dict] | None = None,
     host_execution: bool = False,
+    lane: str | None = None,
+    host_summary: str | None = None,
 ) -> str:
     """Assemble the Realtime session prompt.
 
     ``host_sections`` is whatever the host adapter could resolve, keyed by
     uppercase section name. Unknown keys are rendered after the known ones so
     a host that grows a section does not need a change here.
+
+    ``lane`` names the transport the session was minted on ("cli", "discord",
+    "dashboard"); anything else ships the generic lane line. ``host_summary``
+    is one producer-composed line about the attached host (skill/toolset
+    counts), rendered only when provided and capped at HOST_SUMMARY_CAP —
+    ``None`` means nothing renders, never an empty line.
     """
 
     sections: list[str] = []
@@ -179,6 +232,14 @@ def build_instructions(
             header = IDENTITY_HEADERS.get(name.upper(), name.replace("_", " ").title())
             sections.append(f"{header}:\n\n{body}")
 
+    if host_summary is not None:
+        summary = host_summary.strip()[:HOST_SUMMARY_CAP]
+        if summary:
+            sections.append(summary)
+    # The lane line rides unconditionally, just ahead of the clock: it is one
+    # sentence, it depends on no host, and a session asked where it runs must
+    # answer the truth even on a lane whose prompt carries no sections at all.
+    sections.append(lane_line(lane))
     # The clock rides last and unconditionally: it is one line, it is the most
     # perishable thing in the prompt, and a session with no host sections at
     # all should still be able to say what day it is.
@@ -193,12 +254,16 @@ def build_instructions(
 __all__ = [
     "ANTI_GUESS_RULE",
     "DEFAULT_SECTION_CAP",
+    "GENERIC_LANE_LINE",
+    "HOST_SUMMARY_CAP",
     "IDENTITY_CAPS",
     "IDENTITY_HEADERS",
     "IDENTITY_ORDER",
+    "LANE_LINES",
     "VOICE_PREAMBLE",
     "advertised_tool_names",
     "build_instructions",
     "cap_section",
     "current_moment",
+    "lane_line",
 ]
