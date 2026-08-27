@@ -69,7 +69,39 @@ hermes talk
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
 v0.17.0 install. 650+ offline tests, CI on ubuntu + windows × py3.11–3.13.
 
-**Verify it** (no talking required):
+## Quickstart — your first call on each surface
+
+**Terminal** (simplest — start here):
+
+```bash
+hermes plugins install TheSmokeDev/hermes-talk --enable
+pip install "hermes-talk[audio]"
+hermes talk        # you are live; speak. Ctrl+C hangs up.
+```
+
+**Discord** (the call happens inside a voice channel, not in chat):
+
+1. Hermes's Discord adapter is connected and its bot is in your server
+   (that's the host's own setup, not this plugin's).
+2. Put Hermes in a voice channel first: `/voice join`. Talk borrows that
+   connection — it never opens a second one.
+3. Then `/talk join` starts the Talk session on that channel. `/talk leave`
+   (or leaving the channel) ends it. `/voice leave` disconnects Hermes
+   entirely.
+4. Want mutating tools (`delegate_task`, `steer_agent`, …) in a shared
+   channel? Set `TALK_DISCORD_OPERATOR_USER_IDS=<your Discord user id>` and
+   restart the gateway. Without it everyone can talk but nobody can mutate —
+   that fail-closed default is intentional.
+
+**Dashboard** (browser, no mic drivers needed): with the gateway running,
+open the Hermes dashboard and use the **Talk** tab — start the session from
+there. Audio is browser-native.
+
+In every case, `hermes talk doctor` (or saying "status report" on the call)
+tells you which lane came up and what is missing. If a surface shows
+nothing, run doctor first — it names the gap.
+
+## Verify your install
 
 ```bash
 hermes plugins list    # → hermes-talk · enabled · current version
