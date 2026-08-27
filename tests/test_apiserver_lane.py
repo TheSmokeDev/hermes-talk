@@ -388,7 +388,9 @@ def test_a_run_started_by_the_host_carries_the_operators_scope(monkeypatch, lane
     monkeypatch.setenv("TALK_SESSION_KEY", "operator-pedro")
     seen: dict = {}
 
-    def fake_run_to_completion(_task, *, session_id=None, session_key=None, on_start=None):
+    def fake_run_to_completion(
+        _task, *, session_id=None, session_key=None, on_start=None, on_event=None
+    ):
         seen["session_key"] = session_key
         return "the answer"
 

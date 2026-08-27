@@ -127,6 +127,8 @@ def test_register_wires_every_surface(plugin, monkeypatch):
         "on_session_end",
         "subagent_start",
         "subagent_stop",
+        "post_tool_call",
+        "pre_approval_request",
     ]
     assert len(ctx.tts_providers) == 1
     assert len(ctx.stt_providers) == 1
@@ -234,8 +236,8 @@ def test_every_surface_failing_is_recorded_separately(plugin, monkeypatch):
     plugin.register(ctx)
 
     # Core-absent standalone Talk records realtime as unsupported-optional;
-    # a core-present host attempts it and records the eighth failure.
-    expected_failures = 8 if plugin.talk_core_realtime.core_provider_available() else 7
+    # a core-present host attempts it and records the tenth failure.
+    expected_failures = 10 if plugin.talk_core_realtime.core_provider_available() else 9
     assert len(plugin.REGISTRATION_FAILURES) == expected_failures
     assert plugin.talk_host.get_ctx() is ctx
     expected_receipts = (
@@ -314,7 +316,7 @@ def test_absent_optional_methods_warn_without_registration_failure(plugin, monke
     check = plugin.talk_cli.talk_doctor._plugin_check()
     assert check["status"] == "warn"
     assert check["details"]["required_issue_count"] == 0
-    assert check["details"]["optional_issue_count"] == 6
+    assert check["details"]["optional_issue_count"] == 8
 
 
 def test_absent_required_method_is_a_required_failure_not_an_exception(plugin, monkeypatch):

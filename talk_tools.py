@@ -68,6 +68,8 @@ REGISTRATION_REQUIREMENTS: dict[str, str] = {
     "session_end_hook": "optional",
     "subagent_start_hook": "optional",
     "subagent_stop_hook": "optional",
+    "post_tool_call_hook": "optional",
+    "pre_approval_request_hook": "optional",
     "tts_provider": "optional",
     "transcription_provider": "optional",
     "realtime_voice_provider": "optional",
