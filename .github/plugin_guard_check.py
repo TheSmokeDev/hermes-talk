@@ -42,7 +42,7 @@ def main(argv: list[str]) -> int:
     try:
         result = scan_plugin(repo_root, source="TheSmokeDev/hermes-talk")
         print(format_scan_report(result))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — a crashed scanner must not read as a verdict
         print(f"plugin-guard: scanner crashed — {exc}")
         return 2
 
