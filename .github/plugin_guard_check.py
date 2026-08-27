@@ -28,12 +28,23 @@ def main(argv: list[str]) -> int:
     if not (scanner_home / "tools" / "plugin_guard.py").is_file():
         print(f"plugin-guard: no scanner at {scanner_home}/tools/plugin_guard.py")
         return 2
+    if not (scanner_home / "tools" / "skills_guard.py").is_file():
+        print(f"plugin-guard: no skills_guard at {scanner_home}/tools/skills_guard.py")
+        return 2
 
     sys.path.insert(0, str(scanner_home))
-    from tools.plugin_guard import format_scan_report, scan_plugin
+    try:
+        from tools.plugin_guard import format_scan_report, scan_plugin
+    except ImportError as exc:
+        print(f"plugin-guard: cannot import scanner — {exc}")
+        return 2
 
-    result = scan_plugin(repo_root, source="TheSmokeDev/hermes-talk")
-    print(format_scan_report(result))
+    try:
+        result = scan_plugin(repo_root, source="TheSmokeDev/hermes-talk")
+        print(format_scan_report(result))
+    except Exception as exc:
+        print(f"plugin-guard: scanner crashed — {exc}")
+        return 2
 
     blocking = [f for f in result.findings if f.severity in ("critical", "high")]
     for finding in blocking:

@@ -37,8 +37,13 @@ def _scanner_home() -> Path | None:
 
 
 def test_repo_scans_clean_under_upstream_plugin_guard():
+    raw = os.environ.get(SCANNER_HOME_ENV)
     home = _scanner_home()
     if home is None:
+        if raw:
+            pytest.skip(
+                f"{SCANNER_HOME_ENV}={raw!r} is set but scanner files not found at that path"
+            )
         pytest.skip(f"scanner not present locally; set {SCANNER_HOME_ENV} to run this gate")
     sys.path.insert(0, str(home))
     try:
