@@ -13,6 +13,13 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-27
+
+Delegated work stops being a black box. A voice session now starts knowing
+who you are, approves a mutation in one exchange instead of three, hears
+bounded progress while the job runs, and gets the right result back in the
+right session — even across a reconnect.
+
 ### Added
 - Background work now speaks bounded progress milestones between the
   delegation receipt and the terminal result (hermes-talk#33). A live session
@@ -187,6 +194,24 @@ named rather than smoothed.
   no Hermes session id (none is ever bound in the web server process) and never
   the ephemeral credential — a secret does not become an identifier.
 
+## [0.9.0] — 2026-08-18
+
+The room gets an authority boundary: only the operator's voice can authorize a
+mutation, the session stops talking over itself, and "what can you do right
+now?" is answered from live evidence instead of the system prompt.
+
+### Security
+- Operator speaker authority is now enforced at canonical host execution, not
+  just at the Discord layer (hermes-talk#39). A mutating tool call must bind to
+  the immutable operator identity all the way through the host's own
+  authorization path, so another voice in the room cannot induce a mutation
+  under the operator's authority.
+
+### Fixed
+- Realtime responses are serialized, eliminating duplicate and cut-off speech
+  (hermes-talk#38). One active assistant response at a time; superseded
+  responses are cancelled cleanly instead of overlapping.
+
 ### Added
 - A live capability catalog: the new `talk_capabilities` tool answers "what can
   you do right now?" from evidence instead of from the system prompt — installed
@@ -204,6 +229,14 @@ named rather than smoothed.
   fail. The tool is classified read-only: reading the catalog grants no
   execution authority, and a catalog read consumes its call permit so it cannot
   be replayed as a mutating call.
+
+## [0.8.1] — 2026-08-15
+
+The first PyPI release, and the one where the session stops being a prompt
+with a microphone: a typed provider-neutral boundary, native setup and doctor
+commands, and an explicit subscription auth lane.
+
+### Added
 - A typed provider-neutral Realtime session boundary: `talk_realtime.py` owns
   setup, events, commands, lifecycle states, and the adapter protocol, while
   `talk_openai_realtime.py` owns OpenAI ephemeral minting, WebSocket lifecycle,
@@ -239,6 +272,10 @@ named rather than smoothed.
 - Bounded model compatibility policy for Talk's duplex-audio and live-tool
   requirements. Specialized Whisper/Translate models fail explicitly; unknown
   Realtime-shaped ids are labeled syntax-only instead of certified valid.
+
+### Fixed
+- `pip install "hermes-talk[audio]"` now installs cleanly from PyPI
+  (hermes-talk#42) — the audio extra previously failed on a fresh machine.
 
 ## [0.8.0] — 2026-08-04
 
