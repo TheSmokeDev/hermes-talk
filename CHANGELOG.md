@@ -13,6 +13,25 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-08-27
+
+The voice session now knows what it is and where it lives, and the plugin
+installs clean under Hermes's new security scanner.
+
+### Added
+- Full Hermes self-knowledge in the voice session (hermes-talk#64). The
+  session now carries a lane line naming its own transport — a CLI session
+  says it is a terminal on the operator's machine and that Ctrl+C hangs up;
+  Discord and dashboard sessions name their own off switches — so "where are
+  you running from?" and "how do I turn you off?" get true answers. The
+  preamble steers "what can you do?" to the live `talk_capabilities` catalog
+  instead of a recitation from memory, and states the delegation ceiling
+  plainly: no direct clicking or typing, but delegated agents run the full
+  Hermes toolset including computer use — never "I can't" when the honest
+  answer is "I can hand that to an agent." A one-line host summary (enabled
+  skill/toolset counts) rides session mint when the catalog is already warm,
+  and stays absent rather than stalling startup when it is not.
+
 ### Fixed
 - The plugin now scans `safe` under the upstream `plugin_guard` security
   scanner (NousResearch/hermes-agent, gating `hermes plugins install` since
