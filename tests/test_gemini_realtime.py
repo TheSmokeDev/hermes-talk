@@ -181,6 +181,11 @@ def test_connect_sends_setup_with_key_in_url_and_models_prefix():
     assert setup["systemInstruction"] == {"parts": [{"text": "Be brief."}]}
     assert setup["outputAudioTranscription"] == {}
     assert setup["inputAudioTranscription"] == {}
+    # Session resumption is enabled (record-only in v1), and context-window
+    # compression rides the server defaults — without it audio-only sessions
+    # hard-cap near 15 minutes.
+    assert setup["sessionResumption"] == {}
+    assert setup["contextWindowCompression"] == {"slidingWindow": {}}
     # Function-declaration schema types are UPPERCASE, recursively.
     declarations = setup["tools"][0]["functionDeclarations"]
     assert declarations == [
@@ -413,7 +418,7 @@ def test_server_events_translate_to_neutral_events():
         wire_events = [
             {"setupComplete": {}},
             # Unknown and empty shapes arrive on this wire and are tolerated.
-            {"goAway": {"timeLeft": "30s"}},
+            {"usageOnlyFutureFrame": {"x": 1}},
             {"serverContent": {}},
             {"serverContent": {"usageMetadata": {"totalTokenCount": 12}}},
             {
@@ -677,6 +682,336 @@ def test_cancel_response_after_interrupt_sends_nothing_upstream():
     socket = asyncio.run(scenario())
 
     assert len(socket.sent) == 1  # setup only
+
+
+# -- cancellation, resumption, goAway, and the trailing-output fence ----------------
+
+
+def test_cancelled_tool_result_is_dropped_with_one_receipt_per_call(caplog):
+    async def scenario():
+        socket = _Socket(
+            [
+                {
+                    "toolCall": {
+                        "functionCalls": [
+                            {"id": "fc-1", "name": "search_memory", "args": {}},
+                            {"id": "fc-2", "name": "search_memory", "args": {}},
+                        ]
+                    }
+                },
+                # The operator barged in while fc-1 was pending; the server
+                # discarded it.
+                {"toolCallCancellation": {"ids": ["fc-1"]}},
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        with caplog.at_level(logging.WARNING, logger="talk_gemini_realtime"):
+            await adapter.send(
+                (
+                    rt.SubmitToolResult(call_id="fc-1", output="cancelled result"),
+                    rt.SubmitToolResult(call_id="fc-2", output="live result"),
+                    rt.StartResponse(),
+                )
+            )
+            # A duplicate result for the same cancelled id: still dropped,
+            # still just the one receipt.
+            await adapter.send((rt.SubmitToolResult(call_id="fc-1", output="late"),))
+        await adapter.close()
+        return socket, events
+
+    socket, events = asyncio.run(scenario())
+
+    calls = [event for event in events if isinstance(event, rt.FunctionCall)]
+    assert [call.call_id for call in calls] == ["fc-1", "fc-2"]
+    # Only the live call's toolResponse went upstream. The cancelled result
+    # was dropped, and — with a tool result in the batch — the trailing
+    # StartResponse trigger was withheld as designed.
+    assert socket.sent[1:] == [
+        {
+            "toolResponse": {
+                "functionResponses": [
+                    {
+                        "id": "fc-2",
+                        "name": "search_memory",
+                        "response": {"result": "live result"},
+                    }
+                ]
+            }
+        }
+    ]
+    drops = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "talk_gemini_realtime"
+        and record.levelno == logging.WARNING
+        and "server-cancelled call" in record.getMessage()
+    ]
+    assert len(drops) == 1
+    assert "fc-1" in drops[0]
+
+
+def test_cancellation_of_unknown_ids_is_tolerated_silently(caplog):
+    async def scenario():
+        adapter, _client = _adapter(
+            _Socket([{"toolCallCancellation": {"ids": ["fc-never-seen", 7, None]}}])
+        )
+        await adapter.connect(_setup())
+        with caplog.at_level(logging.WARNING, logger="talk_gemini_realtime"):
+            events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert [type(event) for event in events] == [rt.SessionTerminated]
+    assert not [r for r in caplog.records if r.name == "talk_gemini_realtime"]
+
+
+def test_cancelled_id_cap_forgets_the_oldest():
+    async def scenario():
+        adapter, _client = _adapter(_Socket())
+        await adapter.connect(_setup())
+        adapter._note_cancelled_call_ids(
+            [f"fc-{i}" for i in range(gemini_rt.MAX_CANCELLED_CALL_IDS + 76)]
+        )
+        await adapter.close()
+        return adapter
+
+    adapter = asyncio.run(scenario())
+
+    assert len(adapter._cancelled_call_ids) == gemini_rt.MAX_CANCELLED_CALL_IDS
+    assert "fc-0" not in adapter._cancelled_call_ids
+    assert f"fc-{gemini_rt.MAX_CANCELLED_CALL_IDS + 75}" in adapter._cancelled_call_ids
+
+
+def test_resumption_handle_confirmation_invalidation_and_preservation():
+    adapter, _client = _adapter(_Socket())
+
+    adapter._decode({"sessionResumptionUpdate": {"newHandle": "handle-1", "resumable": True}})
+    assert adapter.resumption_handle == "handle-1"
+    # No resumable opinion: the last CONFIRMED handle is preserved, and the
+    # unconfirmed newHandle is not promoted.
+    adapter._decode({"sessionResumptionUpdate": {"newHandle": "handle-2"}})
+    assert adapter.resumption_handle == "handle-1"
+    # resumable: false invalidates the cache — reusing an invalidated handle
+    # would be silent data loss.
+    adapter._decode(
+        {"sessionResumptionUpdate": {"newHandle": "handle-3", "resumable": False}}
+    )
+    assert adapter.resumption_handle is None
+    adapter._decode({"sessionResumptionUpdate": {"resumable": False}})
+    assert adapter.resumption_handle is None
+
+
+def test_goaway_surfaces_as_a_terminal_failure_with_scrubbed_detail():
+    async def scenario():
+        adapter, _client = _adapter(
+            _Socket([{"goAway": {"timeLeft": f"30s key={FAKE_KEY}"}}])
+        )
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return adapter, events
+
+    adapter, events = asyncio.run(scenario())
+
+    assert isinstance(events[0], rt.ProviderFailure)
+    assert events[0].terminal is True
+    assert "imminent server-side session termination" in events[0].detail
+    assert "30s" in events[0].detail
+    # goAway detail text is server-supplied; the key scrubber applies to it.
+    assert FAKE_KEY not in events[0].detail
+    assert "key=<redacted>" in events[0].detail
+    assert adapter.state is rt.SessionState.FAILED
+    assert isinstance(events[-1], rt.SessionTerminated)
+
+
+def test_goaway_without_time_left_still_surfaces():
+    adapter, _client = _adapter(_Socket())
+    events = adapter._decode({"goAway": {}})
+    assert events == [
+        rt.ProviderFailure(
+            detail="Provider announced imminent server-side session termination (goAway)",
+            terminal=True,
+        )
+    ]
+
+
+def test_one_frame_can_bundle_audio_parts_and_turn_complete():
+    pcm = b"bundled audio"
+
+    async def scenario():
+        wire_events = [
+            {
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [
+                            {"inlineData": {"mimeType": "audio/pcm", "data": _b64(pcm)}}
+                        ]
+                    },
+                    "turnComplete": True,
+                    "usageMetadata": {"totalTokenCount": 9},
+                }
+            },
+        ]
+        adapter, _client = _adapter(_Socket(wire_events))
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    # Every field of the bundled frame is processed before the terminal flag
+    # is honored: the audio, then the final transcript, then the finish.
+    assert events == [
+        rt.ResponseStarted(response_id=None),
+        rt.OutputAudio(data=pcm),
+        rt.Transcript(
+            role=rt.TranscriptRole.ASSISTANT,
+            text="",
+            final=True,
+            provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        ),
+        rt.ResponseFinished(response_id=None),
+        rt.SessionTerminated(state=rt.SessionState.CLOSED),
+    ]
+
+
+def test_trailing_output_after_generation_complete_is_dropped_and_warned_once(caplog):
+    heard, straggler, answer = b"heard", b"straggler", b"answer"
+
+    async def scenario():
+        wire_events = [
+            {
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [{"inlineData": {"mimeType": "audio/pcm", "data": _b64(heard)}}]
+                    }
+                }
+            },
+            {"serverContent": {"generationComplete": True}},
+            # Two trailing frames for the closed generation: both dropped,
+            # one warning for the whole fenced window.
+            {
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [
+                            {"inlineData": {"mimeType": "audio/pcm", "data": _b64(straggler)}}
+                        ]
+                    },
+                    "outputTranscription": {"text": "late words"},
+                }
+            },
+            {"serverContent": {"outputTranscription": {"text": "more late"}}},
+            # A tool call continues the turn past generationComplete: it
+            # disarms the fence, and its answer must not be eaten.
+            {
+                "toolCall": {
+                    "functionCalls": [{"id": "fc-1", "name": "search_memory", "args": {}}]
+                }
+            },
+            {
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [{"inlineData": {"mimeType": "audio/pcm", "data": _b64(answer)}}]
+                    }
+                }
+            },
+        ]
+        socket = _Socket(wire_events)
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup())
+        events = []
+        with caplog.at_level(logging.WARNING, logger="talk_gemini_realtime"):
+            async for event in adapter:
+                events.append(event)
+                if isinstance(event, rt.FunctionCall):
+                    await adapter.send(
+                        (rt.SubmitToolResult(call_id=event.call_id, output="done"),)
+                    )
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert events == [
+        rt.ResponseStarted(response_id=None),
+        rt.OutputAudio(data=heard),
+        rt.Transcript(
+            role=rt.TranscriptRole.ASSISTANT,
+            text="",
+            final=True,
+            provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        ),
+        rt.ResponseFinished(response_id=None),
+        # The toolCall opens and closes around the call — nothing trailing
+        # leaked in between.
+        rt.ResponseStarted(response_id=None),
+        rt.FunctionCall(call_id="fc-1", name="search_memory", arguments="{}"),
+        rt.ResponseFinished(response_id=None),
+        rt.ResponseStarted(response_id=None),
+        rt.OutputAudio(data=answer),
+        rt.SessionTerminated(state=rt.SessionState.CLOSED),
+    ]
+    drops = [
+        record
+        for record in caplog.records
+        if record.name == "talk_gemini_realtime" and "trailing model output" in record.getMessage()
+    ]
+    assert len(drops) == 1
+
+
+def test_operator_speech_disarms_the_trailing_fence():
+    async def scenario():
+        wire_events = [
+            {"serverContent": {"modelTurn": {"parts": []}}},
+            {"serverContent": {"generationComplete": True}},
+            {"serverContent": {"inputTranscription": {"text": "next question"}}},
+            {
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "audio/pcm",
+                                    "data": _b64(b"fresh answer"),
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+        ]
+        adapter, _client = _adapter(_Socket(wire_events))
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert events == [
+        rt.ResponseStarted(response_id=None),
+        rt.Transcript(
+            role=rt.TranscriptRole.ASSISTANT,
+            text="",
+            final=True,
+            provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        ),
+        rt.ResponseFinished(response_id=None),
+        rt.Transcript(
+            role=rt.TranscriptRole.USER,
+            text="next question",
+            final=True,
+            provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+        ),
+        rt.ResponseStarted(response_id=None),
+        rt.OutputAudio(data=b"fresh answer"),
+        rt.SessionTerminated(state=rt.SessionState.CLOSED),
+    ]
 
 
 # -- resampler ---------------------------------------------------------------------

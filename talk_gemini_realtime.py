@@ -27,9 +27,30 @@ operator key):
   chunks; ``generationComplete`` / ``turnComplete`` (carrying
   ``usageMetadata``) / ``interrupted`` are flags on ``serverContent``. Empty
   serverContent frames and unknown messages are tolerated.
-- ``sessionResumptionUpdate.newHandle`` is native: v1 records the latest
-  handle on the session (``resumption_handle``); reconnecting with it is a
-  follow-up feature, not this adapter.
+- ``sessionResumptionUpdate.newHandle`` is native: v1 enables the feature in
+  setup and records the latest CONFIRMED handle on the session
+  (``resumption_handle``); reconnecting with it is a follow-up feature, not
+  this adapter.
+
+Reference-verified behavior (Google Live docs plus the shipped OpenClaw,
+Pipecat, and LiveKit providers — NOT the live probe):
+
+- ``toolCallCancellation.ids`` arrives when the operator interrupts while
+  tool calls are pending: those results must never go upstream.
+- ``sessionResumptionUpdate`` carrying ``resumable: false`` INVALIDATES the
+  cached handle — reusing it would be silent data loss — while an update
+  omitting ``resumable`` leaves the last confirmed handle in place.
+- Audio-only sessions hard-cap near 15 minutes without
+  ``contextWindowCompression``; an empty ``slidingWindow`` takes the server
+  defaults and keeps the system instruction intact.
+- ``goAway.timeLeft`` warns of imminent server-side termination (the socket
+  then dies ABORTED); it surfaces as a terminal failure so the relay speaks
+  and closes cleanly instead of hitting a dead socket.
+- One ``serverContent`` frame can bundle modelTurn parts WITH
+  ``generationComplete``/``turnComplete``, and after ``generationComplete``
+  trailing text/audio for that same generation can still arrive — every
+  field of a frame is processed before the terminal flag is honored, and
+  post-close stragglers are dropped with a one-time warning per window.
 
 Deliberate degrades, each verified against the wire or honestly absent:
 
@@ -95,6 +116,10 @@ CONNECT_TIMEOUT_S = 30.0
 NORMAL_WEBSOCKET_CLOSE_CODES = (None, 1000, 1001)
 #: Declared input format: Live takes 16kHz PCM in, and emits 24kHz PCM out.
 INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
+#: Bound on remembered server-cancelled tool-call ids (OpenClaw uses the
+#: same cap). Past it the oldest id is forgotten; a stale result for a
+#: forgotten id would then go upstream — possible, logged, never silent.
+MAX_CANCELLED_CALL_IDS = 1024
 #: The API key is a URL query parameter on this lane; any error text built
 #: from the request (handshake failures name the URL) must never keep it.
 #: The pattern also catches a bare `` key=…`` in prose-shaped errors: on this
@@ -204,6 +229,14 @@ def build_setup_message(setup: rt.SessionSetup) -> dict[str, Any]:
         "systemInstruction": {"parts": [{"text": setup.instructions}]},
         "outputAudioTranscription": {},
         "inputAudioTranscription": {},
+        # Record-only in v1: handles are tracked (and server-invalidated ones
+        # discarded) but never sent back — reconnect is the follow-up feature.
+        "sessionResumption": {},
+        # Audio-only sessions hard-cap near 15 minutes without compression.
+        # An empty slidingWindow takes the server defaults (trigger at 80% of
+        # the context window, target half of that; system instruction is
+        # never cut).
+        "contextWindowCompression": {"slidingWindow": {}},
     }
     if setup.tools:
         payload["tools"] = [{"functionDeclarations": [_tool_wire(t) for t in setup.tools]}]
@@ -443,7 +476,19 @@ class GeminiRealtimeSession:
         self._resampler = Pcm24To16Resampler()
         self._pending: deque[rt.RealtimeEvent] = deque()
         self._call_names: dict[str, str] = {}
+        #: Call ids the server cancelled mid-turn (``toolCallCancellation``).
+        #: The value tracks whether that id's drop receipt was logged, so the
+        #: receipt fires once per call id. Bounded by MAX_CANCELLED_CALL_IDS.
+        self._cancelled_call_ids: dict[str, bool] = {}
         self._generation_open = False
+        #: Armed by ``generationComplete``: 3.x servers can still send
+        #: trailing audio/text for the just-closed generation before the turn
+        #: ends. While armed, that content is dropped instead of reopening a
+        #: phantom response. Disarmed by anything that legitimately starts
+        #: the next turn: operator speech (inputTranscription/interrupted), a
+        #: toolCall, or a client-sent toolResponse/bare trigger.
+        self._trailing_fence = False
+        self._trailing_warned = False
         self._user_transcript: list[str] = []
         self._degrade_logged: set[str] = set()
         self._terminal_emitted = False
@@ -512,6 +557,9 @@ class GeminiRealtimeSession:
         # A toolResponse alone makes the model speak (probe-verified), so the
         # StartResponse continuation the relay appends to a tool batch must
         # not fire a second, empty-turn response on top of the spoken result.
+        # A batch whose every result was cancelled by the server therefore
+        # sends nothing at all — the barge-in that cancelled it already owns
+        # the next turn.
         tool_result_present = any(
             isinstance(command, rt.SubmitToolResult) for command in commands
         )
@@ -543,10 +591,25 @@ class GeminiRealtimeSession:
                     # probed live — the one shape in this module the live
                     # probe did not exercise.
                     messages.append({"clientContent": {"turnComplete": True}})
+                    self._trailing_fence = False  # we asked for this response
             elif isinstance(command, (rt.CancelResponse, rt.TruncateOutput)):
                 self._degrade_receipt("response cancel/truncate")
             elif isinstance(command, rt.SubmitToolResult):
+                logged = self._cancelled_call_ids.get(command.call_id)
+                if logged is not None:
+                    # The server discarded this call mid-turn; answering it
+                    # would speak a result for a turn the operator cancelled.
+                    self._call_names.pop(command.call_id, None)
+                    if not logged:
+                        self._cancelled_call_ids[command.call_id] = True
+                        logger.warning(
+                            "gemini realtime: dropping tool result for "
+                            "server-cancelled call %s; nothing sent upstream",
+                            command.call_id,
+                        )
+                    continue
                 messages.append(self._tool_response_message(command))
+                self._trailing_fence = False  # a tool answer opens a live turn
             else:
                 raise TypeError(f"unsupported Realtime command: {type(command).__name__}")
         return messages
@@ -624,6 +687,9 @@ class GeminiRealtimeSession:
             text = input_transcription.get("text")
             if isinstance(text, str) and text:
                 self._user_transcript.append(text)
+                # Operator speech onset legitimately starts the next turn, so
+                # what follows can never be trailing output of the last one.
+                self._trailing_fence = False
 
         parts: list = []
         model_turn = content.get("modelTurn")
@@ -640,78 +706,146 @@ class GeminiRealtimeSession:
             if isinstance(candidate, str) and candidate:
                 output_text = candidate
 
+        trailing = False
         if interrupted:
             # The server's own VAD already stopped the in-flight generation.
             # SpeechStarted is the contract's barge-in signal and must land
             # BEFORE this frame's tail parts so the relay's cancellation
             # fence drops them; ResponseFinished then closes the books.
+            self._trailing_fence = False
             self._flush_user_transcript(events)
             if self._generation_open:
                 events.append(rt.SpeechStarted())
         elif has_model_turn or output_text:
             # A new generation opening also closes the operator's turn.
             self._flush_user_transcript(events)
-            if not self._generation_open:
+            if self._trailing_fence:
+                # Stragglers of the generation that just closed (3.x sends
+                # them before the turn ends): dropped, never replayed as a
+                # phantom new response, one warning per fenced window.
+                trailing = True
+                if not self._trailing_warned:
+                    self._trailing_warned = True
+                    logger.warning(
+                        "gemini realtime: dropping trailing model output that "
+                        "arrived after generationComplete"
+                    )
+            elif not self._generation_open:
                 events.append(rt.ResponseStarted(response_id=None))
                 self._generation_open = True
 
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            inline = part.get("inlineData")
-            if not isinstance(inline, dict):
-                continue  # text/thought parts carry no audio for this lane
-            data = inline.get("data")
-            if not isinstance(data, str) or not data:
-                continue
-            try:
-                pcm = base64.b64decode(data, validate=True)
-            except (binascii.Error, ValueError, TypeError):
+        if not trailing:
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline = part.get("inlineData")
+                if not isinstance(inline, dict):
+                    continue  # text/thought parts carry no audio for this lane
+                data = inline.get("data")
+                if not isinstance(data, str) or not data:
+                    continue
+                try:
+                    pcm = base64.b64decode(data, validate=True)
+                except (binascii.Error, ValueError, TypeError):
+                    events.append(
+                        rt.ProviderFailure(detail="Provider sent a malformed audio payload")
+                    )
+                    continue
+                events.append(rt.OutputAudio(data=pcm))
+            if output_text:
                 events.append(
-                    rt.ProviderFailure(detail="Provider sent a malformed audio payload")
+                    rt.Transcript(
+                        role=rt.TranscriptRole.ASSISTANT,
+                        text=output_text,
+                        final=False,
+                        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                    )
                 )
-                continue
-            events.append(rt.OutputAudio(data=pcm))
-        if output_text:
-            events.append(
-                rt.Transcript(
-                    role=rt.TranscriptRole.ASSISTANT,
-                    text=output_text,
-                    final=False,
-                    provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
-                )
-            )
 
+        generation_complete = content.get("generationComplete") is True
+        turn_complete = content.get("turnComplete") is True
         if interrupted:
             if self._generation_open:
                 self._generation_open = False
                 events.append(rt.ResponseFinished(response_id=None))
-        elif (
-            content.get("generationComplete") is True or content.get("turnComplete") is True
-        ) and self._generation_open:
-            self._generation_open = False
-            # The done-shape transcript carries no text of its own; the relay
-            # folds its accumulated deltas into the final turn. usageMetadata
-            # riding turnComplete is tolerated and unused.
-            events.append(
-                rt.Transcript(
-                    role=rt.TranscriptRole.ASSISTANT,
-                    text="",
-                    final=True,
-                    provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        elif turn_complete:
+            # turnComplete dominates a bundled generationComplete: the turn
+            # is fully done, so this turn's trailing fence ends here.
+            self._trailing_fence = False
+            if self._generation_open:
+                self._generation_open = False
+                # The done-shape transcript carries no text of its own; the
+                # relay folds its accumulated deltas into the final turn.
+                # usageMetadata riding turnComplete is tolerated and unused.
+                events.append(
+                    rt.Transcript(
+                        role=rt.TranscriptRole.ASSISTANT,
+                        text="",
+                        final=True,
+                        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                    )
                 )
-            )
-            self._flush_user_transcript(events)  # safety net for odd orderings
-            events.append(rt.ResponseFinished(response_id=None))
+                self._flush_user_transcript(events)  # safety net for odd orderings
+                events.append(rt.ResponseFinished(response_id=None))
+        elif generation_complete:
+            # Arm the straggler fence BEFORE the turn's turnComplete arrives.
+            self._trailing_fence = True
+            self._trailing_warned = False
+            if self._generation_open:
+                self._generation_open = False
+                events.append(
+                    rt.Transcript(
+                        role=rt.TranscriptRole.ASSISTANT,
+                        text="",
+                        final=True,
+                        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                    )
+                )
+                self._flush_user_transcript(events)
+                events.append(rt.ResponseFinished(response_id=None))
         return events
+
+    def _note_resumption_update(self, update: dict[str, Any]) -> None:
+        """Track the latest resumption handle, honoring the server's veto.
+
+        Only a ``resumable: true`` update CONFIRMS a handle. One carrying
+        ``resumable: false`` invalidates whatever was cached — reusing an
+        invalidated handle is silent data loss — and an update omitting
+        ``resumable`` offers no opinion, so the last confirmed handle stays.
+        """
+
+        resumable = update.get("resumable")
+        if resumable is False:
+            self.resumption_handle = None
+            return
+        if resumable is not True:
+            return
+        handle = update.get("newHandle")
+        if isinstance(handle, str) and handle:
+            self.resumption_handle = handle
+
+    def _note_cancelled_call_ids(self, ids: list) -> None:
+        """Remember server-cancelled tool calls so their results never send.
+
+        Ids for calls this session never saw are recorded all the same — a
+        late result for one must still be dropped. Bounded by
+        MAX_CANCELLED_CALL_IDS, oldest forgotten first.
+        """
+
+        for call_id in ids:
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            self._call_names.pop(call_id, None)
+            self._cancelled_call_ids[call_id] = False
+        while len(self._cancelled_call_ids) > MAX_CANCELLED_CALL_IDS:
+            self._cancelled_call_ids.pop(next(iter(self._cancelled_call_ids)))
 
     def _decode(self, message: dict[str, Any]) -> list[rt.RealtimeEvent]:
         """Map one Live server message to zero or more neutral events.
 
-        Unknown shapes (``goAway``, usage-only frames, future fields) decode
-        to nothing and the transport keeps going; a malformed contract
-        identifier is a terminal protocol failure, same rule as the sibling
-        adapters.
+        Unknown shapes (usage-only frames, future fields) decode to nothing
+        and the transport keeps going; a malformed contract identifier is a
+        terminal protocol failure, same rule as the sibling adapters.
         """
 
         try:
@@ -720,15 +854,32 @@ class GeminiRealtimeSession:
                 events.append(rt.SessionReady(session_id=self._session_id))
             resumption = message.get("sessionResumptionUpdate")
             if isinstance(resumption, dict):
-                handle = resumption.get("newHandle")
-                if isinstance(handle, str) and handle:
-                    self.resumption_handle = handle
+                self._note_resumption_update(resumption)
+            cancellation = message.get("toolCallCancellation")
+            if isinstance(cancellation, dict):
+                ids = cancellation.get("ids")
+                if isinstance(ids, list):
+                    self._note_cancelled_call_ids(ids)
             tool_call = message.get("toolCall")
             if isinstance(tool_call, dict):
+                # A tool call continues the turn past generationComplete.
+                self._trailing_fence = False
                 events.extend(self._decode_tool_call(tool_call))
             server_content = message.get("serverContent")
             if isinstance(server_content, dict):
                 events.extend(self._decode_server_content(server_content))
+            go_away = message.get("goAway")
+            if isinstance(go_away, dict):
+                # The socket dies ABORTED right after this; surface it as a
+                # terminal failure so the relay closes cleanly. timeLeft is
+                # server-supplied text, so the key scrubber applies to it too.
+                time_left = go_away.get("timeLeft")
+                detail = "Provider announced imminent server-side session termination"
+                if isinstance(time_left, str) and time_left:
+                    detail += f" (goAway, time left {_scrub(time_left)})"
+                else:
+                    detail += " (goAway)"
+                events.append(rt.ProviderFailure(detail=detail, terminal=True))
             if "error" in message:
                 events.append(
                     rt.ProviderFailure(
@@ -778,6 +929,7 @@ __all__ = [
     "CONNECT_TIMEOUT_S",
     "GEMINI_LIVE_WS_URL",
     "INPUT_AUDIO_MIME_TYPE",
+    "MAX_CANCELLED_CALL_IDS",
     "GeminiRealtimeSession",
     "GeminiWireEOF",
     "GeminiWireError",
