@@ -35,15 +35,19 @@ jobs:
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Download the pinned scanner outside the checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           home="${RUNNER_TEMP}/plugin-guard"
           mkdir -p "${home}/tools"
-          base="https://raw.githubusercontent.com/NousResearch/hermes-agent/${{ steps.scanner.outputs.sha }}/tools"
-          # raw.githubusercontent.com can rate-limit (HTTP 429) on busy CI
-          # days; retry with backoff so a transient throttle cannot fail the
-          # gate. The scanner stays pinned to the SHA resolved above.
-          curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "${base}/plugin_guard.py" -o "${home}/tools/plugin_guard.py"
-          curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "${base}/skills_guard.py" -o "${home}/tools/skills_guard.py"
+          # Fetch through the authenticated GitHub API, not the raw CDN:
+          # raw.githubusercontent.com returns persistent 429s on busy CI
+          # windows, while the API honors the GITHUB_TOKEN's higher limits.
+          # The scanner stays pinned to the SHA resolved above.
+          gh api "repos/NousResearch/hermes-agent/contents/tools/plugin_guard.py?ref=${{ steps.scanner.outputs.sha }}" \
+            -H "Accept: application/vnd.github.raw" > "${home}/tools/plugin_guard.py"
+          gh api "repos/NousResearch/hermes-agent/contents/tools/skills_guard.py?ref=${{ steps.scanner.outputs.sha }}" \
+            -H "Accept: application/vnd.github.raw" > "${home}/tools/skills_guard.py"
           touch "${home}/tools/__init__.py"
 
       - name: Scan this repository
