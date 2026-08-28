@@ -40,6 +40,12 @@ provider-neutral session contract the OpenAI lane already speaks.
   refuses the event as unsupported, degrades to cancel-only with one logged
   receipt per session — a truncation that did not happen is never faked.
 
+### Fixed
+- Grok user transcripts no longer print duplicated: xAI's cumulative
+  input-transcription snapshots decode as non-final partials, identical
+  repeats are suppressed, and the completion event yields exactly one final
+  per input item (live smoke, 2026-08-28).
+
 ## [0.10.1] — 2026-08-27
 
 The voice session now knows what it is and where it lives, and the plugin
