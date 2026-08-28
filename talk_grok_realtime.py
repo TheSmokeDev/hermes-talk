@@ -39,6 +39,7 @@ import json
 import logging
 from collections.abc import Sequence
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from typing import Any
 
 try:
@@ -292,9 +293,30 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
             )
+        if event_type in {
+            "conversation.item.input_audio_transcription.delta",
+            "conversation.item.input_audio_transcription.updated",
+        }:
+            # xAI's streaming input transcription is CUMULATIVE — every event
+            # repeats the full text so far, not a delta — so snapshots decode
+            # as non-final partials; the session suppresses identical repeats.
+            snapshot = event.get("delta")
+            if not isinstance(snapshot, str):
+                snapshot = event.get("transcript")
+            if not isinstance(snapshot, str) or not snapshot.strip():
+                return None
+            return rt.Transcript(
+                role=rt.TranscriptRole.USER,
+                text=snapshot.strip(),
+                final=False,
+                provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+            )
         if event_type == "conversation.item.input_audio_transcription.completed":
-            # The streaming ``.updated`` sibling is a CUMULATIVE transcript,
-            # not a delta — only the final completion maps to a neutral turn.
+            # On the live wire (smoke, 2026-08-28) xAI emits this event more
+            # than once per input item — pre-commit copies are cumulative
+            # snapshots, and a final copy can repeat after the commit. The
+            # neutral "exactly one final per utterance" rule is enforced by
+            # the session's _InputTranscriptDedupe, not here.
             transcript = event.get("transcript")
             if not isinstance(transcript, str) or not transcript.strip():
                 return None
@@ -322,6 +344,57 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
     except ValueError as exc:
         return _protocol_failure(exc)
     return None
+
+
+class _InputTranscriptDedupe:
+    """Per-utterance filter over xAI's cumulative input transcription stream.
+
+    Live wire behavior (smoke, 2026-08-28): xAI repeats cumulative snapshots
+    verbatim and can send ``.completed`` several times per input item, so the
+    decoded stream stutters. This filter keeps the neutral contract — live
+    non-final partials plus exactly one final per utterance:
+
+    - a new input item (``speech_started``/``committed`` with a new id)
+      resets the utterance, so two identical turns both print;
+    - a pre-commit ``.completed`` is still a cumulative snapshot, so it is
+      downgraded to a non-final partial;
+    - an identical repeat of the last emitted snapshot is suppressed;
+    - the first post-commit completion is the one final; later copies are
+      dropped. A final is never snapshot-suppressed — the relay only prints
+      finals, so suppressing one would erase the turn entirely.
+    """
+
+    def __init__(self) -> None:
+        self._item_id: str | None = None
+        self._committed = False
+        self._snapshot: str | None = None
+        self._final_emitted = False
+
+    def _reset(self) -> None:
+        self._committed = False
+        self._snapshot = None
+        self._final_emitted = False
+
+    def begin_item(self, item_id: str | None) -> None:
+        if isinstance(item_id, str) and item_id and item_id != self._item_id:
+            self._item_id = item_id
+            self._reset()
+
+    def mark_committed(self) -> None:
+        self._committed = True
+
+    def admit(self, event: rt.Transcript) -> rt.Transcript | None:
+        final = event.final and self._committed
+        if final:
+            if self._final_emitted:
+                return None
+            self._final_emitted = True
+        elif event.text == self._snapshot:
+            return None
+        self._snapshot = event.text
+        if final == event.final:
+            return event
+        return replace(event, final=False)
 
 
 class GrokWireError(RuntimeError):
@@ -523,6 +596,7 @@ class GrokRealtimeSession:
         self._terminal_emitted = False
         self._truncate_supported = True
         self._truncate_degrade_logged = False
+        self._input_dedupe = _InputTranscriptDedupe()
 
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
@@ -600,10 +674,23 @@ class GrokRealtimeSession:
             if self._observe_truncate_refusal(wire_event):
                 continue
             event = decode_event(wire_event)
-            if event is not None:
-                if isinstance(event, rt.ProviderFailure) and event.terminal:
-                    self.state = rt.SessionState.FAILED
-                return event
+            if event is None:
+                continue
+            if isinstance(event, rt.SpeechStarted):
+                self._input_dedupe.begin_item(event.input_id)
+            elif isinstance(event, rt.InputAudioCommitted):
+                self._input_dedupe.begin_item(event.input_id)
+                self._input_dedupe.mark_committed()
+            elif (
+                isinstance(event, rt.Transcript)
+                and event.provenance is rt.TranscriptProvenance.INPUT_AUDIO
+            ):
+                event = self._input_dedupe.admit(event)
+                if event is None:
+                    continue
+            if isinstance(event, rt.ProviderFailure) and event.terminal:
+                self.state = rt.SessionState.FAILED
+            return event
 
     async def close(self) -> None:
         await self._wire.close()
