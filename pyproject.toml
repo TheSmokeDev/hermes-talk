@@ -1,7 +1,7 @@
 [project]
 name = "hermes-talk"
-version = "0.11.0"
-description = "OpenAI Realtime speech-to-speech voice for Hermes Agent: duplex talk with live tool calling."
+version = "0.12.0"
+description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
