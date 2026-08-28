@@ -39,6 +39,7 @@ SCHEMA_VERSION = 1
 COMMAND = "hermes talk doctor"
 CHECK_ORDER = (
     "plugin",
+    "provider",
     "auth",
     "model",
     "voice",
@@ -162,6 +163,95 @@ def _plugin_check() -> dict[str, Any]:
             details,
         )
     return _check("plugin", "pass", "all plugin surfaces registered", details)
+
+
+def _key_presence(value: str | None) -> str:
+    """A secret-free key receipt: absent, present, or blank — never the value."""
+
+    if value is None:
+        return "absent"
+    return "present" if value.strip() else "blank"
+
+
+def _provider_check() -> dict[str, Any]:
+    """The selected realtime provider, plus the Grok lane's readiness when chosen.
+
+    Read-only and offline: key PRESENCE only (redacted by construction), and
+    model/voice validity against the local fail-closed lists. No live probe.
+    """
+
+    raw = os.environ.get("TALK_PROVIDER")
+    source = "TALK_PROVIDER" if (raw or "").strip() else "default"
+    try:
+        provider = talk_config.talk_provider()
+    except talk_config.TalkConfigError:
+        return _check(
+            "provider",
+            "fail",
+            "configured realtime provider is not supported",
+            {"provider": (raw or "").strip().lower() or None, "source": source},
+            ("Set TALK_PROVIDER to openai or grok, or unset it.",),
+        )
+    details: dict[str, Any] = {"provider": provider, "source": source}
+    if provider == "openai":
+        # The auth/model/voice checks below carry the OpenAI lane as before.
+        return _check("provider", "pass", "openai is the selected realtime provider", details)
+
+    scoped = os.environ.get("TALK_XAI_API_KEY")
+    shared = os.environ.get("XAI_API_KEY")
+    keys = {
+        "scoped": _key_presence(scoped),
+        "shared": _key_presence(shared),
+    }
+    voice_raw = os.environ.get("TALK_GROK_VOICE")
+    model_raw = os.environ.get("TALK_GROK_MODEL")
+    details.update(
+        {
+            "keys": keys,
+            "model": talk_config.talk_grok_model(),
+            "model_source": "TALK_GROK_MODEL" if (model_raw or "").strip() else "default",
+            "voice_source": "TALK_GROK_VOICE" if (voice_raw or "").strip() else "default",
+        }
+    )
+    try:
+        details["voice"] = talk_config.talk_grok_voice()
+        voice_valid = True
+    except talk_config.TalkConfigError:
+        details["voice"] = (voice_raw or "").strip().lower() or None
+        voice_valid = False
+    details["voice_valid"] = voice_valid
+
+    if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
+        return _check(
+            "provider",
+            "fail",
+            "an xAI key variable is set but blank and refuses closed",
+            details,
+            ("Set a real key in TALK_XAI_API_KEY or XAI_API_KEY, or unset the blank one.",),
+        )
+    if "present" not in keys.values():
+        return _check(
+            "provider",
+            "fail",
+            "provider grok is selected but no xAI key is configured",
+            details,
+            ("Set TALK_XAI_API_KEY or XAI_API_KEY.",),
+        )
+    if not voice_valid:
+        return _check(
+            "provider",
+            "fail",
+            "configured Grok voice is not a built-in Grok voice",
+            details,
+            (f"Choose a TALK_GROK_VOICE from: {', '.join(talk_config.GROK_REALTIME_VOICES)}.",),
+        )
+    return _check(
+        "provider",
+        "pass",
+        f"grok realtime provider is configured (model {details['model']}, "
+        f"voice {details['voice']})",
+        details,
+    )
 
 
 def _auth_check() -> dict[str, Any]:
@@ -486,6 +576,7 @@ def collect_report() -> dict[str, Any]:
 
     checks = [
         _plugin_check(),
+        _provider_check(),
         _auth_check(),
         _model_check(),
         _voice_check(),
@@ -522,6 +613,13 @@ def render_human(report: dict[str, Any]) -> str:
                 "  receipt: "
                 f"winner={details['winning_lane'] or 'none'}, "
                 f"codex={details['codex_oauth']}, preference={details['preference']}"
+            )
+        elif check["id"] == "provider" and details.get("provider") == "grok":
+            keys = details.get("keys", {})
+            lines.append(
+                "  receipt: "
+                f"model={details.get('model')}, voice={details.get('voice')}, "
+                f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
             )
         elif check["id"] == "identity":
             profile = details["active_profile"] or "root"
