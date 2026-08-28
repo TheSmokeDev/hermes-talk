@@ -11,6 +11,63 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## 0.12.0 (Unreleased)
+
+A third realtime voice provider: Gemini Live (Google) — the zero-cost lane,
+free-tier AI Studio keys included — behind the same provider-neutral session
+contract the OpenAI and Grok lanes already speak.
+
+### Added
+- `TALK_PROVIDER` gains `gemini` as a third value — call-time resolved,
+  fail-closed on any other value, and never inferred from which API keys
+  happen to be set.
+- `talk_gemini_realtime` adapter: key-in-URL WebSocket to the Gemini Live
+  endpoint — on this lane the URL itself is the secret, so it is assembled at
+  connect, never logged, and scrubbed out of transport errors. The
+  `setup`/`setupComplete` handshake carries model, voice, instructions, and
+  function tools (schema types uppercased into the Live enum vocabulary);
+  tool `args` arrive as parsed dicts and are translated to the contract's
+  JSON strings, with `toolResponse` envelopes keyed by call id — the loop
+  round-tripped live on `gemini-3.1-flash-live-preview`. Assistant audio is
+  native 24kHz; a pure-Python streaming resampler downsamples the relay's
+  24kHz microphone PCM to the 16kHz Live declares for input.
+  `serverContent.interrupted` maps to the contract's barge-in path, and
+  session-resumption handles are recorded for the follow-up reconnect
+  feature (not sent back in v1).
+- Gemini knobs: `TALK_GEMINI_API_KEY` -> `GEMINI_API_KEY` (fail-closed;
+  set-but-blank is a hard refusal), `TALK_GEMINI_MODEL` (default
+  `gemini-3.1-flash-live-preview`), and `TALK_GEMINI_VOICE` (fail-closed and
+  case-sensitive: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`).
+- Gemini's honest degrades, each logged once per session or refused loudly:
+  the Live protocol has no client cancel, truncate, or context-delete
+  command, so those commands degrade to local playback handling with a
+  receipt and a truncation that did not happen is never faked; a standalone
+  `StartResponse` maps to a `turnComplete` client-content trigger (the one
+  shape the live probe did not exercise); and the Discord lane's
+  gated-response flow (`automatic_response=False`) is refused at connect
+  rather than silently answering unvetted speakers.
+- Doctor's `provider` check covers the Gemini lane with the same read-only
+  shape: redacted key presence, model and voice validity, no live probe.
+- Gemini setup also enables session resumption (still record-only: only a
+  `resumable: true` update confirms a handle, and a `resumable: false`
+  update discards the cached one — an invalidated handle is never reused)
+  and context-window compression on server sliding-window defaults, so
+  audio-only sessions are not cut off near the 15-minute mark.
+- Gemini wire hardening against the shipped-provider references (Google Live
+  docs, OpenClaw, Pipecat, LiveKit): tool calls the server cancels
+  mid-interruption (`toolCallCancellation`) have their results dropped with
+  a once-per-call receipt — nothing is answered upstream for a discarded
+  call; `goAway` surfaces as a terminal failure the relay can close on
+  instead of a dead socket; a bundled `serverContent` frame is processed
+  field-by-field before its terminal flag is honored; and trailing
+  audio/text arriving after `generationComplete` is dropped with one
+  warning per window rather than reopening a phantom response.
+
+### Fixed
+- Live smoke: the Gemini endpoint speaks its JSON in BINARY WebSocket frames
+  on some connections — both frame types are now accepted, and one malformed
+  frame is a non-terminal failure instead of killing the call.
+
 ## [0.11.0] — 2026-08-28
 
 A second realtime voice provider: Grok (xAI), behind the same

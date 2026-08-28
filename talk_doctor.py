@@ -174,7 +174,7 @@ def _key_presence(value: str | None) -> str:
 
 
 def _provider_check() -> dict[str, Any]:
-    """The selected realtime provider, plus the Grok lane's readiness when chosen.
+    """The selected realtime provider, plus its lane's readiness when chosen.
 
     Read-only and offline: key PRESENCE only (redacted by construction), and
     model/voice validity against the local fail-closed lists. No live probe.
@@ -190,12 +190,77 @@ def _provider_check() -> dict[str, Any]:
             "fail",
             "configured realtime provider is not supported",
             {"provider": (raw or "").strip().lower() or None, "source": source},
-            ("Set TALK_PROVIDER to openai or grok, or unset it.",),
+            ("Set TALK_PROVIDER to openai, grok, or gemini, or unset it.",),
         )
     details: dict[str, Any] = {"provider": provider, "source": source}
     if provider == "openai":
         # The auth/model/voice checks below carry the OpenAI lane as before.
         return _check("provider", "pass", "openai is the selected realtime provider", details)
+
+    if provider == "gemini":
+        scoped = os.environ.get("TALK_GEMINI_API_KEY")
+        shared = os.environ.get("GEMINI_API_KEY")
+        keys = {
+            "scoped": _key_presence(scoped),
+            "shared": _key_presence(shared),
+        }
+        voice_raw = os.environ.get("TALK_GEMINI_VOICE")
+        model_raw = os.environ.get("TALK_GEMINI_MODEL")
+        details.update(
+            {
+                "keys": keys,
+                "model": talk_config.talk_gemini_model(),
+                "model_source": "TALK_GEMINI_MODEL" if (model_raw or "").strip() else "default",
+                "voice_source": "TALK_GEMINI_VOICE" if (voice_raw or "").strip() else "default",
+            }
+        )
+        try:
+            details["voice"] = talk_config.talk_gemini_voice()
+            voice_valid = True
+        except talk_config.TalkConfigError:
+            # Live voices are case-sensitive; the raw value is reported as-is,
+            # never case-folded into something that looks valid.
+            details["voice"] = (voice_raw or "").strip() or None
+            voice_valid = False
+        details["voice_valid"] = voice_valid
+
+        if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
+            return _check(
+                "provider",
+                "fail",
+                "a Gemini key variable is set but blank and refuses closed",
+                details,
+                (
+                    "Set a real key in TALK_GEMINI_API_KEY or GEMINI_API_KEY, "
+                    "or unset the blank one.",
+                ),
+            )
+        if "present" not in keys.values():
+            return _check(
+                "provider",
+                "fail",
+                "provider gemini is selected but no Gemini key is configured",
+                details,
+                ("Set TALK_GEMINI_API_KEY or GEMINI_API_KEY.",),
+            )
+        if not voice_valid:
+            return _check(
+                "provider",
+                "fail",
+                "configured Gemini voice is not a built-in Gemini Live voice",
+                details,
+                (
+                    f"Choose a TALK_GEMINI_VOICE from: {', '.join(talk_config.GEMINI_LIVE_VOICES)} "
+                    "(case-sensitive).",
+                ),
+            )
+        return _check(
+            "provider",
+            "pass",
+            f"gemini realtime provider is configured (model {details['model']}, "
+            f"voice {details['voice']})",
+            details,
+        )
 
     scoped = os.environ.get("TALK_XAI_API_KEY")
     shared = os.environ.get("XAI_API_KEY")
@@ -614,7 +679,7 @@ def render_human(report: dict[str, Any]) -> str:
                 f"winner={details['winning_lane'] or 'none'}, "
                 f"codex={details['codex_oauth']}, preference={details['preference']}"
             )
-        elif check["id"] == "provider" and details.get("provider") == "grok":
+        elif check["id"] == "provider" and details.get("provider") in ("grok", "gemini"):
             keys = details.get("keys", {})
             lines.append(
                 "  receipt: "
