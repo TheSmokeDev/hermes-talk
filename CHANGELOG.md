@@ -13,13 +13,13 @@ named rather than smoothed.
 
 ## [0.11.0] — 2026-08-28
 
-A second realtime voice provider: Grok (xAI), behind the same
-provider-neutral session contract the OpenAI lane already speaks.
+Two new realtime voice providers — Grok (xAI) and Gemini Live — behind the
+same provider-neutral session contract the OpenAI lane already speaks.
 
 ### Added
-- `TALK_PROVIDER` selects the realtime provider — `openai` (default) or
-  `grok`. Call-time resolved, fail-closed on any other value, and never
-  inferred from which API keys happen to be set.
+- `TALK_PROVIDER` selects the realtime provider — `openai` (default),
+  `grok`, or `gemini`. Call-time resolved, fail-closed on any other value,
+  and never inferred from which API keys happen to be set.
 - `talk_grok_realtime` adapter: bearer-authenticated WebSocket to the xAI
   realtime endpoint (no ephemeral mint exists there — the resolved key is the
   socket's credential), GA-vocabulary events translated into the neutral
@@ -39,6 +39,33 @@ provider-neutral session contract the OpenAI lane already speaks.
 - Server-side truncation on Grok is attempted first and, if the server
   refuses the event as unsupported, degrades to cancel-only with one logged
   receipt per session — a truncation that did not happen is never faked.
+- `talk_gemini_realtime` adapter: key-in-URL WebSocket to the Gemini Live
+  endpoint — on this lane the URL itself is the secret, so it is assembled at
+  connect, never logged, and scrubbed out of transport errors. The
+  `setup`/`setupComplete` handshake carries model, voice, instructions, and
+  function tools (schema types uppercased into the Live enum vocabulary);
+  tool `args` arrive as parsed dicts and are translated to the contract's
+  JSON strings, with `toolResponse` envelopes keyed by call id — the loop
+  round-tripped live on `gemini-3.1-flash-live-preview`. Assistant audio is
+  native 24kHz; a pure-Python streaming resampler downsamples the relay's
+  24kHz microphone PCM to the 16kHz Live declares for input.
+  `serverContent.interrupted` maps to the contract's barge-in path, and
+  session-resumption handles are recorded for the follow-up reconnect
+  feature (not sent back in v1).
+- Gemini knobs: `TALK_GEMINI_API_KEY` -> `GEMINI_API_KEY` (fail-closed;
+  set-but-blank is a hard refusal), `TALK_GEMINI_MODEL` (default
+  `gemini-3.1-flash-live-preview`), and `TALK_GEMINI_VOICE` (fail-closed and
+  case-sensitive: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`).
+- Gemini's honest degrades, each logged once per session or refused loudly:
+  the Live protocol has no client cancel, truncate, or context-delete
+  command, so those commands degrade to local playback handling with a
+  receipt and a truncation that did not happen is never faked; a standalone
+  `StartResponse` maps to a `turnComplete` client-content trigger (the one
+  shape the live probe did not exercise); and the Discord lane's
+  gated-response flow (`automatic_response=False`) is refused at connect
+  rather than silently answering unvetted speakers.
+- Doctor's `provider` check covers the Gemini lane with the same read-only
+  shape: redacted key presence, model and voice validity, no live probe.
 
 ### Fixed
 - Grok user transcripts no longer print duplicated: xAI's cumulative

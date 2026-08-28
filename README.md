@@ -155,12 +155,13 @@ Whatever the lane, the session is minted server-side into an **ephemeral
 client secret** — the raw key or OAuth token touches exactly one OpenAI
 endpoint and never reaches the socket, a log line, or a client.
 
-## Providers — OpenAI (default) or Grok
+## Providers — OpenAI (default), Grok, or Gemini
 
 `TALK_PROVIDER` picks the realtime voice transport: `openai` (default,
-everything above) or `grok` (xAI Grok Voice). The knob is fail-closed and
-never inferred from which keys exist — an operator holding both gets the
-provider they named or an error, not a silent switch.
+everything above), `grok` (xAI Grok Voice), or `gemini` (Gemini Live). The
+knob is fail-closed and never inferred from which keys exist — an operator
+holding several gets the provider they named or an error, not a silent
+switch.
 
 The Grok lane needs an xAI key (`TALK_XAI_API_KEY`, falling back to
 `XAI_API_KEY`; set-but-blank refuses), rides model `grok-voice-latest`
@@ -170,6 +171,20 @@ contract, same tools, same barge-in; terminal and Discord lanes both honor
 the knob. The dashboard tab stays OpenAI-only for now — xAI has no WebRTC
 offer endpoint, so that lane is a separate backend-relay piece. Doctor gains
 a provider check: selection, redacted key presence, model/voice validity.
+
+The Gemini lane is the zero-cost option: free-tier Google AI Studio keys
+work. Set `GEMINI_API_KEY` (or Talk-scoped `TALK_GEMINI_API_KEY`;
+set-but-blank refuses), ride model `gemini-3.1-flash-live-preview`
+(override: `TALK_GEMINI_MODEL`), and pick a voice via `TALK_GEMINI_VOICE` —
+`Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`, fail-closed and
+**case-sensitive**, exactly as Google's wire expects them. Two lane-specific
+notes: the key rides the WebSocket URL query on this provider, so the URL is
+treated as a secret (assembled at connect, never logged, scrubbed from
+transport errors), and the Live protocol has no client cancel/truncate
+command, so barge-in bookkeeping degrades to local playback handling with a
+logged receipt — never a faked upstream call. The Discord lane refuses
+Gemini for now: its gated-response authorization flow has no Live wire
+equivalent, so connect fails closed rather than answering unvetted speakers.
 
 ## Use
 
@@ -413,10 +428,13 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model; doctor certifies only the bounded duplex-audio + tool-calling policy and labels other Realtime-shaped ids compatibility-unknown |
 | `TALK_VOICE` | `cedar` | Realtime voice (fail-closed on unknown ids) |
-| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai` or `grok` (fail-closed; never inferred from which keys exist) |
+| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini` (fail-closed; never inferred from which keys exist) |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model |
 | `TALK_GROK_VOICE` | `ara` | Grok voice: `ara`, `rex`, `sal`, `eve`, `leo` (fail-closed) |
 | `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first; set-but-blank refuses |
+| `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model (bare id; the adapter adds the wire prefix) |
+| `TALK_GEMINI_VOICE` | `Puck` | Gemini Live voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede` (fail-closed, case-sensitive) |
+| `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first; set-but-blank refuses; free-tier keys work |
 | `TALK_PREFER_CODEX_OAUTH` | unset | `true` requires Codex OAuth and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |

@@ -176,10 +176,13 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
-| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai` or `grok`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it; the dashboard lane does not (Phase 2). |
+| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
 | `TALK_GROK_VOICE` | `ara` | **Fail-closed** against the Grok voice list: `ara`, `rex`, `sal`, `eve`, `leo`. Friendly names only — the wire prefix is the adapter's job. |
 | `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. xAI has no OAuth lane — key only. |
+| `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model. Configure the bare id — the adapter adds the `models/` wire prefix. Fallback line: `gemini-2.5-flash-native-audio-latest`. |
+| `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
+| `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first (free-tier keys work). Set-but-blank is a hard refusal, same rule as the OpenAI keys. The key rides the WebSocket URL query on this lane, so the URL is treated as a secret: assembled at connect, never logged, scrubbed out of transport errors. The Live protocol has no client cancel/truncate command — barge-in degrades to local playback handling with a logged receipt. |
 
 ### Audio (terminal lane)
 
