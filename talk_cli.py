@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -41,6 +42,7 @@ try:
         talk_capabilities,
         talk_config,
         talk_doctor,
+        talk_grok_realtime,
         talk_host,
         talk_identity,
         talk_lifecycle,
@@ -63,6 +65,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_capabilities
     import talk_config
     import talk_doctor
+    import talk_grok_realtime
     import talk_host
     import talk_identity
     import talk_lifecycle
@@ -902,9 +905,43 @@ def _mint_session(
         raise
 
 
-def _openai_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
-    """Build the current provider adapter behind the neutral session contract."""
+def _grok_auth() -> talk_auth.TalkAuth:
+    """The xAI credential for the Grok lane, in the factory's auth shape.
 
+    xAI has no OAuth lane and no ephemeral mint — the resolved key itself is
+    the socket's bearer. Source names reuse the OpenAI receipt vocabulary so
+    receipts name lanes, never keys.
+    """
+
+    scoped = (os.environ.get("TALK_XAI_API_KEY") or "").strip()
+    token = talk_config.resolve_xai_key()
+    if scoped:
+        return talk_auth.TalkAuth(
+            token=token,
+            source=talk_auth.SOURCE_CONFIGURED,
+            detail="TALK_XAI_API_KEY (Talk-scoped key)",
+        )
+    return talk_auth.TalkAuth(
+        token=token,
+        source=talk_auth.SOURCE_ENV,
+        detail="XAI_API_KEY environment variable",
+    )
+
+
+def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
+    """Build the configured provider adapter behind the neutral session contract.
+
+    The provider comes from ``TALK_PROVIDER`` (call-time, fail-closed), never
+    from which keys happen to exist. The OpenAI branch is the historical
+    default and stays byte-identical to the pre-provider factory.
+    """
+
+    if talk_config.talk_provider() == "grok":
+        return talk_grok_realtime.GrokRealtimeSession(
+            auth_token=auth.token,
+            auth_source=auth.source,
+            aiohttp_module=_import_aiohttp(),
+        )
     return talk_openai_realtime.OpenAIRealtimeSession(
         auth_token=auth.token,
         auth_source=auth.source,
@@ -999,9 +1036,15 @@ async def run_talk_session(
     talk_transcript.sweep_transcripts(hermes_home)
 
     try:
-        auth = talk_host.host().resolve_auth()
-        model = talk_config.talk_model()
-        voice = talk_config.talk_voice()
+        provider = talk_config.talk_provider()
+        if provider == "grok":
+            auth = _grok_auth()
+            model = talk_config.talk_grok_model()
+            voice = talk_config.talk_grok_voice()
+        else:
+            auth = talk_host.host().resolve_auth()
+            model = talk_config.talk_model()
+            voice = talk_config.talk_voice()
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
@@ -1097,7 +1140,7 @@ async def run_talk_session(
     session = None
     result = 0
     try:
-        session = (session_factory or _openai_session)(auth)
+        session = (session_factory or _realtime_session)(auth)
         await session.connect(setup)
     except asyncio.CancelledError:
         if session is not None:
