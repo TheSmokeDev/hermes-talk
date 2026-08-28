@@ -372,6 +372,106 @@ def test_server_events_translate_to_neutral_events():
     assert len(events) == 12
 
 
+def test_cumulative_input_transcripts_dedupe_to_one_final_per_utterance():
+    # Live smoke against the real xAI API, 2026-08-28: one spoken utterance
+    # produced SIX final user transcripts in the terminal because xAI streams
+    # CUMULATIVE input-transcription snapshots (each repeats the full text so
+    # far, sometimes repeating an identical snapshot) and can emit the
+    # terminal ``.completed`` more than once per input item — including one
+    # last copy after ``input_audio_buffer.committed``. The neutral contract
+    # is live non-final partials plus exactly ONE final per utterance.
+    full = "Hey Grok, what is the weather in Paris right now?"
+    wire_events = [
+        {"type": "session.created", "session": {"id": "sess-1"}},
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "input-1",
+            "audio_start_ms": 0,
+        },
+        {
+            "type": "conversation.item.input_audio_transcription.updated",
+            "item_id": "input-1",
+            "transcript": "Hey Grok.",
+        },
+        # Identical repeated snapshot: suppressed, not re-emitted.
+        {
+            "type": "conversation.item.input_audio_transcription.updated",
+            "item_id": "input-1",
+            "transcript": "Hey Grok.",
+        },
+        {
+            "type": "conversation.item.input_audio_transcription.updated",
+            "item_id": "input-1",
+            "transcript": "Hey Grok, what is the weather in",
+        },
+        # Pre-commit completions are still cumulative snapshots, not finals.
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-1",
+            "transcript": full,
+        },
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-1",
+            "transcript": full,
+        },
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": "input-1",
+            "audio_end_ms": 2400,
+        },
+        {"type": "input_audio_buffer.committed", "item_id": "input-1"},
+        # The true completion: exactly one final, after the commit.
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-1",
+            "transcript": full,
+        },
+        # A second post-commit copy must not print twice.
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-1",
+            "transcript": full,
+        },
+        # A new utterance with IDENTICAL text is a new turn, not a dupe.
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "input-2",
+            "audio_start_ms": 5000,
+        },
+        {"type": "input_audio_buffer.committed", "item_id": "input-2"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-2",
+            "transcript": full,
+        },
+    ]
+
+    async def scenario():
+        adapter, _client = _adapter(_Socket(wire_events))
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    transcripts = [
+        event
+        for event in events
+        if isinstance(event, rt.Transcript)
+        and event.provenance is rt.TranscriptProvenance.INPUT_AUDIO
+    ]
+    assert [(event.text, event.final) for event in transcripts] == [
+        ("Hey Grok.", False),
+        ("Hey Grok, what is the weather in", False),
+        (full, False),
+        (full, True),
+        (full, True),
+    ]
+    assert [event.text for event in transcripts if event.final] == [full, full]
+
+
 def test_session_updated_echo_is_a_receipt_not_authority():
     # The normalized echo carries turn_detection/tools at the session root and
     # may omit the id; it is never parsed for authority and never fails.
