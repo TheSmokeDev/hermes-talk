@@ -111,6 +111,7 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
         "auth",
         "model",
         "voice",
+        "cascade",
         "audio",
         "identity",
         "discord",

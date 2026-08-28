@@ -1,0 +1,750 @@
+"""Custom-voice cascade — chunker, stream lifecycle, barge-in, fail-closed config.
+
+No network, no real keys: the ElevenLabs leg is a scripted fake WebSocket and
+every key in this file is a literal placeholder. The real ``ELEVENLABS_API_KEY``
+in an operator environment is explicitly deleted before any test that resolves
+config, so a dev box cannot leak a credential into an assertion.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+
+import aiohttp
+import pytest
+
+import talk_cascade_voice as cascade
+import talk_cli
+import talk_config
+import talk_doctor
+import talk_openai_realtime
+import talk_realtime as rt
+import talk_wire
+
+FAKE_KEY = "fake-elevenlabs-key-for-tests"
+FAKE_VOICE_ID = "fakeVoiceId0001"
+
+
+def _scrub_elevenlabs_env(monkeypatch):
+    """Make cascade key resolution hermetic on a box that HAS the real key."""
+
+    monkeypatch.delenv("TALK_ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("TALK_ELEVENLABS_VOICE_ID", raising=False)
+    monkeypatch.delenv("TALK_VOICE_MODE", raising=False)
+    monkeypatch.delenv("TALK_CASCADE_TTS", raising=False)
+    monkeypatch.delenv("TALK_ELEVENLABS_MODEL", raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Sentence chunker
+# ---------------------------------------------------------------------------
+
+
+def test_chunker_splits_on_terminal_punctuation():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("Hello world. ") == ["Hello world."]
+    # A terminal mark at the buffer's edge is held until more text proves it.
+    assert chunker.feed("How are you?") == []
+    assert chunker.flush() == ["How are you?"]
+
+
+def test_chunker_splits_exclamation_question_and_ellipsis():
+    chunker = cascade.SentenceChunker()
+    pieces = chunker.feed("Wow! Really? Wait... yes. ")
+    assert pieces == ["Wow!", "Really?", "Wait...", "yes."]
+    assert chunker.flush() == []
+
+
+def test_chunker_never_splits_decimals():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("Pi is 3.14 exactly. ") == ["Pi is 3.14 exactly."]
+
+
+def test_chunker_never_splits_abbreviations():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("Dr. Smith and Mr. Jones arrived. ") == ["Dr. Smith and Mr. Jones arrived."]
+    assert chunker.feed("Use tools, e.g. search, often. ") == ["Use tools, e.g. search, often."]
+
+
+def test_chunker_never_splits_initials_or_acronyms():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("J. Robert spoke. ") == ["J. Robert spoke."]
+    assert chunker.feed("The U.S.A. team won. ") == ["The U.S.A. team won."]
+
+
+def test_chunker_never_splits_dotted_words():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("Visit example.com today. ") == ["Visit example.com today."]
+
+
+def test_chunker_ellipsis_is_one_terminal_unit():
+    chunker = cascade.SentenceChunker()
+    # A naive splitter would emit "Wait." or cut between the dots.
+    pieces = chunker.feed("Wait... really? ")
+    assert pieces == ["Wait...", "really?"]
+
+
+def test_chunker_long_sentence_splits_at_clause_break_past_budget():
+    chunker = cascade.SentenceChunker(budget=20)
+    # First comma sits INSIDE the budget and must not split early.
+    assert chunker.feed("one two three four, five six seven") == []
+    # The second comma is past the budget: split there, never mid-word.
+    assert chunker.feed(", eight nine") == ["one two three four, five six seven,"]
+    assert chunker.flush() == ["eight nine"]
+
+
+def test_chunker_long_sentence_without_clause_break_waits_for_terminal():
+    chunker = cascade.SentenceChunker(budget=20)
+    long_clause = "word " * 30  # 150 chars, no punctuation at all
+    assert chunker.feed(long_clause) == []
+    assert chunker.feed("done. ") == [f"{long_clause}done."]
+
+
+def test_chunker_reset_drops_partial_sentence():
+    chunker = cascade.SentenceChunker()
+    assert chunker.feed("an unfinished thought") == []
+    chunker.reset()
+    assert chunker.flush() == []
+
+
+def test_chunker_terminal_at_buffer_edge_waits_for_next_delta():
+    chunker = cascade.SentenceChunker()
+    # "3." at the edge could be the start of "3.5" — hold it.
+    assert chunker.feed("The answer is 3.") == []
+    assert chunker.feed("5 exactly. ") == ["The answer is 3.5 exactly."]
+
+
+# ---------------------------------------------------------------------------
+# Fake ElevenLabs stream-input socket
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, data: str) -> None:
+        self.type = aiohttp.WSMsgType.TEXT
+        self.data = data
+
+
+class _FakeWs:
+    """A scripted stream-input socket: records sends, yields queued frames."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.incoming: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self.incoming.get()
+        if item is StopAsyncIteration:
+            raise StopAsyncIteration
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def close(self) -> None:
+        self.closed = True
+
+    # -- test scripting -------------------------------------------------------
+
+    def feed(self, frame: dict) -> None:
+        self.incoming.put_nowait(_FakeMessage(json.dumps(frame)))
+
+    def feed_raw(self, raw: str) -> None:
+        self.incoming.put_nowait(_FakeMessage(raw))
+
+    def feed_audio(self, pcm: bytes) -> None:
+        self.feed({"audio": base64.b64encode(pcm).decode("ascii")})
+
+    def feed_final(self) -> None:
+        self.feed({"isFinal": True})
+
+
+class _FakeConnect:
+    """The ``ws_connect`` seam: hands out scripted sockets, records dials."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.sockets: list[_FakeWs] = []
+
+    async def __call__(self, *, url: str, headers: dict) -> _FakeWs:
+        ws = _FakeWs()
+        self.calls.append({"url": url, "headers": headers})
+        self.sockets.append(ws)
+        return ws
+
+
+class _Harness:
+    def __init__(self) -> None:
+        self.audio: list[bytes] = []
+        self.errors: list[str] = []
+        self.connect = _FakeConnect()
+        self.voice = cascade.CascadeVoice(
+            api_key=FAKE_KEY,
+            voice_id=FAKE_VOICE_ID,
+            model=talk_config.DEFAULT_ELEVENLABS_MODEL,
+            on_audio=self.audio.append,
+            on_error=self.errors.append,
+            aiohttp_module=aiohttp,
+            ws_connect=self.connect,
+        )
+        self.voice.start()
+
+
+async def _wait_for(condition, timeout: float = 2.0) -> None:
+    """Poll the loop until ``condition`` holds; fail the test if it never does."""
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition never became true")
+        await asyncio.sleep(0)
+
+
+def _delta(text: str, response_id: str = "resp_1") -> rt.Transcript:
+    return rt.Transcript(
+        role=rt.TranscriptRole.ASSISTANT,
+        text=text,
+        final=False,
+        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        response_id=response_id,
+    )
+
+
+def _final(text: str = "", response_id: str = "resp_1") -> rt.Transcript:
+    return rt.Transcript(
+        role=rt.TranscriptRole.ASSISTANT,
+        text=text,
+        final=True,
+        provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+        response_id=response_id,
+    )
+
+
+def test_stream_lifecycle_bos_chunks_eos_isfinal():
+    asyncio.run(_stream_lifecycle_bos_chunks_eos_isfinal())
+
+
+async def _stream_lifecycle_bos_chunks_eos_isfinal():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("Hello there. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        await _wait_for(lambda: len(ws.sent) == 2)
+        # BOS opens the stream with voice settings; the chunk asks for generation.
+        assert ws.sent[0]["text"] == " "
+        assert "voice_settings" in ws.sent[0]
+        assert ws.sent[1] == {"text": "Hello there.", "try_trigger_generation": True}
+        # The key rides the header; identifiers ride the URL; never the reverse.
+        assert harness.connect.calls[0]["headers"] == {"xi-api-key": FAKE_KEY}
+        assert FAKE_VOICE_ID in harness.connect.calls[0]["url"]
+        assert "eleven_flash_v2_5" in harness.connect.calls[0]["url"]
+        assert FAKE_KEY not in harness.connect.calls[0]["url"]
+
+        voice.handle_event(_final(response_id="resp_1"))
+        await _wait_for(lambda: len(ws.sent) == 3)
+        assert ws.sent[2] == {"text": ""}  # EOS ends the response's text
+
+        ws.feed_audio(b"pcm-one")
+        ws.feed_audio(b"pcm-two")
+        ws.feed_final()
+        await _wait_for(lambda: ws.closed)
+        assert harness.audio == [b"pcm-one", b"pcm-two"]
+        assert harness.errors == []
+    finally:
+        await voice.aclose()
+
+
+
+def test_multi_sentence_response_pipelines_through_one_stream():
+    asyncio.run(_multi_sentence_response_pipelines_through_one_stream())
+
+
+async def _multi_sentence_response_pipelines_through_one_stream():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("First sentence. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        voice.handle_event(_delta("Second one. "))
+        voice.handle_event(_final(response_id="resp_1"))
+        await _wait_for(lambda: len(ws.sent) == 4)
+        assert [m.get("text") for m in ws.sent] == [
+            " ",
+            "First sentence.",
+            "Second one.",
+            "",
+        ]
+        ws.feed_audio(b"audio-1")
+        ws.feed_audio(b"audio-2")
+        ws.feed_final()
+        await _wait_for(lambda: ws.closed)
+        assert harness.audio == [b"audio-1", b"audio-2"]
+    finally:
+        await voice.aclose()
+
+
+
+def test_barge_in_aborts_stream_and_emits_zero_audio_after():
+    asyncio.run(_barge_in_aborts_stream_and_emits_zero_audio_after())
+
+
+async def _barge_in_aborts_stream_and_emits_zero_audio_after():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("A long answer begins. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        ws.feed_audio(b"heard-before-barge")
+        await _wait_for(lambda: harness.audio == [b"heard-before-barge"])
+
+        # The operator starts talking: the in-flight stream dies and the
+        # response's remaining text is fenced off.
+        voice.handle_event(rt.SpeechStarted(input_id="in_1", offset_ms=10))
+        await _wait_for(lambda: ws.closed)
+        audio_at_barge = list(harness.audio)
+        ws.feed_audio(b"never-spoken")
+        voice.handle_event(_delta("tail of the cancelled answer. "))
+        voice.handle_event(_final(response_id="resp_1"))
+        voice.handle_event(rt.ResponseFinished(response_id="resp_1"))
+        await asyncio.sleep(0.05)
+        assert harness.audio == audio_at_barge
+        assert b"never-spoken" not in harness.audio
+
+        # The NEXT response gets a fresh stream and speaks normally.
+        voice.handle_event(rt.ResponseStarted(response_id="resp_2"))
+        voice.handle_event(_delta("New answer. ", response_id="resp_2"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 2)
+        ws2 = harness.connect.sockets[1]
+        voice.handle_event(_final(response_id="resp_2"))
+        await _wait_for(lambda: len(ws2.sent) == 3)
+        ws2.feed_audio(b"fresh-audio")
+        ws2.feed_final()
+        await _wait_for(lambda: ws2.closed)
+        assert harness.audio == [*audio_at_barge, b"fresh-audio"]
+        assert harness.errors == []
+    finally:
+        await voice.aclose()
+
+
+
+def test_tts_error_degrades_one_response_to_text_only():
+    asyncio.run(_tts_error_degrades_one_response_to_text_only())
+
+
+async def _tts_error_degrades_one_response_to_text_only():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("This answer loses its voice. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        ws.feed({"error": "upstream said no"})
+        await _wait_for(lambda: ws.closed)
+        # One logged receipt per response; the transcript lane is untouched.
+        await _wait_for(lambda: len(harness.errors) == 1)
+        assert "text-only" in harness.errors[0]
+        assert harness.audio == []
+
+        # The session survives: the next response speaks again.
+        voice.handle_event(rt.ResponseStarted(response_id="resp_2"))
+        voice.handle_event(_delta("Recovered. ", response_id="resp_2"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 2)
+        ws2 = harness.connect.sockets[1]
+        voice.handle_event(_final(response_id="resp_2"))
+        await _wait_for(lambda: len(ws2.sent) == 3)
+        ws2.feed_audio(b"recovered-audio")
+        ws2.feed_final()
+        await _wait_for(lambda: ws2.closed)
+        assert harness.audio == [b"recovered-audio"]
+        assert len(harness.errors) == 1  # no second receipt for a clean response
+    finally:
+        await voice.aclose()
+
+
+
+def test_malformed_audio_frame_is_a_tts_error():
+    asyncio.run(_malformed_audio_frame_is_a_tts_error())
+
+
+async def _malformed_audio_frame_is_a_tts_error():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("Frame trouble. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        ws.feed({"audio": "!!!not-base64!!!"})
+        await _wait_for(lambda: len(harness.errors) == 1)
+        assert harness.audio == []
+    finally:
+        await voice.aclose()
+
+
+
+def test_connect_failure_degrades_and_recovers():
+    asyncio.run(_connect_failure_degrades_and_recovers())
+
+
+async def _connect_failure_degrades_and_recovers():
+    harness = _Harness()
+    calls = 0
+
+    async def flaky_connect(*, url, headers):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise cascade.CascadeTTSError("dial failed")
+        return await harness.connect(url=url, headers=headers)
+
+    voice = cascade.CascadeVoice(
+        api_key=FAKE_KEY,
+        voice_id=FAKE_VOICE_ID,
+        model=talk_config.DEFAULT_ELEVENLABS_MODEL,
+        on_audio=harness.audio.append,
+        on_error=harness.errors.append,
+        aiohttp_module=aiohttp,
+        ws_connect=flaky_connect,
+    )
+    voice.start()
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("No dial tone. "))
+        voice.handle_event(_final(response_id="resp_1"))
+        await _wait_for(lambda: len(harness.errors) == 1)
+        voice.handle_event(rt.ResponseStarted(response_id="resp_2"))
+        voice.handle_event(_delta("Second try. ", response_id="resp_2"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        voice.handle_event(_final(response_id="resp_2"))
+        await _wait_for(lambda: len(ws.sent) == 3)
+        ws.feed_audio(b"ok")
+        ws.feed_final()
+        await _wait_for(lambda: ws.closed)
+        assert harness.audio == [b"ok"]
+    finally:
+        await voice.aclose()
+
+
+
+def test_unflushed_tail_speaks_at_response_finished():
+    asyncio.run(_unflushed_tail_speaks_at_response_finished())
+
+
+async def _unflushed_tail_speaks_at_response_finished():
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        # No terminal punctuation, no final transcript — response.done ends it.
+        voice.handle_event(_delta("a tail without punctuation"))
+        voice.handle_event(rt.ResponseFinished(response_id="resp_1"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        await _wait_for(lambda: len(ws.sent) == 3)
+        assert ws.sent[1]["text"] == "a tail without punctuation"
+        assert ws.sent[2] == {"text": ""}
+    finally:
+        await voice.aclose()
+
+
+
+def test_stream_input_url_carries_identifiers_only():
+    url = cascade.stream_input_url("voice abc", "model/1")
+    assert "voice%20abc" in url
+    assert "model_id=model%2F1" in url
+    assert "output_format=pcm_24000" in url
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed config lanes
+# ---------------------------------------------------------------------------
+
+
+def test_voice_mode_defaults_to_native(monkeypatch):
+    monkeypatch.delenv("TALK_VOICE_MODE", raising=False)
+    assert talk_config.voice_mode() == "native"
+
+
+def test_voice_mode_cascade_accepted(monkeypatch):
+    monkeypatch.setenv("TALK_VOICE_MODE", " Cascade ")
+    assert talk_config.voice_mode() == "cascade"
+
+
+def test_voice_mode_unknown_refuses(monkeypatch):
+    monkeypatch.setenv("TALK_VOICE_MODE", "telepathy")
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_VOICE_MODE"):
+        talk_config.voice_mode()
+
+
+def test_cascade_tts_defaults_and_refuses_unknown(monkeypatch):
+    monkeypatch.delenv("TALK_CASCADE_TTS", raising=False)
+    assert talk_config.cascade_tts() == "elevenlabs"
+    monkeypatch.setenv("TALK_CASCADE_TTS", "cartesia")
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_CASCADE_TTS"):
+        talk_config.cascade_tts()
+
+
+def test_elevenlabs_key_scoped_wins(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", "fake-scoped")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "fake-shared")
+    assert talk_config.resolve_elevenlabs_key() == "fake-scoped"
+
+
+def test_elevenlabs_key_shared_fallback(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", " fake-shared ")
+    assert talk_config.resolve_elevenlabs_key() == "fake-shared"
+
+
+def test_elevenlabs_key_blank_is_a_refusal(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", "   ")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "fake-shared")
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_ELEVENLABS_API_KEY"):
+        talk_config.resolve_elevenlabs_key()
+    monkeypatch.delenv("TALK_ELEVENLABS_API_KEY")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "")
+    with pytest.raises(talk_config.TalkConfigError, match="ELEVENLABS_API_KEY"):
+        talk_config.resolve_elevenlabs_key()
+
+
+def test_elevenlabs_key_missing_raises(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    with pytest.raises(talk_config.TalkConfigError, match="no ElevenLabs key"):
+        talk_config.resolve_elevenlabs_key()
+
+
+def test_elevenlabs_voice_id_required_with_remediation(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_ELEVENLABS_VOICE_ID"):
+        talk_config.elevenlabs_voice_id()
+    monkeypatch.setenv("TALK_ELEVENLABS_VOICE_ID", "   ")
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_ELEVENLABS_VOICE_ID"):
+        talk_config.elevenlabs_voice_id()
+    monkeypatch.setenv("TALK_ELEVENLABS_VOICE_ID", f" {FAKE_VOICE_ID} ")
+    assert talk_config.elevenlabs_voice_id() == FAKE_VOICE_ID
+
+
+def test_elevenlabs_model_default_and_override(monkeypatch):
+    monkeypatch.delenv("TALK_ELEVENLABS_MODEL", raising=False)
+    assert talk_config.elevenlabs_model() == "eleven_flash_v2_5"
+    monkeypatch.setenv("TALK_ELEVENLABS_MODEL", "eleven_multilingual_v2")
+    assert talk_config.elevenlabs_model() == "eleven_multilingual_v2"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI text-output mode (the cascade's provider leg)
+# ---------------------------------------------------------------------------
+
+
+def test_native_payload_is_byte_identical_without_text_output():
+    payload = talk_wire.build_session_payload(
+        model="m", voice="cedar", instructions="hi", tools=None
+    )
+    assert "output_modalities" not in payload
+    assert payload["audio"]["output"] == {"voice": "cedar"}
+
+
+def test_text_output_payload_drops_voice_and_requests_text():
+    payload = talk_wire.build_session_payload(
+        model="m", voice="cedar", instructions="hi", tools=None, text_output=True
+    )
+    assert payload["output_modalities"] == ["text"]
+    assert "output" not in payload["audio"]  # no provider voice to configure
+    # Listening is untouched: input audio, VAD, and transcription all stay.
+    assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert "transcription" in payload["audio"]["input"]
+
+
+def test_session_update_carries_text_output_from_setup():
+    setup = rt.SessionSetup(
+        model="m", voice="cedar", instructions="hi", text_output=True
+    )
+    message = talk_openai_realtime.build_session_update(setup)
+    assert message["session"]["output_modalities"] == ["text"]
+    assert "output" not in message["session"]["audio"]
+
+    native = talk_openai_realtime.build_session_update(
+        rt.SessionSetup(model="m", voice="cedar", instructions="hi")
+    )
+    assert "output_modalities" not in native["session"]
+    assert native["session"]["audio"]["output"] == {"voice": "cedar"}
+
+
+def test_decode_output_text_events_into_assistant_transcripts():
+    delta = talk_openai_realtime.decode_event(
+        {"type": "response.output_text.delta", "delta": "Hello ", "response_id": "r1"}
+    )
+    assert isinstance(delta, rt.Transcript)
+    assert delta.role is rt.TranscriptRole.ASSISTANT
+    assert delta.final is False
+    assert delta.text == "Hello "
+    assert delta.response_id == "r1"
+
+    done = talk_openai_realtime.decode_event(
+        {"type": "response.output_text.done", "text": "Hello there.", "response_id": "r1"}
+    )
+    assert isinstance(done, rt.Transcript)
+    assert done.final is True
+    assert done.text == "Hello there."
+
+    empty = talk_openai_realtime.decode_event({"type": "response.output_text.delta"})
+    assert empty is None
+
+
+# ---------------------------------------------------------------------------
+# Doctor's cascade lane
+# ---------------------------------------------------------------------------
+
+
+def _doctor_cascade(report: dict) -> dict:
+    return {check["id"]: check for check in report["checks"]}["cascade"]
+
+
+def test_doctor_cascade_native_is_inactive_pass(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "pass"
+    assert check["details"]["voice_mode"] == "native"
+
+
+def test_doctor_cascade_rejects_unknown_voice_mode(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", "telepathy")
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "fail"
+    assert check["remediation"]
+
+
+def test_doctor_cascade_missing_key_and_voice_id_fail(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "fail"
+    assert check["details"]["keys"] == {"scoped": "absent", "shared": "absent"}
+    assert check["details"]["voice_id"] is None
+
+
+def test_doctor_cascade_reports_presence_never_the_key(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("TALK_ELEVENLABS_VOICE_ID", FAKE_VOICE_ID)
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "pass"
+    assert check["details"]["keys"]["scoped"] == "present"
+    # The voice id is a semi-public identifier; the KEY never appears.
+    assert check["details"]["voice_id"] == FAKE_VOICE_ID
+    assert FAKE_KEY not in json.dumps(check)
+
+
+def test_doctor_cascade_blank_key_refuses_closed(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", "  ")
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "fail"
+    assert "blank" in check["summary"]
+
+
+def test_doctor_cascade_gates_to_openai(monkeypatch):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("TALK_ELEVENLABS_VOICE_ID", FAKE_VOICE_ID)
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key")
+    try:
+        check = _doctor_cascade(talk_doctor.collect_report())
+    finally:
+        monkeypatch.delenv("TALK_PROVIDER", raising=False)
+    assert check["status"] == "fail"
+    assert "grok" in check["summary"]
+
+
+# ---------------------------------------------------------------------------
+# CLI startup gates (fail-closed before any socket or device opens)
+# ---------------------------------------------------------------------------
+
+
+def _no_audio_start(monkeypatch):
+    import talk_audio
+
+    def never(_self):  # pragma: no cover - must not be reached
+        raise AssertionError("audio opened before cascade config was resolved")
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", never)
+
+
+def test_cli_cascade_refuses_non_openai_provider(monkeypatch, tmp_path, capsys):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key")
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("TALK_ELEVENLABS_VOICE_ID", FAKE_VOICE_ID)
+    _no_audio_start(monkeypatch)
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+    err = capsys.readouterr().err
+    assert "grok" in err
+    assert "openai" in err
+
+
+def test_cli_cascade_requires_voice_id(monkeypatch, tmp_path, capsys):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_VOICE_MODE", "cascade")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", FAKE_KEY)
+    _no_audio_start(monkeypatch)
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+    assert "TALK_ELEVENLABS_VOICE_ID" in capsys.readouterr().err
+
+
+def test_cli_native_mode_never_touches_cascade_config(monkeypatch, tmp_path, capsys):
+    """Native mode must not even LOOK at cascade knobs: no voice id, no key,
+    and a deliberately invalid TALK_CASCADE_TTS all stay inert — the refusal
+    is that nothing refuses. (The session itself then fails on the missing
+    audio stack, which is the native path behaving exactly as before.)"""
+
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_CASCADE_TTS", "not-a-real-tts")
+
+    import talk_audio
+
+    def fail(_self):
+        raise talk_audio.TalkAudioError('run: pip install "hermes-talk[audio]"')
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", fail)
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+    err = capsys.readouterr().err
+    assert "hermes-talk[audio]" in err  # the NATIVE failure, not a cascade one
+    assert "cascade" not in err.lower()
