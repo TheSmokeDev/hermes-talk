@@ -84,6 +84,13 @@
     return apiCall(path, { method: "POST", body: JSON.stringify(body || {}) }, timeoutMs);
   }
 
+  /** NDJSON encoder for the cascade relay, minted lazily (cascade mode only). */
+  let relayEncoder = null;
+  function encodeRelayLine(line) {
+    if (!relayEncoder) relayEncoder = new TextEncoder();
+    return relayEncoder.encode(JSON.stringify(line) + "\n");
+  }
+
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
   function isAuthError(err) {
     return /^(401|403)\b/.test(String((err && err.message) || ""));
@@ -109,6 +116,12 @@
    * barge-in has no browser analogue and none is faked here. What IS mirrored
    * from talk_relay is the response.cancel gate — cancelling while the model
    * is idle earns a "no active response" error on every operator turn.
+   *
+   * Cascade mode (session.voiceMode === "cascade"): the session was minted
+   * with text output, so no audio track ever arrives. Instead the model's
+   * response.output_text deltas stream to POST /cascade-tts as NDJSON and the
+   * PCM24k that comes back plays through an AudioContext. The ElevenLabs key
+   * never touches this page — the server owns it.
    */
   class TalkTransport {
     constructor(session, callbacks) {
@@ -124,6 +137,18 @@
       this.continuationPending = false;
       this.toolBatch = null;
       this.toolTail = Promise.resolve();
+      this.cascade = session && session.voiceMode === "cascade";
+      // Every response gets its own relay stream; a tool-call continuation
+      // can start streaming while the previous answer's PCM still drains, so
+      // in-flight streams are a SET, and playback carries a generation that
+      // barge-in bumps — a chunk decoded before the operator spoke but
+      // scheduled after must not play (the Python cascade's rule, mirrored).
+      this.cascadeReq = null;
+      this.cascadeReqs = new Set();
+      this.pcmContext = null;
+      this.pcmNextTime = 0;
+      this.pcmSources = [];
+      this.pcmGeneration = 0;
     }
 
     async start() {
@@ -198,6 +223,12 @@
       this.closed = true;
       if (this.offerAbort) this.offerAbort.abort();
       this.offerAbort = null;
+      this.abortCascade();
+      if (this.pcmContext) {
+        const ctx = this.pcmContext;
+        this.pcmContext = null;
+        if (ctx.close) Promise.resolve(ctx.close()).catch(() => {});
+      }
       if (this.channel) this.channel.close();
       this.channel = null;
       if (this.peer) this.peer.close();
@@ -233,6 +264,21 @@
         case "response.output_audio_transcript.done":
           if (event.transcript) this.cb.onTranscript("assistant", event.transcript, true);
           return;
+        case "response.output_text.delta":
+          // Cascade sessions: the model's answer arrives as TEXT, not audio.
+          // The caption uses it directly; the relay speaks it server-side.
+          if (event.delta) this.cb.onTranscript("assistant", event.delta, false);
+          if (event.delta && this.cascade) this.cascadeSend({ delta: event.delta });
+          return;
+        case "response.output_text.done": {
+          const text = typeof event.text === "string" ? event.text : "";
+          if (text) this.cb.onTranscript("assistant", text, true);
+          if (this.cascade) {
+            this.cascadeSend({ done: text });
+            this.finishCascadeStream();
+          }
+          return;
+        }
         case "response.created":
           this.continuationPending = false;
           this.responseActive = true;
@@ -240,11 +286,17 @@
           return;
         case "response.done":
           this.responseActive = false;
+          // A response that ends with its text stream still open was
+          // interrupted upstream; its half-spoken answer dies with it.
+          if (this.cascade && this.cascadeReq && this.cascadeReq.sink) this.abortCascade();
           this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
         case "input_audio_buffer.speech_started":
           this.cb.onStatus("Listening…");
+          // Barge-in kills the cascade mid-word too: abort the relay fetch
+          // (the server cancels the TTS on EOF) and stop every queued buffer.
+          if (this.cascade) this.abortCascade();
           // Barge-in. Server VAD already interrupts; the explicit cancel is the
           // relay's contract, and the gate is why it does not error every turn.
           if (this.responseActive) this.send({ type: "response.cancel" });
@@ -274,6 +326,136 @@
       // same suppression talk_relay applies.
       if (detail.toLowerCase().indexOf("no active response") !== -1) return;
       this.cb.onError(detail ? "Realtime error: " + detail : "Realtime error.");
+    }
+
+    // -- cascade relay (custom voice; the server speaks, the page plays) -----
+
+    /**
+     * Open the relay POST for one response's text stream. The request body is
+     * a ReadableStream (duplex: "half") so deltas flow while the PCM answer
+     * streams back — the first sentence plays while the model is still
+     * writing the second, same as the terminal lane's sentence pipelining.
+     */
+    startCascadeStream() {
+      const req = { controller: new AbortController(), sink: null };
+      this.cascadeReq = req;
+      this.cascadeReqs.add(req);
+      const body = new ReadableStream({
+        start: (controller) => {
+          req.sink = controller;
+        },
+      });
+      const headers = { "content-type": "application/x-ndjson" };
+      const token = readToken();
+      if (token) headers["x-talk-token"] = token;
+      // Raw fetch, not apiCall: this is a bidirectional byte stream, not JSON.
+      fetch(API + "/cascade-tts", {
+        method: "POST",
+        headers: headers,
+        body: body,
+        duplex: "half",
+        signal: req.controller.signal,
+      })
+        .then((res) => {
+          if (!res.ok || !res.body) return undefined;
+          return this.playCascadePcm(req, res.body.getReader());
+        })
+        .catch(() => {
+          // Aborts (barge-in, stop) and refusals alike land here: the answer
+          // degrades to text-only on screen, which is already true.
+        });
+    }
+
+    cascadeSend(line) {
+      // The previous response's relay may still be draining PCM — that is no
+      // reason to drop THIS response's text; it opens its own stream.
+      if (!this.cascadeReq || !this.cascadeReq.sink) this.startCascadeStream();
+      const sink = this.cascadeReq && this.cascadeReq.sink;
+      // An upload stream carries BYTES — a string chunk is a fetch-type error.
+      if (sink) sink.enqueue(encodeRelayLine(line));
+    }
+
+    /** The response's text is complete; the PCM answer keeps streaming. */
+    finishCascadeStream() {
+      const req = this.cascadeReq;
+      if (req && req.sink) {
+        try { req.sink.close(); } catch (e) { /* an errored stream is already closed */ }
+        req.sink = null;
+      }
+    }
+
+    /** Barge-in or hang-up: every in-flight answer stops, server and speaker. */
+    abortCascade() {
+      const reqs = this.cascadeReqs;
+      this.cascadeReqs = new Set();
+      this.cascadeReq = null;
+      reqs.forEach((req) => {
+        if (req.sink) {
+          try { req.sink.close(); } catch (e) { /* already closed */ }
+        }
+        req.controller.abort();
+      });
+      this.stopPcmPlayback();
+    }
+
+    stopPcmPlayback() {
+      for (let i = 0; i < this.pcmSources.length; i++) {
+        try {
+          this.pcmSources[i].stop();
+        } catch (e) {
+          /* a finished source throws on stop — that is the goal anyway */
+        }
+      }
+      this.pcmSources = [];
+      this.pcmNextTime = 0;
+      this.pcmGeneration += 1;
+    }
+
+    /** PCM24k mono s16le off the wire onto the playback timeline. */
+    async playCascadePcm(req, reader) {
+      const generation = this.pcmGeneration;
+      let pending = new Uint8Array(0);
+      try {
+        for (;;) {
+          const step = await reader.read();
+          if (step.done || !this.cascadeReqs.has(req)) break;
+          const chunk = step.value;
+          const joined = new Uint8Array(pending.length + chunk.length);
+          joined.set(pending, 0);
+          joined.set(chunk, pending.length);
+          const even = joined.length - (joined.length % 2);  // s16le = 2 bytes/sample
+          pending = joined.slice(even);
+          if (even > 0) this.schedulePcm(joined.slice(0, even), generation);
+        }
+      } catch (e) {
+        // An aborted fetch rejects the reader — the barge-in already spoke.
+      }
+      this.cascadeReqs.delete(req);
+      if (this.cascadeReq === req) this.cascadeReq = null;
+    }
+
+    /** Schedule one chunk after the last — gapless, in arrival order. */
+    schedulePcm(bytes, generation) {
+      if (generation !== this.pcmGeneration) return;  // decoded before a barge-in
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;  // no playback surface — the transcript still reads
+      if (!this.pcmContext) {
+        this.pcmContext = new Ctx();
+        this.pcmNextTime = 0;
+      }
+      const ctx = this.pcmContext;
+      const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2);
+      const buffer = ctx.createBuffer(1, samples.length, 24000);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const at = Math.max(ctx.currentTime || 0, this.pcmNextTime);
+      source.start(at);
+      this.pcmNextTime = at + buffer.duration;
+      this.pcmSources.push(source);
+      if (this.pcmSources.length > 512) this.pcmSources.splice(0, 256);
     }
 
     /**
@@ -589,15 +771,21 @@
         })
       ),
 
-      h("label", { className: "ht-field" }, "Voice",
-        h("select", {
-          className: "ht-select",
-          value: voice,
-          disabled: !ready || active || starting,
-          onChange: (e) => setVoice(e.target.value),
-        }, ((status && status.voices) || []).map((name) =>
-          h("option", { key: name, value: name }, name)))
-      ),
+      (status && status.voiceMode) === "cascade"
+        ? h("div", { className: "ht-field" },
+            h("div", { className: "ht-note" },
+              "Custom voice: the cascade speaks through ElevenLabs " +
+              "(TALK_ELEVENLABS_VOICE_ID on the server); the provider voice " +
+              "select sits out cascade sessions."))
+        : h("label", { className: "ht-field" }, "Voice",
+            h("select", {
+              className: "ht-select",
+              value: voice,
+              disabled: !ready || active || starting,
+              onChange: (e) => setVoice(e.target.value),
+            }, ((status && status.voices) || []).map((name) =>
+              h("option", { key: name, value: name }, name)))
+          ),
 
       live && h("div", { className: "ht-live" }, live),
       error && h("div", { className: "ht-error" }, error),

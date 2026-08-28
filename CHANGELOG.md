@@ -11,6 +11,36 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## 0.14.0 (Unreleased)
+
+The custom-voice cascade leaves the terminal: Discord rooms and the dashboard
+tab speak through ElevenLabs too.
+
+### Added
+- Discord lane: cascade voice in the voice channel. The lane already enters
+  the terminal's shared `run_talk_session`, so the 0.13.0 wiring —
+  fail-closed config, text-output session setup, observe-before-relay,
+  teardown — applied by construction; this release PROVES it through the
+  real `DiscordAudio` surface (fake voice channel, scripted TTS socket):
+  cascade PCM24k takes the relay's exact 24k→48k conversion into the room,
+  barge-in kills the TTS stream and drains the channel in one step, and a
+  non-OpenAI provider refuses before the channel is touched.
+- Dashboard lane: `POST /api/plugins/hermes-talk/cascade-tts` — a server-side
+  relay for the browser. The tab mints a text-output session (`/session`
+  answers `voiceMode: "cascade"` and skips the provider-voice validation),
+  streams the model's `response.output_text` deltas to the route as NDJSON
+  (`{"delta": ...}` lines, one terminal `{"done": ...}`), and plays the
+  PCM24k that streams back through its AudioContext. Only an explicit `done`
+  completes an answer: an aborted stream (barge-in, tab closed) cancels the
+  TTS instead of flushing it, and a malformed or oversized line cancels with
+  one logged receipt rather than half-speaking. The ElevenLabs key never
+  leaves the server — the route sits behind the same `TALK_DASHBOARD_TOKEN` /
+  loopback gate as the mint, and `CascadeVoice` gains an `on_stream_end`
+  hook so the route knows when a response's audio has settled.
+- `talk_config.cascade_voice_config(provider)`: the cascade fail-closed
+  resolution (provider gate, TTS knob, key, voice id, model) in one place,
+  so the terminal, Discord, and dashboard lanes refuse identically.
+
 ## [0.13.0] — 2026-08-28
 
 Custom voice: a cascade mode that lets the assistant speak in YOUR voice —

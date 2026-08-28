@@ -649,6 +649,32 @@ def elevenlabs_model() -> str:
     )
 
 
+def cascade_voice_config(provider: str) -> tuple[str, str, str]:
+    """The resolved cascade TTS triple — (key, voice id, model). Fail-closed.
+
+    Every lane that opens a cascade session resolves through HERE so the
+    refusal rules — and their messages — exist exactly once: cascade requires
+    the openai provider (its text-output mode is the only one wired and
+    verified; guessing at grok/gemini text modes would mute the call), the TTS
+    knob validates, the key refuses set-but-blank, and the voice id is
+    required. Callers invoke this only after :func:`voice_mode` returned
+    ``cascade``, before a single secret or socket is spent.
+    """
+
+    if provider != "openai":
+        raise TalkConfigError(
+            f"TALK_VOICE_MODE=cascade requires TALK_PROVIDER=openai, but "
+            f"'{provider}' is configured — grok/gemini text-output modes are "
+            "not wired into the cascade yet"
+        )
+    cascade_tts()  # fail-closed; elevenlabs is the only value today
+    return (
+        resolve_elevenlabs_key(),
+        elevenlabs_voice_id(),
+        elevenlabs_model(),
+    )
+
+
 def agent_timeout_s() -> int:
     """Wall-clock budget for one detached background agent run.
 
@@ -842,6 +868,7 @@ __all__ = [
     "audio_input_device",
     "audio_output_device",
     "cascade_tts",
+    "cascade_voice_config",
     "detect_agent_profile",
     "discord_operator_user_ids",
     "elevenlabs_model",

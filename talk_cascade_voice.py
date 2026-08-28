@@ -243,6 +243,9 @@ class CascadeVoice:
     for every provider-neutral event (synchronous, on the session loop),
     :meth:`aclose` at session teardown. ``on_audio`` is the SAME callable the
     relay uses for provider audio; ``on_error`` takes one human sentence.
+    ``on_stream_end`` is the relay-lane seam: a surface that streams one
+    response's PCM back to a client (the dashboard route) needs to know when
+    that response's TTS run settled; the CLI and Discord lanes never subscribe.
     """
 
     def __init__(
@@ -253,6 +256,7 @@ class CascadeVoice:
         model: str,
         on_audio: Callable[[bytes], None],
         on_error: Callable[[str], None],
+        on_stream_end: Callable[[], None] | None = None,
         aiohttp_module: Any = None,
         ws_connect: Callable[..., Any] | None = None,
         chunk_budget: int = CLAUSE_BUDGET_CHARS,
@@ -261,6 +265,7 @@ class CascadeVoice:
         self._url = stream_input_url(voice_id, model)
         self._on_audio = on_audio
         self._on_error = on_error
+        self._on_stream_end = on_stream_end
         self._aiohttp = aiohttp_module
         #: Test seam: an async callable (url, headers) -> fake socket. The real
         #: path opens an aiohttp session per stream.
@@ -451,14 +456,27 @@ class CascadeVoice:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is None:
+        if exc is not None:
+            self._drain_queue()
+            self._chunker.reset()
+            self._on_error(
+                f"cascade voice failed for that answer — staying text-only "
+                f"({type(exc).__name__})"
+            )
+        # One stream run == one response, so a settled task means that
+        # response's audio is done — in success or in failure (the error
+        # receipt above already fired). A CANCELLED task signals nothing:
+        # barge-in and teardown are known to whoever cancelled.
+        self._notify_stream_end()
+
+    def _notify_stream_end(self) -> None:
+        """Fire the relay-lane hook; a consumer bug must not kill the worker."""
+
+        callback = self._on_stream_end
+        if callback is None:
             return
-        self._drain_queue()
-        self._chunker.reset()
-        self._on_error(
-            f"cascade voice failed for that answer — staying text-only "
-            f"({type(exc).__name__})"
-        )
+        with contextlib.suppress(Exception):
+            callback()
 
     async def _stream(self, first_chunk: str) -> None:
         """One stream-input exchange: BOS, chunks, EOS, audio until isFinal."""
