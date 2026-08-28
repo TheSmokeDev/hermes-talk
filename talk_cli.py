@@ -40,6 +40,7 @@ try:
         talk_audio,
         talk_auth,
         talk_capabilities,
+        talk_cascade_voice,
         talk_config,
         talk_doctor,
         talk_gemini_realtime,
@@ -64,6 +65,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_audio
     import talk_auth
     import talk_capabilities
+    import talk_cascade_voice
     import talk_config
     import talk_doctor
     import talk_gemini_realtime
@@ -876,7 +878,13 @@ def _import_aiohttp():
 
 
 def _mint_session(
-    auth: talk_auth.TalkAuth, *, model: str, voice: str, instructions: str, tools: list[dict]
+    auth: talk_auth.TalkAuth,
+    *,
+    model: str,
+    voice: str,
+    instructions: str,
+    tools: list[dict],
+    text_output: bool = False,
 ) -> talk_wire.TalkSessionDescriptor:
     """Mint the ephemeral session, translating a 401 into its remediation.
 
@@ -892,6 +900,7 @@ def _mint_session(
             voice=voice,
             instructions=instructions,
             tools=tools,
+            text_output=text_output,
         )
     except talk_wire.TalkUpstreamError as exc:
         if "(401)" in str(exc):
@@ -992,6 +1001,7 @@ def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession
                 }
                 for tool in setup.tools
             ],
+            text_output=setup.text_output,
         ),
     )
 
@@ -1080,6 +1090,27 @@ async def run_talk_session(
             auth = talk_host.host().resolve_auth()
             model = talk_config.talk_model()
             voice = talk_config.talk_voice()
+        # Cascade voice mode: the provider thinks in text, ElevenLabs speaks.
+        # Resolved HERE, next to the provider pick, so every fail-closed knob
+        # (mode, TTS provider, key, voice id) refuses before a single secret
+        # or socket is spent. Gated to OpenAI: it is the one provider whose
+        # text-output mode is wired and verified — grok/gemini text modes are
+        # unverified, and guessing would mute the call.
+        voice_mode = talk_config.voice_mode()
+        cascade_config: tuple[str, str, str] | None = None
+        if voice_mode == "cascade":
+            if provider != "openai":
+                raise talk_config.TalkConfigError(
+                    f"TALK_VOICE_MODE=cascade requires TALK_PROVIDER=openai, but "
+                    f"'{provider}' is configured — grok/gemini text-output modes are "
+                    "not wired into the cascade yet"
+                )
+            talk_config.cascade_tts()  # fail-closed; elevenlabs is the only value today
+            cascade_config = (
+                talk_config.resolve_elevenlabs_key(),
+                talk_config.elevenlabs_voice_id(),
+                talk_config.elevenlabs_model(),
+            )
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
@@ -1137,6 +1168,7 @@ async def run_talk_session(
         instructions=instructions,
         tools=_tool_definitions(tools),
         automatic_response=authorization_ledger is None,
+        text_output=voice_mode == "cascade",
     )
     pending: list[talk_realtime.RealtimeCommand] = []
     watchers: list[asyncio.Task] = []
@@ -1172,6 +1204,23 @@ async def run_talk_session(
             else None
         ),
     )
+    # Cascade mode feeds the SAME playback sink the relay feeds
+    # (audio.queue_playback): the playback engine does not care whether bytes
+    # came from the provider or the cascade, so the sink is shared, not
+    # forked. The cascade OBSERVES the provider event stream (text deltas,
+    # barge-in, response lifecycle) and synthesizes; the relay keeps owning
+    # turn policy, captions, and the upstream cancel exactly as before.
+    # start() waits for a successful connect so a failed mint never leaves a
+    # worker task running.
+    cascade = None
+    if cascade_config is not None:
+        cascade = talk_cascade_voice.CascadeVoice(
+            api_key=cascade_config[0],
+            voice_id=cascade_config[1],
+            model=cascade_config[2],
+            on_audio=audio.queue_playback,
+            on_error=on_error,
+        )
     session = None
     result = 0
     try:
@@ -1213,6 +1262,8 @@ async def run_talk_session(
         send_lock = asyncio.Lock()
         continuation_pending = False
         packet_lane = SpeakerPacketLane()
+        if cascade is not None:
+            cascade.start()
 
         def start_watchers(messages) -> None:
             for run_id in started_run_ids(messages):
@@ -1252,6 +1303,9 @@ async def run_talk_session(
         print(
             f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
             "Ctrl+C to hang up.\n"
+            if cascade_config is None
+            else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
+            f"via elevenlabs, auth {auth.source}). Ctrl+C to hang up.\n"
         )
 
         async def send_microphone() -> None:
@@ -1407,6 +1461,12 @@ async def run_talk_session(
                         tool_event = authorization_ledger.bind_tool_event(tool_event)
                     tool_coordinator.admit(tool_event)
                     continue
+                # The cascade observes BEFORE the relay: on SpeechStarted it
+                # aborts the in-flight TTS stream in the same synchronous
+                # stretch in which the relay then drains playback — the source
+                # stops before the sink empties, never after.
+                if cascade is not None:
+                    cascade.handle_event(event)
                 outgoing = relay.handle_realtime_event(event)
                 if (
                     authorization_ledger is not None
@@ -1618,6 +1678,10 @@ async def run_talk_session(
         talk_progress.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
+        if cascade is not None:
+            # TTS teardown must not mask the real exit.
+            with suppress(Exception):
+                await cascade.aclose()
         try:
             await session.close()
         except Exception as exc:  # noqa: BLE001 — teardown must continue after adapter failure

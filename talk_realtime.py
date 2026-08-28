@@ -77,6 +77,11 @@ class SessionSetup:
     instructions: str
     tools: tuple[ToolDefinition, ...] = ()
     automatic_response: bool = True
+    #: Ask the provider for TEXT output instead of synthesized audio. The
+    #: cascade voice mode sets this so the provider remains the brain while
+    #: an external TTS speaks; providers that cannot do text-only output
+    #: refuse at their own boundary rather than silently speaking anyway.
+    text_output: bool = False
 
     def __post_init__(self) -> None:
         _identifier(self.model, "model")

@@ -49,6 +49,21 @@ DEFAULT_GEMINI_VOICE = "Puck"
 #: value the API may reject.
 GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 
+#: Voice modes selectable through ``TALK_VOICE_MODE``. ``native`` is today's
+#: behaviour — the provider synthesizes its own voice. ``cascade`` keeps the
+#: provider as the brain and hands speech synthesis to a streaming TTS the
+#: operator chooses. Fail-closed like the provider list: a mode knob that
+#: guesses silently would spend the wrong metered TTS key.
+TALK_VOICE_MODES = ("native", "cascade")
+DEFAULT_VOICE_MODE = "native"
+#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
+#: today; the list exists so a typo refuses instead of silently selecting.
+TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs",)
+DEFAULT_CASCADE_TTS = "elevenlabs"
+#: ElevenLabs TTS model for the cascade lane, probed against the live
+#: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
+DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+
 #: Where Hermes's api_server gateway platform listens by default
 #: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
 DEFAULT_API_SERVER_URL = "http://127.0.0.1:8642"
@@ -536,6 +551,104 @@ def resolve_gemini_key() -> str:
     )
 
 
+def voice_mode() -> str:
+    """Voice synthesis mode, resolved at call time. Fail-closed.
+
+    ``TALK_VOICE_MODE`` = ``native`` (default; the provider synthesizes its
+    own voice, exactly the pre-cascade behaviour) or ``cascade`` (the
+    provider thinks in text, a streaming TTS speaks). Any other value
+    refuses with the valid names rather than silently picking one — a
+    misread mode would spend the wrong metered key or mute the call.
+    """
+
+    raw = (
+        (os.environ.get("TALK_VOICE_MODE") or DEFAULT_VOICE_MODE).strip().lower()
+        or DEFAULT_VOICE_MODE
+    )
+    if raw not in TALK_VOICE_MODES:
+        raise TalkConfigError(
+            f"TALK_VOICE_MODE '{raw}' is not a voice mode "
+            f"({', '.join(TALK_VOICE_MODES)})"
+        )
+    return raw
+
+
+def cascade_tts() -> str:
+    """Cascade TTS provider, resolved at call time. Fail-closed.
+
+    Only ``elevenlabs`` exists today; the knob is still validated so a typo
+    refuses with the valid values instead of guessing at a provider (and its
+    metered key) the operator did not name.
+    """
+
+    raw = (
+        (os.environ.get("TALK_CASCADE_TTS") or DEFAULT_CASCADE_TTS).strip().lower()
+        or DEFAULT_CASCADE_TTS
+    )
+    if raw not in TALK_CASCADE_TTS_PROVIDERS:
+        raise TalkConfigError(
+            f"TALK_CASCADE_TTS '{raw}' is not a cascade TTS provider "
+            f"({', '.join(TALK_CASCADE_TTS_PROVIDERS)})"
+        )
+    return raw
+
+
+def resolve_elevenlabs_key() -> str:
+    """The ElevenLabs key for the cascade TTS leg. Fail-closed, never silent.
+
+    Order: TALK_ELEVENLABS_API_KEY (Talk-scoped) -> ELEVENLABS_API_KEY. Same
+    rule as :func:`resolve_openai_key`: a key that is SET but blank is a
+    hard refusal, not a fall-through. On this lane the key rides the
+    ``xi-api-key`` WebSocket header — never the URL, never a log line.
+    """
+
+    scoped = os.environ.get("TALK_ELEVENLABS_API_KEY")
+    if scoped is not None:
+        if not scoped.strip():
+            raise TalkConfigError(
+                "TALK_ELEVENLABS_API_KEY is set but empty — set a real key or unset it"
+            )
+        return scoped.strip()
+    shared = os.environ.get("ELEVENLABS_API_KEY")
+    if shared is not None:
+        if not shared.strip():
+            raise TalkConfigError(
+                "ELEVENLABS_API_KEY is set but empty — set a real key or unset it"
+            )
+        return shared.strip()
+    raise TalkConfigError(
+        "no ElevenLabs key for Talk: set TALK_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY"
+    )
+
+
+def elevenlabs_voice_id() -> str:
+    """The ElevenLabs voice the cascade speaks with. REQUIRED in cascade mode.
+
+    Callers invoke this only after :func:`voice_mode` returned ``cascade``,
+    so unset is never a silent default here — a cascade with no voice id
+    would have nothing to synthesize against, and guessing at an account's
+    voices would speak with a voice the operator did not choose. The id is
+    an identifier, not a secret; the KEY is the secret.
+    """
+
+    raw = (os.environ.get("TALK_ELEVENLABS_VOICE_ID") or "").strip()
+    if not raw:
+        raise TalkConfigError(
+            "TALK_VOICE_MODE=cascade needs TALK_ELEVENLABS_VOICE_ID — set it to a "
+            "voice id from your ElevenLabs account (VoiceLab -> your voice -> ID)"
+        )
+    return raw
+
+
+def elevenlabs_model() -> str:
+    """ElevenLabs TTS model for the cascade lane (``TALK_ELEVENLABS_MODEL``)."""
+
+    return (
+        (os.environ.get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
+        or DEFAULT_ELEVENLABS_MODEL
+    )
+
+
 def agent_timeout_s() -> int:
     """Wall-clock budget for one detached background agent run.
 
@@ -697,6 +810,8 @@ __all__ = [
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_CASCADE_TTS",
+    "DEFAULT_ELEVENLABS_MODEL",
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
@@ -705,13 +820,16 @@ __all__ = [
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_PROVIDER",
     "DEFAULT_TALK_VOICE",
+    "DEFAULT_VOICE_MODE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
     "GEMINI_LIVE_VOICES",
     "GROK_REALTIME_VOICES",
     "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
     "MODEL_COMPATIBILITY_POLICY_VERSION",
     "OPENAI_REALTIME_VOICES",
+    "TALK_CASCADE_TTS_PROVIDERS",
     "TALK_PROVIDERS",
+    "TALK_VOICE_MODES",
     "TalkConfigError",
     "agent_profile",
     "agent_timeout_s",
@@ -723,13 +841,17 @@ __all__ = [
     "approval_permit_ttl_s",
     "audio_input_device",
     "audio_output_device",
+    "cascade_tts",
     "detect_agent_profile",
     "discord_operator_user_ids",
+    "elevenlabs_model",
+    "elevenlabs_voice_id",
     "get_hermes_home",
     "identity_include",
     "memory_search_timeout_s",
     "realtime_model_compatibility",
     "realtime_model_valid",
+    "resolve_elevenlabs_key",
     "resolve_gemini_key",
     "resolve_openai_key",
     "resolve_xai_key",
@@ -741,4 +863,5 @@ __all__ = [
     "talk_model",
     "talk_provider",
     "talk_voice",
+    "voice_mode",
 ]

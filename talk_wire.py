@@ -66,26 +66,38 @@ def build_session_payload(
     instructions: str,
     tools: list[dict] | None = None,
     automatic_response: bool = True,
+    text_output: bool = False,
 ) -> dict:
-    """OpenAI Realtime session config — server VAD, barge-in enabled."""
+    """OpenAI Realtime session config — server VAD, barge-in enabled.
 
+    ``text_output`` switches the session to ``output_modalities: ["text"]``
+    for the cascade voice lane: the model keeps listening, thinking, and
+    calling tools, but emits text deltas instead of synthesized audio. The
+    ``audio.output`` block carries no voice then — there is no provider
+    voice to configure, and sending one would pretend a choice nobody made.
+    """
+
+    audio: dict = {
+        "input": {
+            "noise_reduction": {"type": "near_field"},
+            "turn_detection": {
+                "type": "server_vad",
+                "create_response": automatic_response,
+                "interrupt_response": True,
+            },
+            "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
+        },
+    }
+    if not text_output:
+        audio["output"] = {"voice": voice}
     payload: dict = {
         "type": "realtime",
         "model": model,
         "instructions": instructions,
-        "audio": {
-            "input": {
-                "noise_reduction": {"type": "near_field"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "create_response": automatic_response,
-                    "interrupt_response": True,
-                },
-                "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
-            },
-            "output": {"voice": voice},
-        },
+        "audio": audio,
     }
+    if text_output:
+        payload["output_modalities"] = ["text"]
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -142,6 +154,7 @@ def mint_ephemeral_session(
     instructions: str,
     tools: list[dict] | None = None,
     automatic_response: bool = True,
+    text_output: bool = False,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
 
@@ -156,6 +169,7 @@ def mint_ephemeral_session(
         instructions=instructions,
         tools=tools,
         automatic_response=automatic_response,
+        text_output=text_output,
     )
     payload = post_client_secret(auth_token, session)
     secret, expires_at_ms = parse_client_secret(payload)
