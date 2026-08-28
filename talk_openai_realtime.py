@@ -49,6 +49,7 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
         instructions=setup.instructions,
         tools=[_tool_wire(tool) for tool in setup.tools] or None,
         automatic_response=setup.automatic_response,
+        text_output=setup.text_output,
     )
     return {
         "type": "session.update",
@@ -237,6 +238,31 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
             )
+        if event_type == "response.output_text.delta":
+            # Text-output mode (the cascade voice lane): the model emits its
+            # answer as text instead of synthesizing audio. The delta rides
+            # the SAME assistant-transcript event as the audio transcript —
+            # the relay's captions and the cascade's chunker both consume it,
+            # and neither cares which provider channel carried the words.
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return None
+            return rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text=delta,
+                final=False,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id=event.get("response_id"),
+            )
+        if event_type == "response.output_text.done":
+            completed = event.get("text")
+            return rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text=completed if isinstance(completed, str) else "",
+                final=True,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id=event.get("response_id"),
+            )
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript")
             if not isinstance(transcript, str) or not transcript.strip():
@@ -322,6 +348,7 @@ class _OpenAIWireSession:
             instructions=configuration["instructions"],
             tools=configuration.get("tools"),
             automatic_response=configuration["automatic_response"],
+            text_output=configuration.get("text_output", False),
         )
 
     async def connect(
@@ -333,6 +360,7 @@ class _OpenAIWireSession:
         tools: list[dict] | None,
         automatic_response: bool,
         session_update: dict[str, Any],
+        text_output: bool = False,
     ) -> None:
         if self._connect_started or self._closed:
             raise OpenAIWireError("Realtime wire connect may only run once")
@@ -346,6 +374,7 @@ class _OpenAIWireSession:
                     instructions=instructions,
                     tools=tools,
                     automatic_response=automatic_response,
+                    text_output=text_output,
                 )
             finally:
                 self._clear_raw_credentials()
@@ -521,6 +550,7 @@ class OpenAIRealtimeSession:
                 tools=tools,
                 automatic_response=setup.automatic_response,
                 session_update=build_session_update(setup),
+                text_output=setup.text_output,
             )
         except asyncio.CancelledError:
             self.state = rt.SessionState.CLOSED
