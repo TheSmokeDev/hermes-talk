@@ -48,7 +48,14 @@ def clean_provider_env(monkeypatch):
 class _Message:
     def __init__(self, payload, *, message_type="text"):
         self.type = message_type
-        self.data = payload if isinstance(payload, str) else json.dumps(payload)
+        if message_type == "binary":
+            # The Google endpoint speaks its JSON in binary frames on some
+            # connections; a binary payload is bytes, not str.
+            self.data = (
+                payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+            )
+        else:
+            self.data = payload if isinstance(payload, str) else json.dumps(payload)
 
 
 class _Socket:
@@ -139,7 +146,7 @@ def _adapter(socket, *, key: str = FAKE_KEY):
     client = _Client(socket)
     aiohttp = types.SimpleNamespace(
         ClientSession=lambda: client,
-        WSMsgType=types.SimpleNamespace(TEXT="text", ERROR="error"),
+        WSMsgType=types.SimpleNamespace(TEXT="text", BINARY="binary", ERROR="error"),
     )
     adapter = gemini_rt.GeminiRealtimeSession(
         auth_token=key,
@@ -1012,6 +1019,75 @@ def test_operator_speech_disarms_the_trailing_fence():
         rt.OutputAudio(data=b"fresh answer"),
         rt.SessionTerminated(state=rt.SessionState.CLOSED),
     ]
+
+
+# -- binary frames (live-smoke finding, 2026-08-28) --------------------------------
+
+
+def test_binary_frames_carry_the_full_session():
+    pcm = b"binary pcm"
+
+    async def scenario():
+        wire_events = [
+            _Message({"setupComplete": {}}, message_type="binary"),
+            _Message(
+                {
+                    "serverContent": {
+                        "modelTurn": {
+                            "parts": [
+                                {
+                                    "inlineData": {
+                                        "mimeType": "audio/pcm;rate=24000",
+                                        "data": _b64(pcm),
+                                    }
+                                }
+                            ]
+                        },
+                        "turnComplete": True,
+                    }
+                },
+                message_type="binary",
+            ),
+        ]
+        adapter, _client = _adapter(_Socket(wire_events))
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert isinstance(events[0], rt.SessionReady)
+    assert isinstance(events[1], rt.ResponseStarted)
+    assert events[2] == rt.OutputAudio(data=pcm)
+    assert events[3].final is True
+    assert isinstance(events[4], rt.ResponseFinished)
+    assert events[5] == rt.SessionTerminated(state=rt.SessionState.CLOSED)
+
+
+def test_malformed_binary_frame_is_non_terminal_and_the_stream_continues():
+    async def scenario():
+        wire_events = [
+            _Message(b"\xff\xfe not json", message_type="binary"),
+            _Message("[]", message_type="binary"),  # valid UTF-8, not an object
+            _Message({"setupComplete": {}}, message_type="binary"),
+        ]
+        adapter, _client = _adapter(_Socket(wire_events))
+        await adapter.connect(_setup())
+        events = [event async for event in adapter]
+        await adapter.close()
+        return adapter, events
+
+    adapter, events = asyncio.run(scenario())
+
+    assert events == [
+        rt.ProviderFailure(detail="Provider sent a malformed frame"),
+        rt.ProviderFailure(detail="Provider sent a non-object frame"),
+        rt.SessionReady(session_id=adapter._session_id),
+        rt.SessionTerminated(state=rt.SessionState.CLOSED),
+    ]
+    assert all(not event.terminal for event in events[:2])
+    assert adapter.state is rt.SessionState.CLOSED
 
 
 # -- resampler ---------------------------------------------------------------------

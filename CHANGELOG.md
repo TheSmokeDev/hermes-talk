@@ -63,6 +63,11 @@ contract the OpenAI and Grok lanes already speak.
   audio/text arriving after `generationComplete` is dropped with one
   warning per window rather than reopening a phantom response.
 
+### Fixed
+- Live smoke: the Gemini endpoint speaks its JSON in BINARY WebSocket frames
+  on some connections — both frame types are now accepted, and one malformed
+  frame is a non-terminal failure instead of killing the call.
+
 ## [0.11.0] — 2026-08-28
 
 A second realtime voice provider: Grok (xAI), behind the same

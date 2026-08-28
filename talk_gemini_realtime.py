@@ -31,6 +31,10 @@ operator key):
   setup and records the latest CONFIRMED handle on the session
   (``resumption_handle``); reconnecting with it is a follow-up feature, not
   this adapter.
+- Live smoke, 2026-08-28: the endpoint speaks its JSON in BINARY WebSocket
+  frames on some connections. TEXT and BINARY frames are accepted and parse
+  identically, and one malformed frame is a NON-terminal failure — a single
+  bad frame must never kill a call.
 
 Reference-verified behavior (Google Live docs plus the shipped OpenClaw,
 Pipecat, and LiveKit providers — NOT the live probe):
@@ -271,6 +275,10 @@ class GeminiWireError(RuntimeError):
     """A terminal low-level Gemini Live transport or wire-protocol failure."""
 
 
+class GeminiWireFrameError(ValueError):
+    """One undecodable frame; non-fatal — the stream continues after it."""
+
+
 class GeminiWireEOF(EOFError):
     """The WebSocket iterator ended; ``detail`` is blank only for a clean EOF."""
 
@@ -395,7 +403,16 @@ class _GeminiWireSession:
             if message.type == getattr(aiohttp.WSMsgType, "ERROR", object()):
                 detail = _scrub(str(getattr(message, "data", "") or "").strip())
                 raise GeminiWireError(detail or "Provider WebSocket receive failed")
-            if message.type is not aiohttp.WSMsgType.TEXT:
+            if message.type is aiohttp.WSMsgType.TEXT:
+                payload = message.data
+            elif message.type is getattr(aiohttp.WSMsgType, "BINARY", object()):
+                # The Google endpoint speaks its JSON in BINARY frames on
+                # some connections (live smoke, 2026-08-28): decode UTF-8 and
+                # parse exactly like a text frame. UnicodeDecodeError is a
+                # ValueError, so malformed bytes land in the same
+                # malformed-frame path as bad text JSON below.
+                payload = message.data
+            else:
                 passive_types = {
                     getattr(aiohttp.WSMsgType, name, object())
                     for name in ("CLOSE", "CLOSED", "CLOSING", "PING", "PONG")
@@ -407,11 +424,13 @@ class _GeminiWireSession:
                     f"Provider sent unsupported WebSocket frame type: {frame_name}"
                 )
             try:
-                wire_event = json.loads(message.data)
+                if isinstance(payload, (bytes, bytearray)):
+                    payload = bytes(payload).decode("utf-8")
+                wire_event = json.loads(payload)
             except (TypeError, ValueError) as exc:
-                raise GeminiWireError("Provider sent malformed JSON") from exc
+                raise GeminiWireFrameError("Provider sent a malformed frame") from exc
             if not isinstance(wire_event, dict):
-                raise GeminiWireError("Provider sent a non-object event")
+                raise GeminiWireFrameError("Provider sent a non-object frame")
             return wire_event
 
     async def _close_once(self) -> None:
@@ -914,6 +933,10 @@ class GeminiRealtimeSession:
                     else rt.SessionState.CLOSED
                 )
                 return rt.SessionTerminated(state=self.state, detail=exc.detail)
+            except GeminiWireFrameError as exc:
+                # One malformed frame (text or binary) never kills the call;
+                # the failure is reported and the stream continues.
+                return rt.ProviderFailure(detail=str(exc))
             except GeminiWireError as exc:
                 self.state = rt.SessionState.FAILED
                 return rt.ProviderFailure(detail=str(exc), terminal=True)
@@ -933,6 +956,7 @@ __all__ = [
     "GeminiRealtimeSession",
     "GeminiWireEOF",
     "GeminiWireError",
+    "GeminiWireFrameError",
     "Pcm24To16Resampler",
     "_GeminiWireSession",
     "build_setup_message",
