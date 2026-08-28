@@ -11,7 +11,7 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## 0.11.0 (Unreleased)
+## [0.11.0] — 2026-08-28
 
 A second realtime voice provider: Grok (xAI), behind the same
 provider-neutral session contract the OpenAI lane already speaks.
