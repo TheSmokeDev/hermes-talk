@@ -43,6 +43,7 @@ CHECK_ORDER = (
     "auth",
     "model",
     "voice",
+    "cascade",
     "audio",
     "identity",
     "discord",
@@ -448,6 +449,108 @@ def _voice_check() -> dict[str, Any]:
     )
 
 
+def _cascade_check() -> dict[str, Any]:
+    """The custom-voice cascade lane: mode, TTS provider, key and voice presence.
+
+    Read-only and offline, same as the provider check: key PRESENCE only
+    (redacted by construction — the value never enters the report), the voice
+    id as the semi-public identifier it is, and no live ElevenLabs probe.
+    """
+
+    raw_mode = os.environ.get("TALK_VOICE_MODE")
+    source = "TALK_VOICE_MODE" if (raw_mode or "").strip() else "default"
+    try:
+        mode = talk_config.voice_mode()
+    except talk_config.TalkConfigError:
+        return _check(
+            "cascade",
+            "fail",
+            "configured voice mode is not supported",
+            {"voice_mode": (raw_mode or "").strip().lower() or None, "source": source},
+            (f"Set TALK_VOICE_MODE to {' or '.join(talk_config.TALK_VOICE_MODES)}, or unset it.",),
+        )
+    if mode == "native":
+        return _check(
+            "cascade",
+            "pass",
+            "voice mode is native; the cascade lane is inactive",
+            {"voice_mode": mode, "source": source},
+        )
+
+    scoped = os.environ.get("TALK_ELEVENLABS_API_KEY")
+    shared = os.environ.get("ELEVENLABS_API_KEY")
+    keys = {"scoped": _key_presence(scoped), "shared": _key_presence(shared)}
+    voice_id_raw = os.environ.get("TALK_ELEVENLABS_VOICE_ID")
+    voice_id = (voice_id_raw or "").strip() or None
+    details: dict[str, Any] = {
+        "voice_mode": mode,
+        "source": source,
+        "keys": keys,
+        "voice_id": voice_id,
+        "model": talk_config.elevenlabs_model(),
+    }
+    try:
+        details["tts"] = talk_config.cascade_tts()
+    except talk_config.TalkConfigError:
+        details["tts"] = (os.environ.get("TALK_CASCADE_TTS") or "").strip().lower() or None
+        return _check(
+            "cascade",
+            "fail",
+            "configured cascade TTS provider is not supported",
+            details,
+            ("Set TALK_CASCADE_TTS to elevenlabs, or unset it.",),
+        )
+    try:
+        provider = talk_config.talk_provider()
+    except talk_config.TalkConfigError:
+        provider = None  # the provider check already reports that failure
+    details["provider"] = provider
+    if provider is not None and provider != "openai":
+        return _check(
+            "cascade",
+            "fail",
+            f"cascade voice mode requires the openai provider, not {provider}",
+            details,
+            ("Set TALK_PROVIDER=openai for cascade mode, or use TALK_VOICE_MODE=native.",),
+        )
+    if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
+        return _check(
+            "cascade",
+            "fail",
+            "an ElevenLabs key variable is set but blank and refuses closed",
+            details,
+            (
+                "Set a real key in TALK_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY, "
+                "or unset the blank one.",
+            ),
+        )
+    if "present" not in keys.values():
+        return _check(
+            "cascade",
+            "fail",
+            "cascade voice mode is selected but no ElevenLabs key is configured",
+            details,
+            ("Set TALK_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY.",),
+        )
+    if voice_id is None:
+        return _check(
+            "cascade",
+            "fail",
+            "cascade voice mode needs a voice id and none is configured",
+            details,
+            (
+                "Set TALK_ELEVENLABS_VOICE_ID to a voice id from your ElevenLabs "
+                "account (VoiceLab -> your voice -> ID).",
+            ),
+        )
+    return _check(
+        "cascade",
+        "pass",
+        f"cascade voice mode is configured (tts {details['tts']}, model {details['model']})",
+        details,
+    )
+
+
 def _audio_check() -> dict[str, Any]:
     available = talk_audio.audio_available()
     details = {
@@ -645,6 +748,7 @@ def collect_report() -> dict[str, Any]:
         _auth_check(),
         _model_check(),
         _voice_check(),
+        _cascade_check(),
         _audio_check(),
         _identity_check(),
         _discord_check(),
@@ -684,6 +788,14 @@ def render_human(report: dict[str, Any]) -> str:
             lines.append(
                 "  receipt: "
                 f"model={details.get('model')}, voice={details.get('voice')}, "
+                f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
+            )
+        elif check["id"] == "cascade" and details.get("voice_mode") == "cascade":
+            keys = details.get("keys", {})
+            lines.append(
+                "  receipt: "
+                f"tts={details.get('tts')}, model={details.get('model')}, "
+                f"voice-id={details.get('voice_id') or 'unset'}, "
                 f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
             )
         elif check["id"] == "identity":
