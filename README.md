@@ -186,6 +186,43 @@ logged receipt — never a faked upstream call. The Discord lane refuses
 Gemini for now: its gated-response authorization flow has no Live wire
 equivalent, so connect fails closed rather than answering unvetted speakers.
 
+## Custom voice — the cascade lane (ElevenLabs)
+
+Native mode speaks with the provider's own voices, and those voices are
+provider-locked. Cascade mode splits the call: the realtime provider stays
+the brain (listening, thinking, tools, turn-taking) and hands its answer
+TEXT to a streaming ElevenLabs TTS, so the assistant speaks in any voice on
+your ElevenLabs account — including a clone of your own.
+
+```bash
+TALK_VOICE_MODE=cascade \
+TALK_ELEVENLABS_VOICE_ID=<your-voice-id> \
+hermes talk
+```
+
+The key comes from `TALK_ELEVENLABS_API_KEY` or `ELEVENLABS_API_KEY`
+(Talk-scoped wins; set-but-blank refuses), and the TTS model defaults to
+`eleven_flash_v2_5` (override: `TALK_ELEVENLABS_MODEL`). To clone your own
+voice, create it in ElevenLabs VoiceLab first (VoiceLab → your voice → copy
+the ID); voice management stays in your ElevenLabs account, not the plugin.
+
+The trade, stated plainly: native provider audio starts ~300–600ms after
+turn end, and the cascade adds roughly one extra half-second on the FIRST
+sentence (sentence chunking plus TTS first-audio, ~490ms measured) — later
+sentences pipeline under playback. You trade ~0.5s of first-word latency
+for your voice.
+
+Cascade is OpenAI-only for now (it is the one provider whose text-output
+mode is wired and verified — picking grok or gemini fails closed and names
+the provider). Barge-in cuts the cloned voice off exactly like native:
+SpeechStarted aborts the in-flight TTS stream and drains playback in the
+same synchronous step, so a cancelled sentence never speaks. A TTS failure
+degrades that one answer to text-only with a single logged receipt; the
+call itself survives. `TALK_VOICE_MODE` is fail-closed and defaults to
+`native`, which is byte-identical to the pre-cascade behavior. Doctor gains
+a `cascade` check: mode, TTS provider, redacted key presence, voice-id
+status — no live probe.
+
 ## Use
 
 ```bash
@@ -435,6 +472,11 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model (bare id; the adapter adds the wire prefix) |
 | `TALK_GEMINI_VOICE` | `Puck` | Gemini Live voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede` (fail-closed, case-sensitive) |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first; set-but-blank refuses; free-tier keys work |
+| `TALK_VOICE_MODE` | `native` | `native` (provider voices, unchanged) or `cascade` (provider thinks in text, ElevenLabs speaks); fail-closed |
+| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider — the only value today; fail-closed |
+| `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first; set-but-blank refuses; rides the `xi-api-key` header, never the URL |
+| `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with — **required** in cascade mode (stock or cloned, from your ElevenLabs account) |
+| `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane |
 | `TALK_PREFER_CODEX_OAUTH` | unset | `true` requires Codex OAuth and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |

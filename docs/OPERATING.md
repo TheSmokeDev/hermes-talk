@@ -184,6 +184,16 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 | `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first (free-tier keys work). Set-but-blank is a hard refusal, same rule as the OpenAI keys. The key rides the WebSocket URL query on this lane, so the URL is treated as a secret: assembled at connect, never logged, scrubbed out of transport errors. The Live protocol has no client cancel/truncate command — barge-in degrades to local playback handling with a logged receipt. |
 
+### Custom voice (cascade lane)
+
+| Variable | Default | Effect / failure mode |
+|---|---|---|
+| `TALK_VOICE_MODE` | `native` | `native` = the provider synthesizes its own voice (the pre-cascade behavior, byte-identical). `cascade` = the provider session opens in text-output mode and ElevenLabs speaks the answer through the same playback sink. **Fail-closed** on any other value. Cascade requires `TALK_PROVIDER=openai` (grok/gemini text modes are not wired yet — the refusal names the provider). |
+| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider. **Fail-closed**; `elevenlabs` is the only value today. |
+| `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the other provider keys. The key rides the `xi-api-key` WebSocket header — never the URL, never a log line, never an error string. |
+| `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
+| `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane. `eleven_flash_v2_5` probed at ~490ms to first audio on PCM 24kHz (2026-08-28), which is the cascade's latency trade: roughly one extra half-second on the first sentence versus native; later sentences pipeline under playback. |
+
 ### Audio (terminal lane)
 
 | Variable | Default | Effect / failure mode |

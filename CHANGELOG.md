@@ -11,6 +11,39 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## 0.13.0 (Unreleased)
+
+Custom voice: a cascade mode that lets the assistant speak in YOUR voice —
+any stock or cloned voice on the operator's ElevenLabs account — while the
+realtime provider stays the brain.
+
+### Added
+- `TALK_VOICE_MODE` (`native` default | `cascade`, fail-closed). In cascade
+  mode the provider session opens in text-output mode; assistant text deltas
+  flow through a sentence chunker into a streaming ElevenLabs TTS, and the
+  returned PCM24k feeds the SAME playback sink the relay uses for provider
+  audio — the playback engine is shared, not forked. Cascade is gated to
+  OpenAI (its text-output mode is wired and verified); selecting grok or
+  gemini fails closed and names the provider.
+- `talk_cascade_voice` module: the sentence chunker (terminal punctuation
+  plus clause breaks past a ~120-char budget; decimals, abbreviations,
+  initials, acronyms, dotted words, and ellipses never false-split, and a
+  split never lands mid-word) and the ElevenLabs stream-input client
+  (BOS/voice settings/chunks with `try_trigger_generation`/EOS, base64 audio
+  frames, `isFinal` terminal). The key rides the `xi-api-key` header only —
+  never the URL, never a log line.
+- Barge-in covers the cascade: SpeechStarted aborts the in-flight TTS stream
+  and drains pending chunks in the same synchronous step the relay drains
+  playback, so a cancelled sentence never speaks; the next response opens a
+  fresh stream. A TTS failure degrades that one response to text-only with a
+  single logged receipt — the voice session survives.
+- Cascade knobs: `TALK_CASCADE_TTS` (`elevenlabs` only, fail-closed),
+  `TALK_ELEVENLABS_API_KEY` -> `ELEVENLABS_API_KEY` (set-but-blank refuses),
+  `TALK_ELEVENLABS_VOICE_ID` (required in cascade mode, fail-closed with
+  remediation), and `TALK_ELEVENLABS_MODEL` (default `eleven_flash_v2_5`).
+- Doctor gains a `cascade` check: voice mode, TTS provider, redacted key
+  presence, voice-id status, provider gate — read-only, no live probe.
+
 ## [0.12.0] — 2026-08-28
 
 A third realtime voice provider: Gemini Live (Google) — the zero-cost lane,
