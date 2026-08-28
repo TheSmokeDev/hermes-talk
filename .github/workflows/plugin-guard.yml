@@ -39,8 +39,11 @@ jobs:
           home="${RUNNER_TEMP}/plugin-guard"
           mkdir -p "${home}/tools"
           base="https://raw.githubusercontent.com/NousResearch/hermes-agent/${{ steps.scanner.outputs.sha }}/tools"
-          curl -fsSL "${base}/plugin_guard.py" -o "${home}/tools/plugin_guard.py"
-          curl -fsSL "${base}/skills_guard.py" -o "${home}/tools/skills_guard.py"
+          # raw.githubusercontent.com can rate-limit (HTTP 429) on busy CI
+          # days; retry with backoff so a transient throttle cannot fail the
+          # gate. The scanner stays pinned to the SHA resolved above.
+          curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "${base}/plugin_guard.py" -o "${home}/tools/plugin_guard.py"
+          curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "${base}/skills_guard.py" -o "${home}/tools/skills_guard.py"
           touch "${home}/tools/__init__.py"
 
       - name: Scan this repository
