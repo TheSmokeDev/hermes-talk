@@ -63,6 +63,11 @@ def _hermetic(monkeypatch, tmp_path):
         "TALK_MODEL",
         "TALK_VOICE",
         "TALK_DISCORD_OPERATOR_USER_IDS",
+        "TALK_PROVIDER",
+        "TALK_GROK_MODEL",
+        "TALK_GROK_VOICE",
+        "TALK_XAI_API_KEY",
+        "XAI_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     talk_host.bind_ctx(None)
@@ -98,6 +103,7 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
     assert set(report["summary"]) == {"pass", "warn", "fail"}
     assert [check["id"] for check in report["checks"]] == [
         "plugin",
+        "provider",
         "auth",
         "model",
         "voice",
@@ -524,3 +530,80 @@ def test_doctor_labels_unlisted_realtime_id_as_syntax_only_unknown(monkeypatch):
     assert check["details"]["validation_scope"] == "syntax-only"
     assert "unknown" in check["summary"].lower()
     assert "valid" not in check["summary"].lower()
+
+
+def test_provider_check_passes_openai_by_default():
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["provider"] == "openai"
+    assert check["details"]["source"] == "default"
+
+
+def test_provider_check_refuses_an_unknown_provider(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "alexa")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["provider"] == "alexa"
+    assert check["remediation"]
+
+
+def test_grok_provider_check_reports_readiness_without_the_key_value(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("TALK_XAI_API_KEY", "xai-scoped-test")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["keys"] == {"scoped": "present", "shared": "absent"}
+    assert check["details"]["model"] == "grok-voice-latest"
+    assert check["details"]["voice"] == "ara"
+    assert check["details"]["voice_valid"] is True
+    assert "xai-scoped-test" not in json.dumps(check)
+
+
+def test_grok_provider_check_fails_without_a_key(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["keys"] == {"scoped": "absent", "shared": "absent"}
+    assert "no xAI key" in check["summary"]
+
+
+def test_grok_provider_check_fails_on_a_blank_scoped_key(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("TALK_XAI_API_KEY", "   ")
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["keys"]["scoped"] == "blank"
+
+
+def test_grok_provider_check_fails_on_an_unknown_voice(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
+    monkeypatch.setenv("TALK_GROK_VOICE", "morgan-freeman")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["voice"] == "morgan-freeman"
+    assert check["details"]["voice_valid"] is False
+
+
+def test_human_report_renders_the_grok_provider_receipt(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    rendered = talk_doctor.render_human(talk_doctor.collect_report())
+
+    assert "[PASS] provider: grok realtime provider is configured" in rendered
+    assert "key-shared=present" in rendered
+    assert "xai-shared-test" not in rendered
