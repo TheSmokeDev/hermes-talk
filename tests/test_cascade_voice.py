@@ -474,6 +474,101 @@ def test_stream_input_url_carries_identifiers_only():
 
 
 # ---------------------------------------------------------------------------
+# The stream-end hook (the dashboard relay lane's end-of-audio signal)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_end_hook_fires_on_success_and_failure_but_not_barge_in():
+    asyncio.run(_stream_end_hook_semantics())
+
+
+async def _stream_end_hook_semantics():
+    ended: list[str] = []
+    harness = _Harness()
+    voice = cascade.CascadeVoice(
+        api_key=FAKE_KEY,
+        voice_id=FAKE_VOICE_ID,
+        model=talk_config.DEFAULT_ELEVENLABS_MODEL,
+        on_audio=harness.audio.append,
+        on_error=harness.errors.append,
+        on_stream_end=lambda: ended.append("end"),
+        aiohttp_module=aiohttp,
+        ws_connect=harness.connect,
+    )
+    voice.start()
+    try:
+        # Success: the hook fires once the terminal frame settles the run.
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("Clean answer. "))
+        voice.handle_event(_final(response_id="resp_1"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        ws.feed_audio(b"pcm")
+        ws.feed_final()
+        await _wait_for(lambda: ended == ["end"])
+        assert harness.audio == [b"pcm"]
+
+        # Failure: the error receipt fires first, then the hook — a relay
+        # draining a response stream must hear both, in that order.
+        voice.handle_event(rt.ResponseStarted(response_id="resp_2"))
+        voice.handle_event(_delta("Broken answer. ", response_id="resp_2"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 2)
+        harness.connect.sockets[1].feed({"error": "upstream said no"})
+        await _wait_for(lambda: len(harness.errors) == 1)
+        await _wait_for(lambda: ended == ["end", "end"])
+
+        # Barge-in: a CANCELLED run fires nothing — whoever aborted knows.
+        voice.handle_event(rt.ResponseStarted(response_id="resp_3"))
+        voice.handle_event(_delta("Interrupted answer. ", response_id="resp_3"))
+        await _wait_for(lambda: len(harness.connect.sockets) == 3)
+        voice.handle_event(rt.SpeechStarted(input_id="in_1", offset_ms=0))
+        await _wait_for(lambda: harness.connect.sockets[2].closed)
+        await asyncio.sleep(0.05)
+        assert ended == ["end", "end"]
+    finally:
+        await voice.aclose()
+
+
+def test_stream_end_hook_consumer_failure_does_not_kill_the_worker():
+    asyncio.run(_stream_end_hook_consumer_failure())
+
+
+async def _stream_end_hook_consumer_failure():
+    harness = _Harness()
+
+    def broken_hook() -> None:
+        raise RuntimeError("consumer bug")
+
+    voice = cascade.CascadeVoice(
+        api_key=FAKE_KEY,
+        voice_id=FAKE_VOICE_ID,
+        model=talk_config.DEFAULT_ELEVENLABS_MODEL,
+        on_audio=harness.audio.append,
+        on_error=harness.errors.append,
+        on_stream_end=broken_hook,
+        aiohttp_module=aiohttp,
+        ws_connect=harness.connect,
+    )
+    voice.start()
+    try:
+        for index in (1, 2):
+            response_id = f"resp_{index}"
+            voice.handle_event(rt.ResponseStarted(response_id=response_id))
+            voice.handle_event(_delta("Still speaking. ", response_id=response_id))
+            voice.handle_event(_final(response_id=response_id))
+            await _wait_for(lambda index=index: len(harness.connect.sockets) == index)
+            ws = harness.connect.sockets[index - 1]
+            ws.feed_audio(f"pcm-{index}".encode())
+            ws.feed_final()
+            await _wait_for(lambda ws=ws: ws.closed)
+        # The hook raised on BOTH runs; the worker survived to speak again.
+        assert harness.audio == [b"pcm-1", b"pcm-2"]
+        assert harness.errors == []
+    finally:
+        await voice.aclose()
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed config lanes
 # ---------------------------------------------------------------------------
 

@@ -1093,24 +1093,12 @@ async def run_talk_session(
         # Cascade voice mode: the provider thinks in text, ElevenLabs speaks.
         # Resolved HERE, next to the provider pick, so every fail-closed knob
         # (mode, TTS provider, key, voice id) refuses before a single secret
-        # or socket is spent. Gated to OpenAI: it is the one provider whose
-        # text-output mode is wired and verified — grok/gemini text modes are
-        # unverified, and guessing would mute the call.
+        # or socket is spent. The rules live in talk_config.cascade_voice_config
+        # so every lane (terminal, Discord, dashboard) refuses identically.
         voice_mode = talk_config.voice_mode()
         cascade_config: tuple[str, str, str] | None = None
         if voice_mode == "cascade":
-            if provider != "openai":
-                raise talk_config.TalkConfigError(
-                    f"TALK_VOICE_MODE=cascade requires TALK_PROVIDER=openai, but "
-                    f"'{provider}' is configured — grok/gemini text-output modes are "
-                    "not wired into the cascade yet"
-                )
-            talk_config.cascade_tts()  # fail-closed; elevenlabs is the only value today
-            cascade_config = (
-                talk_config.resolve_elevenlabs_key(),
-                talk_config.elevenlabs_voice_id(),
-                talk_config.elevenlabs_model(),
-            )
+            cascade_config = talk_config.cascade_voice_config(provider)
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:

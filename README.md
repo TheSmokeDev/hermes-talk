@@ -223,6 +223,14 @@ call itself survives. `TALK_VOICE_MODE` is fail-closed and defaults to
 a `cascade` check: mode, TTS provider, redacted key presence, voice-id
 status — no live probe.
 
+The cascade speaks on every Talk surface:
+
+| Surface | How the cascade speaks |
+| --- | --- |
+| Terminal (`hermes talk`) | The provider session opens in text-output mode; the cascade feeds the SAME playback sink the relay feeds. |
+| Discord (`talk join`) | The same shared session loop; cascade PCM24k takes the relay's exact path through the 24k→48k voice-channel conversion. |
+| Dashboard tab | The browser keeps its WebRTC socket but mints a text-output session and relays the model's text deltas to `POST /api/plugins/hermes-talk/cascade-tts`; the server-side cascade speaks them and streams PCM back. The ElevenLabs key never reaches the browser — the route sits behind the same `TALK_DASHBOARD_TOKEN` / loopback gate as the mint, and barge-in aborts the fetch, which cancels the TTS exactly like the terminal lane. |
+
 ## Use
 
 ```bash

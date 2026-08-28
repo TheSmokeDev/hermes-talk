@@ -194,6 +194,15 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
 | `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane. `eleven_flash_v2_5` probed at ~490ms to first audio on PCM 24kHz (2026-08-28), which is the cascade's latency trade: roughly one extra half-second on the first sentence versus native; later sentences pipeline under playback. |
 
+Cascade mode applies to every Talk surface — terminal, Discord, and the
+dashboard tab share the same knobs and the same fail-closed resolution. On the
+dashboard the ElevenLabs key stays server-side: the tab relays the model's text
+deltas to `POST /api/plugins/hermes-talk/cascade-tts` (same
+`TALK_DASHBOARD_TOKEN` / loopback gate as the mint) and plays the PCM24k that
+streams back. One NDJSON `{"delta": ...}` line per text delta, one terminal
+`{"done": ...}` line per response; an aborted stream (barge-in, tab closed)
+cancels the answer's TTS rather than flushing it.
+
 ### Audio (terminal lane)
 
 | Variable | Default | Effect / failure mode |

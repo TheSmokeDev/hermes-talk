@@ -21,6 +21,11 @@ Three invariants this layer exists to hold:
   independent gate: ``TALK_DASHBOARD_TOKEN`` when set, loopback-only when it is
   not, and a refusal — never a pass — for a peer this process cannot identify.
 
+The cascade relay (``/cascade-tts``) extends the first invariant to the
+ElevenLabs key: the browser holds the provider socket and relays the model's
+TEXT deltas here, the server-side :class:`talk_cascade_voice.CascadeVoice`
+speaks them, and only PCM audio ever leaves the process.
+
 Out-of-process caveat: the dashboard imports this file into the WEB SERVER
 process, which has no bound plugin context. Agent-loop-only tools
 (``session_search``, in-loop ``delegate_task``) degrade to their announced
@@ -31,8 +36,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
+import logging
 import os
 import sys
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 
 #: The dashboard loads this module by path, so ``talk_*`` is not importable by
@@ -47,9 +56,11 @@ if str(_PLUGIN_ROOT) not in sys.path:
 import talk_apiserver  # noqa: E402
 import talk_auth  # noqa: E402
 import talk_capabilities  # noqa: E402
+import talk_cascade_voice  # noqa: E402
 import talk_config  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
+import talk_realtime  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_tools  # noqa: E402
@@ -57,6 +68,7 @@ import talk_wire  # noqa: E402
 
 try:
     from fastapi import APIRouter, HTTPException, Request
+    from fastapi.responses import StreamingResponse
 except ImportError:  # pragma: no cover - offline tests run without the dashboard deps
 
     class APIRouter:  # type: ignore[no-redef]
@@ -78,6 +90,17 @@ except ImportError:  # pragma: no cover - offline tests run without the dashboar
 
     class Request:  # type: ignore[no-redef]
         """Annotation target only — never instantiated on this path."""
+
+    class StreamingResponse:  # type: ignore[no-redef]
+        """The two attributes the route and offline tests touch, in fastapi's shape."""
+
+        def __init__(self, content, media_type=None) -> None:
+            self.body_iterator = content
+            self.media_type = media_type
+            self.status_code = 200
+
+
+_log = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -190,8 +213,13 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str):
-    """Assemble instructions and mint. Blocking — called on a worker thread."""
+def _mint(auth_token: str, voice: str, *, text_output: bool = False):
+    """Assemble instructions and mint. Blocking — called on a worker thread.
+
+    ``text_output`` is the cascade lane: the minted session asks the provider
+    for TEXT output instead of synthesized audio, and the browser streams the
+    text deltas back through the cascade relay to be spoken server-side.
+    """
 
     tools = talk_tools.default_talk_tools()
     return talk_wire.mint_ephemeral_session(
@@ -202,7 +230,17 @@ def _mint(auth_token: str, voice: str):
             talk_host.host().identity_sections(), tools=tools, lane="dashboard"
         ),
         tools=tools,
+        text_output=text_output,
     )
+
+
+def _resolve_voice_mode() -> str:
+    """The configured voice mode for a mint — fail-closed, named on refusal."""
+
+    try:
+        return talk_config.voice_mode()
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _resolve_voice(requested) -> str:
@@ -244,6 +282,13 @@ async def talk_status(request: Request) -> dict:
         detail_suffix = f" (TALK_VOICE unusable: {exc})"
     else:
         detail_suffix = ""
+    try:
+        voice_mode = talk_config.voice_mode()
+    except talk_config.TalkConfigError as exc:
+        # Stay answerable: the tile reads as native and the mint refuses with
+        # the exact remediation when Start is pressed.
+        voice_mode = ""
+        detail_suffix += f" (TALK_VOICE_MODE unusable: {exc})"
     status = talk_auth.auth_status()
     return {
         "ok": True,
@@ -252,6 +297,7 @@ async def talk_status(request: Request) -> dict:
         "detail": f"{status.get('detail') or ''}{detail_suffix}",
         "model": talk_config.talk_model(),
         "voice": voice,
+        "voiceMode": voice_mode or "native",
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
         # Tri-state, not a bool: no plugin context is ever bound in the web
@@ -275,7 +321,20 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
-    voice = _resolve_voice(body.get("voice"))
+    voice_mode = _resolve_voice_mode()
+    text_output = voice_mode == "cascade"
+    if text_output:
+        # A cascade session has no provider voice to validate — the mint asks
+        # for text output and the relay speaks. The cascade config refuses
+        # HERE, before a single secret is spent on the mint, with the same
+        # rules and messages the terminal and Discord lanes get.
+        try:
+            talk_config.cascade_voice_config(talk_config.talk_provider())
+        except talk_config.TalkConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        voice = ""
+    else:
+        voice = _resolve_voice(body.get("voice"))
     try:
         auth = talk_auth.resolve_auth()
     except talk_auth.TalkAuthError as exc:
@@ -288,6 +347,7 @@ async def create_session(request: Request) -> dict:
             _mint,
             auth.token,
             voice,
+            text_output=text_output,
         )
     except talk_wire.TalkWireError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -319,7 +379,15 @@ async def create_session(request: Request) -> dict:
         operator=f"dashboard:{auth.source}",
         profile=talk_config.agent_profile(),
     )
-    return {"ok": True, **descriptor.to_wire(), "authSource": auth.source}
+    return {
+        "ok": True,
+        **descriptor.to_wire(),
+        "authSource": auth.source,
+        # The tab switches its playback pipeline on this: native plays the
+        # provider's audio track; cascade relays text deltas to /cascade-tts
+        # and plays the PCM that comes back.
+        "voiceMode": voice_mode,
+    }
 
 
 @router.post("/tool")
@@ -370,6 +438,193 @@ async def run_tool(request: Request) -> dict:
     return {"ok": True, "output": output}
 
 
+# -- the cascade relay (custom voice on the browser lane) ---------------------
+
+#: The relay speaks the cascade's wire format straight back: PCM 24kHz mono
+#: s16le, chunked as it lands.
+CASCADE_PCM_MEDIA_TYPE = "application/octet-stream"
+
+#: One NDJSON line carries a delta (a few words) or a done (one whole answer).
+#: A line past this bound is not text the model wrote; it is a buggy or hostile
+#: client, and the feed aborts rather than buffering without limit.
+CASCADE_MAX_LINE_BYTES = 65_536
+
+#: Queue sentinels for the relay's drain loop: _PCM_END is the cascade's
+#: stream-settled hook for this response; _FEED_DONE is the browser's text
+#: stream ending (done, abort, or garbage — the state flag distinguishes).
+_PCM_END = object()
+_FEED_DONE = object()
+
+
+def _resolve_cascade_relay_config() -> tuple[str, str, str]:
+    """The cascade triple for one relay call — fail-closed, HTTP-shaped.
+
+    The browser only calls this route for a session minted with
+    ``voiceMode: "cascade"``, so a server no longer in cascade mode means the
+    config changed mid-session: a refusal (409), never a guess. A broken
+    cascade knob is a 400 carrying the same remediation the CLI would print.
+    """
+
+    if _resolve_voice_mode() != "cascade":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "cascade voice mode is not enabled on this server "
+                "(TALK_VOICE_MODE) — this session was not minted for the relay"
+            ),
+        )
+    try:
+        return talk_config.cascade_voice_config(talk_config.talk_provider())
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _parse_cascade_line(raw: bytes) -> dict | None:
+    """One NDJSON line as a dict, or ``None`` when it is protocol garbage."""
+
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _cascade_request_lines(request) -> AsyncIterator[dict | None]:
+    """Yield the request body's NDJSON objects as they arrive.
+
+    Yields ``None`` once — then stops — for a malformed or oversized line.
+    The caller treats that exactly like a client abort: the response's TTS is
+    cancelled, never half-spoken from garbage.
+    """
+
+    buffer = b""
+    async for chunk in request.stream():
+        buffer += chunk
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            line = raw.strip()
+            if not line:
+                continue
+            parsed = _parse_cascade_line(line)
+            if parsed is None:
+                yield None
+                return
+            yield parsed
+        if len(buffer) > CASCADE_MAX_LINE_BYTES:
+            yield None
+            return
+    tail = buffer.strip()
+    if tail:  # a final line without its trailing newline still counts
+        yield _parse_cascade_line(tail)
+
+
+def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
+    """The browser's relayed text in the cascade's provider-neutral shape."""
+
+    return talk_realtime.Transcript(
+        role=talk_realtime.TranscriptRole.ASSISTANT,
+        text=text,
+        final=final,
+        provenance=talk_realtime.TranscriptProvenance.OUTPUT_AUDIO,
+    )
+
+
+async def _cascade_pcm_stream(request, config: tuple[str, str, str]) -> AsyncIterator[bytes]:
+    """Feed one response's relayed text through CascadeVoice; yield its PCM.
+
+    A fresh CascadeVoice per request: one POST == one response's speech. The
+    feeder task and this drain loop run CONCURRENTLY — that overlap is the
+    sentence pipelining, PCM flowing back while the browser is still sending
+    the model's text. Only an explicit ``{"done": ...}`` line completes the
+    answer: a stream that ends without it (the browser aborted on barge-in,
+    or the socket tore) falls to ``aclose()``, which cancels the in-flight
+    TTS exactly like the terminal lane's barge-in — an interrupted answer
+    must not keep talking.
+    """
+
+    audio_queue: asyncio.Queue = asyncio.Queue()
+    api_key, voice_id, model = config
+    voice = talk_cascade_voice.CascadeVoice(
+        api_key=api_key,
+        voice_id=voice_id,
+        model=model,
+        on_audio=audio_queue.put_nowait,
+        on_error=lambda text: _log.warning("dashboard cascade relay: %s", text),
+        on_stream_end=lambda: audio_queue.put_nowait(_PCM_END),
+    )
+    voice.start()
+    state = {"completed": False, "speakable": False}
+
+    async def consume_request() -> None:
+        """Feed the cascade from the browser's NDJSON stream."""
+
+        try:
+            async for line in _cascade_request_lines(request):
+                if line is None:
+                    _log.warning(
+                        "dashboard cascade relay: malformed stream line — answer cancelled"
+                    )
+                    return
+                delta = line.get("delta")
+                if isinstance(delta, str) and delta:
+                    state["speakable"] = state["speakable"] or bool(delta.strip())
+                    voice.handle_event(_relay_transcript(delta, final=False))
+                    continue
+                done = line.get("done")
+                if isinstance(done, str):
+                    state["speakable"] = state["speakable"] or bool(done.strip())
+                    voice.handle_event(_relay_transcript(done, final=True))
+                    state["completed"] = True
+                    return
+                _log.warning(
+                    "dashboard cascade relay: unrecognized stream line — answer cancelled"
+                )
+                return
+        finally:
+            audio_queue.put_nowait(_FEED_DONE)
+
+    feeder = asyncio.create_task(consume_request())
+    try:
+        while True:
+            item = await audio_queue.get()
+            if item is _PCM_END:
+                break  # the response's TTS run settled, spoken or failed
+            if item is _FEED_DONE:
+                if not state["completed"]:
+                    break  # aborted: stop now; aclose() below silences the TTS
+                if not state["speakable"]:
+                    break  # a whitespace-only answer never starts a TTS run
+                continue  # text done, audio still landing — wait for _PCM_END
+            yield item
+    finally:
+        if not feeder.done():
+            feeder.cancel()
+            await asyncio.wait({feeder})
+        with suppress(Exception):  # TTS teardown must not mask the real exit
+            await voice.aclose()
+
+
+@router.post("/cascade-tts")
+async def cascade_tts(request: Request):
+    """Stream one assistant response's text through the cascade; PCM24k back.
+
+    The dashboard tab holds the provider socket (WebRTC), so the cascade on
+    this lane is a RELAY: the browser streams the model's own assistant text
+    deltas here as NDJSON (``{"delta": ...}`` lines and one terminal
+    ``{"done": ...}``), and this route runs them through the same CascadeVoice
+    the terminal and Discord lanes use, returning PCM as it lands. The
+    ElevenLabs key never leaves this process — it rides only the server-side
+    stream-input socket, behind the same dashboard gate as the mint.
+    """
+
+    require_dashboard_auth(request)
+    config = _resolve_cascade_relay_config()
+    return StreamingResponse(
+        _cascade_pcm_stream(request, config),
+        media_type=CASCADE_PCM_MEDIA_TYPE,
+    )
+
+
 @router.get("/runs")
 async def list_runs(request: Request) -> dict:
     """Background runs for the panel and the WORK_STARTED watcher.
@@ -388,10 +643,12 @@ async def list_runs(request: Request) -> dict:
 #: Every route in this plugin, for the guard-coverage invariant test. A new
 #: route that is not listed here (or not gated) fails that test rather than
 #: shipping open.
-ROUTE_HANDLERS = (talk_status, create_session, run_tool, list_runs)
+ROUTE_HANDLERS = (talk_status, create_session, run_tool, cascade_tts, list_runs)
 
 
 __all__ = [
+    "CASCADE_MAX_LINE_BYTES",
+    "CASCADE_PCM_MEDIA_TYPE",
     "DASHBOARD_TOKEN_ENV",
     "DASHBOARD_TOKEN_HEADER",
     "LOOPBACK_HOSTS",
@@ -399,6 +656,7 @@ __all__ = [
     "ROUTE_HANDLERS",
     "RUNS_LIMIT",
     "TOKEN_REQUIRED_MESSAGE",
+    "cascade_tts",
     "create_session",
     "dashboard_token",
     "list_runs",
