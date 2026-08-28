@@ -24,6 +24,20 @@ DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
 DEFAULT_AGENT_TIMEOUT_S = 1_800
 
+#: Realtime voice providers selectable through ``TALK_PROVIDER``. The list is
+#: fail-closed on purpose: a provider knob that guesses silently would spend
+#: the wrong metered key, which is a billing error, not a UX nicety.
+TALK_PROVIDERS = ("openai", "grok")
+DEFAULT_TALK_PROVIDER = "openai"
+#: xAI Grok Voice model alias, handshake-verified against the live endpoint
+#: 2026-08-28 (the alias resolved to a concrete voice model at session
+#: create). The model rides the socket URL query, never the session update.
+DEFAULT_GROK_MODEL = "grok-voice-latest"
+DEFAULT_GROK_VOICE = "ara"
+#: Friendly Grok voice names, WITHOUT the wire prefix — the adapter adds
+#: ``xai_`` at encode time so operators never configure wire vocabulary.
+GROK_REALTIME_VOICES = ("ara", "rex", "sal", "eve", "leo")
+
 #: Where Hermes's api_server gateway platform listens by default
 #: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
 DEFAULT_API_SERVER_URL = "http://127.0.0.1:8642"
@@ -325,10 +339,50 @@ def session_key() -> str | None:
     return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
 
 
+def talk_provider() -> str:
+    """Realtime voice provider, resolved at call time. Fail-closed.
+
+    ``TALK_PROVIDER`` names the provider explicitly; it is NEVER inferred
+    from which API keys happen to be set. An operator holding both keys who
+    mistypes the knob gets an error naming the valid values, not a silent
+    switch to a different metered account.
+    """
+
+    raw = (
+        (os.environ.get("TALK_PROVIDER") or DEFAULT_TALK_PROVIDER).strip().lower()
+        or DEFAULT_TALK_PROVIDER
+    )
+    if raw not in TALK_PROVIDERS:
+        raise TalkConfigError(
+            f"TALK_PROVIDER '{raw}' is not a realtime voice provider "
+            f"({', '.join(TALK_PROVIDERS)})"
+        )
+    return raw
+
+
 def talk_model() -> str:
     """Realtime model, resolved at call time."""
 
     return (os.environ.get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
+
+
+def talk_grok_model() -> str:
+    """Grok realtime model, resolved at call time (``TALK_GROK_MODEL``)."""
+
+    return (os.environ.get("TALK_GROK_MODEL") or DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL
+
+
+def talk_grok_voice() -> str:
+    """Grok realtime voice, fail-closed on unknown ids (``TALK_GROK_VOICE``)."""
+
+    raw = (os.environ.get("TALK_GROK_VOICE") or DEFAULT_GROK_VOICE).strip().lower()
+    raw = raw or DEFAULT_GROK_VOICE
+    if raw not in GROK_REALTIME_VOICES:
+        raise TalkConfigError(
+            f"TALK_GROK_VOICE '{raw}' is not a Grok voice "
+            f"({', '.join(GROK_REALTIME_VOICES)})"
+        )
+    return raw
 
 
 def realtime_model_compatibility(model: str) -> str:
@@ -391,6 +445,29 @@ def resolve_openai_key() -> str:
     raise TalkConfigError(
         "no OpenAI key for Talk: set TALK_OPENAI_API_KEY or OPENAI_API_KEY"
     )
+
+
+def resolve_xai_key() -> str:
+    """The xAI key for the Grok provider. Fail-closed, never silent.
+
+    Order: TALK_XAI_API_KEY (Talk-scoped) -> XAI_API_KEY. Same rule as
+    :func:`resolve_openai_key`: a key that is SET but blank is a hard
+    refusal, not a fall-through. xAI has no OAuth lane — API key only.
+    """
+
+    scoped = os.environ.get("TALK_XAI_API_KEY")
+    if scoped is not None:
+        if not scoped.strip():
+            raise TalkConfigError(
+                "TALK_XAI_API_KEY is set but empty — set a real key or unset it"
+            )
+        return scoped.strip()
+    shared = os.environ.get("XAI_API_KEY")
+    if shared is not None:
+        if not shared.strip():
+            raise TalkConfigError("XAI_API_KEY is set but empty — set a real key or unset it")
+        return shared.strip()
+    raise TalkConfigError("no xAI key for Talk: set TALK_XAI_API_KEY or XAI_API_KEY")
 
 
 def agent_timeout_s() -> int:
@@ -554,13 +631,18 @@ __all__ = [
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_GROK_MODEL",
+    "DEFAULT_GROK_VOICE",
     "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
+    "DEFAULT_TALK_PROVIDER",
     "DEFAULT_TALK_VOICE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
+    "GROK_REALTIME_VOICES",
     "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
     "MODEL_COMPATIBILITY_POLICY_VERSION",
     "OPENAI_REALTIME_VOICES",
+    "TALK_PROVIDERS",
     "TalkConfigError",
     "agent_profile",
     "agent_timeout_s",
@@ -580,7 +662,11 @@ __all__ = [
     "realtime_model_compatibility",
     "realtime_model_valid",
     "resolve_openai_key",
+    "resolve_xai_key",
     "state_dir",
+    "talk_grok_model",
+    "talk_grok_voice",
     "talk_model",
+    "talk_provider",
     "talk_voice",
 ]
