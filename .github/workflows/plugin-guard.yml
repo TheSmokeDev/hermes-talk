@@ -40,14 +40,24 @@ jobs:
         run: |
           home="${RUNNER_TEMP}/plugin-guard"
           mkdir -p "${home}/tools"
-          # Fetch through the authenticated GitHub API, not the raw CDN:
-          # raw.githubusercontent.com returns persistent 429s on busy CI
-          # windows, while the API honors the GITHUB_TOKEN's higher limits.
-          # The scanner stays pinned to the SHA resolved above.
-          gh api "repos/NousResearch/hermes-agent/contents/tools/plugin_guard.py?ref=${{ steps.scanner.outputs.sha }}" \
-            -H "Accept: application/vnd.github.raw" > "${home}/tools/plugin_guard.py"
-          gh api "repos/NousResearch/hermes-agent/contents/tools/skills_guard.py?ref=${{ steps.scanner.outputs.sha }}" \
-            -H "Accept: application/vnd.github.raw" > "${home}/tools/skills_guard.py"
+          # Fetch through the authenticated GitHub API, not the raw CDN
+          # (raw.githubusercontent.com 429s persistently under load). Even the
+          # API can bounce at a sliding rate window, so retry patiently —
+          # the scanner stays pinned to the SHA resolved above.
+          fetch() {
+            local path="$1" out="$2" attempt
+            for attempt in 1 2 3 4 5 6; do
+              if gh api "repos/NousResearch/hermes-agent/contents/tools/${path}?ref=${{ steps.scanner.outputs.sha }}" \
+                  -H "Accept: application/vnd.github.raw" > "$out"; then
+                return 0
+              fi
+              echo "scanner fetch attempt ${attempt} failed; backing off"
+              sleep 25
+            done
+            return 1
+          }
+          fetch plugin_guard.py "${home}/tools/plugin_guard.py"
+          fetch skills_guard.py "${home}/tools/skills_guard.py"
           touch "${home}/tools/__init__.py"
 
       - name: Scan this repository
