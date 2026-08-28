@@ -11,34 +11,16 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## [0.11.0] — 2026-08-28
+## 0.12.0 (Unreleased)
 
-Two new realtime voice providers — Grok (xAI) and Gemini Live — behind the
-same provider-neutral session contract the OpenAI lane already speaks.
+A third realtime voice provider: Gemini Live (Google) — the zero-cost lane,
+free-tier AI Studio keys included — behind the same provider-neutral session
+contract the OpenAI and Grok lanes already speak.
 
 ### Added
-- `TALK_PROVIDER` selects the realtime provider — `openai` (default),
-  `grok`, or `gemini`. Call-time resolved, fail-closed on any other value,
-  and never inferred from which API keys happen to be set.
-- `talk_grok_realtime` adapter: bearer-authenticated WebSocket to the xAI
-  realtime endpoint (no ephemeral mint exists there — the resolved key is the
-  socket's credential), GA-vocabulary events translated into the neutral
-  contract, application-level `ping` events and normalized `session.updated`
-  echoes tolerated without being parsed for authority. The full tool loop
-  (function-call arguments to `function_call_output` to follow-up response)
-  round-trips with the existing command vocabulary.
-- Grok knobs: `TALK_XAI_API_KEY` -> `XAI_API_KEY` (fail-closed; set-but-blank
-  is a hard refusal), `TALK_GROK_MODEL` (default `grok-voice-latest`), and
-  `TALK_GROK_VOICE` (fail-closed: `ara`, `rex`, `sal`, `eve`, `leo`).
-- Terminal and Discord lanes inherit the provider through the shared session
-  factory; the dashboard lane is unchanged (xAI has no WebRTC offer endpoint
-  — that lane is a Phase 2 backend relay).
-- `hermes talk doctor` gains a `provider` check: selection, redacted key
-  presence, and model/voice validity for the Grok lane. Read-only, no live
-  probe.
-- Server-side truncation on Grok is attempted first and, if the server
-  refuses the event as unsupported, degrades to cancel-only with one logged
-  receipt per session — a truncation that did not happen is never faked.
+- `TALK_PROVIDER` gains `gemini` as a third value — call-time resolved,
+  fail-closed on any other value, and never inferred from which API keys
+  happen to be set.
 - `talk_gemini_realtime` adapter: key-in-URL WebSocket to the Gemini Live
   endpoint — on this lane the URL itself is the secret, so it is assembled at
   connect, never logged, and scrubbed out of transport errors. The
@@ -66,6 +48,49 @@ same provider-neutral session contract the OpenAI lane already speaks.
   rather than silently answering unvetted speakers.
 - Doctor's `provider` check covers the Gemini lane with the same read-only
   shape: redacted key presence, model and voice validity, no live probe.
+- Gemini setup also enables session resumption (still record-only: only a
+  `resumable: true` update confirms a handle, and a `resumable: false`
+  update discards the cached one — an invalidated handle is never reused)
+  and context-window compression on server sliding-window defaults, so
+  audio-only sessions are not cut off near the 15-minute mark.
+- Gemini wire hardening against the shipped-provider references (Google Live
+  docs, OpenClaw, Pipecat, LiveKit): tool calls the server cancels
+  mid-interruption (`toolCallCancellation`) have their results dropped with
+  a once-per-call receipt — nothing is answered upstream for a discarded
+  call; `goAway` surfaces as a terminal failure the relay can close on
+  instead of a dead socket; a bundled `serverContent` frame is processed
+  field-by-field before its terminal flag is honored; and trailing
+  audio/text arriving after `generationComplete` is dropped with one
+  warning per window rather than reopening a phantom response.
+
+## [0.11.0] — 2026-08-28
+
+A second realtime voice provider: Grok (xAI), behind the same
+provider-neutral session contract the OpenAI lane already speaks.
+
+### Added
+- `TALK_PROVIDER` selects the realtime provider — `openai` (default) or
+  `grok`. Call-time resolved, fail-closed on any other value, and never
+  inferred from which API keys happen to be set.
+- `talk_grok_realtime` adapter: bearer-authenticated WebSocket to the xAI
+  realtime endpoint (no ephemeral mint exists there — the resolved key is the
+  socket's credential), GA-vocabulary events translated into the neutral
+  contract, application-level `ping` events and normalized `session.updated`
+  echoes tolerated without being parsed for authority. The full tool loop
+  (function-call arguments to `function_call_output` to follow-up response)
+  round-trips with the existing command vocabulary.
+- Grok knobs: `TALK_XAI_API_KEY` -> `XAI_API_KEY` (fail-closed; set-but-blank
+  is a hard refusal), `TALK_GROK_MODEL` (default `grok-voice-latest`), and
+  `TALK_GROK_VOICE` (fail-closed: `ara`, `rex`, `sal`, `eve`, `leo`).
+- Terminal and Discord lanes inherit the provider through the shared session
+  factory; the dashboard lane is unchanged (xAI has no WebRTC offer endpoint
+  — that lane is a Phase 2 backend relay).
+- `hermes talk doctor` gains a `provider` check: selection, redacted key
+  presence, and model/voice validity for the Grok lane. Read-only, no live
+  probe.
+- Server-side truncation on Grok is attempted first and, if the server
+  refuses the event as unsupported, degrades to cancel-only with one logged
+  receipt per session — a truncation that did not happen is never faked.
 
 ### Fixed
 - Grok user transcripts no longer print duplicated: xAI's cumulative
