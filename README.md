@@ -155,6 +155,22 @@ Whatever the lane, the session is minted server-side into an **ephemeral
 client secret** — the raw key or OAuth token touches exactly one OpenAI
 endpoint and never reaches the socket, a log line, or a client.
 
+## Providers — OpenAI (default) or Grok
+
+`TALK_PROVIDER` picks the realtime voice transport: `openai` (default,
+everything above) or `grok` (xAI Grok Voice). The knob is fail-closed and
+never inferred from which keys exist — an operator holding both gets the
+provider they named or an error, not a silent switch.
+
+The Grok lane needs an xAI key (`TALK_XAI_API_KEY`, falling back to
+`XAI_API_KEY`; set-but-blank refuses), rides model `grok-voice-latest`
+(override: `TALK_GROK_MODEL`), and offers five voices — `ara`, `rex`, `sal`,
+`eve`, `leo` — via `TALK_GROK_VOICE` (fail-closed on unknown names). Same
+contract, same tools, same barge-in; terminal and Discord lanes both honor
+the knob. The dashboard tab stays OpenAI-only for now — xAI has no WebRTC
+offer endpoint, so that lane is a separate backend-relay piece. Doctor gains
+a provider check: selection, redacted key presence, model/voice validity.
+
 ## Use
 
 ```bash
@@ -397,6 +413,10 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Realtime model; doctor certifies only the bounded duplex-audio + tool-calling policy and labels other Realtime-shaped ids compatibility-unknown |
 | `TALK_VOICE` | `cedar` | Realtime voice (fail-closed on unknown ids) |
+| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai` or `grok` (fail-closed; never inferred from which keys exist) |
+| `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model |
+| `TALK_GROK_VOICE` | `ara` | Grok voice: `ara`, `rex`, `sal`, `eve`, `leo` (fail-closed) |
+| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first; set-but-blank refuses |
 | `TALK_PREFER_CODEX_OAUTH` | unset | `true` requires Codex OAuth and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |

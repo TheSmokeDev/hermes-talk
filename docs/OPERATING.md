@@ -176,6 +176,10 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
+| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai` or `grok`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it; the dashboard lane does not (Phase 2). |
+| `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
+| `TALK_GROK_VOICE` | `ara` | **Fail-closed** against the Grok voice list: `ara`, `rex`, `sal`, `eve`, `leo`. Friendly names only — the wire prefix is the adapter's job. |
+| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. xAI has no OAuth lane — key only. |
 
 ### Audio (terminal lane)
 
