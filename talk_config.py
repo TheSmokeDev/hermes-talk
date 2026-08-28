@@ -27,7 +27,7 @@ DEFAULT_AGENT_TIMEOUT_S = 1_800
 #: Realtime voice providers selectable through ``TALK_PROVIDER``. The list is
 #: fail-closed on purpose: a provider knob that guesses silently would spend
 #: the wrong metered key, which is a billing error, not a UX nicety.
-TALK_PROVIDERS = ("openai", "grok")
+TALK_PROVIDERS = ("openai", "grok", "gemini")
 DEFAULT_TALK_PROVIDER = "openai"
 #: xAI Grok Voice model alias, handshake-verified against the live endpoint
 #: 2026-08-28 (the alias resolved to a concrete voice model at session
@@ -37,6 +37,17 @@ DEFAULT_GROK_VOICE = "ara"
 #: Friendly Grok voice names, WITHOUT the wire prefix — the adapter adds
 #: ``xai_`` at encode time so operators never configure wire vocabulary.
 GROK_REALTIME_VOICES = ("ara", "rex", "sal", "eve", "leo")
+#: Gemini Live native-audio preview model, probed against the live endpoint
+#: 2026-08-28 (setup accepted, tool loop round-tripped). The adapter adds the
+#: ``models/`` wire prefix; operators configure the bare id. Fallback line:
+#: ``gemini-2.5-flash-native-audio-latest``.
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-live-preview"
+DEFAULT_GEMINI_VOICE = "Puck"
+#: Gemini Live prebuilt voices are CASE-SENSITIVE on the wire per Google's
+#: docs, so this list keeps the canonical casing and :func:`talk_gemini_voice`
+#: refuses to case-fold: silently "fixing" ``puck`` would guess at a wire
+#: value the API may reject.
+GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 
 #: Where Hermes's api_server gateway platform listens by default
 #: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
@@ -385,6 +396,34 @@ def talk_grok_voice() -> str:
     return raw
 
 
+def talk_gemini_model() -> str:
+    """Gemini Live model, resolved at call time (``TALK_GEMINI_MODEL``)."""
+
+    return (
+        (os.environ.get("TALK_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+        or DEFAULT_GEMINI_MODEL
+    )
+
+
+def talk_gemini_voice() -> str:
+    """Gemini Live voice, fail-closed on unknown ids (``TALK_GEMINI_VOICE``).
+
+    Unlike the other voice knobs this one does NOT case-fold: Live voice
+    names are case-sensitive on the wire, so a lowercase typo must refuse
+    with the canonical names rather than guess at a casing the API may not
+    accept.
+    """
+
+    raw = (os.environ.get("TALK_GEMINI_VOICE") or DEFAULT_GEMINI_VOICE).strip()
+    raw = raw or DEFAULT_GEMINI_VOICE
+    if raw not in GEMINI_LIVE_VOICES:
+        raise TalkConfigError(
+            f"TALK_GEMINI_VOICE '{raw}' is not a Gemini Live voice "
+            f"({', '.join(GEMINI_LIVE_VOICES)}; case-sensitive)"
+        )
+    return raw
+
+
 def realtime_model_compatibility(model: str) -> str:
     """Return ``compatible``, ``incompatible``, or honest syntax-only ``unknown``.
 
@@ -468,6 +507,33 @@ def resolve_xai_key() -> str:
             raise TalkConfigError("XAI_API_KEY is set but empty — set a real key or unset it")
         return shared.strip()
     raise TalkConfigError("no xAI key for Talk: set TALK_XAI_API_KEY or XAI_API_KEY")
+
+
+def resolve_gemini_key() -> str:
+    """The Gemini API key for the Gemini Live provider. Fail-closed, never silent.
+
+    Order: TALK_GEMINI_API_KEY (Talk-scoped) -> GEMINI_API_KEY. Same rule as
+    :func:`resolve_openai_key`: a key that is SET but blank is a hard
+    refusal, not a fall-through. On this lane the key rides the socket URL
+    query, so it is treated as a URL-embedded secret end to end — never
+    logged, and scrubbed out of transport errors before they surface.
+    """
+
+    scoped = os.environ.get("TALK_GEMINI_API_KEY")
+    if scoped is not None:
+        if not scoped.strip():
+            raise TalkConfigError(
+                "TALK_GEMINI_API_KEY is set but empty — set a real key or unset it"
+            )
+        return scoped.strip()
+    shared = os.environ.get("GEMINI_API_KEY")
+    if shared is not None:
+        if not shared.strip():
+            raise TalkConfigError("GEMINI_API_KEY is set but empty — set a real key or unset it")
+        return shared.strip()
+    raise TalkConfigError(
+        "no Gemini key for Talk: set TALK_GEMINI_API_KEY or GEMINI_API_KEY"
+    )
 
 
 def agent_timeout_s() -> int:
@@ -631,6 +697,8 @@ __all__ = [
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_GEMINI_MODEL",
+    "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
     "DEFAULT_GROK_VOICE",
     "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
@@ -638,6 +706,7 @@ __all__ = [
     "DEFAULT_TALK_PROVIDER",
     "DEFAULT_TALK_VOICE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
+    "GEMINI_LIVE_VOICES",
     "GROK_REALTIME_VOICES",
     "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
     "MODEL_COMPATIBILITY_POLICY_VERSION",
@@ -661,9 +730,12 @@ __all__ = [
     "memory_search_timeout_s",
     "realtime_model_compatibility",
     "realtime_model_valid",
+    "resolve_gemini_key",
     "resolve_openai_key",
     "resolve_xai_key",
     "state_dir",
+    "talk_gemini_model",
+    "talk_gemini_voice",
     "talk_grok_model",
     "talk_grok_voice",
     "talk_model",
