@@ -42,6 +42,7 @@ try:
         talk_capabilities,
         talk_config,
         talk_doctor,
+        talk_gemini_realtime,
         talk_grok_realtime,
         talk_host,
         talk_identity,
@@ -65,6 +66,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_capabilities
     import talk_config
     import talk_doctor
+    import talk_gemini_realtime
     import talk_grok_realtime
     import talk_host
     import talk_identity
@@ -928,6 +930,29 @@ def _grok_auth() -> talk_auth.TalkAuth:
     )
 
 
+def _gemini_auth() -> talk_auth.TalkAuth:
+    """The Gemini credential for the Gemini Live lane, in the factory's shape.
+
+    Gemini has no OAuth lane and no ephemeral mint — the resolved key rides
+    the socket URL query. Source names reuse the OpenAI receipt vocabulary so
+    receipts name lanes, never keys.
+    """
+
+    scoped = (os.environ.get("TALK_GEMINI_API_KEY") or "").strip()
+    token = talk_config.resolve_gemini_key()
+    if scoped:
+        return talk_auth.TalkAuth(
+            token=token,
+            source=talk_auth.SOURCE_CONFIGURED,
+            detail="TALK_GEMINI_API_KEY (Talk-scoped key)",
+        )
+    return talk_auth.TalkAuth(
+        token=token,
+        source=talk_auth.SOURCE_ENV,
+        detail="GEMINI_API_KEY environment variable",
+    )
+
+
 def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
     """Build the configured provider adapter behind the neutral session contract.
 
@@ -938,6 +963,12 @@ def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession
 
     if talk_config.talk_provider() == "grok":
         return talk_grok_realtime.GrokRealtimeSession(
+            auth_token=auth.token,
+            auth_source=auth.source,
+            aiohttp_module=_import_aiohttp(),
+        )
+    if talk_config.talk_provider() == "gemini":
+        return talk_gemini_realtime.GeminiRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
             aiohttp_module=_import_aiohttp(),
@@ -1041,6 +1072,10 @@ async def run_talk_session(
             auth = _grok_auth()
             model = talk_config.talk_grok_model()
             voice = talk_config.talk_grok_voice()
+        elif provider == "gemini":
+            auth = _gemini_auth()
+            model = talk_config.talk_gemini_model()
+            voice = talk_config.talk_gemini_voice()
         else:
             auth = talk_host.host().resolve_auth()
             model = talk_config.talk_model()

@@ -68,6 +68,10 @@ def _hermetic(monkeypatch, tmp_path):
         "TALK_GROK_VOICE",
         "TALK_XAI_API_KEY",
         "XAI_API_KEY",
+        "TALK_GEMINI_MODEL",
+        "TALK_GEMINI_VOICE",
+        "TALK_GEMINI_API_KEY",
+        "GEMINI_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     talk_host.bind_ctx(None)
@@ -607,3 +611,76 @@ def test_human_report_renders_the_grok_provider_receipt(monkeypatch):
     assert "[PASS] provider: grok realtime provider is configured" in rendered
     assert "key-shared=present" in rendered
     assert "xai-shared-test" not in rendered
+
+
+def test_gemini_provider_check_reports_readiness_without_the_key_value(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+    monkeypatch.setenv("TALK_GEMINI_API_KEY", "gemini-scoped-test")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["keys"] == {"scoped": "present", "shared": "absent"}
+    assert check["details"]["model"] == "gemini-3.1-flash-live-preview"
+    assert check["details"]["voice"] == "Puck"
+    assert check["details"]["voice_valid"] is True
+    assert "gemini-scoped-test" not in json.dumps(check)
+
+
+def test_gemini_provider_check_fails_without_a_key(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["keys"] == {"scoped": "absent", "shared": "absent"}
+    assert "no Gemini key" in check["summary"]
+
+
+def test_gemini_provider_check_fails_on_a_blank_scoped_key(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+    monkeypatch.setenv("TALK_GEMINI_API_KEY", "   ")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-shared-test")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["keys"]["scoped"] == "blank"
+
+
+def test_gemini_provider_check_fails_on_an_unknown_voice(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-shared-test")
+    monkeypatch.setenv("TALK_GEMINI_VOICE", "morgan-freeman")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["voice"] == "morgan-freeman"
+    assert check["details"]["voice_valid"] is False
+
+
+def test_gemini_provider_check_keeps_voice_casing_in_failures(monkeypatch):
+    # Live voice names are case-sensitive; a lowercase typo must surface
+    # as-is, never case-folded into something that looks valid.
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-shared-test")
+    monkeypatch.setenv("TALK_GEMINI_VOICE", "puck")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["voice"] == "puck"
+    assert "case-sensitive" in " ".join(check["remediation"])
+
+
+def test_human_report_renders_the_gemini_provider_receipt(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-shared-test")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    rendered = talk_doctor.render_human(talk_doctor.collect_report())
+
+    assert "[PASS] provider: gemini realtime provider is configured" in rendered
+    assert "key-shared=present" in rendered
+    assert "gemini-shared-test" not in rendered
