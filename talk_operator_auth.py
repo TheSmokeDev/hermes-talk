@@ -6,6 +6,12 @@ opaque response token, and later resolves a function call only through the
 Realtime response ID and that token. Missing, stale, mixed, or unresolved
 attribution denies mutation while leaving conversation and read-only tools
 available.
+
+It also owns the capability bridge's host-tool classification (the
+``VOICE_*`` sets and :func:`classify_host_tool`): canonical Hermes tool names
+arriving at the voice surface route inline (curated read-only), through the
+spoken-permit flow (sensitive reads), or to the delegate/run lane (everything
+else), and a denied call steers to delegation instead of refusing flat.
 """
 
 from __future__ import annotations
@@ -54,6 +60,94 @@ MUTATION_DENIAL = (
     "I couldn't verify that this response belongs to a configured Discord "
     "operator, so the {tool} tool was not run. Read-only requests are still available."
 )
+
+# -- host-tool classification (the capability bridge) ----------------------------
+#
+# The names below are CANONICAL HERMES tool names, not talk tools. They arrive
+# on the host-execution lane, where the session advertises the host's real
+# schemas — and on the legacy lane, where the model can emit a real host name
+# it learned from the capability catalog. Three classes, default-deny:
+#
+# - VOICE_INLINE_SAFE: curated read-only host tools that may execute without a
+#   spoken permit. Every entry is read-only AND safe to speak in a room: the
+#   host's own webhook-safe class (toolsets.py _HERMES_WEBHOOK_SAFE_TOOLS)
+#   plus session_search, which the legacy lane already exposes to every
+#   speaker as search_memory. No file readers, nothing that returns local
+#   state — a read-only tool whose OUTPUT is a secret is not safe in voice.
+# - VOICE_PERMIT_GATED: state-reading-but-sensitive host tools allowed under a
+#   fresh spoken operator permit — the same machinery that gates
+#   MUTATING_TALK_TOOLS.
+# - everything else: not callable from voice. The denial STEERS to delegation
+#   instead of refusing flat.
+VOICE_INLINE_SAFE = frozenset(
+    {"session_search", "web_search", "web_extract", "vision_analyze"}
+)
+VOICE_PERMIT_GATED = frozenset({"computer_use"})
+
+CLASS_INLINE = "inline"
+CLASS_PERMIT = "permit"
+CLASS_DELEGATE = "delegate"
+
+#: The computer-use actions that read, not mutate (the host's
+#: tools/computer_use/tool.py ``_SAFE_ACTIONS``). Only these may ride a spoken
+#: permit. A destructive action (click, type, …) is NEVER passed through from
+#: voice: its in-handler approval gate fails open without a bound approval
+#: context, so a permitted call carrying one would execute ungated. Those
+#: belong on the delegate lane, where the api-server run's approval loop is a
+#: real gate. The action is matched case-insensitively; a missing or
+#: unparseable action classifies as delegate — fail closed.
+COMPUTER_USE_VOICE_READ_ACTIONS = frozenset({"capture", "wait", "list_apps", "list_windows"})
+
+#: Deny receipts that steer (spec §4): state the limit, offer the bridge,
+#: never a bare refusal. Both keep the "not run" clause the audit tests pin.
+#: What they deliberately do NOT do is name a reason the speaker could argue
+#: with — attribution failures stay in the log, not in the room.
+UNCLASSIFIED_DENIAL = (
+    "The {tool} tool was not run — it isn't something I can do directly in a "
+    "voice call. I can spin up an agent that can — want me to?"
+)
+PERMIT_GATED_DENIAL = (
+    "I couldn't verify a fresh spoken approval from a configured operator, so "
+    "the {tool} tool was not run. I can spin up an agent that can do it — want me to?"
+)
+
+
+def _arguments_dict(arguments: Any) -> dict | None:
+    """The call's arguments as a dict, however the provider serialized them."""
+
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def classify_host_tool(name: str, arguments: Any = None) -> str:
+    """The voice class of one host tool call: inline, permit, or delegate.
+
+    Unclassified names — real or invented — classify as delegate: the caller
+    denies with the steering receipt, and the work continues on the
+    delegate/run lane where the host's own approval loop is a real gate.
+    """
+
+    if name in VOICE_INLINE_SAFE:
+        return CLASS_INLINE
+    if name in VOICE_PERMIT_GATED:
+        if name == "computer_use":
+            parsed = _arguments_dict(arguments)
+            action = parsed.get("action") if parsed else None
+            if (
+                isinstance(action, str)
+                and action.strip().lower() in COMPUTER_USE_VOICE_READ_ACTIONS
+            ):
+                return CLASS_PERMIT
+            return CLASS_DELEGATE
+        return CLASS_PERMIT
+    return CLASS_DELEGATE
 
 _SESSION_SAMPLE_RATE = 24_000
 _SAMPLES_PER_MS = _SESSION_SAMPLE_RATE // 1_000
@@ -733,9 +827,22 @@ class DiscordToolAuthorizationLedger:
                 permit.consumed = True
         if name in READ_ONLY_TALK_TOOLS:
             return None
-        if name not in MUTATING_TALK_TOOLS:
-            _log.error("denied unclassified Discord Talk tool %s", name)
-            return MUTATION_DENIAL.format(tool=name)
+        if name in MUTATING_TALK_TOOLS:
+            denial_template = MUTATION_DENIAL
+        else:
+            classification = classify_host_tool(name, event.get("arguments"))
+            if classification == CLASS_INLINE:
+                _log.info(
+                    "approved read-only host tool %s for inline voice execution", name
+                )
+                return None
+            if classification == CLASS_DELEGATE:
+                _log.warning(
+                    "denied voice tool %s: not directly voice-callable, steered to delegation",
+                    name,
+                )
+                return UNCLASSIFIED_DENIAL.format(tool=name)
+            denial_template = PERMIT_GATED_DENIAL
         if trusted and binding.user_id is not None and binding.user_id in operator_ids:
             # Approvals are logged as well as denials: an audit trail that only
             # records refusals cannot show what was actually authorized. Never
@@ -762,8 +869,8 @@ class DiscordToolAuthorizationLedger:
                 reason = binding.reason
             else:
                 reason = "unbound response"
-        _log.warning("denied Discord mutating Talk tool %s: %s", name, reason)
-        return MUTATION_DENIAL.format(tool=name)
+        _log.warning("denied Discord state-changing voice tool %s: %s", name, reason)
+        return denial_template.format(tool=name)
 
     def complete_response(self, response_id: Any, *, continued: bool) -> None:
         """Release completed response state, retaining a continued chain token."""
@@ -801,11 +908,20 @@ class DiscordToolAuthorizationLedger:
 
 __all__ = [
     "BINDING_METADATA_KEY",
+    "CLASS_DELEGATE",
+    "CLASS_INLINE",
+    "CLASS_PERMIT",
+    "COMPUTER_USE_VOICE_READ_ACTIONS",
     "MUTATING_TALK_TOOLS",
     "MUTATION_DENIAL",
+    "PERMIT_GATED_DENIAL",
     "READ_ONLY_TALK_TOOLS",
     "TRUSTED_BINDING_EVENT_KEY",
     "TRUSTED_CONTINUATION_EVENT_KEY",
+    "UNCLASSIFIED_DENIAL",
+    "VOICE_INLINE_SAFE",
+    "VOICE_PERMIT_GATED",
     "DiscordToolAuthorizationLedger",
     "SpeakerBinding",
+    "classify_host_tool",
 ]
