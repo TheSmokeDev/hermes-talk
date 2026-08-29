@@ -1075,6 +1075,9 @@ async def run_talk_session(
 
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
+    # Start filling the capability catalog now so the instruction section below
+    # reads a warm snapshot instead of an empty one; never blocks, never fatal.
+    talk_capabilities.warm_in_background()
 
     try:
         provider = talk_config.talk_provider()
@@ -1121,6 +1124,10 @@ async def run_talk_session(
         host_execution=host_execution_attachment is not None,
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
+        # The live-catalog section rides every lane: instruction_section reads
+        # the cached snapshot and never blocks, so a cold catalog omits the
+        # section rather than stalling or failing the session start.
+        capabilities=talk_capabilities.instruction_section(),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by

@@ -272,3 +272,64 @@ def test_host_summary_is_capped_at_200_chars():
 
     assert "s" * talk_identity.HOST_SUMMARY_CAP in instructions
     assert "s" * (talk_identity.HOST_SUMMARY_CAP + 1) not in instructions
+
+
+# --- the capabilities section (capability bridge) ------------------------------
+
+
+def test_the_capabilities_section_renders_with_its_header():
+    instructions = talk_identity.build_instructions(
+        None, capabilities="This Hermes install reports 3 skills installed."
+    )
+
+    assert talk_identity.CAPABILITIES_HEADER in instructions
+    assert "3 skills installed" in instructions
+
+
+def test_the_capabilities_section_fails_open_when_absent_or_blank():
+    assert talk_identity.CAPABILITIES_HEADER not in talk_identity.build_instructions(None)
+    blank = talk_identity.build_instructions(None, capabilities="   ")
+
+    # A blank section is no section at all — never an empty prompt block.
+    assert blank == talk_identity.build_instructions(None)
+
+
+def test_the_capabilities_section_is_capped():
+    instructions = talk_identity.build_instructions(None, capabilities="c" * 9_999)
+
+    assert "c" * talk_identity.CAPABILITIES_CAP in instructions
+    assert "c" * (talk_identity.CAPABILITIES_CAP + 1) not in instructions
+
+
+def test_the_capabilities_section_sits_between_host_summary_and_lane_line():
+    built = talk_identity.build_instructions(
+        None,
+        lane="cli",
+        host_summary="Hermes host attached: 3 skills enabled, 1 toolsets active.",
+        capabilities="This Hermes install reports 3 skills installed.",
+    )
+
+    assert built.index("Hermes host attached:") < built.index(
+        talk_identity.CAPABILITIES_HEADER
+    )
+    assert built.index(talk_identity.CAPABILITIES_HEADER) < built.index(
+        talk_identity.LANE_LINES["cli"]
+    )
+
+
+def test_the_preamble_carries_the_never_invent_and_steering_rules():
+    """The rules ship on the preamble — the one carrier no ctx gate, pinned
+    include list, or failed scan can drop (same doctrine as ANTI_GUESS_RULE)."""
+
+    text = talk_identity.VOICE_PREAMBLE
+    assert "Never invent tool names" in text
+    assert "do not answer with a bare refusal" in text
+    assert "hand it to an agent that can" in text
+
+
+def test_the_preamble_teaches_the_spoken_approval_flow():
+    text = talk_identity.VOICE_PREAMBLE
+    assert "resolve_approval" in text
+    assert "once, this session, or no" in text
+    assert "Always is never grantable by voice" in text
+    assert "interrupts the question or does not answer" in text

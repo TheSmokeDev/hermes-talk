@@ -105,14 +105,96 @@ DELEGATE_TOOL_NAME = "delegate_task"
 #: without it fall back to :func:`_steer_via_registry`.
 STEER_TOOL_NAME = "steer_subagent"
 
-#: Best-effort in-process catalog read. Unlike the ``/v1/*`` routes, this repo
-#: has no visibility into a Hermes host's internal dispatch registry, so the
-#: name is a guess by construction — and safe to guess, because a host that
-#: has no such tool answers with the "unknown tool" marker
-#: :func:`_agent_loop_absent` already generalizes over, and the caller falls
-#: through to the api_server lane. Wrong here costs the fast path, not the
-#: feature.
-CAPABILITY_CATALOG_TOOL_NAME = "list_capabilities"
+def _catalog_from_host_modules() -> dict | None:
+    """Enumerate the capability catalog from the host's own registries.
+
+    ``None`` means "no answer here" — the host modules are absent or one of
+    the reads failed — never "nothing is installed". The skills and toolsets
+    reads are the SAME builders the api_server's catalog routes run
+    (``gateway/platforms/api_server.py`` ``_handle_skills`` /
+    ``_handle_toolsets``), so the in-process tier and the REST tier answer
+    from one source of truth instead of drifting apart.
+
+    The ``tools`` read is the LIVE answer: ``get_tool_definitions`` applies
+    the registry's ``check_fn`` availability gates (a tool whose driver or
+    keys are missing simply does not resolve), which the static
+    enabled/configured toolset flags cannot see. It degrades to an empty
+    list on its own failure rather than failing the catalog — the REST tier
+    carries no such field, so nothing downstream may treat empty as
+    "nothing resolved".
+
+    All-or-nothing on skills/toolsets, matching :mod:`talk_capabilities`'s
+    REST doctrine: a half-read catalog would be spoken as though the missing
+    half did not exist.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import (
+            _get_effective_configurable_toolsets,
+            _get_platform_tools,
+            _toolset_has_keys,
+            get_nous_subscription_features,
+        )
+        from tools.skills_tool import _find_all_skills, _sort_skills
+        from toolsets import resolve_toolset
+    except Exception as exc:  # noqa: BLE001 — no host registries in this process
+        _log.debug("in-process catalog modules unavailable: %s: %s", type(exc).__name__, exc)
+        return None
+    try:
+        skills = _sort_skills(_find_all_skills(skip_disabled=False))
+        config = load_config()
+        enabled_toolsets = _get_platform_tools(
+            config, "api_server", include_default_mcp_servers=False
+        )
+        features = get_nous_subscription_features(config)
+        toolsets: list[dict] = []
+        for name, label, desc in _get_effective_configurable_toolsets():
+            try:
+                tools = sorted(set(resolve_toolset(name)))
+            except Exception:  # noqa: BLE001 — the route degrades the same way
+                tools = []
+            toolsets.append(
+                {
+                    "name": name,
+                    "label": label,
+                    "description": desc,
+                    "enabled": name in enabled_toolsets,
+                    "configured": _toolset_has_keys(name, config, features=features),
+                    "tools": tools,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — half a catalog is no catalog
+        _log.debug("in-process catalog read failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+    resolved: list[str] = []
+    try:
+        from model_tools import get_tool_definitions
+
+        resolved = sorted(
+            {
+                str(definition["function"]["name"])
+                for definition in get_tool_definitions(
+                    quiet_mode=True, skip_tool_search_assembly=True
+                )
+                if isinstance(definition, dict)
+                and isinstance(definition.get("function"), dict)
+                and isinstance(definition["function"].get("name"), str)
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 — liveness is additive, not required
+        _log.debug("in-process resolved-tool read failed: %s: %s", type(exc).__name__, exc)
+
+    return {
+        "skills": [entry for entry in skills if isinstance(entry, dict)],
+        "toolsets": toolsets,
+        "tools": resolved,
+        # The in-process tier has no gateway feature document or run counters;
+        # the bounded readers treat absent as empty either way.
+        "capabilities": {},
+        "health": {},
+    }
 
 #: Hermes's Honcho memory plugin's query-shaped read surface. A guess by the
 #: same construction as :data:`CAPABILITY_CATALOG_TOOL_NAME` and safe for the
@@ -792,27 +874,21 @@ class HostAdapter:
     def capability_catalog_probe(self) -> str | None:
         """Read this host's own capability catalog in-process. NEVER raises.
 
-        Returns the raw dispatch result when the attached Hermes exposes
-        :data:`CAPABILITY_CATALOG_TOOL_NAME`, or ``None`` when there is no
-        bound context, the host does not know that tool, or the call failed.
-        ``None`` means "ask the api_server instead", never "this install has
-        no capabilities" — an empty catalog and an unreadable one are
-        different sentences and must not collapse into one.
+        Returns the catalog JSON when this process holds Hermes's registries
+        (see :func:`_catalog_from_host_modules`), or ``None`` when it does
+        not or the read failed. ``None`` means "ask the api_server instead",
+        never "this install has no capabilities" — an empty catalog and an
+        unreadable one are different sentences and must not collapse into
+        one.
         """
 
-        ctx = get_ctx()
-        if ctx is None:
+        payload = _catalog_from_host_modules()
+        if payload is None:
             return None
         try:
-            raw = ctx.dispatch_tool(CAPABILITY_CATALOG_TOOL_NAME, {})
-        except Exception as exc:  # noqa: BLE001 — an in-process probe is never fatal
-            _log.warning(
-                "in-process capability probe failed: %s: %s", type(exc).__name__, exc
-            )
+            return json.dumps(payload, default=str)
+        except (TypeError, ValueError):  # pragma: no cover - plain data by construction
             return None
-        if _agent_loop_absent(raw, CAPABILITY_CATALOG_TOOL_NAME):
-            return None
-        return raw if isinstance(raw, str) else json.dumps(raw, default=str)
 
     def search_memory(self, query: str, limit: int = 5) -> str:
         """Search past Hermes sessions for what was said about ``query``.

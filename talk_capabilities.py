@@ -9,10 +9,12 @@ is in flight.
 
 **Two tiers, in-process first.** The same doctrine
 :meth:`talk_host.HostAdapter.agent_lane` and :mod:`talk_apiserver` already
-established: if a Hermes agent is attached, ask it directly through the host's
-own ``dispatch_tool``; otherwise ask the api_server over ``/v1/*``. A host
-that does not know the in-process tool falls through rather than failing —
-see :data:`talk_host.CAPABILITY_CATALOG_TOOL_NAME`.
+established: inside a Hermes process the catalog is enumerated directly from
+the host's own registries (``tools.skills_tool``, ``hermes_cli.tools_config``,
+``model_tools.get_tool_definitions`` — see
+:func:`talk_host._catalog_from_host_modules`); otherwise the api_server
+answers over ``/v1/*``. A process with no host registries falls through
+rather than failing.
 
 **Reading is all it does.** Nothing here executes, mints, or authorizes
 anything, which is why ``talk_capabilities`` is classified in
@@ -99,7 +101,14 @@ CAPABILITY_FEATURES = (
 
 @dataclass(frozen=True, slots=True)
 class CatalogSnapshot:
-    """One resolved catalog read. ``detail`` is written to be said out loud."""
+    """One resolved catalog read. ``detail`` is written to be said out loud.
+
+    ``tools`` is the LIVE resolved tool-name set — present only from the
+    in-process tier, where ``get_tool_definitions`` applies the registry's
+    availability gates. The REST tier cannot answer liveness and leaves it
+    empty; empty therefore means "no live answer", never "nothing resolved",
+    and consumers must not treat it as zero capability.
+    """
 
     source: str
     skills: tuple[dict, ...]
@@ -107,6 +116,7 @@ class CatalogSnapshot:
     capabilities: dict
     health: dict
     detail: str
+    tools: tuple[str, ...] = ()
 
 
 #: Cached snapshot + when it was taken. Guarded for the same reason
@@ -194,10 +204,9 @@ def _bounded_capabilities(raw: dict) -> dict:
 def _looks_like_catalog(payload: dict) -> bool:
     """True only for a dict that is recognizably a capability catalog.
 
-    The in-process tool name is a GUESS (:data:`talk_host.CAPABILITY_CATALOG_TOOL_NAME`),
-    so a dict answer proves only that SOME tool answered — a real-but-different
-    tool registered under that name, an error envelope whose text dodges the
-    ``_agent_loop_absent`` markers, or a prose-shaped reply must all read as
+    The in-process tier builds this payload itself
+    (:func:`talk_host._catalog_from_host_modules`), so this guard is pure
+    defense in depth: a payload with none of the catalog keys must read as
     "no answer here" and fall through, never be stored as an empty catalog.
     """
 
@@ -228,6 +237,7 @@ def _from_in_process() -> CatalogSnapshot | None:
         return None
     capabilities = payload.get("capabilities")
     health = payload.get("health")
+    tools = payload.get("tools")
     return CatalogSnapshot(
         source=SOURCE_IN_PROCESS,
         skills=_entries(payload.get("skills")),
@@ -237,6 +247,11 @@ def _from_in_process() -> CatalogSnapshot | None:
         ),
         health=_bounded_health(health if isinstance(health, dict) else {}),
         detail="the Hermes agent I'm attached to",
+        tools=(
+            tuple(sorted({str(name) for name in tools if isinstance(name, str) and name}))
+            if isinstance(tools, list)
+            else ()
+        ),
     )
 
 
@@ -371,6 +386,108 @@ def status() -> CatalogSnapshot:
     return cached
 
 
+def warm_in_background() -> None:
+    """Kick a catalog read off the caller's thread. Fire and forget.
+
+    Session starts call this before instruction assembly so the cache is
+    filling while auth and audio set up; a section built moments later reads
+    whatever has landed, never waits.
+    """
+
+    _refresh_in_background()
+
+
+# -- the resident-prompt section (capability bridge) -----------------------------
+
+#: How many tool categories the prompt section may name. The prompt is
+#: resident and re-billed on every turn — a budget, not a preference.
+MAX_SECTION_CATEGORIES = 10
+
+#: One catalog name, fit for the resident prompt. Catalog entries are
+#: upstream text; a name with punctuation or whitespace tricks does not get
+#: to ride a prompt nobody is reading on a screen. Identifiers only.
+_SECTION_NAME_MAX_CHARS = 32
+_SECTION_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ")
+
+
+def _section_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > _SECTION_NAME_MAX_CHARS:
+        return None
+    if any(ch not in _SECTION_NAME_CHARS for ch in name):
+        return None
+    return name
+
+
+def _usable(entry: dict) -> bool:
+    """A catalog flag disqualifies only when present AND negative."""
+
+    return not (
+        entry.get("enabled") is False
+        or entry.get("disabled") is True
+        or entry.get("installed") is False
+        or entry.get("configured") is False
+    )
+
+
+def instruction_section(snapshot: CatalogSnapshot | None = None) -> str | None:
+    """The bounded capabilities block for the session prompt, or ``None``.
+
+    ``None`` fails open to the plain preamble: the catalog is unreachable,
+    or it holds nothing true to claim. When a snapshot IS available the
+    section says what this install can do — a skill count and the usable
+    tool categories — plus the two rules that keep the model honest: the
+    delegation ceiling, and never inventing tool names.
+
+    When the snapshot carries the live resolved tool set (the in-process
+    tier), a category whose tools ALL failed the host's availability gates
+    is not claimed: enabled-and-configured is a static config fact, not
+    evidence the tool resolves right now.
+    """
+
+    snap = status() if snapshot is None else snapshot
+    if snap.source == SOURCE_NONE:
+        return None
+    skill_count = sum(1 for entry in snap.skills if _usable(entry))
+    live = set(snap.tools)
+    categories: list[str] = []
+    for entry in snap.toolsets:
+        if not _usable(entry):
+            continue
+        name = _section_name(entry.get("name") or entry.get("label"))
+        if name is None or name in categories:
+            continue
+        if live:
+            tools = entry.get("tools")
+            if isinstance(tools, list) and not any(
+                isinstance(tool, str) and tool in live for tool in tools
+            ):
+                continue
+        categories.append(name)
+        if len(categories) >= MAX_SECTION_CATEGORIES:
+            break
+    if not skill_count and not categories:
+        return None
+    inventory = f"This Hermes install reports {skill_count} "
+    inventory += "skill" if skill_count == 1 else "skills"
+    inventory += " installed"
+    if categories:
+        inventory += (
+            ", and these tool categories usable right now: " + ", ".join(categories)
+        )
+    inventory += "."
+    return (
+        inventory
+        + " You can delegate anything Hermes can do: hand it to the delegate_task tool and "
+        "the agent runs the full Hermes toolset — if the host needs approval for an action, "
+        "you will be asked out loud before it fires. Never invent tool names: the only tools "
+        "you can call directly are this session's advertised tools, and capability questions "
+        "go to the talk_capabilities tool."
+    )
+
+
 def reset_for_tests() -> None:
     """Clear the cached snapshot between tests (never called in production).
 
@@ -392,12 +509,15 @@ __all__ = [
     "CHECKING_DETAIL",
     "HEALTH_COUNTERS",
     "INERT_DETAIL",
+    "MAX_SECTION_CATEGORIES",
     "SOURCE_API_SERVER",
     "SOURCE_IN_PROCESS",
     "SOURCE_NONE",
     "UNREACHABLE_DETAIL",
     "CatalogSnapshot",
+    "instruction_section",
     "reset_for_tests",
     "status",
     "warm",
+    "warm_in_background",
 ]
