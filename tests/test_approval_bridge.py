@@ -372,6 +372,26 @@ def test_barge_in_with_nothing_open_is_a_noop():
     assert talk_approvals.note_barge_in() is False
 
 
+def test_a_full_bridge_evicts_and_denies_the_oldest_pending(monkeypatch):
+    """The registry is bounded; an approval nobody will hear must not park its
+    run until the host timeout — eviction denies it."""
+
+    posts = []
+    monkeypatch.setattr(
+        talk_approvals.talk_apiserver,
+        "respond_to_approval",
+        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+    )
+    talk_approvals.attach_session(FakeLoop(), lambda event: None)
+
+    for rid in range(1, talk_approvals._MAX_PENDING + 2):
+        talk_approvals._note_event(rid, f"run_remote_{rid}", _approval_event())
+
+    assert _wait_for(lambda: ("run_remote_1", "deny") in posts)
+    assert not talk_approvals.has_pending(1)
+    assert talk_approvals.has_pending(talk_approvals._MAX_PENDING + 1)
+
+
 # -- the record clears on the run's own events -------------------------------------
 
 
