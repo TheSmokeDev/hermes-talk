@@ -650,9 +650,13 @@ def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, 
     assert done.wait(3.0), "the flush never reached the api-server lane"
     assert reviewed and "memory" in reviewed[0].lower()
     assert "discord lane user" in reviewed[0]
-    assert _wait_for(lambda: not capture.path.exists())
     root = tmp_path / "state" / "talk-transcripts"
-    assert not list(root.glob("*.jsonl")) and not list(root.glob("*.claimed-*"))
+    # The claim's rename makes the ORIGINAL path vanish at claim time, so
+    # watching it proves nothing; the claimed copy's deletion is the handoff
+    # thread's last step — poll the directory clean instead of racing it.
+    assert _wait_for(
+        lambda: not list(root.glob("*.jsonl")) and not list(root.glob("*.claimed-*"))
+    )
     assert talk_transcript.handoff_status()["state"] == "handoff pending"
 
 
@@ -718,10 +722,11 @@ def test_the_attached_host_tier_still_carries_the_flush(tmp_path, monkeypatch, f
 
     assert _wait_for(lambda: bool(calls))
     assert calls and calls[0][0] == "delegate_task"
-    assert _wait_for(lambda: not capture.path.exists())
     assert _wait_for(
         lambda: "child_session_id" in talk_transcript.handoff_status()
     )
+    root = tmp_path / "state" / "talk-transcripts"
+    assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
 
 def test_a_host_refusal_still_drops_the_transcript(tmp_path, flush_lanes):
@@ -776,4 +781,5 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     assert spawned.wait(3.0), "the detached flush never spawned"
     assert seen and seen[0][0] == "/usr/local/bin/hermes"
     assert "-z" in seen[0] and "memory" in seen[0][-1].lower()
-    assert _wait_for(lambda: not capture.path.exists())
+    root = tmp_path / "state" / "talk-transcripts"
+    assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
