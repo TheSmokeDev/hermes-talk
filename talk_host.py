@@ -53,6 +53,7 @@ from typing import Any
 try:
     from . import (
         talk_apiserver,
+        talk_approvals,
         talk_auth,
         talk_config,
         talk_progress,
@@ -62,6 +63,7 @@ try:
     )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
+    import talk_approvals
     import talk_auth
     import talk_config
     import talk_progress
@@ -455,22 +457,28 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
 
     def worker(run_id: int) -> str:
         talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
+
+        def _on_start(api_run_id: str) -> None:
+            # The remote id is stop_work's only address for this run —
+            # without it the lane is stop-capable in theory and
+            # unstoppable in practice. It is also the ONLY handle a
+            # reconnect could resume tracking by, and in memory alone it
+            # died with the process that is, by definition, the one that
+            # is gone — so it rides the STRICT locked append
+            # (durable=True: retried once, escalated to an error log if
+            # it still cannot land), never the fail-open telemetry tee.
+            talk_runs.annotate_run(run_id, durable=True, api_run_id=api_run_id)
+            # The spoken approval bridge: the SSE sidecar that turns the
+            # run's approval.request events into a spoken prompt. One daemon
+            # thread per run, closed by the host when the run ends.
+            talk_approvals.watch_run(run_id, api_run_id)
+
         try:
             return talk_apiserver.run_to_completion(
                 task,
                 session_id=session_id,
                 session_key=session_key,
-                # The remote id is stop_work's only address for this run —
-                # without it the lane is stop-capable in theory and
-                # unstoppable in practice. It is also the ONLY handle a
-                # reconnect could resume tracking by, and in memory alone it
-                # died with the process that is, by definition, the one that
-                # is gone — so it rides the STRICT locked append
-                # (durable=True: retried once, escalated to an error log if
-                # it still cannot land), never the fail-open telemetry tee.
-                on_start=lambda api_run_id: talk_runs.annotate_run(
-                    run_id, durable=True, api_run_id=api_run_id
-                ),
+                on_start=_on_start,
                 # Progress tap (hermes-talk#33): each poll's status payload is
                 # THIS run's own — the per-run addressing is what makes the
                 # projection incapable of cross-routing. The payload's

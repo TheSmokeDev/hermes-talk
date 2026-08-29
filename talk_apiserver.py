@@ -532,6 +532,124 @@ def stop_run(run_id: str) -> None:
         )
 
 
+class ApprovalGoneError(TalkApiServerError):
+    """The host answered 409: no pending approval remains to resolve.
+
+    Distinct from a transport failure on purpose: the caller CLEARS its
+    pending record on this verdict but keeps it (retryable) on a network
+    failure.
+    """
+
+
+#: Read-idle bound for the run-events SSE stream. The host emits a keepalive
+#: comment every 30s (api_server.py ``_handle_run_events``), so a healthy
+#: stream never idles this long; a dead one breaks here instead of hanging a
+#: daemon thread forever.
+SSE_READ_IDLE_S = 45.0
+
+
+def stream_run_events(run_id: str, on_event, *, idle_timeout_s: float = SSE_READ_IDLE_S) -> None:
+    """Read ``GET /v1/runs/{id}/events`` (SSE) and hand each event to ``on_event``.
+
+    BLOCKS for the life of the run — this belongs on a dedicated daemon
+    thread, never the voice loop. The host's frames are bare
+    ``data: {json}`` lines (the event name rides INSIDE the payload's
+    ``event`` key) plus ``:`` keepalive comments. Returns when the server
+    closes the stream (run terminal) or the read idles out. Never raises: a
+    dead stream degrades to the host's own approval timeout, and the poll
+    loop in :func:`run_to_completion` remains the run's completion
+    authority — one reconnect attempt is deliberately NOT made, because a
+    re-subscribe re-reads nothing the run already finished saying.
+
+    Inert under pytest unless a test opts in — the same guard and the same
+    reason as :func:`status`: run workers spawn this sidecar transitively,
+    and a suite faking the rest of the lane must never dial port 8642 for
+    real.
+    """
+
+    if not _lane_enabled():
+        return
+    url = f"{talk_config.api_server_url()}{RUNS_PATH}/{run_id}/events"
+    timeout = httpx.Timeout(
+        talk_config.api_server_probe_timeout_s() * 4,
+        read=idle_timeout_s,
+    )
+    try:
+        with httpx.stream("GET", url, headers=_auth_headers(), timeout=timeout) as response:
+            if response.status_code != 200:
+                _log.debug(
+                    "run events stream for %s refused (%s)", run_id, response.status_code
+                )
+                return
+            data_lines: list[str] = []
+            for line in response.iter_lines():
+                if line:
+                    if line.startswith(":"):
+                        continue  # keepalive / stream-closed comment
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    continue
+                if not data_lines:
+                    continue
+                payload = "\n".join(data_lines)
+                data_lines = []
+                try:
+                    event = json.loads(payload)
+                except ValueError:
+                    continue  # a torn frame costs itself, never the stream
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    on_event(event)
+                except Exception:  # noqa: BLE001 — a consumer must never kill the stream
+                    _log.debug("run event consumer failed for %s", run_id, exc_info=True)
+    except httpx.HTTPError as exc:
+        _log.debug(
+            "run events stream ended for %s: %s: %s", run_id, type(exc).__name__, exc
+        )
+
+
+def respond_to_approval(run_id: str, choice: str) -> dict:
+    """POST ``/v1/runs/{id}/approval`` — resolve the run's pending approval.
+
+    Returns the decoded payload on 2xx (the host's receipt carries
+    ``resolved``, the count it unblocked). Raises :class:`ApprovalGoneError`
+    on the host's 409s (no active approval session / nothing pending) and
+    :class:`TalkApiServerError` with speakable text on any other failure.
+
+    The choice is NOT re-validated here — the narrowing of what voice may
+    grant lives in :mod:`talk_approvals`, the one choke point every caller
+    goes through.
+    """
+
+    try:
+        response = httpx.post(
+            f"{talk_config.api_server_url()}{RUNS_PATH}/{run_id}/approval",
+            json={"choice": choice},
+            headers=_auth_headers(),
+            timeout=talk_config.api_server_probe_timeout_s() * 4,
+        )
+    except httpx.HTTPError as exc:
+        raise TalkApiServerError(
+            f"I couldn't reach the Hermes api server ({type(exc).__name__})"
+        ) from exc
+    if response.status_code == 409:
+        raise ApprovalGoneError(
+            "the host says that approval was already answered or expired"
+        )
+    if response.status_code // 100 != 2:
+        raise TalkApiServerError(
+            f"the Hermes api server refused the approval answer ({response.status_code})"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise TalkApiServerError(
+            "the Hermes api server returned a non-JSON approval receipt"
+        ) from exc
+    return payload if isinstance(payload, dict) else {}
+
+
 def reset_for_tests() -> None:
     """Clear the cached verdict between tests (never called in production)."""
 
@@ -554,9 +672,11 @@ __all__ = [
     "REASON_UNAUTHORIZED",
     "RUNS_PATH",
     "SKILLS_PATH",
+    "SSE_READ_IDLE_S",
     "TERMINAL_RUN_STATUSES",
     "TOOLSETS_PATH",
     "ApiServerStatus",
+    "ApprovalGoneError",
     "TalkApiServerError",
     "capabilities_payload",
     "get_run",
@@ -566,10 +686,12 @@ __all__ = [
     "list_toolsets",
     "probe",
     "reset_for_tests",
+    "respond_to_approval",
     "run_to_completion",
     "start_run",
     "status",
     "stop_run",
+    "stream_run_events",
     "warm",
     "warm_in_background",
 ]

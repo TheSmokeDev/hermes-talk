@@ -1,0 +1,496 @@
+"""The spoken approval bridge — voice resolves run approvals out loud.
+
+A delegated run on the api-server lane parks in ``waiting_for_approval`` when
+its agent hits a gated action, and until now the only resolver on the voice
+surface was silence: the host's own 300s wait eventually denied it. This
+module bridges the host's approval substrate
+(``GET /v1/runs/{id}/events`` SSE + ``POST /v1/runs/{id}/approval``) into
+speech:
+
+1. Every api-server run gets an SSE sidecar (:func:`watch_run`, spawned by
+   the run worker when the remote run id lands). An ``approval.request``
+   event registers a pending approval and announces a prompt through the live
+   Talk session — same contained-announcement channel as run results.
+2. The operator's spoken answer comes back as the model calling the
+   ``resolve_approval`` talk tool — which on Discord rides the existing
+   spoken-permit machinery (``talk_operator_auth``: fresh operator speech,
+   bounded window, single use) before :func:`resolve` runs at all.
+3. :func:`resolve` POSTs the choice. **``always`` is never grantable by
+   voice** — the grantable set is narrowed in code here
+   (:data:`GRANTABLE_BY_VOICE`), in the tool schema, and in the prompt
+   wording; this module is the choke point.
+4. Fail closed on everything ambiguous: the prompt times out into a deny
+   (:data:`talk_config.approval_prompt_timeout_s`), and a barge-in that
+   interrupts an open prompt denies it (:func:`note_barge_in`) — a question
+   not fully heard is not a question answered.
+
+The operator's own answer is the ONLY authorization input. The model relays
+it; it cannot mint one, because on the Discord lane the tool call itself
+needs the permit the operator's speech just created.
+
+Threading mirrors :mod:`talk_lifecycle`: the SSE reader and deny timers live
+on daemon threads, the session callback is marshalled onto the session loop
+with ``loop.call_soon_threadsafe``, and every entry point is fail-open.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+from dataclasses import dataclass
+from typing import Any
+
+try:
+    from . import talk_apiserver, talk_config, talk_runs
+except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_apiserver
+    import talk_config
+    import talk_runs
+
+_log = logging.getLogger(__name__)
+
+#: What voice may grant. ``always`` is absent BY CONSTRUCTION: it would
+#: outlive the call that granted it, and no spoken sentence may do that.
+#: Narrowed again per-request against the host's own offered set.
+GRANTABLE_BY_VOICE = ("once", "session", "deny")
+
+#: Event kinds handed to the session callback.
+EVENT_APPROVAL_PROMPT = "approval_prompt"
+EVENT_APPROVAL_OUTCOME = "approval_outcome"
+
+#: How long the resolve POST politely waits before its receipt detaches (the
+#: same shape as stop_work's STOP_CONFIRM_WAIT_S): long enough that the common
+#: path speaks the real outcome, short enough that a wedged server cannot
+#: dead-air the call.
+RESOLVE_CONFIRM_WAIT_S = 1.5
+
+#: Pending approvals are few by nature; the cap exists so a runaway producer
+#: (a host that re-fires requests) cannot grow the registry without bound.
+#: Eviction denies the evicted — an approval nobody will hear must not park
+#: its run until the host's own timeout.
+_MAX_PENDING = 8
+
+#: The cap on request text carried into a spoken prompt. The host already
+#: redacts secrets from the command; this bound is for the ear, not the wire.
+_REQUEST_TEXT_CAP = 300
+
+_LOCK = threading.Lock()
+_PENDING: dict[int, _PendingApproval] = {}
+_SESSION: tuple[Any, Any] | None = None  # (loop, callback)
+
+
+@dataclass(slots=True)
+class _PendingApproval:
+    """One unanswered approval request registered from an SSE event.
+
+    ``opened`` flips only when the prompt was actually handed to the wire —
+    the deny timer arms then, not at registration, so a prompt deferred
+    behind live speech never times out before the operator has heard it.
+    """
+
+    api_run_id: str
+    request_text: str
+    choices: tuple[str, ...]
+    opened: bool = False
+    timer: threading.Timer | None = None
+
+    def cancel_timer(self) -> None:
+        timer, self.timer = self.timer, None
+        if timer is not None:
+            timer.cancel()
+
+
+def _spawn_daemon(fn, *args, name: str = "talk-approval") -> None:
+    """Fire-and-forget worker. Daemon by design: a deny POST still in flight
+    at hangup must never stall process exit."""
+
+    threading.Thread(target=fn, args=args, daemon=True, name=name).start()
+
+
+def attach_session(loop: Any, callback: Any) -> None:
+    """Bind the live Talk session as the announcement target.
+
+    Same contract as :func:`talk_lifecycle.attach_session`: ``callback`` runs
+    ON the loop via ``call_soon_threadsafe`` and owns its own scheduling; one
+    session at a time, last attach wins. While nothing is bound, prompts are
+    not announced and nothing is denied from here — the host's own approval
+    timeout governs, which is exactly the pre-bridge behavior the dashboard
+    lane keeps.
+    """
+
+    global _SESSION
+    with _LOCK:
+        _SESSION = (loop, callback)
+
+
+def detach_session() -> None:
+    """Announcements stop; pending records clear without resolving.
+
+    A cleared record is NOT a denial: with no live session there is nobody to
+    answer, and the host's own timeout fails the approval closed. The remote
+    run outlives this process's session state by design.
+    """
+
+    global _SESSION
+    with _LOCK:
+        _SESSION = None
+        for pending in _PENDING.values():
+            pending.cancel_timer()
+        _PENDING.clear()
+
+
+def has_pending(run_id: int) -> bool:
+    """Whether the bridge owns an approval for this run right now.
+
+    Read by the lane's progress watcher: while the bridge owns it, the
+    generic "waiting on an approval" milestone stays silent — the spoken
+    prompt is the actionable sentence.
+    """
+
+    with _LOCK:
+        return run_id in _PENDING
+
+
+def pending_choices(run_id: int) -> tuple[str, ...] | None:
+    with _LOCK:
+        pending = _PENDING.get(run_id)
+        return pending.choices if pending is not None else None
+
+
+def _notify(event: dict) -> None:
+    """Marshal one bridge event to the owning Talk session, fail-open."""
+
+    with _LOCK:
+        session = _SESSION
+    if session is None:
+        return
+    loop, callback = session
+    try:
+        loop.call_soon_threadsafe(callback, event)
+    except RuntimeError:
+        # The loop closed between snapshot and call — the session is tearing
+        # down and the event has nowhere to go. Not an error.
+        return
+    except Exception:  # noqa: BLE001 — a notify must never escape a worker
+        _log.debug("approval bridge notify failed", exc_info=True)
+
+
+def _request_text(event: dict) -> str:
+    """The speakable request from an approval.request payload, bounded.
+
+    The host redacts secrets from ``command`` before the event enters the SSE
+    stream (``gateway/run.py _redact_approval_command``); the cap here is for
+    the ear. Description first — it names the action class; the command is
+    the fallback for approvals that carry only one.
+    """
+
+    for key in ("description", "command"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_REQUEST_TEXT_CAP]
+    return "an action the host gates"
+
+
+def _narrow_choices(event: dict) -> tuple[str, ...]:
+    """Voice-grantable ∩ host-offered. ``always`` cannot survive either side."""
+
+    offered = event.get("choices")
+    if not isinstance(offered, list):
+        return GRANTABLE_BY_VOICE
+    narrowed = tuple(
+        choice for choice in GRANTABLE_BY_VOICE if choice in set(map(str, offered))
+    )
+    # "deny" is always an answer, even when the host's list is unreadable.
+    return narrowed or ("deny",)
+
+
+def _register(run_id: int, api_run_id: str, event: dict) -> None:
+    """Register one approval.request and announce it, or evict-deny for room."""
+
+    pending = _PendingApproval(
+        api_run_id=api_run_id,
+        request_text=_request_text(event),
+        choices=_narrow_choices(event),
+    )
+    evicted: _PendingApproval | None = None
+    evicted_run_id: int | None = None
+    with _LOCK:
+        if run_id in _PENDING:
+            _PENDING.pop(run_id).cancel_timer()
+        if len(_PENDING) >= _MAX_PENDING:
+            evicted_run_id = next(iter(_PENDING))
+            evicted = _PENDING.pop(evicted_run_id)
+        _PENDING[run_id] = pending
+    if evicted is not None:
+        _log.warning(
+            "approval bridge full — denying the oldest pending approval (run %s)",
+            evicted_run_id,
+        )
+        evicted.cancel_timer()
+        _spawn_daemon(
+            _post_choice, evicted.api_run_id, "deny", name="talk-approval-evict"
+        )
+    _log.info(
+        "run %s is waiting on an approval (%s) — prompting the operator",
+        run_id,
+        pending.choices,
+    )
+    _notify(
+        {
+            "kind": EVENT_APPROVAL_PROMPT,
+            "run_id": run_id,
+            "request": pending.request_text,
+            "choices": pending.choices,
+        }
+    )
+
+
+def _clear(run_id: int) -> _PendingApproval | None:
+    """Pop a pending record and cancel its deny timer."""
+
+    with _LOCK:
+        pending = _PENDING.pop(run_id, None)
+    if pending is not None:
+        pending.cancel_timer()
+    return pending
+
+
+def note_prompt_sent(run_id: int) -> None:
+    """The prompt hit the wire: arm the fail-closed deny timer.
+
+    Called from the announcement pump's post-send hook. A prompt that never
+    sends (teardown mid-queue) never arms — its record clears at detach, and
+    the host's own timeout denies the approval.
+    """
+
+    with _LOCK:
+        pending = _PENDING.get(run_id)
+        if pending is None or pending.opened:
+            return
+        pending.opened = True
+        timer = threading.Timer(
+            talk_config.approval_prompt_timeout_s(), _expire, args=(run_id,)
+        )
+        timer.daemon = True
+        pending.timer = timer
+        timer.start()
+
+
+def _post_choice(api_run_id: str, choice: str) -> tuple[str, str]:
+    """One resolve POST. Returns (kind, detail): "ok", "gone", or "err"."""
+
+    try:
+        talk_apiserver.respond_to_approval(api_run_id, choice)
+    except talk_apiserver.ApprovalGoneError as exc:
+        return ("gone", str(exc))
+    except Exception as exc:  # noqa: BLE001 — the outcome IS the record
+        return ("err", f"{type(exc).__name__}: {exc}")
+    return ("ok", "")
+
+
+def _annotate(run_id: int, outcome: str) -> None:
+    """Record an approval resolution on the run, like a stop receipt."""
+
+    try:
+        talk_runs.annotate_run(run_id, tee=True, approval_result=outcome)
+    except Exception:  # noqa: BLE001 — a receipt must never cost the run
+        _log.debug("approval receipt annotation failed for run %s", run_id, exc_info=True)
+
+
+def _expire(run_id: int) -> None:
+    """Timer fire: the prompt went unanswered — deny. Silence is not consent."""
+
+    pending = _clear(run_id)
+    if pending is None:
+        return
+    _log.warning("approval prompt for run %s timed out — denying", run_id)
+    _annotate(run_id, "denied: no answer before the prompt timed out")
+    _spawn_daemon(_post_choice, pending.api_run_id, "deny", name="talk-approval-timeout")
+    _notify(
+        {
+            "kind": EVENT_APPROVAL_OUTCOME,
+            "run_id": run_id,
+            "outcome": "timeout",
+        }
+    )
+
+
+def note_barge_in() -> bool:
+    """A barge-in over an OPEN approval prompt denies it. True if one fired.
+
+    The lane calls this only when a response was actually live at speech
+    start, so an answer spoken AFTER the prompt finished is never misread
+    as an interruption of it.
+    """
+
+    with _LOCK:
+        opened = [run_id for run_id, p in _PENDING.items() if p.opened]
+    denied = False
+    for run_id in opened:
+        pending = _clear(run_id)
+        if pending is None:
+            continue
+        denied = True
+        _log.warning("approval prompt for run %s interrupted — denying", run_id)
+        _annotate(run_id, "denied: the operator interrupted the approval question")
+        _spawn_daemon(_post_choice, pending.api_run_id, "deny", name="talk-approval-barge")
+        _notify(
+            {
+                "kind": EVENT_APPROVAL_OUTCOME,
+                "run_id": run_id,
+                "outcome": "barge_in",
+            }
+        )
+    return denied
+
+
+def resolve(run_id: int, choice: str) -> str:
+    """The resolve_approval tool's brain: validate, POST, receipt.
+
+    NEVER raises — the return text is spoken. The choice set is narrowed
+    HERE, in code: ``always`` (and anything else outside
+    :data:`GRANTABLE_BY_VOICE`) is rejected before any network call, whatever
+    the model emitted.
+    """
+
+    choice = str(choice or "").strip().lower()
+    if choice not in GRANTABLE_BY_VOICE:
+        # Not a denial of this approval — a refusal of the CHOICE itself.
+        return (
+            f"'{choice or 'that'}' isn't a choice voice can grant — the choices are "
+            "once, session, or deny. If the operator asked for always, offer session."
+        )
+    with _LOCK:
+        pending = _PENDING.get(run_id)
+    if pending is None:
+        return (
+            f"I don't have a pending approval for run {run_id} — it may already "
+            "be answered or timed out."
+        )
+    if choice not in pending.choices:
+        return (
+            f"The host didn't offer '{choice}' for this one — it offered: "
+            f"{', '.join(pending.choices)}."
+        )
+
+    # Off the courtesy-wait path: the POST runs on a daemon with a bounded
+    # wait, exactly like stop_work's api-server branch — a wedged server must
+    # never dead-air the voice loop.
+    outcomes: queue.Queue = queue.Queue(maxsize=1)
+
+    def _post() -> None:
+        outcomes.put(_post_choice(pending.api_run_id, choice))
+
+    _spawn_daemon(_post, name="talk-approval-resolve")
+    try:
+        verdict, detail = outcomes.get(timeout=RESOLVE_CONFIRM_WAIT_S)
+    except queue.Empty:
+        # The answer is on its way; the late verdict lands on the run's meta
+        # where check_work can read it — a daemon receipt dies with the
+        # process, so the durable record carries it (same finding as stop).
+        def _late(_rid: int = run_id, _choice: str = choice) -> None:
+            late_kind, late_detail = outcomes.get()
+            _annotate(_rid, f"{_choice}: {_late_wording(late_kind, late_detail)}")
+
+        _spawn_daemon(_late, name="talk-approval-late")
+        return (
+            f"Sending '{choice}' for run {run_id} — the server hasn't answered "
+            "yet; ask me in a moment and I'll have the receipt."
+        )
+    if verdict == "err":
+        return (
+            f"That answer didn't go through ({detail}) — the approval for run "
+            f"{run_id} is still open; answer again, or let it time out denied."
+        )
+    if verdict == "gone":
+        _clear(run_id)
+        _annotate(run_id, f"{choice}: the host says it was already answered or expired")
+        return f"The host says run {run_id}'s approval was already answered or expired."
+
+    _clear(run_id)
+    _annotate(run_id, f"{choice}: accepted")
+    if choice == "deny":
+        return (
+            f"Denied — run {run_id} was told no. It will adapt or stop, and "
+            "I'll report when it lands."
+        )
+    if choice == "session":
+        return (
+            f"Approved for the rest of run {run_id} — that's as far as voice "
+            "goes; there is no always. I'll tell you when it lands."
+        )
+    return (
+        f"Approved — just this once. Run {run_id} is continuing; I'll tell "
+        "you when it lands."
+    )
+
+
+def _late_wording(verdict: str, detail: str) -> str:
+    return {
+        "ok": "accepted (late receipt)",
+        "gone": "already answered or expired (late receipt)",
+    }.get(verdict, f"failed (late receipt): {detail}")
+
+
+def _note_event(run_id: int, api_run_id: str, event: Any) -> None:
+    """Route one SSE event from the run's own stream."""
+
+    if not isinstance(event, dict):
+        return
+    kind = event.get("event")
+    if kind == "approval.request":
+        _register(run_id, api_run_id, event)
+    elif kind == "approval.responded":
+        # Resolved — by this bridge or by any other client. Either way the
+        # pending record and its deny timer are done.
+        _clear(run_id)
+    elif kind in ("run.completed", "run.failed", "run.cancelled"):
+        # The run is over; a parked approval is moot. No deny POST — there is
+        # nothing left to unblock, and the host has already moved on.
+        _clear(run_id)
+
+
+def watch_run(run_id: int, api_run_id: str) -> None:
+    """Spawn the SSE sidecar for one api-server run. Never raises.
+
+    One extra connection per run, opened when the remote run id lands and
+    closed by the host when the run ends. Only approval events act; anything
+    else the stream carries is ignored here — progress narration stays with
+    the proven poll loop, unchanged.
+    """
+
+    def _reader() -> None:
+        try:
+            talk_apiserver.stream_run_events(
+                api_run_id, lambda event: _note_event(run_id, api_run_id, event)
+            )
+        except Exception:  # noqa: BLE001 — the sidecar degrades silently by design
+            _log.debug("approval watcher for run %s ended early", run_id, exc_info=True)
+
+    threading.Thread(
+        target=_reader, daemon=True, name=f"talk-approval-watch-{run_id}"
+    ).start()
+
+
+def reset_for_tests() -> None:
+    """Clear bridge state between tests (never called in production)."""
+
+    detach_session()
+
+
+__all__ = [
+    "EVENT_APPROVAL_OUTCOME",
+    "EVENT_APPROVAL_PROMPT",
+    "GRANTABLE_BY_VOICE",
+    "RESOLVE_CONFIRM_WAIT_S",
+    "attach_session",
+    "detach_session",
+    "has_pending",
+    "note_barge_in",
+    "note_prompt_sent",
+    "pending_choices",
+    "reset_for_tests",
+    "resolve",
+    "watch_run",
+]

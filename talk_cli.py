@@ -37,6 +37,7 @@ from contextlib import suppress
 try:
     from . import (
         talk_apiserver,
+        talk_approvals,
         talk_audio,
         talk_auth,
         talk_capabilities,
@@ -62,6 +63,7 @@ try:
     from .talk_relay import RealtimeRelay
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
+    import talk_approvals
     import talk_audio
     import talk_auth
     import talk_capabilities
@@ -858,6 +860,62 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     return _announcement_commands(headline, "")
 
 
+#: Approval prompts (the capability bridge) ride the same contained
+#: announcement shape as results: the headline is plugin-owned wording, the
+#: request text is quoted untrusted DATA, the response is tools-off, and the
+#: item deletes itself. The model ASKS the question; the operator's answer
+#: comes back as ordinary speech on a fresh turn, where the resolve_approval
+#: call it produces rides the normal permit machinery.
+
+
+def approval_prompt_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """The wire messages that make the model ASK an approval question."""
+
+    run_id = event.get("run_id")
+    if run_id is None:
+        return []
+    choices = tuple(event.get("choices") or ())
+    request = str(event.get("request") or "").strip()
+    options = ["'once' to allow it just this time"]
+    if "session" in choices:
+        options.append("'session' to allow it for the rest of the run")
+    options.append("or 'no' to deny")
+    headline = (
+        f"Background run #{run_id} is waiting for approval. Ask the operator "
+        "out loud: "
+        + ", ".join(options)
+        + ". If they interrupt the question or do not answer, it is denied."
+    )
+    return _announcement_commands(headline, request)
+
+
+def approval_outcome_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """The wire messages that make the model SAY a denial that fired itself.
+
+    Timeout and barge-in denials happen without a tool call, so the model
+    learns about them here — otherwise it would still be waiting for an
+    answer to a question the bridge already closed.
+    """
+
+    run_id = event.get("run_id")
+    if run_id is None:
+        return []
+    outcome = event.get("outcome")
+    if outcome == "timeout":
+        headline = (
+            f"Background run #{run_id}'s approval got no answer in time, so it "
+            "was denied — silence is not consent."
+        )
+    elif outcome == "barge_in":
+        headline = (
+            f"Background run #{run_id}'s approval question was interrupted, so "
+            "it was denied — interrupting a question never approves it."
+        )
+    else:
+        return []
+    return _announcement_commands(headline, "")
+
+
 def _active_parent_session_id() -> str | None:
     """Snapshot the bound Hermes session id, or fail closed on older hosts."""
 
@@ -1173,6 +1231,11 @@ async def run_talk_session(
     def on_barge_in() -> None:
         played = audio.played_ms
         audio.drain_playback()
+        if relay.response_active:
+            # An approval question interrupted mid-ask is a question not fully
+            # heard: the bridge denies it. Speech after the prompt's response
+            # finished (response_active False) is an answer, never a barge-in.
+            talk_approvals.note_barge_in()
         if relay.last_audio_item_id and played > 0:
             pending.append(
                 talk_realtime.TruncateOutput(
@@ -1228,6 +1291,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -1244,6 +1308,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -1362,6 +1427,13 @@ async def run_talk_session(
                 # speech, not the result.
                 milestone = progress.poll(run)
                 if milestone is not None:
+                    # While the approval bridge owns a run's approval, the
+                    # generic "waiting on an approval" milestone stays silent —
+                    # the spoken prompt is the actionable sentence.
+                    if milestone == talk_progress.PHASE_BLOCKED and talk_approvals.has_pending(
+                        run_id
+                    ):
+                        continue
                     commands = run_phase_commands(run, milestone)
                     if commands:
                         await announce_queue.put(QueuedAnnouncement(commands))
@@ -1509,6 +1581,31 @@ async def run_talk_session(
             if commands:
                 announce_queue.put_nowait(commands)
 
+        def on_approval_event(event: dict) -> None:
+            """Queue an approval bridge event on the loop.
+
+            Prompts arm their fail-closed deny timer only at the pump's
+            post-send point (QueuedAnnouncement.on_sent): a prompt deferred
+            behind live speech must not burn its answer window before the
+            operator has heard a word of it. Outcomes (timeout/barge-in
+            denials) are plain re-sayable speech, no claim.
+            """
+
+            if event.get("kind") == talk_approvals.EVENT_APPROVAL_PROMPT:
+                commands = approval_prompt_commands(event)
+                run_id = event.get("run_id")
+                if commands and isinstance(run_id, int):
+                    announce_queue.put_nowait(
+                        QueuedAnnouncement(
+                            commands,
+                            on_sent=lambda: talk_approvals.note_prompt_sent(run_id),
+                        )
+                    )
+            elif event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME:
+                commands = approval_outcome_commands(event)
+                if commands:
+                    announce_queue.put_nowait(QueuedAnnouncement(commands))
+
         def on_note_landed(subagent_id: str) -> None:
             """Queue a landed steering note on the session loop."""
 
@@ -1525,6 +1622,9 @@ async def run_talk_session(
         # gate: the hook registrations are process-scoped, so attach is what
         # makes them live for THIS session and nothing else.
         talk_progress.attach_session(loop, on_subagent_event, owner_session_id)
+        # The approval bridge shares the loop; its prompts are gated by the
+        # bridge itself (nothing announces while detached).
+        talk_approvals.attach_session(loop, on_approval_event)
         # This connection's own identity (hermes-talk#35), minted BEFORE any
         # tool can dispatch work. Independent of whether a Hermes ctx happens
         # to be bound, so tier-2/3 work has an exact destination off tier 1
@@ -1626,6 +1726,7 @@ async def run_talk_session(
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
             talk_progress.detach_session()
+            talk_approvals.detach_session()
             # Unbound again: with no live connection there is no destination,
             # so further dispatch is refused rather than accepted into a void.
             talk_runs.detach_owner()
@@ -1671,6 +1772,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         if cascade is not None:

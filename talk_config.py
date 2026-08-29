@@ -88,6 +88,12 @@ DEFAULT_MEMORY_SEARCH_TIMEOUT_S = 10.0
 #: to one spoken exchange: long enough to act on a fresh yes, short enough
 #: that a stale yes cannot fire into a conversation that has moved on.
 DEFAULT_APPROVAL_PERMIT_TTL_S = 30.0
+#: How long a spoken approval PROMPT stays open for an answer before the
+#: bridge denies it (fail closed). Sized well under the host's own approval
+#: wait (300s by default) so the voice lane's deny lands first and the run
+#: unwinds on the operator's answer-or-silence, not on a host timer nobody
+#: on the call can hear.
+DEFAULT_APPROVAL_PROMPT_TIMEOUT_S = 60.0
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -828,6 +834,19 @@ def approval_permit_ttl_s() -> float:
     return _positive_float("TALK_APPROVAL_PERMIT_TTL_S", DEFAULT_APPROVAL_PERMIT_TTL_S)
 
 
+def approval_prompt_timeout_s() -> float:
+    """How long a spoken approval prompt stays open before it is denied.
+
+    Fail closed: an unanswered approval question on a live call resolves as
+    deny after this window — silence is not consent. Junk or non-positive
+    overrides take the default.
+    """
+
+    return _positive_float(
+        "TALK_APPROVAL_PROMPT_TIMEOUT_S", DEFAULT_APPROVAL_PROMPT_TIMEOUT_S
+    )
+
+
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
@@ -835,6 +854,7 @@ __all__ = [
     "DEFAULT_API_SERVER_PROBE_TTL_S",
     "DEFAULT_API_SERVER_URL",
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
+    "DEFAULT_APPROVAL_PROMPT_TIMEOUT_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_ELEVENLABS_MODEL",
@@ -865,6 +885,7 @@ __all__ = [
     "api_server_probe_ttl_s",
     "api_server_url",
     "approval_permit_ttl_s",
+    "approval_prompt_timeout_s",
     "audio_input_device",
     "audio_output_device",
     "cascade_tts",

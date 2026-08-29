@@ -28,6 +28,7 @@ from pathlib import Path
 # the import on whichever module loads second.
 try:
     from . import (
+        talk_approvals,
         talk_audio,
         talk_auth,
         talk_capabilities,
@@ -41,6 +42,7 @@ try:
         talk_vault,
     )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_approvals
     import talk_audio
     import talk_auth
     import talk_capabilities
@@ -303,6 +305,38 @@ _TOOL_TALK_STATUS: dict = {
 }
 
 
+_TOOL_RESOLVE_APPROVAL: dict = {
+    "type": "function",
+    "name": "resolve_approval",
+    "description": (
+        "Answer a pending approval request from background work you delegated. "
+        "Call this the moment the operator answers an approval question, with "
+        "the run number from the question and their choice. 'once' allows the "
+        "action this one time, 'session' allows it for the rest of that run, "
+        "'deny' refuses it. There is no 'always' by voice — if the operator "
+        "asks for always, offer session instead. If their answer is unclear, "
+        "ask once; if still unclear, deny. An unanswered question, or the "
+        "operator interrupting it, denies automatically."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "integer",
+                "description": "The run number from the approval question.",
+            },
+            "choice": {
+                "type": "string",
+                "enum": ["once", "session", "deny"],
+                "description": "The operator's answer.",
+            },
+        },
+        "required": ["run_id", "choice"],
+        "additionalProperties": False,
+    },
+}
+
+
 _TOOL_TALK_CAPABILITIES: dict = {
     "type": "function",
     "name": "talk_capabilities",
@@ -364,6 +398,7 @@ def default_talk_tools() -> list[dict]:
         _TOOL_STEER_AGENT,
         _TOOL_REDIRECT_AGENT,
         _TOOL_STOP_WORK,
+        _TOOL_RESOLVE_APPROVAL,
         _TOOL_TALK_STATUS,
         _TOOL_TALK_CAPABILITIES,
     ]
@@ -531,6 +566,14 @@ def _handle_stop_work(arguments: dict) -> str:
         return "stop_work needs to know which job to stop."
     reason = str(arguments.get("reason") or "").strip() or None
     return talk_host.host().stop_work(target, reason)
+
+
+def _handle_resolve_approval(arguments: dict) -> str:
+    try:
+        run_id = int(arguments.get("run_id"))
+    except (TypeError, ValueError):
+        return "resolve_approval needs the run number from the approval question."
+    return talk_approvals.resolve(run_id, arguments.get("choice"))
 
 
 def _identity_summary() -> dict[str, int]:
@@ -703,6 +746,7 @@ _HANDLERS = {
     "steer_agent": _handle_steer_agent,
     "redirect_agent": _handle_redirect_agent,
     "stop_work": _handle_stop_work,
+    "resolve_approval": _handle_resolve_approval,
     "talk_status": _handle_talk_status,
     "talk_capabilities": _handle_talk_capabilities,
 }
