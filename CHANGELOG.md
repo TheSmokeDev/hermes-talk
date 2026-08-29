@@ -11,6 +11,50 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## 0.15.0 (Unreleased)
+
+The capability bridge: voice becomes the manager of Hermes's whole capability
+surface — the session knows the live install, does what's safe directly,
+delegates the rest, and gated work resolves by spoken approval. Never a bare
+"I can't."
+
+### Added
+- **Live-catalog prompt section.** Session instructions carry a bounded
+  capabilities block — skill count + the tool categories usable right now +
+  the delegation ceiling + the never-invent-tool-names rule — assembled from
+  the real catalog and capped like every other resident section. When the
+  catalog is unreachable the section is absent and the prompt is exactly what
+  it was before (fail-open). The tier-1 catalog probe stops dispatching the
+  guessed `list_capabilities` tool name (dead upstream) and reads the host's
+  own registries instead — the same builders the `/v1/skills` and
+  `/v1/toolsets` routes run, plus the live, availability-gated resolved-tool
+  set from `model_tools.get_tool_definitions`.
+- **Host-tool classification table** (`talk_operator_auth`): curated read-only
+  host tools (`web_search`, `web_extract`, `vision_analyze`, `session_search`)
+  may run inline; `computer_use`'s read actions ride a fresh spoken operator
+  permit; everything else — including every destructive computer-use action —
+  delegates. Unclassified names and permit-gated failures now deny with a
+  steering receipt ("I can't do that directly in a voice call — I can spin up
+  an agent that can. Want me to?") instead of a flat refusal.
+- **Spoken approvals for delegated runs.** Every api-server run gains an SSE
+  sidecar on `/v1/runs/{id}/events`; an `approval.request` becomes a spoken,
+  contained prompt, and the operator's answer resolves it through the new
+  `resolve_approval` tool (on Discord, behind the existing spoken-permit
+  machinery). Voice grants `once`, `session`, or `deny` — `always` is
+  ungrantable, narrowed in code. An unanswered question denies on
+  `TALK_APPROVAL_PROMPT_TIMEOUT_S` (default 60s); interrupting the question
+  denies immediately. Progress narration and the result ride the existing
+  watcher machinery unchanged; resolutions annotate run meta like stop
+  receipts.
+
+### Fixed
+- **Transcript flush no longer drops the conversation when no Talk connection
+  is bound.** The session-end memory handoff routed through the ticketed run
+  lane and was refused ("no Talk connection is bound") on the Discord lane,
+  deleting the transcript unread. The flush now runs a ticket-free lane
+  ladder, and when no agent lane exists at all the transcript is restored for
+  the next sweep ("handoff deferred") instead of dropped.
+
 ## [0.14.0] — 2026-08-28
 
 The custom-voice cascade leaves the terminal: Discord rooms and the dashboard

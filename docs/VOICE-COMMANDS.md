@@ -19,6 +19,7 @@ delivery; "landed" only ever follows a real delivery artifact.
 | "tell that audit to focus on the token refresh instead" | `steer_agent` | "queued for their next step — I'll confirm when it lands" | queueing only; "landed" arrives later, pushed, when a delivery artifact fires |
 | "stop — wrong repo, use the ship branch" | `redirect_agent` | "redirect accepted — it takes the correction at its current step, or its very next one" | the stronger verb: interrupts current thinking where the host supports it (0.20+), degrades to the steer queue mid-tool or on older hosts — and says which |
 | "kill the audit" / "stop run 7" | `stop_work` | "sent the stop — winding down" then a death receipt ("it's down", exit code) when confirmed | stopping drops unread steering notes (their receipts flip to `superseded`); every stop offered is real on that lane |
+| "once" / "this session" / "no" (answering an approval question) | `resolve_approval` | "approved — just this once", "approved for the rest of the run", or "denied — the agent was told no" | voice can grant `once`, `session`, or `deny` — **never `always`** (narrowed in code, not in the prompt); an unanswered question denies itself on a timer, and interrupting the question denies it on the spot |
 | "what are you running on?" / "status report" | `talk_status` | version, model, voice, auth lane, agent lane, audio, identity sections | the verification command — field-by-field meaning in [OPERATING.md](OPERATING.md#2-talk_status--the-one-command) |
 | "what can you do right now?" / "which tools do you have?" | `talk_capabilities` | installed skills, resolved toolsets with their enabled/configured flags, gateway feature flags, live run counts | live evidence, not the prompt — read in-process off the attached agent, or over the api server when detached; a toolset listed `enabled: false` is reported as installed but NOT usable |
 
@@ -29,7 +30,11 @@ run #7 was accepted", "…is executing — Reading files", "…is waiting on
 an approval", "…is still working"). Milestones fire on phase changes only
 — not every poll tick — and the tool label is the only job detail that
 can surface (never arguments, paths, or output). All arrive the moment
-the host reports them.
+the host reports them. And (v0.15+) when delegated work parks on a gated
+action, the approval question itself: "Background run #7 is waiting for
+approval — once, this session, or no?" While that question is open the
+generic "waiting on an approval" milestone stays silent — the question is
+the actionable sentence.
 
 ## Steer vs redirect vs stop — three sentences
 
