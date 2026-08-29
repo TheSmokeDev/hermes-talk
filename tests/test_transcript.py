@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import fixture_data
+import pytest
 
 import talk_transcript
 
@@ -574,3 +575,203 @@ def test_dead_claim_is_recovered_when_pid_now_belongs_to_unrelated_live_process(
     finally:
         sleeper.kill()
         sleeper.wait(timeout=5)
+
+
+# -- the capability-bridge flush lane: no bound owner required --------------------
+#
+# 2026-08-28 regression: a Discord-lane session ended, the sweep's handoff
+# routed through the ticketed run lane, and talk_runs refused — "no Talk
+# connection is bound, so there's nowhere to deliver the result" — because the
+# session's teardown had already detached the owner. The transcript was
+# dropped unread. The flush is maintenance, not user-visible work: it needs no
+# return route.
+
+
+def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _finished_capture(tmp_path, seed: str):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn(seed + " user"))
+    capture.append_turn("assistant", _long_turn(seed + " assistant"))
+    capture.finish()
+    return capture
+
+
+@pytest.fixture
+def flush_lanes(monkeypatch, tmp_path):
+    """No host attached, no spawnable hermes, no api server — until the test
+    turns one on. flush_agent's tiers are driven at the module seam, and the
+    real Hermes home is walled off (profile detection must never read it)."""
+
+    import talk_apiserver
+    import talk_host
+    import talk_runs
+
+    talk_host.bind_ctx(None)
+    talk_runs.detach_owner()
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
+    monkeypatch.setattr(talk_apiserver, "is_available", lambda: False)
+    yield
+    talk_host.bind_ctx(None)
+    talk_runs.detach_owner()
+
+
+def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, flush_lanes):
+    """The Discord-lane regression: teardown detached the owner BEFORE the
+    sweep, and the handoff refused. The flush lane needs no ticket — the
+    transcript is reviewed and consumed, not dropped."""
+
+    import talk_apiserver
+
+    capture = _finished_capture(tmp_path, "discord lane")
+    reviewed = []
+    done = threading.Event()
+
+    def fake_run_to_completion(prompt, *, session_id, session_key):
+        reviewed.append(prompt)
+        done.set()
+        return "reviewed"
+
+    monkeypatch.setattr(talk_apiserver, "is_available", lambda: True)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", fake_run_to_completion)
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)  # the default handoff
+
+    assert done.wait(3.0), "the flush never reached the api-server lane"
+    assert reviewed and "memory" in reviewed[0].lower()
+    assert "discord lane user" in reviewed[0]
+    assert _wait_for(lambda: not capture.path.exists())
+    root = tmp_path / "state" / "talk-transcripts"
+    assert not list(root.glob("*.jsonl")) and not list(root.glob("*.claimed-*"))
+    assert talk_transcript.handoff_status()["state"] == "handoff pending"
+
+
+def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
+    tmp_path, monkeypatch, flush_lanes
+):
+    """No host, no api server, no hermes on PATH: the transcript is RESTORED
+    under its original name for the next sweep, never dropped."""
+
+    import talk_apiserver
+
+    capture = _finished_capture(tmp_path, "deferred")
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert _wait_for(
+        lambda: talk_transcript.handoff_status()["state"] == "handoff deferred"
+    )
+    root = tmp_path / "state" / "talk-transcripts"
+    # Back under its ORIGINAL name, lease released, nothing claimed.
+    assert capture.path.exists()
+    assert not list(root.glob("*.claimed-*"))
+    assert not list(root.glob("*.lease"))
+
+    reviewed = []
+    done = threading.Event()
+
+    def fake_run_to_completion(prompt, *, session_id, session_key):
+        reviewed.append(prompt)
+        done.set()
+        return "reviewed"
+
+    monkeypatch.setattr(talk_apiserver, "is_available", lambda: True)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", fake_run_to_completion)
+
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert done.wait(3.0), "the deferred transcript was never retried"
+    assert reviewed and "deferred user" in reviewed[0]
+    assert _wait_for(lambda: not capture.path.exists())
+
+
+def test_the_attached_host_tier_still_carries_the_flush(tmp_path, monkeypatch, flush_lanes):
+    """Tier 1 unchanged: a live parent agent takes the handoff inline."""
+
+    import talk_host
+
+    capture = _finished_capture(tmp_path, "attached")
+    calls = []
+
+    class Ctx:
+        def dispatch_tool(self, name, args):
+            calls.append((name, args))
+            return json.dumps({"result": "delegated: session 20260828_185300_ab12cd accepted"})
+
+    talk_host.bind_ctx(Ctx())
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert _wait_for(lambda: bool(calls))
+    assert calls and calls[0][0] == "delegate_task"
+    assert _wait_for(lambda: not capture.path.exists())
+    assert _wait_for(
+        lambda: "child_session_id" in talk_transcript.handoff_status()
+    )
+
+
+def test_a_host_refusal_still_drops_the_transcript(tmp_path, flush_lanes):
+    """Deferral is for ABSENT lanes only. A real lane that answers with a
+    refusal made a decision — the transcript is dropped, exactly as before.
+    (The wording is pinned by test_handoff_refusal_is_logged_and_dropped on
+    the synchronous path; this asserts the outcome, not the log race.)"""
+
+    import talk_host
+
+    capture = _finished_capture(tmp_path, "refused")
+
+    class Ctx:
+        def dispatch_tool(self, name, args):
+            return json.dumps({"error": "delegation is paused", "success": False})
+
+    talk_host.bind_ctx(Ctx())
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert _wait_for(lambda: not capture.path.exists())
+    assert _wait_for(
+        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
+    )
+
+
+def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
+    tmp_path, monkeypatch, flush_lanes
+):
+    """No host, no api server, but a hermes binary: the flush spawns detached."""
+
+    import talk_host
+
+    capture = _finished_capture(tmp_path, "detached flush")
+    spawned = threading.Event()
+    seen = []
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            seen.append(argv)
+            spawned.set()
+
+        def communicate(self, timeout=None):
+            return ("reviewed", "")
+
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(talk_host.subprocess, "Popen", FakePopen)
+
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert spawned.wait(3.0), "the detached flush never spawned"
+    assert seen and seen[0][0] == "/usr/local/bin/hermes"
+    assert "-z" in seen[0] and "memory" in seen[0][-1].lower()
+    assert _wait_for(lambda: not capture.path.exists())

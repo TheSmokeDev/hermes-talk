@@ -59,6 +59,7 @@ try:
         talk_progress,
         talk_runs,
         talk_steer,
+        talk_transcript,
         talk_vault,
     )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
@@ -69,6 +70,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_progress
     import talk_runs
     import talk_steer
+    import talk_transcript
     import talk_vault
 
 _log = logging.getLogger(__name__)
@@ -1088,6 +1090,86 @@ class HostAdapter:
         return (
             f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running as a "
             "detached Hermes agent; I'll tell you when it lands."
+        )
+
+    def flush_agent(self, prompt: str) -> str:
+        """Run one maintenance flush — NO live Talk connection required.
+
+        The transcript memory handoff runs at session boundaries, which are
+        exactly the moments the run registry's return-route ticket
+        (hermes-talk#35) is legitimately absent: the owner detached before
+        the sweep, or the session-end hook fired in a process that never
+        attached one. Routing the flush through :meth:`run_agent` therefore
+        refused every time — "no Talk connection is bound" — and the
+        transcript was dropped unread. This ladder is the same three tiers
+        minus the ticket: nobody is listening, so nothing here speaks a
+        result, registers a run, or asks for approval.
+
+        Returns a WORK_STARTED-shaped receipt on acceptance (the handoff
+        contract in :mod:`talk_transcript`). Raises
+        :class:`talk_transcript.FlushDeferred` — never a spoken refusal —
+        when NO lane exists at all, so the caller can queue the transcript
+        for the next sweep instead of dropping it.
+        """
+
+        ctx = get_ctx()
+        if ctx is not None:
+            try:
+                raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
+            except Exception as exc:  # noqa: BLE001 — a flush failure is a failure
+                return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+            if not _agent_loop_absent(raw):
+                spoken = _speakable(raw)
+                if spoken.startswith("that failed"):
+                    return f"I couldn't start that work — {spoken}"
+                return f"WORK_STARTED — {spoken}"
+
+        if talk_apiserver.is_available():
+            session_key = talk_config.session_key()
+
+            def _flush_via_api_server() -> None:
+                try:
+                    outcome = talk_apiserver.run_to_completion(
+                        prompt, session_id=None, session_key=session_key
+                    )
+                    _log.info("transcript memory handoff completed: %.200s", outcome)
+                except Exception as exc:  # noqa: BLE001 — the flush already landed or it did not
+                    _log.warning(
+                        "transcript memory handoff run failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            _spawn_daemon(_flush_via_api_server, name="talk-flush-apiserver")
+            return "WORK_STARTED — memory review running through the api server"
+
+        binary = hermes_binary()
+        if binary is not None:
+            profile = talk_config.agent_profile()
+
+            def _flush_detached() -> None:
+                try:
+                    out, err = subprocess.Popen(
+                        agent_argv(binary, prompt, profile),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    ).communicate(timeout=talk_config.agent_timeout_s())
+                    _log.info("transcript memory handoff exited: %.200s", (out or err or ""))
+                except Exception as exc:  # noqa: BLE001 — logged, never raised
+                    _log.warning(
+                        "transcript memory handoff spawn failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            _spawn_daemon(_flush_detached, name="talk-flush-detached")
+            return "WORK_STARTED — memory review spawned as a detached Hermes one-shot"
+
+        raise talk_transcript.FlushDeferred(
+            "no agent lane is available for the transcript handoff"
         )
 
 
