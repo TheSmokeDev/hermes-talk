@@ -54,9 +54,9 @@ def test_every_inline_safe_entry_is_read_only_by_host_precedent():
     """The list is short and auditable: the host's own webhook-safe read class
     plus session_search, which the legacy lane already exposes read-only."""
 
-    assert talk_operator_auth.VOICE_INLINE_SAFE == frozenset(
+    assert frozenset(
         {"session_search", "web_search", "web_extract", "vision_analyze"}
-    )
+    ) == talk_operator_auth.VOICE_INLINE_SAFE
     # No overlap with the permit class: a name routes to exactly one class.
     assert talk_operator_auth.VOICE_INLINE_SAFE.isdisjoint(
         talk_operator_auth.VOICE_PERMIT_GATED
