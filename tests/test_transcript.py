@@ -673,10 +673,12 @@ def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
         lambda: talk_transcript.handoff_status()["state"] == "handoff deferred"
     )
     root = tmp_path / "state" / "talk-transcripts"
-    # Back under its ORIGINAL name, lease released, nothing claimed.
-    assert capture.path.exists()
+    # The status flips before the claim's finally restores the file — wait for
+    # the restore itself, not the bookkeeping, before asserting or re-sweeping.
+    assert _wait_for(
+        lambda: capture.path.exists() and not list(root.glob("*.lease"))
+    )
     assert not list(root.glob("*.claimed-*"))
-    assert not list(root.glob("*.lease"))
 
     reviewed = []
     done = threading.Event()
