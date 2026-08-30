@@ -632,7 +632,7 @@ def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, 
 
     import talk_apiserver
 
-    capture = _finished_capture(tmp_path, "discord lane")
+    _finished_capture(tmp_path, "discord lane")
     reviewed = []
     done = threading.Event()
 
@@ -707,7 +707,7 @@ def test_the_attached_host_tier_still_carries_the_flush(tmp_path, monkeypatch, f
 
     import talk_host
 
-    capture = _finished_capture(tmp_path, "attached")
+    _finished_capture(tmp_path, "attached")
     calls = []
 
     class Ctx:
@@ -761,7 +761,7 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
 
     import talk_host
 
-    capture = _finished_capture(tmp_path, "detached flush")
+    _finished_capture(tmp_path, "detached flush")
     spawned = threading.Event()
     seen = []
 
