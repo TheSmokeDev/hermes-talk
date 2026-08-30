@@ -78,6 +78,14 @@ _REQUEST_TEXT_CAP = 300
 _LOCK = threading.Lock()
 _PENDING: dict[int, _PendingApproval] = {}
 _SESSION: tuple[Any, Any] | None = None  # (loop, callback)
+#: Attach generation, bumped by every attach AND detach (the sibling owner
+#: gate to talk_progress/talk_lifecycle's owner_session_id). A run's SSE
+#: sidecar snapshots it at spawn; events from an older generation are
+#: quarantined wholesale — never announced, never registered — so a run
+#: outliving its session cannot route an approval into the NEXT session's
+#: call. The host's own approval timeout governs those runs, exactly the
+#: pre-bridge behavior.
+_GENERATION = 0
 
 
 @dataclass(slots=True)
@@ -127,8 +135,9 @@ def attach_session(loop: Any, callback: Any) -> None:
     lane keeps.
     """
 
-    global _SESSION
+    global _SESSION, _GENERATION
     with _LOCK:
+        _GENERATION += 1
         _SESSION = (loop, callback)
 
 
@@ -137,15 +146,25 @@ def detach_session() -> None:
 
     A cleared record is NOT a denial: with no live session there is nobody to
     answer, and the host's own timeout fails the approval closed. The remote
-    run outlives this process's session state by design.
+    run outlives this process's session state by design. The generation bump
+    orphans every live sidecar: whatever they hear next belongs to a session
+    that no longer exists.
     """
 
-    global _SESSION
+    global _SESSION, _GENERATION
     with _LOCK:
+        _GENERATION += 1
         _SESSION = None
         for pending in _PENDING.values():
             pending.cancel_timer()
         _PENDING.clear()
+
+
+def current_generation() -> int:
+    """The attach generation right now — a sidecar's spawn stamp."""
+
+    with _LOCK:
+        return _GENERATION
 
 
 def has_pending(run_id: int) -> bool:
@@ -517,9 +536,24 @@ def _late_wording(verdict: str, detail: str) -> str:
     }.get(verdict, f"failed (late receipt): {detail}")
 
 
-def _note_event(run_id: int, api_run_id: str, event: Any) -> None:
-    """Route one SSE event from the run's own stream."""
+def _note_event(
+    run_id: int, api_run_id: str, event: Any, generation: int | None = None
+) -> None:
+    """Route one SSE event from the run's own stream.
 
+    ``generation`` is the sidecar's spawn stamp; an event from an older
+    generation is quarantined wholesale — the run belongs to a session that
+    is gone, and the current call must neither hear nor resolve it. ``None``
+    (direct callers) means current.
+    """
+
+    if generation is not None and generation != current_generation():
+        _log.debug(
+            "quarantined a stale approval sidecar event for run %s (generation %s)",
+            run_id,
+            generation,
+        )
+        return
     if not isinstance(event, dict):
         return
     kind = event.get("event")
@@ -544,10 +578,13 @@ def watch_run(run_id: int, api_run_id: str) -> None:
     the proven poll loop, unchanged.
     """
 
+    generation = current_generation()
+
     def _reader() -> None:
         try:
             talk_apiserver.stream_run_events(
-                api_run_id, lambda event: _note_event(run_id, api_run_id, event)
+                api_run_id,
+                lambda event: _note_event(run_id, api_run_id, event, generation),
             )
         except Exception:  # noqa: BLE001 — the sidecar degrades silently by design
             _log.debug("approval watcher for run %s ended early", run_id, exc_info=True)
@@ -569,6 +606,7 @@ __all__ = [
     "GRANTABLE_BY_VOICE",
     "RESOLVE_CONFIRM_WAIT_S",
     "attach_session",
+    "current_generation",
     "detach_session",
     "has_pending",
     "note_barge_in",

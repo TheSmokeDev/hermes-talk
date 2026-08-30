@@ -392,6 +392,35 @@ def test_a_late_transport_failure_reopens_the_record_and_rearms_the_floor(monkey
     assert _wait_for(lambda: not talk_approvals.has_pending(7))
 
 
+# -- session ownership: stale sidecars are quarantined (F6) -----------------------
+
+
+def test_a_stale_sidecar_from_a_previous_session_is_quarantined():
+    """attach AND detach bump the generation: a watcher spawned under an
+    older session must neither announce nor register into the next one —
+    the next call's operator cannot be asked to resolve work they never
+    started. The host's own timeout governs the orphaned run."""
+
+    talk_approvals.attach_session(FakeLoop(), lambda event: None)
+    stale_generation = talk_approvals.current_generation()
+    talk_approvals.detach_session()
+
+    seen = []
+    talk_approvals.attach_session(FakeLoop(), seen.append)
+
+    talk_approvals._note_event(7, "run_remote_1", _approval_event(), stale_generation)
+
+    assert seen == []
+    assert not talk_approvals.has_pending(7)
+
+    # An event stamped with the LIVE generation still registers normally.
+    talk_approvals._note_event(
+        8, "run_remote_1", _approval_event(), talk_approvals.current_generation()
+    )
+    assert talk_approvals.has_pending(8)
+    assert seen[-1]["run_id"] == 8
+
+
 # -- timeout and barge-in: both deny ----------------------------------------------
 
 
