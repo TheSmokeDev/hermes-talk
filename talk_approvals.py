@@ -193,14 +193,21 @@ def _request_text(event: dict) -> str:
 
 
 def _narrow_choices(event: dict) -> tuple[str, ...]:
-    """Voice-grantable ∩ host-offered. ``always`` cannot survive either side."""
+    """Voice-grantable ∩ host-offered. ``always`` cannot survive either side.
+
+    Fail closed on shape: the host always emits ``choices`` as a list of
+    strings (api_server ``_approval_event_choices``), so a missing, non-list,
+    or unrecognizable value is schema drift or forgery — the answer set
+    collapses to deny-only instead of widening to everything voice could
+    grant. ``once``/``session`` are offered ONLY when those exact strings
+    appear in the host-offered list.
+    """
 
     offered = event.get("choices")
     if not isinstance(offered, list):
-        return GRANTABLE_BY_VOICE
-    narrowed = tuple(
-        choice for choice in GRANTABLE_BY_VOICE if choice in set(map(str, offered))
-    )
+        return ("deny",)
+    offered_names = {choice for choice in offered if isinstance(choice, str)}
+    narrowed = tuple(choice for choice in GRANTABLE_BY_VOICE if choice in offered_names)
     # "deny" is always an answer, even when the host's list is unreadable.
     return narrowed or ("deny",)
 

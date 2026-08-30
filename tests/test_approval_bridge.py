@@ -107,6 +107,34 @@ def test_a_host_narrowed_offer_is_narrowed_further_not_widened():
     assert seen[0]["choices"] == ("once", "deny")
 
 
+def test_malformed_or_missing_choices_collapse_to_deny_only():
+    """Fail closed on schema drift: the host always sends ``choices`` as a
+    list of strings, so a missing, non-list, or unrecognizable value must
+    narrow the answer set to deny — never widen it to everything voice
+    could grant."""
+
+    loop = FakeLoop()
+    seen = []
+    talk_approvals.attach_session(loop, seen.append)
+
+    absent = _approval_event()
+    del absent["choices"]
+    talk_approvals._note_event(7, "run_remote_1", absent)
+    assert seen[-1]["choices"] == ("deny",)
+
+    talk_approvals._note_event(8, "run_remote_1", _approval_event(choices=None))
+    assert seen[-1]["choices"] == ("deny",)
+
+    talk_approvals._note_event(9, "run_remote_1", _approval_event(choices="once"))
+    assert seen[-1]["choices"] == ("deny",)
+
+    talk_approvals._note_event(10, "run_remote_1", _approval_event(choices=[1, {"x": 2}]))
+    assert seen[-1]["choices"] == ("deny",)
+
+    talk_approvals._note_event(11, "run_remote_1", _approval_event(choices=["ALWAYS", "Once"]))
+    assert seen[-1]["choices"] == ("deny",)
+
+
 def test_no_attached_session_means_no_prompt_and_no_denial():
     """The dashboard-lane rule: with nobody to ask, the bridge stays out and
     the host's own approval timeout governs — the pre-bridge behavior."""
