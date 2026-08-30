@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.14.0"
+version = "0.15.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"

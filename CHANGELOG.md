@@ -11,7 +11,7 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## 0.15.0 (Unreleased)
+## [0.15.0] — 2026-08-30
 
 The capability bridge: voice becomes the manager of Hermes's whole capability
 surface — the session knows the live install, does what's safe directly,
