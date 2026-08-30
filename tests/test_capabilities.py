@@ -709,3 +709,41 @@ def test_in_process_snapshot_carries_the_tools_resolved_flag(monkeypatch, rest_l
     talk_capabilities.reset_for_tests()
     snap = talk_capabilities.warm()
     assert snap.tools_resolved is False
+def test_wait_until_warm_gives_a_cold_start_the_section_deterministically(monkeypatch):
+    """F8: the session-start mint used to race the background warm — a cold
+    process lost and permanently omitted the live-catalog section. A bounded
+    wait makes the first session deterministic."""
+
+    snapshot = _section_snapshot()
+
+    def slow_resolve():
+        time.sleep(0.05)
+        return snapshot
+
+    monkeypatch.setattr(talk_capabilities, "_resolve_or_explain", slow_resolve)
+    talk_capabilities.reset_for_tests()
+
+    got = talk_capabilities.wait_until_warm(2.0)
+
+    assert got is snapshot
+    assert talk_capabilities.instruction_section(got) is not None
+
+
+def test_wait_until_warm_zero_never_blocks_and_expiry_fails_open(monkeypatch):
+    hold = threading.Event()
+
+    def blocked_resolve():
+        hold.wait(3.0)
+        return _section_snapshot()
+
+    monkeypatch.setattr(talk_capabilities, "_resolve_or_explain", blocked_resolve)
+    talk_capabilities.reset_for_tests()
+    try:
+        started = time.monotonic()
+        assert talk_capabilities.wait_until_warm(0) is None  # 0 = never wait
+        assert talk_capabilities.wait_until_warm(0.05) is None  # bounded expiry
+        assert time.monotonic() - started < 1.0
+        # Fail-open all the way to the prompt: no snapshot, no section, no stall.
+        assert talk_capabilities.instruction_section(None) is None
+    finally:
+        hold.set()

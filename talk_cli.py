@@ -1217,16 +1217,21 @@ async def run_talk_session(
         print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
         host_execution_attachment.close()
         return 1
+    # The live-catalog section rides every lane. A cold process used to lose
+    # the race between the background warm above and this mint — the FIRST
+    # session then permanently lacked the section — so the warm gets a
+    # bounded head start (TALK_CATALOG_STARTUP_WAIT_S, 0 = never wait). On
+    # expiry the session starts exactly as before: section omitted, no stall.
+    catalog_snapshot = talk_capabilities.wait_until_warm(
+        talk_config.catalog_startup_wait_s()
+    )
     instructions = talk_identity.build_instructions(
         talk_host.host().identity_sections(),
         tools=tools,
         host_execution=host_execution_attachment is not None,
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
-        # The live-catalog section rides every lane: instruction_section reads
-        # the cached snapshot and never blocks, so a cold catalog omits the
-        # section rather than stalling or failing the session start.
-        capabilities=talk_capabilities.instruction_section(),
+        capabilities=talk_capabilities.instruction_section(catalog_snapshot),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by

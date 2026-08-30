@@ -79,6 +79,7 @@ DEFAULT_API_SERVER_POLL_S = 1.0
 #: probe verdict above, and for the same reason: what a Hermes install has
 #: installed changes on the timescale of a restart, not of a sentence.
 DEFAULT_CAPABILITY_CATALOG_TTL_S = 30.0
+DEFAULT_CATALOG_STARTUP_WAIT_S = 2.5
 #: Hard wait bound for one in-process remembered-context (Honcho) lookup.
 #: Long enough for a slow index, short enough that a wedged plugin cannot
 #: hold the serialized tool pipeline for the life of the call.
@@ -767,6 +768,27 @@ def capability_catalog_ttl_s() -> float:
     )
 
 
+def catalog_startup_wait_s() -> float:
+    """How long a session start may wait for the FIRST catalog read.
+
+    Bounds the head start that makes the live-catalog prompt section
+    deterministic on a cold process. ``0`` is honored and disables the wait
+    entirely (the pre-#F8 fire-and-forget behavior); junk and negative
+    values take the default. On expiry the session starts exactly as before
+    — section omitted, never a stall.
+    """
+
+    raw = (os.environ.get("TALK_CATALOG_STARTUP_WAIT_S") or "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return DEFAULT_CATALOG_STARTUP_WAIT_S
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_CATALOG_STARTUP_WAIT_S
+
+
 def memory_search_timeout_s() -> float:
     """Wait bound for the in-process remembered-context (Honcho) lookup.
 
@@ -856,6 +878,7 @@ __all__ = [
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_APPROVAL_PROMPT_TIMEOUT_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_CATALOG_STARTUP_WAIT_S",
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_ELEVENLABS_MODEL",
     "DEFAULT_GEMINI_MODEL",
@@ -890,6 +913,7 @@ __all__ = [
     "audio_output_device",
     "cascade_tts",
     "cascade_voice_config",
+    "catalog_startup_wait_s",
     "detect_agent_profile",
     "discord_operator_user_ids",
     "elevenlabs_model",

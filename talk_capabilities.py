@@ -135,6 +135,10 @@ _SNAPSHOT: CatalogSnapshot | None = None
 _SNAPSHOT_AT: float = 0.0
 _STORE_SEQ = 0
 _REFRESHING = False
+#: Set the first time ANY snapshot lands (an honest failure included — waiting
+#: longer would not improve it). :func:`wait_until_warm` blocks on this so a
+#: cold session start can give the background read a bounded head start.
+_FILLED = threading.Event()
 
 
 def _rest_lane_enabled() -> bool:
@@ -330,6 +334,7 @@ def _store(snapshot: CatalogSnapshot, started_seq: int) -> None:
         _STORE_SEQ += 1
         _SNAPSHOT = snapshot
         _SNAPSHOT_AT = time.monotonic()
+    _FILLED.set()
 
 
 def _refresh_in_background() -> None:
@@ -400,6 +405,37 @@ def warm_in_background() -> None:
     """
 
     _refresh_in_background()
+
+
+def wait_until_warm(timeout_s: float) -> CatalogSnapshot | None:
+    """Bounded wait for the FIRST catalog read to land. Fail-open.
+
+    Session starts warm the cache in the background and mint the resident
+    prompt moments later; on a cold process the section used to lose that
+    race and silently omit the live catalog for the whole session. This
+    waits — at most ``timeout_s`` — for a resolved snapshot (a stored
+    failure counts: waiting longer would not improve it) and returns
+    whatever is cached. ``timeout_s <= 0`` never blocks. ``None`` means the
+    wait expired with nothing stored — the caller proceeds exactly as
+    before, and the degraded start is logged so the missing section is
+    visible instead of silent.
+    """
+
+    with _LOCK:
+        cached = _SNAPSHOT
+    if cached is not None:
+        return cached
+    _refresh_in_background()
+    if timeout_s > 0 and _FILLED.wait(timeout_s):
+        with _LOCK:
+            return _SNAPSHOT
+    if timeout_s > 0:
+        _log.info(
+            "capability catalog still warming after %.1fs — this session "
+            "starts without the live-catalog section",
+            timeout_s,
+        )
+    return None
 
 
 # -- the resident-prompt section (capability bridge) -----------------------------
@@ -509,6 +545,7 @@ def reset_for_tests() -> None:
         _SNAPSHOT_AT = 0.0
         _STORE_SEQ += 1
         _REFRESHING = False
+    _FILLED.clear()
 
 
 __all__ = [
@@ -526,6 +563,7 @@ __all__ = [
     "instruction_section",
     "reset_for_tests",
     "status",
+    "wait_until_warm",
     "warm",
     "warm_in_background",
 ]
