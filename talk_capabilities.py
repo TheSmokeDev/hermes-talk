@@ -105,9 +105,12 @@ class CatalogSnapshot:
 
     ``tools`` is the LIVE resolved tool-name set — present only from the
     in-process tier, where ``get_tool_definitions`` applies the registry's
-    availability gates. The REST tier cannot answer liveness and leaves it
-    empty; empty therefore means "no live answer", never "nothing resolved",
-    and consumers must not treat it as zero capability.
+    availability gates. ``tools_resolved`` is what separates the two
+    meanings an empty tuple would otherwise collapse: ``True`` means the
+    live read SUCCEEDED (an empty set is then a real answer — nothing
+    resolves right now, and consumers must filter against it, not fall back
+    to static flags); ``False`` means there is no live answer at all (the
+    REST tier, or a failed read — static enabled/configured flags govern).
     """
 
     source: str
@@ -117,6 +120,7 @@ class CatalogSnapshot:
     health: dict
     detail: str
     tools: tuple[str, ...] = ()
+    tools_resolved: bool = False
 
 
 #: Cached snapshot + when it was taken. Guarded for the same reason
@@ -252,6 +256,7 @@ def _from_in_process() -> CatalogSnapshot | None:
             if isinstance(tools, list)
             else ()
         ),
+        tools_resolved=bool(payload.get("tools_resolved")) and isinstance(tools, list),
     )
 
 
@@ -451,7 +456,10 @@ def instruction_section(snapshot: CatalogSnapshot | None = None) -> str | None:
     if snap.source == SOURCE_NONE:
         return None
     skill_count = sum(1 for entry in snap.skills if _usable(entry))
-    live = set(snap.tools)
+    # The flag, not the tuple's truthiness: a successful zero-tool resolution
+    # must filter (claiming nothing usable is then the truth), and only a
+    # missing live answer falls back to the static enabled/configured flags.
+    live = set(snap.tools) if snap.tools_resolved else None
     categories: list[str] = []
     for entry in snap.toolsets:
         if not _usable(entry):
@@ -459,7 +467,7 @@ def instruction_section(snapshot: CatalogSnapshot | None = None) -> str | None:
         name = _section_name(entry.get("name") or entry.get("label"))
         if name is None or name in categories:
             continue
-        if live:
+        if live is not None:
             tools = entry.get("tools")
             if isinstance(tools, list) and not any(
                 isinstance(tool, str) and tool in live for tool in tools

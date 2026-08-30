@@ -573,6 +573,9 @@ def _section_snapshot(**overrides) -> talk_capabilities.CatalogSnapshot:
         "tools": (),
     }
     base.update(overrides)
+    # Passing a live tool set implies the live read succeeded, unless the
+    # test says otherwise — the F7 zero-tool cases pass the flag explicitly.
+    base.setdefault("tools_resolved", bool(base["tools"]))
     return talk_capabilities.CatalogSnapshot(**base)
 
 
@@ -671,3 +674,38 @@ def test_section_defaults_to_the_cached_snapshot(monkeypatch, rest_lane_on):
 
     assert section is not None
     assert "browser" in section
+def test_section_with_a_successful_zero_tool_read_claims_no_categories():
+    """F7: a live read that resolved ZERO tools is a real answer — static
+    enabled/configured flags must not resurrect categories the registry's
+    availability gates just refused. The skill count still rides."""
+
+    snapshot = _section_snapshot(tools=(), tools_resolved=True)
+
+    section = talk_capabilities.instruction_section(snapshot)
+    assert "browser" not in section
+    assert "usable right now" not in section
+    assert "1 skill installed" in section
+
+
+def test_in_process_snapshot_carries_the_tools_resolved_flag(monkeypatch, rest_lane_on):
+    """The flag survives the payload -> snapshot hop for both answers."""
+
+    base = {"skills": [], "toolsets": [{"name": "browser"}]}
+
+    monkeypatch.setattr(
+        talk_host.HostAdapter,
+        "capability_catalog_probe",
+        lambda _self: json.dumps(dict(base, tools=[], tools_resolved=True)),
+    )
+    snap = talk_capabilities.warm()
+    assert snap.source == talk_capabilities.SOURCE_IN_PROCESS
+    assert snap.tools_resolved is True and snap.tools == ()
+
+    monkeypatch.setattr(
+        talk_host.HostAdapter,
+        "capability_catalog_probe",
+        lambda _self: json.dumps(dict(base, tools=[], tools_resolved=False)),
+    )
+    talk_capabilities.reset_for_tests()
+    snap = talk_capabilities.warm()
+    assert snap.tools_resolved is False

@@ -173,6 +173,7 @@ def _catalog_from_host_modules() -> dict | None:
         return None
 
     resolved: list[str] = []
+    tools_resolved = False
     try:
         from model_tools import get_tool_definitions
 
@@ -187,6 +188,10 @@ def _catalog_from_host_modules() -> dict | None:
                 and isinstance(definition["function"].get("name"), str)
             }
         )
+        # A successful read that resolved ZERO tools is a real live answer —
+        # the flag, not the list's truthiness, is what distinguishes it from
+        # "the read failed".
+        tools_resolved = True
     except Exception as exc:  # noqa: BLE001 — liveness is additive, not required
         _log.debug("in-process resolved-tool read failed: %s: %s", type(exc).__name__, exc)
 
@@ -194,6 +199,7 @@ def _catalog_from_host_modules() -> dict | None:
         "skills": [entry for entry in skills if isinstance(entry, dict)],
         "toolsets": toolsets,
         "tools": resolved,
+        "tools_resolved": tools_resolved,
         # The in-process tier has no gateway feature document or run counters;
         # the bounded readers treat absent as empty either way.
         "capabilities": {},
