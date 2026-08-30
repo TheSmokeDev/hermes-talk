@@ -87,12 +87,20 @@ class _PendingApproval:
     ``opened`` flips only when the prompt was actually handed to the wire —
     the deny timer arms then, not at registration, so a prompt deferred
     behind live speech never times out before the operator has heard it.
+
+    ``resolving`` flips while a spoken answer's POST is in flight: the deny
+    timer stands down (an answer on the wire is not silence), barge-in skips
+    it (it is not an unanswered question), and a second resolve is refused.
+    A transport failure reopens the record via :func:`_reopen`; a late
+    ``ok``/``gone`` verdict finalizes it — the record can never be denied on
+    top of an answer the host already accepted.
     """
 
     api_run_id: str
     request_text: str
     choices: tuple[str, ...]
     opened: bool = False
+    resolving: bool = False
     timer: threading.Timer | None = None
 
     def cancel_timer(self) -> None:
@@ -226,8 +234,15 @@ def _register(run_id: int, api_run_id: str, event: dict) -> None:
         if run_id in _PENDING:
             _PENDING.pop(run_id).cancel_timer()
         if len(_PENDING) >= _MAX_PENDING:
-            evicted_run_id = next(iter(_PENDING))
-            evicted = _PENDING.pop(evicted_run_id)
+            # Never evict a record whose answer is in flight — denying an
+            # approval the host may have just accepted is the contradiction
+            # F3 exists to prevent. All-resolving overflow is brief (each
+            # verdict finalizes or reopens) and bounded by the cap itself.
+            evicted_run_id = next(
+                (rid for rid, p in _PENDING.items() if not p.resolving), None
+            )
+            if evicted_run_id is not None:
+                evicted = _PENDING.pop(evicted_run_id)
         _PENDING[run_id] = pending
     if evicted is not None:
         _log.warning(
@@ -276,6 +291,11 @@ def note_prompt_sent(run_id: int) -> None:
         if pending is None or pending.opened:
             return
         pending.opened = True
+        if pending.resolving:
+            # The answer beat the prompt to the wire (a deferred announcement
+            # can land after the operator already spoke). Record the send;
+            # arm nothing — _reopen restores the floor if the answer fails.
+            return
         timer = threading.Timer(
             talk_config.approval_prompt_timeout_s(), _expire, args=(run_id,)
         )
@@ -305,12 +325,40 @@ def _annotate(run_id: int, outcome: str) -> None:
         _log.debug("approval receipt annotation failed for run %s", run_id, exc_info=True)
 
 
+def _reopen(run_id: int, pending: _PendingApproval) -> None:
+    """A transport failure: the answer never landed, so the record answers
+    again. Restore the fail-closed floor — an opened prompt re-arms a FRESH
+    deny timer (generous, but bounded; the host's own approval timeout is
+    the outer floor either way)."""
+
+    with _LOCK:
+        current = _PENDING.get(run_id)
+        if current is not pending:
+            return
+        current.resolving = False
+        if current.opened and current.timer is None:
+            timer = threading.Timer(
+                talk_config.approval_prompt_timeout_s(), _expire, args=(run_id,)
+            )
+            timer.daemon = True
+            current.timer = timer
+            timer.start()
+
+
 def _expire(run_id: int) -> None:
     """Timer fire: the prompt went unanswered — deny. Silence is not consent."""
 
-    pending = _clear(run_id)
-    if pending is None:
-        return
+    with _LOCK:
+        pending = _PENDING.get(run_id)
+        if pending is None or pending.resolving:
+            # Answered, cleared, or an answer is in flight — not silence.
+            # A skipped timer is spent: drop the handle so a later _reopen
+            # can arm a fresh one.
+            if pending is not None:
+                pending.timer = None
+            return
+        del _PENDING[run_id]
+    pending.cancel_timer()
     _log.warning("approval prompt for run %s timed out — denying", run_id)
     _annotate(run_id, "denied: no answer before the prompt timed out")
     _spawn_daemon(_post_choice, pending.api_run_id, "deny", name="talk-approval-timeout")
@@ -332,12 +380,14 @@ def note_barge_in() -> bool:
     """
 
     with _LOCK:
-        opened = [run_id for run_id, p in _PENDING.items() if p.opened]
+        interrupted = [
+            (run_id, p) for run_id, p in _PENDING.items() if p.opened and not p.resolving
+        ]
+        for run_id, _pending in interrupted:
+            del _PENDING[run_id]
     denied = False
-    for run_id in opened:
-        pending = _clear(run_id)
-        if pending is None:
-            continue
+    for run_id, pending in interrupted:
+        pending.cancel_timer()
         denied = True
         _log.warning("approval prompt for run %s interrupted — denying", run_id)
         _annotate(run_id, "denied: the operator interrupted the approval question")
@@ -370,6 +420,16 @@ def resolve(run_id: int, choice: str) -> str:
         )
     with _LOCK:
         pending = _PENDING.get(run_id)
+        claimed = (
+            pending is not None and choice in pending.choices and not pending.resolving
+        )
+        if claimed:
+            # The answer owns the record now: the deny timer stands down (a
+            # spoken answer on the wire is not silence), barge-in skips it,
+            # and a second resolve is refused until this verdict lands. A
+            # transport failure hands the record back via _reopen.
+            pending.resolving = True
+            pending.cancel_timer()
     if pending is None:
         return (
             f"I don't have a pending approval for run {run_id} — it may already "
@@ -379,6 +439,11 @@ def resolve(run_id: int, choice: str) -> str:
         return (
             f"The host didn't offer '{choice}' for this one — it offered: "
             f"{', '.join(pending.choices)}."
+        )
+    if not claimed:
+        return (
+            f"I'm already sending an answer for run {run_id} — ask me in a "
+            "moment and I'll have the receipt."
         )
 
     # Off the courtesy-wait path: the POST runs on a daemon with a bounded
@@ -396,9 +461,20 @@ def resolve(run_id: int, choice: str) -> str:
         # The answer is on its way; the late verdict lands on the run's meta
         # where check_work can read it — a daemon receipt dies with the
         # process, so the durable record carries it (same finding as stop).
-        def _late(_rid: int = run_id, _choice: str = choice) -> None:
+        def _late(
+            _rid: int = run_id,
+            _choice: str = choice,
+            _pending: _PendingApproval = pending,
+        ) -> None:
             late_kind, late_detail = outcomes.get()
             _annotate(_rid, f"{_choice}: {_late_wording(late_kind, late_detail)}")
+            if late_kind in ("ok", "gone"):
+                # The host accepted (or had already settled) this approval —
+                # finalize the record so no timer or barge-in can deny on top
+                # of an answer that landed.
+                _clear(_rid)
+            else:
+                _reopen(_rid, _pending)
 
         _spawn_daemon(_late, name="talk-approval-late")
         return (
@@ -406,6 +482,7 @@ def resolve(run_id: int, choice: str) -> str:
             "yet; ask me in a moment and I'll have the receipt."
         )
     if verdict == "err":
+        _reopen(run_id, pending)
         return (
             f"That answer didn't go through ({detail}) — the approval for run "
             f"{run_id} is still open; answer again, or let it time out denied."

@@ -293,6 +293,105 @@ def test_a_transport_failure_keeps_the_approval_open(monkeypatch):
     assert talk_approvals.has_pending(7)
 
 
+# -- resolving state: an answer in flight owns the record (F3) --------------------
+
+
+def test_a_late_timer_cannot_deny_an_answer_in_flight(monkeypatch):
+    """The deny timer stands down the moment a spoken answer claims the
+    record: a timer firing late (or a barge-in) while the POST is on the wire
+    must not stack a deny on top of an answer the host may accept."""
+
+    release = threading.Event()
+    posts = []
+
+    def slow_accept(run_id, choice):
+        release.wait(3.0)
+        posts.append((run_id, choice))
+        return {"resolved": 1}
+
+    monkeypatch.setattr(talk_approvals.talk_apiserver, "respond_to_approval", slow_accept)
+    monkeypatch.setattr(talk_approvals, "RESOLVE_CONFIRM_WAIT_S", 0.01)
+    monkeypatch.setenv("TALK_APPROVAL_PROMPT_TIMEOUT_S", "30")
+    talk_approvals.attach_session(FakeLoop(), lambda event: None)
+    talk_approvals._note_event(7, "run_remote_1", _approval_event())
+    talk_approvals.note_prompt_sent(7)
+
+    receipt = talk_approvals.resolve(7, "once")
+    assert "Sending 'once'" in receipt
+
+    talk_approvals._expire(7)  # the old timer firing late — must skip
+    assert talk_approvals.note_barge_in() is False  # not an unanswered question
+    assert talk_approvals.has_pending(7)  # still owned by the in-flight answer
+
+    release.set()
+    assert _wait_for(lambda: not talk_approvals.has_pending(7))
+    assert posts == [("run_remote_1", "once")]  # exactly one POST — no deny
+
+
+def test_a_second_answer_while_one_is_in_flight_is_refused(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    posts = []
+
+    def slow_accept(run_id, choice):
+        started.set()
+        release.wait(3.0)
+        posts.append((run_id, choice))
+        return {"resolved": 1}
+
+    monkeypatch.setattr(talk_approvals.talk_apiserver, "respond_to_approval", slow_accept)
+    monkeypatch.setattr(talk_approvals, "RESOLVE_CONFIRM_WAIT_S", 0.01)
+    _register(FakeLoop())
+
+    first = talk_approvals.resolve(7, "once")
+    assert "Sending 'once'" in first
+    assert started.wait(1.0)
+
+    second = talk_approvals.resolve(7, "deny")
+    assert "already sending an answer" in second
+
+    release.set()
+    assert _wait_for(lambda: not talk_approvals.has_pending(7))
+    assert posts == [("run_remote_1", "once")]
+
+
+def test_a_late_transport_failure_reopens_the_record_and_rearms_the_floor(monkeypatch):
+    """A POST that fails after the courtesy wait hands the record back: the
+    approval is answerable again AND the fail-closed deny timer is re-armed —
+    a transport failure must never leave an opened prompt floorless."""
+
+    calls = []
+    release = threading.Event()
+    denied = threading.Event()
+
+    def failing_then_deny(run_id, choice):
+        if choice == "deny":
+            calls.append(choice)
+            denied.set()
+            return {"resolved": 1}
+        release.wait(3.0)
+        calls.append(choice)
+        raise talk_apiserver.TalkApiServerError("refused (500)")
+
+    monkeypatch.setattr(
+        talk_approvals.talk_apiserver, "respond_to_approval", failing_then_deny
+    )
+    monkeypatch.setattr(talk_approvals, "RESOLVE_CONFIRM_WAIT_S", 0.01)
+    monkeypatch.setenv("TALK_APPROVAL_PROMPT_TIMEOUT_S", "0.25")
+    talk_approvals.attach_session(FakeLoop(), lambda event: None)
+    talk_approvals._note_event(7, "run_remote_1", _approval_event())
+    talk_approvals.note_prompt_sent(7)
+
+    receipt = talk_approvals.resolve(7, "once")
+    assert "Sending 'once'" in receipt
+    release.set()
+
+    # The late failure reopens the record, and the re-armed timer denies it.
+    assert denied.wait(3.0), "the re-armed deny timer never fired"
+    assert calls == ["once", "deny"]
+    assert _wait_for(lambda: not talk_approvals.has_pending(7))
+
+
 # -- timeout and barge-in: both deny ----------------------------------------------
 
 
