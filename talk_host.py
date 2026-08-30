@@ -40,6 +40,7 @@ a bare ``hermes -z`` cannot resolve a model and the child dies immediately.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
@@ -1181,10 +1182,8 @@ class HostAdapter:
                 out, err = proc.communicate(timeout=talk_config.agent_timeout_s())
             except subprocess.TimeoutExpired:
                 proc.kill()
-                try:
+                with contextlib.suppress(Exception):  # the reap is best-effort
                     proc.communicate(timeout=5)
-                except Exception:  # noqa: BLE001 — the reap is best-effort
-                    pass
                 return (
                     "I couldn't finish that work — the Hermes one-shot ran "
                     "past its time budget"

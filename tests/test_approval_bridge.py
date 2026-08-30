@@ -269,7 +269,9 @@ def test_a_gone_approval_clears_the_record_and_says_so(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda *_, **__: (_ for _ in ()).throw(talk_apiserver.ApprovalGoneError("already answered")),
+        lambda *_, **__: (_ for _ in ()).throw(
+            talk_apiserver.ApprovalGoneError("already answered")
+        ),
     )
     _register(FakeLoop())
 
