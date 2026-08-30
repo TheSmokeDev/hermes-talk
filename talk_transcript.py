@@ -1,4 +1,10 @@
-"""Durable Talk transcript capture and crash-safe memory handoff."""
+"""Durable Talk transcript capture and crash-safe memory handoff.
+
+The handoff is maintenance, not user-visible work: it runs at session
+boundaries, when no Talk connection may be bound. A flush that cannot start
+for want of an agent lane raises :class:`FlushDeferred` and the transcript is
+RESTORED for the next sweep — never dropped unread.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +29,16 @@ _HANDOFF_LOCK = threading.Lock()
 _CHILD_SESSION_PATTERN = re.compile(r"\b\d{8}_\d{6}_[A-Za-z0-9]+\b")
 
 
+class FlushDeferred(Exception):
+    """No agent lane exists for the handoff right now — queue, don't drop.
+
+    Distinct from a flush FAILURE on purpose: a refusal from a real lane is
+    an answer (the transcript is dropped, today as before); the absence of
+    any lane is transient — the next session start or session-end sweep is
+    expected to have one.
+    """
+
+
 def handoff_status() -> dict[str, str]:
     """Return bounded handoff metadata, never transcript text or an absence claim."""
 
@@ -45,6 +61,14 @@ def _record_handoff_failure() -> None:
     with _HANDOFF_LOCK:
         _HANDOFF_STATUS.clear()
         _HANDOFF_STATUS["state"] = "handoff failed"
+
+
+def _record_handoff_deferred() -> None:
+    """No lane this sweep; the transcript persists for the next one."""
+
+    with _HANDOFF_LOCK:
+        _HANDOFF_STATUS.clear()
+        _HANDOFF_STATUS["state"] = "handoff deferred"
 
 
 def reset_status_for_tests() -> None:
@@ -281,7 +305,28 @@ def _default_run_agent(prompt: str) -> str:
     except ImportError:  # pragma: no cover - flat-module fallback
         import talk_host
 
-    return talk_host.host().run_agent(prompt, background=False)
+    return talk_host.host().flush_agent(prompt)
+
+
+def _restore_claim(claimed: Path) -> None:
+    """Un-claim a deferred transcript so the next sweep retries the SAME file.
+
+    The claim rename is ours alone (the lease proves it), so restoring the
+    original name cannot collide with a live writer. Fail-open in the safe
+    direction: a restore that cannot land leaves the ``.claimed-*`` file for
+    the next sweep's claim recovery — the transcript is never deleted on a
+    deferral path.
+    """
+
+    restored = claimed.with_name(claimed.name.split(".claimed-", 1)[0])
+    try:
+        os.rename(claimed, restored)
+    except OSError as exc:
+        _log.warning(
+            "deferred Talk transcript could not be restored to %s: %s",
+            restored.name,
+            exc,
+        )
 
 
 def _finish_claim(
@@ -290,23 +335,46 @@ def _finish_claim(
     lease: _Lease,
     flush: Callable[[str], object],
 ) -> None:
-    """Process one descriptor-bound claim, then drop it regardless of outcome."""
+    """Process one descriptor-bound claim; delete it only on a proven handoff.
 
+    The transcript is the only copy, so deletion requires proof: a
+    WORK_STARTED receipt (a live parent agent accepted and owns the work) or
+    a FLUSH_DONE receipt (the review completed synchronously). EVERY other
+    outcome — a refusal, a failed run, a nonzero one-shot exit, an exception,
+    or :class:`FlushDeferred` (no lane at all) — restores the file for the
+    next sweep. At-least-once by design: a rare duplicate memory review
+    replaces silent loss, and a process death mid-flush leaves a
+    ``.claimed-*`` file the next sweep re-claims through its lease.
+    """
+
+    keep = False
     try:
         turns = _read_turns(transcript_fd)
         chars = sum(len(turn["text"]) for turn in turns)
         if len(turns) < MIN_TURNS or chars < MIN_CHARS:
             return
         result = flush(_memory_prompt(turns))
-        if isinstance(result, str) and not result.startswith("WORK_STARTED"):
+        if isinstance(result, str) and not result.startswith(
+            ("WORK_STARTED", "FLUSH_DONE")
+        ):
+            keep = True
             _record_handoff_failure()
-            _log.warning("Talk transcript memory handoff was refused and dropped: %s", result)
+            _log.warning(
+                "Talk transcript memory handoff failed; keeping the transcript "
+                "for the next sweep: %s",
+                result,
+            )
         else:
             _record_handoff(result)
+    except FlushDeferred as exc:
+        keep = True
+        _record_handoff_deferred()
+        _log.warning("Talk transcript memory handoff deferred for a later sweep: %s", exc)
     except Exception as exc:  # noqa: BLE001 - one bad memory handoff is isolated
+        keep = True
         _record_handoff_failure()
         _log.warning(
-            "dropping claimed Talk transcript after flush failure: %s: %s",
+            "keeping claimed Talk transcript after a flush failure: %s: %s",
             type(exc).__name__,
             exc,
         )
@@ -314,7 +382,10 @@ def _finish_claim(
         try:
             with suppress(OSError):
                 os.close(transcript_fd)
-            claimed.unlink(missing_ok=True)
+            if keep:
+                _restore_claim(claimed)
+            else:
+                claimed.unlink(missing_ok=True)
         except OSError as exc:
             _log.warning("claimed Talk transcript could not be deleted: %s", exc)
         finally:

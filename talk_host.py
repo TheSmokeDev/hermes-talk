@@ -40,6 +40,7 @@ a bare ``hermes -z`` cannot resolve a model and the child dies immediately.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
@@ -53,20 +54,24 @@ from typing import Any
 try:
     from . import (
         talk_apiserver,
+        talk_approvals,
         talk_auth,
         talk_config,
         talk_progress,
         talk_runs,
         talk_steer,
+        talk_transcript,
         talk_vault,
     )
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
+    import talk_approvals
     import talk_auth
     import talk_config
     import talk_progress
     import talk_runs
     import talk_steer
+    import talk_transcript
     import talk_vault
 
 _log = logging.getLogger(__name__)
@@ -105,14 +110,102 @@ DELEGATE_TOOL_NAME = "delegate_task"
 #: without it fall back to :func:`_steer_via_registry`.
 STEER_TOOL_NAME = "steer_subagent"
 
-#: Best-effort in-process catalog read. Unlike the ``/v1/*`` routes, this repo
-#: has no visibility into a Hermes host's internal dispatch registry, so the
-#: name is a guess by construction — and safe to guess, because a host that
-#: has no such tool answers with the "unknown tool" marker
-#: :func:`_agent_loop_absent` already generalizes over, and the caller falls
-#: through to the api_server lane. Wrong here costs the fast path, not the
-#: feature.
-CAPABILITY_CATALOG_TOOL_NAME = "list_capabilities"
+def _catalog_from_host_modules() -> dict | None:
+    """Enumerate the capability catalog from the host's own registries.
+
+    ``None`` means "no answer here" — the host modules are absent or one of
+    the reads failed — never "nothing is installed". The skills and toolsets
+    reads are the SAME builders the api_server's catalog routes run
+    (``gateway/platforms/api_server.py`` ``_handle_skills`` /
+    ``_handle_toolsets``), so the in-process tier and the REST tier answer
+    from one source of truth instead of drifting apart.
+
+    The ``tools`` read is the LIVE answer: ``get_tool_definitions`` applies
+    the registry's ``check_fn`` availability gates (a tool whose driver or
+    keys are missing simply does not resolve), which the static
+    enabled/configured toolset flags cannot see. It degrades to an empty
+    list on its own failure rather than failing the catalog — the REST tier
+    carries no such field, so nothing downstream may treat empty as
+    "nothing resolved".
+
+    All-or-nothing on skills/toolsets, matching :mod:`talk_capabilities`'s
+    REST doctrine: a half-read catalog would be spoken as though the missing
+    half did not exist.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import (
+            _get_effective_configurable_toolsets,
+            _get_platform_tools,
+            _toolset_has_keys,
+            get_nous_subscription_features,
+        )
+        from tools.skills_tool import _find_all_skills, _sort_skills
+        from toolsets import resolve_toolset
+    except Exception as exc:  # noqa: BLE001 — no host registries in this process
+        _log.debug("in-process catalog modules unavailable: %s: %s", type(exc).__name__, exc)
+        return None
+    try:
+        skills = _sort_skills(_find_all_skills(skip_disabled=False))
+        config = load_config()
+        enabled_toolsets = _get_platform_tools(
+            config, "api_server", include_default_mcp_servers=False
+        )
+        features = get_nous_subscription_features(config)
+        toolsets: list[dict] = []
+        for name, label, desc in _get_effective_configurable_toolsets():
+            try:
+                tools = sorted(set(resolve_toolset(name)))
+            except Exception:  # noqa: BLE001 — the route degrades the same way
+                tools = []
+            toolsets.append(
+                {
+                    "name": name,
+                    "label": label,
+                    "description": desc,
+                    "enabled": name in enabled_toolsets,
+                    "configured": _toolset_has_keys(name, config, features=features),
+                    "tools": tools,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — half a catalog is no catalog
+        _log.debug("in-process catalog read failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+    resolved: list[str] = []
+    tools_resolved = False
+    try:
+        from model_tools import get_tool_definitions
+
+        resolved = sorted(
+            {
+                str(definition["function"]["name"])
+                for definition in get_tool_definitions(
+                    quiet_mode=True, skip_tool_search_assembly=True
+                )
+                if isinstance(definition, dict)
+                and isinstance(definition.get("function"), dict)
+                and isinstance(definition["function"].get("name"), str)
+            }
+        )
+        # A successful read that resolved ZERO tools is a real live answer —
+        # the flag, not the list's truthiness, is what distinguishes it from
+        # "the read failed".
+        tools_resolved = True
+    except Exception as exc:  # noqa: BLE001 — liveness is additive, not required
+        _log.debug("in-process resolved-tool read failed: %s: %s", type(exc).__name__, exc)
+
+    return {
+        "skills": [entry for entry in skills if isinstance(entry, dict)],
+        "toolsets": toolsets,
+        "tools": resolved,
+        "tools_resolved": tools_resolved,
+        # The in-process tier has no gateway feature document or run counters;
+        # the bounded readers treat absent as empty either way.
+        "capabilities": {},
+        "health": {},
+    }
 
 #: Hermes's Honcho memory plugin's query-shaped read surface. A guess by the
 #: same construction as :data:`CAPABILITY_CATALOG_TOOL_NAME` and safe for the
@@ -373,30 +466,49 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
 
     def worker(run_id: int) -> str:
         talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
+        # The same spawn stamp the SSE sidecar carries: a poll tap that
+        # outlives its session must not reconcile prompts into the next one.
+        approval_generation = talk_approvals.current_generation()
+        remote: dict[str, str] = {}
+
+        def _on_start(api_run_id: str) -> None:
+            # The remote id is stop_work's only address for this run —
+            # without it the lane is stop-capable in theory and
+            # unstoppable in practice. It is also the ONLY handle a
+            # reconnect could resume tracking by, and in memory alone it
+            # died with the process that is, by definition, the one that
+            # is gone — so it rides the STRICT locked append
+            # (durable=True: retried once, escalated to an error log if
+            # it still cannot land), never the fail-open telemetry tee.
+            talk_runs.annotate_run(run_id, durable=True, api_run_id=api_run_id)
+            remote["api_run_id"] = api_run_id
+            # The spoken approval bridge: the SSE sidecar that turns the
+            # run's approval.request events into a spoken prompt. One daemon
+            # thread per run, closed by the host when the run ends.
+            talk_approvals.watch_run(run_id, api_run_id)
+
+        def _on_poll(payload) -> None:
+            # Progress tap (hermes-talk#33): each poll's status payload is
+            # THIS run's own — the per-run addressing is what makes the
+            # projection incapable of cross-routing. The payload's
+            # last_event maps to a bounded phase; its session id is the
+            # correlator the same-process hook projection keys on.
+            talk_progress.project_api_poll(run_id, payload)
+            api_run_id = remote.get("api_run_id")
+            if api_run_id:
+                # The approval backstop: if this run's SSE sidecar died, the
+                # poll is the only ear left — reconcile a spoken prompt.
+                talk_approvals.reconcile_from_poll(
+                    run_id, api_run_id, payload, approval_generation
+                )
+
         try:
             return talk_apiserver.run_to_completion(
                 task,
                 session_id=session_id,
                 session_key=session_key,
-                # The remote id is stop_work's only address for this run —
-                # without it the lane is stop-capable in theory and
-                # unstoppable in practice. It is also the ONLY handle a
-                # reconnect could resume tracking by, and in memory alone it
-                # died with the process that is, by definition, the one that
-                # is gone — so it rides the STRICT locked append
-                # (durable=True: retried once, escalated to an error log if
-                # it still cannot land), never the fail-open telemetry tee.
-                on_start=lambda api_run_id: talk_runs.annotate_run(
-                    run_id, durable=True, api_run_id=api_run_id
-                ),
-                # Progress tap (hermes-talk#33): each poll's status payload is
-                # THIS run's own — the per-run addressing is what makes the
-                # projection incapable of cross-routing. The payload's
-                # last_event maps to a bounded phase; its session id is the
-                # correlator the same-process hook projection keys on.
-                on_event=lambda payload: talk_progress.project_api_poll(
-                    run_id, payload
-                ),
+                on_start=_on_start,
+                on_event=_on_poll,
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
             message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
@@ -792,27 +904,21 @@ class HostAdapter:
     def capability_catalog_probe(self) -> str | None:
         """Read this host's own capability catalog in-process. NEVER raises.
 
-        Returns the raw dispatch result when the attached Hermes exposes
-        :data:`CAPABILITY_CATALOG_TOOL_NAME`, or ``None`` when there is no
-        bound context, the host does not know that tool, or the call failed.
-        ``None`` means "ask the api_server instead", never "this install has
-        no capabilities" — an empty catalog and an unreadable one are
-        different sentences and must not collapse into one.
+        Returns the catalog JSON when this process holds Hermes's registries
+        (see :func:`_catalog_from_host_modules`), or ``None`` when it does
+        not or the read failed. ``None`` means "ask the api_server instead",
+        never "this install has no capabilities" — an empty catalog and an
+        unreadable one are different sentences and must not collapse into
+        one.
         """
 
-        ctx = get_ctx()
-        if ctx is None:
+        payload = _catalog_from_host_modules()
+        if payload is None:
             return None
         try:
-            raw = ctx.dispatch_tool(CAPABILITY_CATALOG_TOOL_NAME, {})
-        except Exception as exc:  # noqa: BLE001 — an in-process probe is never fatal
-            _log.warning(
-                "in-process capability probe failed: %s: %s", type(exc).__name__, exc
-            )
+            return json.dumps(payload, default=str)
+        except (TypeError, ValueError):  # pragma: no cover - plain data by construction
             return None
-        if _agent_loop_absent(raw, CAPABILITY_CATALOG_TOOL_NAME):
-            return None
-        return raw if isinstance(raw, str) else json.dumps(raw, default=str)
 
     def search_memory(self, query: str, limit: int = 5) -> str:
         """Search past Hermes sessions for what was said about ``query``.
@@ -1004,6 +1110,97 @@ class HostAdapter:
         return (
             f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running as a "
             "detached Hermes agent; I'll tell you when it lands."
+        )
+
+    def flush_agent(self, prompt: str) -> str:
+        """Run one maintenance flush — NO live Talk connection required.
+
+        The transcript memory handoff runs at session boundaries, which are
+        exactly the moments the run registry's return-route ticket
+        (hermes-talk#35) is legitimately absent: the owner detached before
+        the sweep, or the session-end hook fired in a process that never
+        attached one. Routing the flush through :meth:`run_agent` therefore
+        refused every time — "no Talk connection is bound" — and the
+        transcript was dropped unread. This ladder is the same three tiers
+        minus the ticket: nobody is listening, so nothing here speaks a
+        result, registers a run, or asks for approval.
+
+        The receipt contract (:mod:`talk_transcript` reads the prefix): a
+        WORK_STARTED receipt means a live parent agent ACCEPTED and owns the
+        handoff (tier 1 — the host's delegation registry persists it); a
+        FLUSH_DONE receipt means the review actually COMPLETED (tiers 2-3
+        run synchronously, on purpose — the caller is already a detached
+        worker thread, and the claim's fate depends on this outcome: a
+        started-but-unproven daemon was how transcripts kept getting lost).
+        Any other string is a failure the caller keeps the transcript for.
+        Raises :class:`talk_transcript.FlushDeferred` — never a spoken
+        refusal — when NO lane exists at all.
+        """
+
+        ctx = get_ctx()
+        if ctx is not None:
+            try:
+                raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
+            except Exception as exc:  # noqa: BLE001 — a flush failure is a failure
+                return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+            if not _agent_loop_absent(raw):
+                spoken = _speakable(raw)
+                if spoken.startswith("that failed"):
+                    return f"I couldn't start that work — {spoken}"
+                return f"WORK_STARTED — {spoken}"
+
+        if talk_apiserver.is_available():
+            session_key = talk_config.session_key()
+            try:
+                outcome = talk_apiserver.run_to_completion(
+                    prompt, session_id=None, session_key=session_key
+                )
+            except Exception as exc:  # noqa: BLE001 — the flush did not land
+                return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
+            # run_to_completion's documented failure shape is returned text,
+            # not an exception: "the agent run failed/cancelled: ...".
+            if outcome.startswith("the agent run "):
+                return f"I couldn't finish that work — {outcome}"
+            _log.info("transcript memory handoff completed: %.200s", outcome)
+            return "FLUSH_DONE — memory review completed through the api server"
+
+        binary = hermes_binary()
+        if binary is not None:
+            profile = talk_config.agent_profile()
+            try:
+                proc = subprocess.Popen(
+                    agent_argv(binary, prompt, profile),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except Exception as exc:  # noqa: BLE001 — a spawn failure is a failure
+                return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
+            try:
+                out, err = proc.communicate(timeout=talk_config.agent_timeout_s())
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(Exception):  # the reap is best-effort
+                    proc.communicate(timeout=5)
+                return (
+                    "I couldn't finish that work — the Hermes one-shot ran "
+                    "past its time budget"
+                )
+            except Exception as exc:  # noqa: BLE001 — the flush did not land
+                return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
+            if proc.returncode != 0:
+                detail = (err or out or "").strip()[:200]
+                return (
+                    "I couldn't finish that work — the Hermes one-shot exited "
+                    f"{proc.returncode}: {detail}"
+                )
+            _log.info("transcript memory handoff exited: %.200s", (out or err or ""))
+            return "FLUSH_DONE — memory review completed by a detached Hermes one-shot"
+
+        raise talk_transcript.FlushDeferred(
+            "no agent lane is available for the transcript handoff"
         )
 
 

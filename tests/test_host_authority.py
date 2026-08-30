@@ -436,3 +436,93 @@ def test_a_catalog_read_cannot_be_replayed_as_a_mutating_call(monkeypatch):
 
     assert len(attachment.minted) == 0
     assert any("not run" in cmd.output for cmd in results[0])
+
+
+# ---------- Transport-independent classification (capability bridge, F1) ----------
+
+
+def _local_event(name, arguments, call_id="call-1", item_id="item-1"):
+    return {
+        "response_id": "resp-1",
+        "item_id": item_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def test_local_lane_never_dispatches_a_delegate_class_host_tool():
+    """The classification gate rides ABOVE the transport authorizer: even the
+    all-permitting local single-speaker authorizer cannot dispatch a
+    destructive or unclassified host tool bare — its in-handler approval
+    gates fail open on the plugin thread. The denial steers to delegation
+    instead of refusing flat."""
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=talk_cli.local_operator_authorizer
+    )
+    events = [
+        _local_event(
+            "computer_use", '{"action": "click", "coordinate": [5, 5]}', "call-1", "item-1"
+        ),
+        _local_event("terminal_command", '{"command": "rm -rf ./x"}', "call-2", "item-2"),
+        _local_event("tool_describe", '{"name": "anything"}', "call-3", "item-3"),
+    ]
+
+    results = _run_batch(relay, events)
+
+    assert attachment.minted == []  # nothing reached the canonical host batch
+    for result in results:
+        assert "was not run" in result[0].output
+        assert "spin up an agent" in result[0].output
+
+
+def test_local_lane_still_dispatches_inline_safe_permit_reads_and_talk_tools():
+    """What the gate does NOT catch: curated read-only host tools, the
+    permit-class read actions (the local single speaker IS the operator),
+    and talk tools — delegate_task is the steering receipt's destination and
+    must never be classification-denied."""
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=talk_cli.local_operator_authorizer
+    )
+    events = [
+        _local_event("web_search", '{"query": "hermes"}', "call-1", "item-1"),
+        _local_event("computer_use", '{"action": "capture"}', "call-2", "item-2"),
+        _local_event("delegate_task", '{"task": "ship it"}', "call-3", "item-3"),
+    ]
+
+    results = _run_batch(relay, events)
+
+    minted = [entry[0]["tool_name"] for entry in attachment.minted]
+    assert minted == ["web_search", "computer_use", "delegate_task"]
+    for result in results:
+        assert "exact host output" in result[0].output
+
+
+def test_discord_lane_classification_is_unchanged_by_the_relay_gate(monkeypatch):
+    """Belt and suspenders on Discord: the ledger already classifies (it also
+    guards the legacy lane), and the relay gate agrees with it — a
+    permit-less destructive computer_use never mints, with the steering
+    denial spoken."""
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    event = _make_tool_event(
+        ledger,
+        tool_name="computer_use",
+        arguments='{"action": "click"}',
+    )
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    results = _run_batch(relay, [event])
+
+    assert attachment.minted == []
+    assert any("not run" in cmd.output for cmd in results[0])

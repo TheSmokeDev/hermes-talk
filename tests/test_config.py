@@ -280,3 +280,18 @@ def test_memory_search_timeout_defaults_and_overrides(monkeypatch):
     assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
     monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0")
     assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+def test_catalog_startup_wait_honors_zero_and_rejects_junk(monkeypatch):
+    monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "0")
+    assert talk_config.catalog_startup_wait_s() == 0.0
+    monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "-3")
+    assert (
+        talk_config.catalog_startup_wait_s()
+        == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
+    )
+    monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "junk")
+    assert (
+        talk_config.catalog_startup_wait_s()
+        == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
+    )
+    monkeypatch.delenv("TALK_CATALOG_STARTUP_WAIT_S")
+    assert talk_config.catalog_startup_wait_s() == 2.5

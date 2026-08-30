@@ -448,6 +448,47 @@ detached, so ending the call does **not** stop it — but the watcher that would
 have spoken the result dies with the session, so a run from a previous session
 is reported as `lost`, never as "still running".
 
+## What the voice can do — the capability bridge
+
+The session prompt carries a bounded, live-catalog section: how many skills
+are installed, which tool categories are usable *right now*, and the two rules
+that keep the model honest — it can **delegate anything Hermes can do**, and it
+must **never invent tool names**. The section is assembled from the real
+catalog lanes (the host's own registries in-process, or the api-server's
+`/v1/skills` + `/v1/toolsets` + `/v1/capabilities` out of process); when the
+catalog is unreachable the section is simply absent, and the session runs on
+the plain preamble exactly as before.
+
+That changes three everyday exchanges:
+
+- **"What can you do?"** is answered from the catalog — live evidence, never
+  a recited prompt. A toolset whose tools all failed the host's availability
+  gates is not claimed.
+- **"Check my screen" / anything past the advertised tools** delegates by
+  default. The classification table in `talk_operator_auth` decides what a
+  host tool call may do at the voice surface: a short curated read-only list
+  (`web_search`, `web_extract`, `vision_analyze`, `session_search`) runs
+  inline; `computer_use`'s read actions (`capture`, `wait`, `list_apps`,
+  `list_windows`) need a fresh spoken operator permit; everything else — and
+  every destructive computer-use action, whose in-handler gate fails open
+  without a real approval context — delegates. The classification applies on
+  every transport, the local terminal lane included: mutating host tools
+  steer to delegation with spoken approvals rather than running bare. A
+  denied call never refuses flat: you hear "I can't do that directly in a
+  voice call — I can spin up an agent that can. Want me to?"
+- **Delegated work that hits a gated action now asks you out loud.** The run
+  lane streams the host's `approval.request` events; Talk speaks the request
+  ("run 3 wants to run a shell command — once, this session, or no?") and your
+  spoken answer resolves it via the new `resolve_approval` tool, which on
+  Discord rides the same fresh-speech permit machinery as the other mutating
+  tools. **Voice can grant `once`, `session`, or `deny` — never `always`**:
+  the choice set is narrowed in code, in the tool schema, and in the prompt,
+  and `session` is scoped to that run. Fail closed on everything ambiguous: an
+  unanswered question times out into a deny (`TALK_APPROVAL_PROMPT_TIMEOUT_S`,
+  default 60s), and interrupting the question denies it too — a question not
+  fully heard is not a question answered. Progress and the result still arrive
+  through the existing milestone/result machinery.
+
 ### `TALK_AGENT_PROFILE` — which profile the background agent runs under
 
 If your model config lives in a **profile** rather than the root

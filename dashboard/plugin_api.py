@@ -227,7 +227,12 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False):
         model=talk_config.talk_model(),
         voice=voice,
         instructions=talk_identity.build_instructions(
-            talk_host.host().identity_sections(), tools=tools, lane="dashboard"
+            talk_host.host().identity_sections(),
+            tools=tools,
+            lane="dashboard",
+            # The session route already paid for the catalog warm, so the
+            # live-catalog section reads a warm snapshot here.
+            capabilities=talk_capabilities.instruction_section(),
         ),
         tools=tools,
         text_output=text_output,

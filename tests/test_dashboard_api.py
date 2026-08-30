@@ -170,6 +170,7 @@ def test_mint_advertises_the_full_tool_surface(minted, monkeypatch):
         "steer_agent",
         "redirect_agent",
         "stop_work",
+        "resolve_approval",
         "talk_status",
         "talk_capabilities",
     ]

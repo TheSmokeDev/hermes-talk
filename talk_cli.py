@@ -37,6 +37,7 @@ from contextlib import suppress
 try:
     from . import (
         talk_apiserver,
+        talk_approvals,
         talk_audio,
         talk_auth,
         talk_capabilities,
@@ -62,6 +63,7 @@ try:
     from .talk_relay import RealtimeRelay
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_apiserver
+    import talk_approvals
     import talk_audio
     import talk_auth
     import talk_capabilities
@@ -490,16 +492,52 @@ class ToolResponseCoordinator:
 
 
 def local_operator_authorizer(tool_name: str, event: dict) -> None:
-    """Permit every host tool call for a session with no remote speakers.
+    """Grant speaker authority for a session with no remote speakers.
 
     A non-Discord Talk session hears exactly one person: the operator at
     this machine's microphone. Shell access to the box already carries full
-    host authority, so voice adds no privilege the keyboard lacks. Discord
-    (and any future multi-speaker transport) must wire a real authorization
-    ledger instead; HostExecutionRelay refuses to exist without an explicit
-    choice between the two.
+    host authority, so voice adds no SPEAKER privilege the keyboard lacks.
+    Discord (and any future multi-speaker transport) must wire a real
+    authorization ledger instead; HostExecutionRelay refuses to exist
+    without an explicit choice between the two.
+
+    Authority is not the whole gate: WHAT may run on the plugin thread is
+    settled transport-independently by :func:`_host_tool_classification_denial`,
+    which rides above every authorizer — a destructive host tool steers to
+    the delegate lane even for the operator, because its in-handler approval
+    gates fail open on this thread.
     """
 
+    return None
+
+
+def _host_tool_classification_denial(name: str, event: dict) -> str | None:
+    """The transport-independent classification gate (capability bridge §2).
+
+    The authorizer settles WHO may act — speaker authority and spoken
+    permits. This gate settles WHAT may run on the plugin thread at all, on
+    EVERY transport: a CLASS_DELEGATE host tool never dispatches from here,
+    because its in-handler approval gates fail open without an interactive
+    approval context (the spec's forbidden bare-dispatch class), so the
+    denial steers the work to the delegate lane, where the api-server run's
+    approval loop is a real gate. Talk tools are not host tools and never
+    classify — delegate_task is the steering receipt's own destination.
+    CLASS_INLINE and CLASS_PERMIT dispatch under whatever authority the
+    transport's authorizer just granted: the local single-speaker session IS
+    the operator, and the Discord ledger has already demanded its fresh
+    spoken permit by the time this runs.
+    """
+
+    if (
+        name in talk_operator_auth.READ_ONLY_TALK_TOOLS
+        or name in talk_operator_auth.MUTATING_TALK_TOOLS
+    ):
+        return None
+    classification = talk_operator_auth.classify_host_tool(
+        name, event.get("arguments")
+    )
+    if classification == talk_operator_auth.CLASS_DELEGATE:
+        return talk_operator_auth.UNCLASSIFIED_DENIAL.format(tool=name)
     return None
 
 
@@ -561,7 +599,12 @@ class HostExecutionRelay:
             # event["arguments"] string read below — nothing rewrites the
             # dict in between, so the authorized and executed arguments
             # cannot diverge.
-            denial = self.tool_authorizer(str(event.get("name") or ""), event)
+            name = str(event.get("name") or "")
+            denial = self.tool_authorizer(name, event)
+            if denial is None:
+                # WHO may act is settled; WHAT may run on this thread is a
+                # separate, transport-independent question.
+                denial = _host_tool_classification_denial(name, event)
             if denial is not None:
                 outputs[position] = self._output(call_id, denial)
                 continue
@@ -858,6 +901,62 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     return _announcement_commands(headline, "")
 
 
+#: Approval prompts (the capability bridge) ride the same contained
+#: announcement shape as results: the headline is plugin-owned wording, the
+#: request text is quoted untrusted DATA, the response is tools-off, and the
+#: item deletes itself. The model ASKS the question; the operator's answer
+#: comes back as ordinary speech on a fresh turn, where the resolve_approval
+#: call it produces rides the normal permit machinery.
+
+
+def approval_prompt_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """The wire messages that make the model ASK an approval question."""
+
+    run_id = event.get("run_id")
+    if run_id is None:
+        return []
+    choices = tuple(event.get("choices") or ())
+    request = str(event.get("request") or "").strip()
+    options = ["'once' to allow it just this time"]
+    if "session" in choices:
+        options.append("'session' to allow it for the rest of the run")
+    options.append("or 'no' to deny")
+    headline = (
+        f"Background run #{run_id} is waiting for approval. Ask the operator "
+        "out loud: "
+        + ", ".join(options)
+        + ". If they interrupt the question or do not answer, it is denied."
+    )
+    return _announcement_commands(headline, request)
+
+
+def approval_outcome_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
+    """The wire messages that make the model SAY a denial that fired itself.
+
+    Timeout and barge-in denials happen without a tool call, so the model
+    learns about them here — otherwise it would still be waiting for an
+    answer to a question the bridge already closed.
+    """
+
+    run_id = event.get("run_id")
+    if run_id is None:
+        return []
+    outcome = event.get("outcome")
+    if outcome == "timeout":
+        headline = (
+            f"Background run #{run_id}'s approval got no answer in time, so it "
+            "was denied — silence is not consent."
+        )
+    elif outcome == "barge_in":
+        headline = (
+            f"Background run #{run_id}'s approval question was interrupted, so "
+            "it was denied — interrupting a question never approves it."
+        )
+    else:
+        return []
+    return _announcement_commands(headline, "")
+
+
 def _active_parent_session_id() -> str | None:
     """Snapshot the bound Hermes session id, or fail closed on older hosts."""
 
@@ -1075,6 +1174,9 @@ async def run_talk_session(
 
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
+    # Start filling the capability catalog now so the instruction section below
+    # reads a warm snapshot instead of an empty one; never blocks, never fatal.
+    talk_capabilities.warm_in_background()
 
     try:
         provider = talk_config.talk_provider()
@@ -1115,12 +1217,21 @@ async def run_talk_session(
         print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
         host_execution_attachment.close()
         return 1
+    # The live-catalog section rides every lane. A cold process used to lose
+    # the race between the background warm above and this mint — the FIRST
+    # session then permanently lacked the section — so the warm gets a
+    # bounded head start (TALK_CATALOG_STARTUP_WAIT_S, 0 = never wait). On
+    # expiry the session starts exactly as before: section omitted, no stall.
+    catalog_snapshot = talk_capabilities.wait_until_warm(
+        talk_config.catalog_startup_wait_s()
+    )
     instructions = talk_identity.build_instructions(
         talk_host.host().identity_sections(),
         tools=tools,
         host_execution=host_execution_attachment is not None,
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
+        capabilities=talk_capabilities.instruction_section(catalog_snapshot),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
@@ -1166,6 +1277,11 @@ async def run_talk_session(
     def on_barge_in() -> None:
         played = audio.played_ms
         audio.drain_playback()
+        if relay.response_active:
+            # An approval question interrupted mid-ask is a question not fully
+            # heard: the bridge denies it. Speech after the prompt's response
+            # finished (response_active False) is an answer, never a barge-in.
+            talk_approvals.note_barge_in()
         if relay.last_audio_item_id and played > 0:
             pending.append(
                 talk_realtime.TruncateOutput(
@@ -1221,6 +1337,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -1237,6 +1354,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         audio.stop()
@@ -1355,6 +1473,13 @@ async def run_talk_session(
                 # speech, not the result.
                 milestone = progress.poll(run)
                 if milestone is not None:
+                    # While the approval bridge owns a run's approval, the
+                    # generic "waiting on an approval" milestone stays silent —
+                    # the spoken prompt is the actionable sentence.
+                    if milestone == talk_progress.PHASE_BLOCKED and talk_approvals.has_pending(
+                        run_id
+                    ):
+                        continue
                     commands = run_phase_commands(run, milestone)
                     if commands:
                         await announce_queue.put(QueuedAnnouncement(commands))
@@ -1502,6 +1627,31 @@ async def run_talk_session(
             if commands:
                 announce_queue.put_nowait(commands)
 
+        def on_approval_event(event: dict) -> None:
+            """Queue an approval bridge event on the loop.
+
+            Prompts arm their fail-closed deny timer only at the pump's
+            post-send point (QueuedAnnouncement.on_sent): a prompt deferred
+            behind live speech must not burn its answer window before the
+            operator has heard a word of it. Outcomes (timeout/barge-in
+            denials) are plain re-sayable speech, no claim.
+            """
+
+            if event.get("kind") == talk_approvals.EVENT_APPROVAL_PROMPT:
+                commands = approval_prompt_commands(event)
+                run_id = event.get("run_id")
+                if commands and isinstance(run_id, int):
+                    announce_queue.put_nowait(
+                        QueuedAnnouncement(
+                            commands,
+                            on_sent=lambda: talk_approvals.note_prompt_sent(run_id),
+                        )
+                    )
+            elif event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME:
+                commands = approval_outcome_commands(event)
+                if commands:
+                    announce_queue.put_nowait(QueuedAnnouncement(commands))
+
         def on_note_landed(subagent_id: str) -> None:
             """Queue a landed steering note on the session loop."""
 
@@ -1518,6 +1668,9 @@ async def run_talk_session(
         # gate: the hook registrations are process-scoped, so attach is what
         # makes them live for THIS session and nothing else.
         talk_progress.attach_session(loop, on_subagent_event, owner_session_id)
+        # The approval bridge shares the loop; its prompts are gated by the
+        # bridge itself (nothing announces while detached).
+        talk_approvals.attach_session(loop, on_approval_event)
         # This connection's own identity (hermes-talk#35), minted BEFORE any
         # tool can dispatch work. Independent of whether a Hermes ctx happens
         # to be bound, so tier-2/3 work has an exact destination off tier 1
@@ -1619,6 +1772,7 @@ async def run_talk_session(
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
             talk_progress.detach_session()
+            talk_approvals.detach_session()
             # Unbound again: with no live connection there is no destination,
             # so further dispatch is refused rather than accepted into a void.
             talk_runs.detach_owner()
@@ -1664,6 +1818,7 @@ async def run_talk_session(
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
+        talk_approvals.detach_session()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         if cascade is not None:

@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.14.0"
+version = "0.15.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,7 @@ py-modules = [
   "talk_doctor",
   "talk_setup",
   "talk_apiserver",
+  "talk_approvals",
   "talk_capabilities",
   "talk_cascade_voice",
   "talk_wire",
@@ -76,6 +77,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 [tool.ruff.lint.isort]
 known-first-party = [
   "talk_apiserver",
+  "talk_approvals",
   "talk_audio",
   "talk_auth",
   "talk_capabilities",

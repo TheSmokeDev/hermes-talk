@@ -11,6 +11,88 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.15.0] — 2026-08-30
+
+The capability bridge: voice becomes the manager of Hermes's whole capability
+surface — the session knows the live install, does what's safe directly,
+delegates the rest, and gated work resolves by spoken approval. Never a bare
+"I can't."
+
+### Added
+- **Live-catalog prompt section.** Session instructions carry a bounded
+  capabilities block — skill count + the tool categories usable right now +
+  the delegation ceiling + the never-invent-tool-names rule — assembled from
+  the real catalog and capped like every other resident section. When the
+  catalog is unreachable the section is absent and the prompt is exactly what
+  it was before (fail-open). The tier-1 catalog probe stops dispatching the
+  guessed `list_capabilities` tool name (dead upstream) and reads the host's
+  own registries instead — the same builders the `/v1/skills` and
+  `/v1/toolsets` routes run, plus the live, availability-gated resolved-tool
+  set from `model_tools.get_tool_definitions`.
+- **Host-tool classification table** (`talk_operator_auth`): curated read-only
+  host tools (`web_search`, `web_extract`, `vision_analyze`, `session_search`)
+  may run inline; `computer_use`'s read actions ride a fresh spoken operator
+  permit; everything else — including every destructive computer-use action —
+  delegates. Unclassified names and permit-gated failures now deny with a
+  steering receipt ("I can't do that directly in a voice call — I can spin up
+  an agent that can. Want me to?") instead of a flat refusal.
+- **Spoken approvals for delegated runs.** Every api-server run gains an SSE
+  sidecar on `/v1/runs/{id}/events`; an `approval.request` becomes a spoken,
+  contained prompt, and the operator's answer resolves it through the new
+  `resolve_approval` tool (on Discord, behind the existing spoken-permit
+  machinery). Voice grants `once`, `session`, or `deny` — `always` is
+  ungrantable, narrowed in code. An unanswered question denies on
+  `TALK_APPROVAL_PROMPT_TIMEOUT_S` (default 60s); interrupting the question
+  denies immediately. Progress narration and the result ride the existing
+  watcher machinery unchanged; resolutions annotate run meta like stop
+  receipts.
+
+### Fixed
+- **Transcript flush no longer drops the conversation when no Talk connection
+  is bound.** The session-end memory handoff routed through the ticketed run
+  lane and was refused ("no Talk connection is bound") on the Discord lane,
+  deleting the transcript unread. The flush now runs a ticket-free lane
+  ladder, and when no agent lane exists at all the transcript is restored for
+  the next sweep ("handoff deferred") instead of dropped.
+
+### Hardened (adversarial review round)
+Eight findings from the pre-release adversarial review, all fixed with
+regression tests:
+- **Classification is transport-independent.** The host-tool classification
+  now rides the execution relay itself, above every authorizer — the local
+  single-speaker lane can no longer dispatch a destructive or unclassified
+  host tool bare (its in-handler approval gates fail open on the plugin
+  thread). *Behavior change:* local voice host-execution steers mutating host
+  tools to the delegate lane with spoken approvals instead of running them
+  ungated.
+- **An answer in flight owns its approval.** A resolve POST outlasting the
+  courtesy wait can no longer be followed by a timeout deny or a second
+  answer; a late acceptance finalizes the record, and a transport failure
+  reopens it and re-arms the fail-closed timer.
+- **Malformed approval metadata narrows to deny-only.** A missing or
+  unrecognizable `choices` list used to widen the answer set to everything
+  voice can grant; it now collapses to `deny`.
+- **Dead event streams still get spoken prompts.** The run-events stream is
+  single-shot upstream (a reconnect 404s); when a run's watcher dies, the
+  poll loop reconciles one conservative prompt (`once`/`deny`) instead of
+  letting the approval sit silent until the host's 300s auto-deny. Resolves
+  also carry the request's own id (`approvalId`) for exact routing on hosts
+  that support it.
+- **Stale sidecars are quarantined by attach generation.** A delegated run
+  outliving its session can no longer speak its approval into — or be
+  resolved from — the next session.
+- **Transcripts are deleted only on proof.** The flush tiers run
+  synchronously and return a completion receipt; a refusal, failed run,
+  nonzero one-shot exit, or exception keeps the only copy for the next sweep
+  (at-least-once instead of silent loss).
+- **A zero-tool live read is a real answer.** The prompt section no longer
+  falls back to static enabled/configured flags when the registry's
+  availability gates resolved nothing.
+- **Cold starts mint the catalog deterministically.** Session start gives the
+  background catalog read a bounded head start
+  (`TALK_CATALOG_STARTUP_WAIT_S`, default 2.5s, `0` = never wait) instead of
+  racing it.
+
 ## [0.14.0] — 2026-08-28
 
 The custom-voice cascade leaves the terminal: Discord rooms and the dashboard

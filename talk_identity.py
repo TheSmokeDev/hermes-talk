@@ -90,6 +90,18 @@ VOICE_PREAMBLE = (
     "pointer back to the conversation. Write the task out yourself — what to "
     "do, where it lives, and what done looks like — as if to someone who "
     "never heard a word of it. "
+    "Never invent tool names: the only tools you can call directly are the "
+    "ones advertised to this session. If a request needs something outside "
+    "that set, do not reach for a tool you do not have, and do not answer "
+    "with a bare refusal — say you cannot do it directly in voice, offer to "
+    "hand it to an agent that can, and ask. "
+    "Work you delegated can pause for the host's approval. When that happens "
+    "you will hear which run is asking and what it wants to do: read the "
+    "request out, then ask the operator — once, this session, or no. When "
+    "they answer, call resolve_approval with the run number and their "
+    "choice. Always is never grantable by voice — offer session instead. If "
+    "the operator interrupts the question or does not answer, the request is "
+    "denied; say so and move on. "
     "When a tool returns a WORK_STARTED receipt, say it is running and move "
     "on: the result is handed back to you when it lands and you summarize it "
     "in a sentence or two. If you are asked how the work is going before "
@@ -144,6 +156,15 @@ GENERIC_LANE_LINE = (
 #: Cap on the mint-time host summary line. It is one line of prompt, never a
 #: section: the producer composes it, this cap is the guarantee it stays one.
 HOST_SUMMARY_CAP = 200
+
+#: Cap on the capabilities section — the live-catalog summary the producer
+#: (:func:`talk_capabilities.instruction_section`) composes. Same budget
+#: discipline as the identity sections: resident, re-billed per turn.
+CAPABILITIES_CAP = 1_200
+
+#: The capabilities section's header — what the block IS, so the model weighs
+#: it as a live read instead of a remembered one.
+CAPABILITIES_HEADER = "What this Hermes install can do right now (live catalog)"
 
 
 def lane_line(lane: str | None) -> str:
@@ -202,6 +223,7 @@ def build_instructions(
     host_execution: bool = False,
     lane: str | None = None,
     host_summary: str | None = None,
+    capabilities: str | None = None,
 ) -> str:
     """Assemble the Realtime session prompt.
 
@@ -214,6 +236,12 @@ def build_instructions(
     is one producer-composed line about the attached host (skill/toolset
     counts), rendered only when provided and capped at HOST_SUMMARY_CAP —
     ``None`` means nothing renders, never an empty line.
+
+    ``capabilities`` is the producer-composed live-catalog section
+    (:func:`talk_capabilities.instruction_section`), capped at
+    CAPABILITIES_CAP and rendered just ahead of the lane line. ``None``
+    fails open to the plain prompt — exactly what sessions shipped before
+    the section existed.
     """
 
     sections: list[str] = []
@@ -236,6 +264,10 @@ def build_instructions(
         summary = host_summary.strip()[:HOST_SUMMARY_CAP]
         if summary:
             sections.append(summary)
+    if capabilities is not None:
+        block = capabilities.strip()[:CAPABILITIES_CAP]
+        if block:
+            sections.append(f"{CAPABILITIES_HEADER}:\n\n{block}")
     # The lane line rides unconditionally, just ahead of the clock: it is one
     # sentence, it depends on no host, and a session asked where it runs must
     # answer the truth even on a lane whose prompt carries no sections at all.
@@ -253,6 +285,8 @@ def build_instructions(
 
 __all__ = [
     "ANTI_GUESS_RULE",
+    "CAPABILITIES_CAP",
+    "CAPABILITIES_HEADER",
     "DEFAULT_SECTION_CAP",
     "GENERIC_LANE_LINE",
     "HOST_SUMMARY_CAP",

@@ -102,7 +102,7 @@ class HostExecutionAttachment:
     def __init__(self, *, block=False):
         self.definitions = [
             {
-                "name": "host_tool",
+                "name": "web_search",
                 "description": "Run the canonical host tool.",
                 "parameters": {
                     "type": "object",
@@ -247,14 +247,14 @@ def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
                 response_id="response-1",
                 item_id="item-1",
                 call_id="call-1",
-                name="host_tool",
+                name="web_search",
                 arguments='{"value":1}',
             ),
             rt.FunctionCall(
                 response_id="response-1",
                 item_id="item-2",
                 call_id="call-2",
-                name="host_tool",
+                name="web_search",
                 arguments='{"value":2}',
             ),
             rt.ResponseFinished(response_id="response-1"),
@@ -281,7 +281,7 @@ def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
         return await asyncio.wait_for(running, 0.5)
 
     assert asyncio.run(scenario()) == 0
-    assert [tool.name for tool in fake.setup.tools] == ["host_tool"]
+    assert [tool.name for tool in fake.setup.tools] == ["web_search"]
     assert fake.setup.tools[0].parameters == attachment.definitions[0]["parameters"]
     assert "limited legacy" not in fake.setup.instructions.lower()
     assert "canonical hermes host tools" in fake.setup.instructions.lower()
@@ -291,7 +291,7 @@ def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
             "item_id": "item-1",
             "call_id": "call-1",
             "batch_id": attachment.minted[0][0]["batch_id"],
-            "tool_name": "host_tool",
+            "tool_name": "web_search",
             "arguments": {"value": 1},
         },
         {
@@ -299,7 +299,7 @@ def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
             "item_id": "item-2",
             "call_id": "call-2",
             "batch_id": attachment.minted[0][0]["batch_id"],
-            "tool_name": "host_tool",
+            "tool_name": "web_search",
             "arguments": {"value": 2},
         },
     ]
@@ -316,7 +316,7 @@ def test_host_attachment_tools_execute_as_one_batch_without_blocking_audio():
     assert attachment.closed
 
 
-def test_malformed_host_tool_arguments_return_an_error_without_authority_or_effect():
+def test_malformed_web_search_arguments_return_an_error_without_authority_or_effect():
     attachment = HostExecutionAttachment()
     fake = FakeProviderSession(
         [
@@ -325,7 +325,7 @@ def test_malformed_host_tool_arguments_return_an_error_without_authority_or_effe
                 response_id="response-1",
                 item_id="item-1",
                 call_id="call-1",
-                name="host_tool",
+                name="web_search",
                 arguments="[]",
             ),
             rt.ResponseFinished(response_id="response-1"),
