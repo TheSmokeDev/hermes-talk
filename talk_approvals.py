@@ -86,6 +86,17 @@ _SESSION: tuple[Any, Any] | None = None  # (loop, callback)
 #: call. The host's own approval timeout governs those runs, exactly the
 #: pre-bridge behavior.
 _GENERATION = 0
+#: run_ids with a live SSE sidecar (spawn → reader exit). While a run's
+#: watcher lives, the host's pre-created server-side buffer guarantees its
+#: approval events are delivered, so the poll reconcile stays out; when the
+#: watcher dies mid-run (the stream is single-shot — a reconnect 404s), the
+#: reconcile below is the only remaining ear.
+_WATCHERS: set[int] = set()
+#: run_ids already given their one reconcile prompt. The host's run status
+#: sticks on ``waiting_for_approval`` after its own timeout auto-deny (and
+#: emits no SSE event for it), so without this stamp a dead approval would
+#: re-prompt on every poll forever.
+_RECONCILED: set[int] = set()
 
 
 @dataclass(slots=True)
@@ -107,6 +118,11 @@ class _PendingApproval:
     api_run_id: str
     request_text: str
     choices: tuple[str, ...]
+    #: The host's approval request id (always present on real SSE events).
+    #: Sent back as ``approvalId`` so a host that supports exact routing
+    #: resolves THIS request instead of FIFO-popping the oldest; ``None``
+    #: for reconciled prompts, where the id was lost with the stream.
+    request_id: str | None = None
     opened: bool = False
     resolving: bool = False
     timer: threading.Timer | None = None
@@ -158,6 +174,7 @@ def detach_session() -> None:
         for pending in _PENDING.values():
             pending.cancel_timer()
         _PENDING.clear()
+        _RECONCILED.clear()
 
 
 def current_generation() -> int:
@@ -242,10 +259,16 @@ def _narrow_choices(event: dict) -> tuple[str, ...]:
 def _register(run_id: int, api_run_id: str, event: dict) -> None:
     """Register one approval.request and announce it, or evict-deny for room."""
 
+    raw_request_id = event.get("request_id")
     pending = _PendingApproval(
         api_run_id=api_run_id,
         request_text=_request_text(event),
         choices=_narrow_choices(event),
+        request_id=(
+            raw_request_id
+            if isinstance(raw_request_id, str) and raw_request_id
+            else None
+        ),
     )
     evicted: _PendingApproval | None = None
     evicted_run_id: int | None = None
@@ -270,7 +293,11 @@ def _register(run_id: int, api_run_id: str, event: dict) -> None:
         )
         evicted.cancel_timer()
         _spawn_daemon(
-            _post_choice, evicted.api_run_id, "deny", name="talk-approval-evict"
+            _post_choice,
+            evicted.api_run_id,
+            "deny",
+            evicted.request_id,
+            name="talk-approval-evict",
         )
     _log.info(
         "run %s is waiting on an approval (%s) — prompting the operator",
@@ -323,11 +350,13 @@ def note_prompt_sent(run_id: int) -> None:
         timer.start()
 
 
-def _post_choice(api_run_id: str, choice: str) -> tuple[str, str]:
+def _post_choice(
+    api_run_id: str, choice: str, request_id: str | None = None
+) -> tuple[str, str]:
     """One resolve POST. Returns (kind, detail): "ok", "gone", or "err"."""
 
     try:
-        talk_apiserver.respond_to_approval(api_run_id, choice)
+        talk_apiserver.respond_to_approval(api_run_id, choice, approval_id=request_id)
     except talk_apiserver.ApprovalGoneError as exc:
         return ("gone", str(exc))
     except Exception as exc:  # noqa: BLE001 — the outcome IS the record
@@ -380,7 +409,13 @@ def _expire(run_id: int) -> None:
     pending.cancel_timer()
     _log.warning("approval prompt for run %s timed out — denying", run_id)
     _annotate(run_id, "denied: no answer before the prompt timed out")
-    _spawn_daemon(_post_choice, pending.api_run_id, "deny", name="talk-approval-timeout")
+    _spawn_daemon(
+        _post_choice,
+        pending.api_run_id,
+        "deny",
+        pending.request_id,
+        name="talk-approval-timeout",
+    )
     _notify(
         {
             "kind": EVENT_APPROVAL_OUTCOME,
@@ -410,7 +445,13 @@ def note_barge_in() -> bool:
         denied = True
         _log.warning("approval prompt for run %s interrupted — denying", run_id)
         _annotate(run_id, "denied: the operator interrupted the approval question")
-        _spawn_daemon(_post_choice, pending.api_run_id, "deny", name="talk-approval-barge")
+        _spawn_daemon(
+            _post_choice,
+            pending.api_run_id,
+            "deny",
+            pending.request_id,
+            name="talk-approval-barge",
+        )
         _notify(
             {
                 "kind": EVENT_APPROVAL_OUTCOME,
@@ -471,7 +512,7 @@ def resolve(run_id: int, choice: str) -> str:
     outcomes: queue.Queue = queue.Queue(maxsize=1)
 
     def _post() -> None:
-        outcomes.put(_post_choice(pending.api_run_id, choice))
+        outcomes.put(_post_choice(pending.api_run_id, choice, pending.request_id))
 
     _spawn_daemon(_post, name="talk-approval-resolve")
     try:
@@ -567,6 +608,8 @@ def _note_event(
         # The run is over; a parked approval is moot. No deny POST — there is
         # nothing left to unblock, and the host has already moved on.
         _clear(run_id)
+        with _LOCK:
+            _RECONCILED.discard(run_id)
 
 
 def watch_run(run_id: int, api_run_id: str) -> None:
@@ -579,6 +622,8 @@ def watch_run(run_id: int, api_run_id: str) -> None:
     """
 
     generation = current_generation()
+    with _LOCK:
+        _WATCHERS.add(run_id)
 
     def _reader() -> None:
         try:
@@ -588,16 +633,73 @@ def watch_run(run_id: int, api_run_id: str) -> None:
             )
         except Exception:  # noqa: BLE001 — the sidecar degrades silently by design
             _log.debug("approval watcher for run %s ended early", run_id, exc_info=True)
+        finally:
+            # The stream is single-shot (a reconnect 404s): once the reader
+            # exits, the poll reconcile is this run's only remaining ear.
+            with _LOCK:
+                _WATCHERS.discard(run_id)
 
     threading.Thread(
         target=_reader, daemon=True, name=f"talk-approval-watch-{run_id}"
     ).start()
 
 
+def reconcile_from_poll(
+    run_id: int, api_run_id: str, payload: Any, generation: int
+) -> None:
+    """Speak for an approval whose SSE sidecar died. Never raises.
+
+    The host buffers a run's events server-side from creation, so a LIVE
+    watcher always hears ``approval.request`` — this reconcile registers a
+    prompt only for a run whose watcher is gone. The poll payload carries no
+    approval details (upstream keeps them out of the status record), so the
+    prompt is generic and the choices conservative: "once" appears in every
+    host-offered set, "session" does not. One reconcile per run: upstream's
+    status sticks on ``waiting_for_approval`` after its own timeout auto-deny
+    (with no SSE event), so a repeat prompt could be asking about an approval
+    that no longer exists — the resolve's 409 already answers that case with
+    "already answered or expired".
+    """
+
+    if not isinstance(payload, dict):
+        return
+    if str(payload.get("status") or "") != "waiting_for_approval":
+        return
+    with _LOCK:
+        if (
+            generation != _GENERATION
+            or _SESSION is None
+            or run_id in _PENDING
+            or run_id in _WATCHERS
+            or run_id in _RECONCILED
+        ):
+            return
+        _RECONCILED.add(run_id)
+    _log.info(
+        "run %s is waiting on an approval but its event stream is gone — "
+        "reconciling a prompt from the poll",
+        run_id,
+    )
+    _register(
+        run_id,
+        api_run_id,
+        {
+            "description": (
+                f"run {run_id} is waiting on an approval, but the details were "
+                "lost with its event stream"
+            ),
+            "choices": ["once", "deny"],
+        },
+    )
+
+
 def reset_for_tests() -> None:
     """Clear bridge state between tests (never called in production)."""
 
     detach_session()
+    with _LOCK:
+        _WATCHERS.clear()
+        _RECONCILED.clear()
 
 
 __all__ = [
@@ -612,6 +714,7 @@ __all__ = [
     "note_barge_in",
     "note_prompt_sent",
     "pending_choices",
+    "reconcile_from_poll",
     "reset_for_tests",
     "resolve",
     "watch_run",

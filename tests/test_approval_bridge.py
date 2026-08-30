@@ -183,7 +183,7 @@ def test_resolve_once_posts_once_and_receives_it(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop())
 
@@ -200,7 +200,7 @@ def test_resolve_session_and_deny_post_their_choice(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop())
 
@@ -217,7 +217,7 @@ def test_always_is_ungrantable_by_voice_at_the_code_level(monkeypatch):
 
     calls = []
 
-    def forbidden(run_id, choice):
+    def forbidden(run_id, choice, approval_id=None):
         calls.append((run_id, choice))
         raise AssertionError("a network call carried 'always'")
 
@@ -240,7 +240,7 @@ def test_resolve_rejects_a_choice_the_host_did_not_offer(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop(), choices=["once", "deny"])
 
@@ -256,7 +256,7 @@ def test_resolve_without_a_pending_approval_says_so(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
 
     receipt = talk_approvals.resolve(99, "once")
@@ -269,7 +269,7 @@ def test_a_gone_approval_clears_the_record_and_says_so(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda *_: (_ for _ in ()).throw(talk_apiserver.ApprovalGoneError("already answered")),
+        lambda *_, **__: (_ for _ in ()).throw(talk_apiserver.ApprovalGoneError("already answered")),
     )
     _register(FakeLoop())
 
@@ -283,7 +283,7 @@ def test_a_transport_failure_keeps_the_approval_open(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda *_: (_ for _ in ()).throw(talk_apiserver.TalkApiServerError("refused (500)")),
+        lambda *_, **__: (_ for _ in ()).throw(talk_apiserver.TalkApiServerError("refused (500)")),
     )
     _register(FakeLoop())
 
@@ -304,7 +304,7 @@ def test_a_late_timer_cannot_deny_an_answer_in_flight(monkeypatch):
     release = threading.Event()
     posts = []
 
-    def slow_accept(run_id, choice):
+    def slow_accept(run_id, choice, approval_id=None):
         release.wait(3.0)
         posts.append((run_id, choice))
         return {"resolved": 1}
@@ -333,7 +333,7 @@ def test_a_second_answer_while_one_is_in_flight_is_refused(monkeypatch):
     release = threading.Event()
     posts = []
 
-    def slow_accept(run_id, choice):
+    def slow_accept(run_id, choice, approval_id=None):
         started.set()
         release.wait(3.0)
         posts.append((run_id, choice))
@@ -364,7 +364,7 @@ def test_a_late_transport_failure_reopens_the_record_and_rearms_the_floor(monkey
     release = threading.Event()
     denied = threading.Event()
 
-    def failing_then_deny(run_id, choice):
+    def failing_then_deny(run_id, choice, approval_id=None):
         if choice == "deny":
             calls.append(choice)
             denied.set()
@@ -421,6 +421,85 @@ def test_a_stale_sidecar_from_a_previous_session_is_quarantined():
     assert seen[-1]["run_id"] == 8
 
 
+# -- poll reconcile: a dead stream still gets a spoken prompt (F2) ----------------
+
+
+def test_a_dead_watcher_reconciles_one_generic_prompt_from_the_poll():
+    """The events stream is single-shot upstream (a reconnect 404s): when a
+    run's sidecar dies mid-run, the poll is the only remaining ear. One
+    generic prompt, conservative choices, idempotent across polls — and only
+    one per run, because upstream's status sticks on waiting_for_approval
+    after its own timeout with no SSE event to say so."""
+
+    seen = []
+    talk_approvals.attach_session(FakeLoop(), seen.append)
+    generation = talk_approvals.current_generation()
+    payload = {"status": "waiting_for_approval", "last_event": "approval.request"}
+
+    talk_approvals.reconcile_from_poll(7, "run_remote_1", payload, generation)
+    talk_approvals.reconcile_from_poll(7, "run_remote_1", payload, generation)
+
+    prompts = [e for e in seen if e.get("kind") == talk_approvals.EVENT_APPROVAL_PROMPT]
+    assert len(prompts) == 1
+    assert talk_approvals.has_pending(7)
+    assert prompts[0]["choices"] == ("once", "deny")
+    assert "details were lost" in prompts[0]["request"]
+
+    # A non-waiting payload never registers; a stale generation never does.
+    talk_approvals.reconcile_from_poll(8, "run_remote_8", {"status": "running"}, generation)
+    talk_approvals.reconcile_from_poll(
+        9, "run_remote_9", payload, generation - 1
+    )
+    assert not talk_approvals.has_pending(8)
+    assert not talk_approvals.has_pending(9)
+
+
+def test_reconcile_stays_out_while_the_watcher_lives(monkeypatch):
+    """A live watcher's server-side buffer guarantees delivery — reconciling
+    beside it would double-prompt. The reconcile ear opens only when the
+    reader exits."""
+
+    hold = threading.Event()
+    monkeypatch.setattr(
+        talk_approvals.talk_apiserver,
+        "stream_run_events",
+        lambda api_run_id, on_event: hold.wait(3.0),
+    )
+    talk_approvals.attach_session(FakeLoop(), lambda event: None)
+    generation = talk_approvals.current_generation()
+    payload = {"status": "waiting_for_approval"}
+
+    talk_approvals.watch_run(7, "run_remote_1")
+    try:
+        talk_approvals.reconcile_from_poll(7, "run_remote_1", payload, generation)
+        assert not talk_approvals.has_pending(7)
+    finally:
+        hold.set()
+
+    assert _wait_for(lambda: 7 not in talk_approvals._WATCHERS)
+    talk_approvals.reconcile_from_poll(7, "run_remote_1", payload, generation)
+    assert talk_approvals.has_pending(7)
+
+
+def test_resolve_routes_the_exact_request_when_the_event_carried_one(monkeypatch):
+    """Real SSE events always carry request_id; sending it back as approvalId
+    lets a host with exact routing resolve THIS request instead of
+    FIFO-popping the oldest. Hosts that predate the field ignore it."""
+
+    posts = []
+
+    def record(run_id, choice, approval_id=None):
+        posts.append((run_id, choice, approval_id))
+        return {"resolved": 1}
+
+    monkeypatch.setattr(talk_approvals.talk_apiserver, "respond_to_approval", record)
+    _register(FakeLoop(), request_id="req-abc123")
+
+    talk_approvals.resolve(7, "once")
+
+    assert posts == [("run_remote_1", "once", "req-abc123")]
+
+
 # -- timeout and barge-in: both deny ----------------------------------------------
 
 
@@ -437,7 +516,7 @@ def test_an_unanswered_prompt_times_out_into_a_deny(monkeypatch):
     posts = []
     done = threading.Event()
 
-    def record(run_id, choice):
+    def record(run_id, choice, approval_id=None):
         posts.append((run_id, choice))
         done.set()
         return {"resolved": 1}
@@ -487,7 +566,7 @@ def test_barge_in_over_an_open_prompt_denies_it(monkeypatch):
     posts = []
     done = threading.Event()
 
-    def record(run_id, choice):
+    def record(run_id, choice, approval_id=None):
         posts.append((run_id, choice))
         done.set()
         return {"resolved": 1}
@@ -513,7 +592,7 @@ def test_barge_in_before_the_prompt_sends_denies_nothing(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     talk_approvals.attach_session(FakeLoop(), lambda event: None)
     talk_approvals._note_event(7, "run_remote_1", _approval_event())
@@ -536,7 +615,7 @@ def test_a_full_bridge_evicts_and_denies_the_oldest_pending(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     talk_approvals.attach_session(FakeLoop(), lambda event: None)
 
@@ -570,7 +649,7 @@ def test_a_terminal_run_event_clears_without_denying(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop())
 
@@ -586,7 +665,7 @@ def test_detach_clears_pending_without_resolving(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop())
 
@@ -605,7 +684,7 @@ def test_the_tool_handler_validates_and_routes(monkeypatch):
     monkeypatch.setattr(
         talk_approvals.talk_apiserver,
         "respond_to_approval",
-        lambda run_id, choice: posts.append((run_id, choice)) or {"resolved": 1},
+        lambda run_id, choice, approval_id=None: posts.append((run_id, choice)) or {"resolved": 1},
     )
     _register(FakeLoop())
 
@@ -739,6 +818,28 @@ def test_respond_to_approval_posts_the_choice(monkeypatch):
     assert seen["json"] == {"choice": "once"}
     assert seen["url"].endswith("/v1/runs/run_9/approval")
     assert seen["headers"] == {"Authorization": "Bearer k-123"}
+
+
+def test_respond_to_approval_carries_the_approval_id_when_given(monkeypatch):
+    seen = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"resolved": 1}
+
+    def capture(url, **kwargs):
+        seen.update({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(talk_apiserver.httpx, "post", capture)
+    monkeypatch.delenv("TALK_API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+
+    talk_apiserver.respond_to_approval("run_9", "once", approval_id="req-77")
+
+    assert seen["json"] == {"choice": "once", "approvalId": "req-77"}
 
 
 def test_respond_to_approval_409_is_the_gone_verdict(monkeypatch):

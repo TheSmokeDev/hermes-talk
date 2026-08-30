@@ -459,6 +459,10 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
 
     def worker(run_id: int) -> str:
         talk_runs.annotate_run(run_id, lane=LANE_API_SERVER)
+        # The same spawn stamp the SSE sidecar carries: a poll tap that
+        # outlives its session must not reconcile prompts into the next one.
+        approval_generation = talk_approvals.current_generation()
+        remote: dict[str, str] = {}
 
         def _on_start(api_run_id: str) -> None:
             # The remote id is stop_work's only address for this run —
@@ -470,10 +474,26 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
             # (durable=True: retried once, escalated to an error log if
             # it still cannot land), never the fail-open telemetry tee.
             talk_runs.annotate_run(run_id, durable=True, api_run_id=api_run_id)
+            remote["api_run_id"] = api_run_id
             # The spoken approval bridge: the SSE sidecar that turns the
             # run's approval.request events into a spoken prompt. One daemon
             # thread per run, closed by the host when the run ends.
             talk_approvals.watch_run(run_id, api_run_id)
+
+        def _on_poll(payload) -> None:
+            # Progress tap (hermes-talk#33): each poll's status payload is
+            # THIS run's own — the per-run addressing is what makes the
+            # projection incapable of cross-routing. The payload's
+            # last_event maps to a bounded phase; its session id is the
+            # correlator the same-process hook projection keys on.
+            talk_progress.project_api_poll(run_id, payload)
+            api_run_id = remote.get("api_run_id")
+            if api_run_id:
+                # The approval backstop: if this run's SSE sidecar died, the
+                # poll is the only ear left — reconcile a spoken prompt.
+                talk_approvals.reconcile_from_poll(
+                    run_id, api_run_id, payload, approval_generation
+                )
 
         try:
             return talk_apiserver.run_to_completion(
@@ -481,14 +501,7 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 session_id=session_id,
                 session_key=session_key,
                 on_start=_on_start,
-                # Progress tap (hermes-talk#33): each poll's status payload is
-                # THIS run's own — the per-run addressing is what makes the
-                # projection incapable of cross-routing. The payload's
-                # last_event maps to a bounded phase; its session id is the
-                # correlator the same-process hook projection keys on.
-                on_event=lambda payload: talk_progress.project_api_poll(
-                    run_id, payload
-                ),
+                on_event=_on_poll,
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
             message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]

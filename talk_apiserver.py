@@ -609,7 +609,9 @@ def stream_run_events(run_id: str, on_event, *, idle_timeout_s: float = SSE_READ
         )
 
 
-def respond_to_approval(run_id: str, choice: str) -> dict:
+def respond_to_approval(
+    run_id: str, choice: str, *, approval_id: str | None = None
+) -> dict:
     """POST ``/v1/runs/{id}/approval`` — resolve the run's pending approval.
 
     Returns the decoded payload on 2xx (the host's receipt carries
@@ -617,15 +619,23 @@ def respond_to_approval(run_id: str, choice: str) -> dict:
     on the host's 409s (no active approval session / nothing pending) and
     :class:`TalkApiServerError` with speakable text on any other failure.
 
+    ``approval_id`` is the request's own id from the ``approval.request``
+    event: a host that supports exact routing (the field is ``approvalId``
+    on the wire) resolves THAT request instead of FIFO-popping the oldest;
+    hosts that predate the field ignore it.
+
     The choice is NOT re-validated here — the narrowing of what voice may
     grant lives in :mod:`talk_approvals`, the one choke point every caller
     goes through.
     """
 
+    body: dict = {"choice": choice}
+    if approval_id:
+        body["approvalId"] = approval_id
     try:
         response = httpx.post(
             f"{talk_config.api_server_url()}{RUNS_PATH}/{run_id}/approval",
-            json={"choice": choice},
+            json=body,
             headers=_auth_headers(),
             timeout=talk_config.api_server_probe_timeout_s() * 4,
         )
