@@ -492,16 +492,52 @@ class ToolResponseCoordinator:
 
 
 def local_operator_authorizer(tool_name: str, event: dict) -> None:
-    """Permit every host tool call for a session with no remote speakers.
+    """Grant speaker authority for a session with no remote speakers.
 
     A non-Discord Talk session hears exactly one person: the operator at
     this machine's microphone. Shell access to the box already carries full
-    host authority, so voice adds no privilege the keyboard lacks. Discord
-    (and any future multi-speaker transport) must wire a real authorization
-    ledger instead; HostExecutionRelay refuses to exist without an explicit
-    choice between the two.
+    host authority, so voice adds no SPEAKER privilege the keyboard lacks.
+    Discord (and any future multi-speaker transport) must wire a real
+    authorization ledger instead; HostExecutionRelay refuses to exist
+    without an explicit choice between the two.
+
+    Authority is not the whole gate: WHAT may run on the plugin thread is
+    settled transport-independently by :func:`_host_tool_classification_denial`,
+    which rides above every authorizer — a destructive host tool steers to
+    the delegate lane even for the operator, because its in-handler approval
+    gates fail open on this thread.
     """
 
+    return None
+
+
+def _host_tool_classification_denial(name: str, event: dict) -> str | None:
+    """The transport-independent classification gate (capability bridge §2).
+
+    The authorizer settles WHO may act — speaker authority and spoken
+    permits. This gate settles WHAT may run on the plugin thread at all, on
+    EVERY transport: a CLASS_DELEGATE host tool never dispatches from here,
+    because its in-handler approval gates fail open without an interactive
+    approval context (the spec's forbidden bare-dispatch class), so the
+    denial steers the work to the delegate lane, where the api-server run's
+    approval loop is a real gate. Talk tools are not host tools and never
+    classify — delegate_task is the steering receipt's own destination.
+    CLASS_INLINE and CLASS_PERMIT dispatch under whatever authority the
+    transport's authorizer just granted: the local single-speaker session IS
+    the operator, and the Discord ledger has already demanded its fresh
+    spoken permit by the time this runs.
+    """
+
+    if (
+        name in talk_operator_auth.READ_ONLY_TALK_TOOLS
+        or name in talk_operator_auth.MUTATING_TALK_TOOLS
+    ):
+        return None
+    classification = talk_operator_auth.classify_host_tool(
+        name, event.get("arguments")
+    )
+    if classification == talk_operator_auth.CLASS_DELEGATE:
+        return talk_operator_auth.UNCLASSIFIED_DENIAL.format(tool=name)
     return None
 
 
@@ -563,7 +599,12 @@ class HostExecutionRelay:
             # event["arguments"] string read below — nothing rewrites the
             # dict in between, so the authorized and executed arguments
             # cannot diverge.
-            denial = self.tool_authorizer(str(event.get("name") or ""), event)
+            name = str(event.get("name") or "")
+            denial = self.tool_authorizer(name, event)
+            if denial is None:
+                # WHO may act is settled; WHAT may run on this thread is a
+                # separate, transport-independent question.
+                denial = _host_tool_classification_denial(name, event)
             if denial is not None:
                 outputs[position] = self._output(call_id, denial)
                 continue
