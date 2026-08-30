@@ -55,6 +55,44 @@ delegates the rest, and gated work resolves by spoken approval. Never a bare
   ladder, and when no agent lane exists at all the transcript is restored for
   the next sweep ("handoff deferred") instead of dropped.
 
+### Hardened (adversarial review round)
+Eight findings from the pre-release adversarial review, all fixed with
+regression tests:
+- **Classification is transport-independent.** The host-tool classification
+  now rides the execution relay itself, above every authorizer — the local
+  single-speaker lane can no longer dispatch a destructive or unclassified
+  host tool bare (its in-handler approval gates fail open on the plugin
+  thread). *Behavior change:* local voice host-execution steers mutating host
+  tools to the delegate lane with spoken approvals instead of running them
+  ungated.
+- **An answer in flight owns its approval.** A resolve POST outlasting the
+  courtesy wait can no longer be followed by a timeout deny or a second
+  answer; a late acceptance finalizes the record, and a transport failure
+  reopens it and re-arms the fail-closed timer.
+- **Malformed approval metadata narrows to deny-only.** A missing or
+  unrecognizable `choices` list used to widen the answer set to everything
+  voice can grant; it now collapses to `deny`.
+- **Dead event streams still get spoken prompts.** The run-events stream is
+  single-shot upstream (a reconnect 404s); when a run's watcher dies, the
+  poll loop reconciles one conservative prompt (`once`/`deny`) instead of
+  letting the approval sit silent until the host's 300s auto-deny. Resolves
+  also carry the request's own id (`approvalId`) for exact routing on hosts
+  that support it.
+- **Stale sidecars are quarantined by attach generation.** A delegated run
+  outliving its session can no longer speak its approval into — or be
+  resolved from — the next session.
+- **Transcripts are deleted only on proof.** The flush tiers run
+  synchronously and return a completion receipt; a refusal, failed run,
+  nonzero one-shot exit, or exception keeps the only copy for the next sweep
+  (at-least-once instead of silent loss).
+- **A zero-tool live read is a real answer.** The prompt section no longer
+  falls back to static enabled/configured flags when the registry's
+  availability gates resolved nothing.
+- **Cold starts mint the catalog deterministically.** Session start gives the
+  background catalog read a bounded head start
+  (`TALK_CATALOG_STARTUP_WAIT_S`, default 2.5s, `0` = never wait) instead of
+  racing it.
+
 ## [0.14.0] — 2026-08-28
 
 The custom-voice cascade leaves the terminal: Discord rooms and the dashboard

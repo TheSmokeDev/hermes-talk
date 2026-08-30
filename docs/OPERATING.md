@@ -292,6 +292,7 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_AGENT_PROFILE` | auto-detect | Hermes profile for the detached spawn. **Set-but-blank = explicit opt-out** (never pass `--profile`). Full story: [README](../README.md#talk_agent_profile--which-profile-the-background-agent-runs-under). |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Wall-clock budget for one background run and its watcher. Junk or ≤0 silently takes the default. |
 | `TALK_APPROVAL_PROMPT_TIMEOUT_S` | `60.0` | How long a spoken approval question (the capability bridge) stays open before it resolves as **deny** — fail closed, silence is not consent. Sized under the host's own approval wait (300s) so the voice lane's deny lands first and the run unwinds on the operator's answer-or-silence. Junk or ≤0 silently takes the default. |
+| `TALK_CATALOG_STARTUP_WAIT_S` | `2.5` | Bounded head start a session start gives the first capability-catalog read, so a cold process still mints the live-catalog prompt section deterministically. `0` is honored and disables the wait (fire-and-forget); on expiry the session starts with the section omitted — logged, never a stall. Junk or negative silently takes the default. |
 | `TALK_MEMORY_SEARCH_TIMEOUT_S` | `10.0` | Wait bound for the in-process remembered-context (Honcho) tier of `search_memory`. On timeout the model speaks a retryable failure instead of the tool pipeline blocking; the transcript tier (`session_search`, a local FTS5 read) is not bounded. Junk or ≤0 silently takes the default. |
 
 ### api-server lane

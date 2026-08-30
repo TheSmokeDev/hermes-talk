@@ -471,9 +471,11 @@ That changes three everyday exchanges:
   inline; `computer_use`'s read actions (`capture`, `wait`, `list_apps`,
   `list_windows`) need a fresh spoken operator permit; everything else — and
   every destructive computer-use action, whose in-handler gate fails open
-  without a real approval context — delegates. A denied call never refuses
-  flat: you hear "I can't do that directly in a voice call — I can spin up an
-  agent that can. Want me to?"
+  without a real approval context — delegates. The classification applies on
+  every transport, the local terminal lane included: mutating host tools
+  steer to delegation with spoken approvals rather than running bare. A
+  denied call never refuses flat: you hear "I can't do that directly in a
+  voice call — I can spin up an agent that can. Want me to?"
 - **Delegated work that hits a gated action now asks you out loud.** The run
   lane streams the host's `approval.request` events; Talk speaks the request
   ("run 3 wants to run a shell command — once, this session, or no?") and your
