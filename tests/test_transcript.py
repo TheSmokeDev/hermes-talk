@@ -360,7 +360,11 @@ def test_hostile_transcript_delimiters_remain_json_quoted_untrusted_data(tmp_pat
     assert quoted in prompt
 
 
-def test_handoff_refusal_is_logged_and_dropped(tmp_path, caplog):
+def test_handoff_refusal_keeps_the_transcript_for_the_next_sweep(tmp_path, caplog):
+    """A refusal is not a review: the only copy is restored under its
+    original name for the next sweep (at-least-once), never deleted on an
+    unproven handoff."""
+
     capture = talk_transcript.TranscriptCapture(tmp_path)
     capture.append_turn("user", _long_turn("refused user"))
     capture.append_turn("assistant", _long_turn("refused assistant"))
@@ -371,8 +375,8 @@ def test_handoff_refusal_is_logged_and_dropped(tmp_path, caplog):
         run_agent=lambda _prompt: "I can't hand off work right now",
     )
 
-    assert "memory handoff was refused" in caplog.text
-    assert not capture.path.exists()
+    assert "memory handoff failed" in caplog.text
+    assert capture.path.exists()
 
 
 def test_default_handoff_never_blocks_sweep_startup(tmp_path, monkeypatch):
@@ -472,7 +476,7 @@ def test_force_killed_sweeper_claim_is_recovered_by_next_process(tmp_path):
     assert len(prompts) == 1
 
 
-def test_failed_claimed_flush_is_logged_dropped_and_does_not_block_next_file(
+def test_failed_claimed_flush_is_logged_kept_and_does_not_block_next_file(
     tmp_path, caplog
 ):
     for seed in ("first", "second"):
@@ -484,13 +488,22 @@ def test_failed_claimed_flush_is_logged_dropped_and_does_not_block_next_file(
 
     def flaky(prompt):
         calls.append(prompt)
-        if len(calls) == 1:
+        if "first user" in prompt:
             raise RuntimeError("host unavailable")
 
     talk_transcript.sweep_transcripts(tmp_path, run_agent=flaky)
 
     assert len(calls) == 2
     assert "host unavailable" in caplog.text
+    # One failure is isolated AND non-destructive: the failed transcript is
+    # kept under its original name, the other was reviewed and consumed.
+    leftovers = list((tmp_path / "state" / "talk-transcripts").iterdir())
+    assert len(leftovers) == 1
+    assert "first user" in leftovers[0].read_text(encoding="utf-8")
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=calls.append)
+
+    assert len(calls) == 3 and "first user" in calls[-1]
     assert list((tmp_path / "state" / "talk-transcripts").iterdir()) == []
 
 
@@ -729,11 +742,12 @@ def test_the_attached_host_tier_still_carries_the_flush(tmp_path, monkeypatch, f
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
 
-def test_a_host_refusal_still_drops_the_transcript(tmp_path, flush_lanes):
-    """Deferral is for ABSENT lanes only. A real lane that answers with a
-    refusal made a decision — the transcript is dropped, exactly as before.
-    (The wording is pinned by test_handoff_refusal_is_logged_and_dropped on
-    the synchronous path; this asserts the outcome, not the log race.)"""
+def test_a_host_refusal_keeps_the_transcript_for_the_next_sweep(tmp_path, flush_lanes):
+    """A lane that answers with a refusal still has not reviewed the
+    transcript — the only copy is restored for the next sweep
+    (at-least-once), never dropped on an unproven handoff. (The wording is
+    pinned by test_handoff_refusal_keeps_the_transcript_for_the_next_sweep
+    on the synchronous path; this asserts the outcome, not the log race.)"""
 
     import talk_host
 
@@ -748,10 +762,12 @@ def test_a_host_refusal_still_drops_the_transcript(tmp_path, flush_lanes):
     talk_transcript.reset_status_for_tests()
     talk_transcript.sweep_transcripts(tmp_path)
 
-    assert _wait_for(lambda: not capture.path.exists())
     assert _wait_for(
         lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
     )
+    root = tmp_path / "state" / "talk-transcripts"
+    assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
+    assert not list(root.glob("*.claimed-*"))
 
 
 def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
@@ -766,12 +782,17 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     seen = []
 
     class FakePopen:
+        returncode = 0
+
         def __init__(self, argv, **kwargs):
             seen.append(argv)
             spawned.set()
 
         def communicate(self, timeout=None):
             return ("reviewed", "")
+
+        def kill(self):
+            pass
 
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: "/usr/local/bin/hermes")
     monkeypatch.setattr(talk_host.subprocess, "Popen", FakePopen)
@@ -783,3 +804,66 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     assert "-z" in seen[0] and "memory" in seen[0][-1].lower()
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
+
+
+def test_an_api_server_flush_failure_keeps_the_transcript(
+    tmp_path, monkeypatch, flush_lanes
+):
+    """WORK_STARTED-then-dead was the drop class: the api-server tier now
+    completes synchronously, and a failed run keeps the only copy for the
+    next sweep."""
+
+    import talk_apiserver
+
+    capture = _finished_capture(tmp_path, "failed flush")
+
+    def failing_run(prompt, *, session_id, session_key):
+        return "the agent run failed: model overloaded"
+
+    monkeypatch.setattr(talk_apiserver, "is_available", lambda: True)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", failing_run)
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert _wait_for(
+        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
+    )
+    root = tmp_path / "state" / "talk-transcripts"
+    assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
+    assert not list(root.glob("*.claimed-*"))
+
+
+def test_a_detached_nonzero_exit_keeps_the_transcript(
+    tmp_path, monkeypatch, flush_lanes
+):
+    """The detached one-shot's exit status is part of the proof: a nonzero
+    exit is a failed review, and the transcript is restored, not deleted."""
+
+    import talk_host
+
+    capture = _finished_capture(tmp_path, "detached failed")
+
+    class FailingPopen:
+        returncode = 3
+
+        def __init__(self, argv, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            return ("", "boom")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(talk_host.subprocess, "Popen", FailingPopen)
+
+    talk_transcript.reset_status_for_tests()
+    talk_transcript.sweep_transcripts(tmp_path)
+
+    assert _wait_for(
+        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
+    )
+    root = tmp_path / "state" / "talk-transcripts"
+    assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
