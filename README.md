@@ -340,12 +340,13 @@ microphone. Waiting there wouldn't be patience, it would be dead air.
 ### Turning the api-server lane on
 
 ```bash
-# in your gateway environment
-API_SERVER_ENABLED=true
-API_SERVER_KEY=<a key you choose>
+# in your gateway environment (HERMES_HOME/.env works)
+API_SERVER_KEY=<a strong key you choose — 16+ characters>
 ```
 
-Restart the gateway. Talk finds it by itself — no Talk-side configuration is
+Restart the gateway. The platform enables itself when a usable key exists —
+current hosts require the key (an unauthenticated api-server refuses to
+start), so `API_SERVER_ENABLED` alone does nothing. Talk finds it by itself — no Talk-side configuration is
 needed, because `API_SERVER_KEY` is the same variable the gateway reads. If you
 want Talk to use a *different* key or a non-default address, set
 `TALK_API_SERVER_KEY` / `TALK_API_SERVER_URL`.

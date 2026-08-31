@@ -187,7 +187,7 @@ def test_probe_timeout_neither_raises_nor_waits_forever(monkeypatch):
     # configured is the budget handed to httpx. A timing assertion here would
     # be flaky on CI and would prove nothing on a fast box.
     assert seen["timeout"] == 0.25
-    assert "API_SERVER_ENABLED" in verdict.detail
+    assert "API_SERVER_KEY" in verdict.detail
 
 
 def test_probe_distinguishes_a_bad_key_from_an_absent_server(monkeypatch):

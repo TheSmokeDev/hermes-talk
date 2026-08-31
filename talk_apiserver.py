@@ -163,8 +163,9 @@ def probe() -> ApiServerStatus:
             reason=REASON_ABSENT,
             detail=(
                 "the Hermes api server isn't reachable "
-                f"({type(exc).__name__}) — set API_SERVER_ENABLED=true and "
-                "restart the gateway to turn it on"
+                f"({type(exc).__name__}) — set a strong API_SERVER_KEY "
+                "(16+ chars) in the gateway environment and restart it; the "
+                "platform enables itself when a usable key exists"
             ),
         )
     if response.status_code == 401:
