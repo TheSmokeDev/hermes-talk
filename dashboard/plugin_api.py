@@ -213,15 +213,16 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False):
-    """Assemble instructions and mint. Blocking — called on a worker thread.
+def _mint(
+    auth_token: str,
+    voice: str,
+    *,
+    text_output: bool = False,
+    desktop_relay: bool = False,
+):
+    """Assemble instructions and mint. Blocking — called on a worker thread."""
 
-    ``text_output`` is the cascade lane: the minted session asks the provider
-    for TEXT output instead of synthesized audio, and the browser streams the
-    text deltas back through the cascade relay to be spoken server-side.
-    """
-
-    tools = talk_tools.default_talk_tools()
+    tools = [] if desktop_relay else talk_tools.default_talk_tools()
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),
@@ -230,11 +231,10 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False):
             talk_host.host().identity_sections(),
             tools=tools,
             lane="dashboard",
-            # The session route already paid for the catalog warm, so the
-            # live-catalog section reads a warm snapshot here.
-            capabilities=talk_capabilities.instruction_section(),
+            capabilities=(None if desktop_relay else talk_capabilities.instruction_section()),
         ),
         tools=tools,
+        automatic_response=not desktop_relay,
         text_output=text_output,
     )
 
@@ -326,7 +326,13 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    requested_mode = body.get("mode")
+    if requested_mode not in (None, "desktop-relay"):
+        raise HTTPException(status_code=400, detail="unsupported session mode")
+    desktop_relay = requested_mode == "desktop-relay"
     voice_mode = _resolve_voice_mode()
+    if desktop_relay and voice_mode != "native":
+        raise HTTPException(status_code=400, detail="desktop-relay requires native voice mode")
     text_output = voice_mode == "cascade"
     if text_output:
         # A cascade session has no provider voice to validate — the mint asks
@@ -353,6 +359,7 @@ async def create_session(request: Request) -> dict:
             auth.token,
             voice,
             text_output=text_output,
+            desktop_relay=desktop_relay,
         )
     except talk_wire.TalkWireError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -392,6 +399,7 @@ async def create_session(request: Request) -> dict:
         # provider's audio track; cascade relays text deltas to /cascade-tts
         # and plays the PCM that comes back.
         "voiceMode": voice_mode,
+        "mode": requested_mode or "dashboard",
     }
 
 
