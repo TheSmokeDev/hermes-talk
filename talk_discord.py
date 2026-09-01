@@ -376,6 +376,8 @@ class DiscordAudio:
         self._played_baseline = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
+        #: SSRCs already warned about (E2EE audio withheld, speaker unknown).
+        self._unidentified_ssrcs: set[Any] = set()
         #: Wall-clock instant up to which we have handed the session audio.
         #: Zero until start(), which is what gates silence synthesis.
         self._audio_clock = 0.0
@@ -550,6 +552,14 @@ class DiscordAudio:
             self._capture_listener_generation = generation
             self._closing_listener_handoff_generation = None
             self._listener_condition.notify_all()
+        with suppress(Exception):  # receipt only; host attributes may differ
+            mapping = getattr(receiver, "_ssrc_to_user", None)
+            _log.info(
+                "discord capture live: bot_ssrc=%s e2ee=%s mapped_ssrcs=%s",
+                getattr(receiver, "_bot_ssrc", None),
+                getattr(receiver, "_dave_session", None) is not None,
+                sorted(mapping) if isinstance(mapping, dict) else None,
+            )
 
         if self._capture_only:
             return
@@ -699,6 +709,7 @@ class DiscordAudio:
             except queue.Empty:
                 break
         self._capture_remainder.clear()
+        self._unidentified_ssrcs.clear()
         self._audio_clock = 0.0
         self._last_keepalive = 0.0
         self._loop = None
@@ -792,33 +803,9 @@ class DiscordAudio:
             lock = getattr(receiver, "_lock", None)
             if lock is not None:
                 with lock:
-                    receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
-                    chunks = [
-                        (
-                            ssrc,
-                            receiver_mapping.get(ssrc)
-                            if isinstance(receiver_mapping, dict)
-                            else None,
-                            bytes(buf),
-                        )
-                        for ssrc, buf in buffers.items()
-                        if buf
-                    ]
-                    for buf in buffers.values():
-                        del buf[:]
+                    chunks = self._take_receiver_chunks(receiver)
             else:  # pragma: no cover - every shipped host has the lock
-                receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
-                chunks = [
-                    (
-                        ssrc,
-                        receiver_mapping.get(ssrc) if isinstance(receiver_mapping, dict) else None,
-                        bytes(buf),
-                    )
-                    for ssrc, buf in buffers.items()
-                    if buf
-                ]
-                for buf in buffers.values():
-                    del buf[:]
+                chunks = self._take_receiver_chunks(receiver)
             if chunks:
                 self._touch_host_timer()
             for ssrc, raw_user_id, chunk in chunks:
@@ -845,6 +832,100 @@ class DiscordAudio:
                         pass
         except Exception:  # noqa: BLE001 — this runs on the HOST's thread
             _log.debug("discord capture drain failed", exc_info=True)
+
+    def _take_receiver_chunks(self, receiver: Any) -> list[tuple[Any, Any, bytes]]:
+        """Swap out every SSRC buffer; the caller holds the receiver lock.
+
+        Discord voice is end-to-end encrypted (DAVE). The host only runs the
+        DAVE decrypt for an SSRC it has already mapped to a user, and it
+        learns that mapping from Discord's SPEAKING event (which never
+        arrives for someone already talking when the bot joined) or from its
+        own silence gate, which our continuous drain starves. An unmapped
+        SSRC therefore reaches the Opus decoder still encrypted and comes
+        out as white noise. Identify the speaker here the way the host
+        would, and withhold the frames decoded before that mapping existed
+        rather than hand the model static.
+        """
+
+        buffers = receiver._buffers
+        mapping = getattr(receiver, "_ssrc_to_user", None)
+        if not isinstance(mapping, dict):
+            mapping = None
+        encrypted = getattr(receiver, "_dave_session", None) is not None
+        chunks: list[tuple[Any, Any, bytes]] = []
+        for ssrc, buf in buffers.items():
+            if not buf:
+                continue
+            raw_user_id = mapping.get(ssrc) if mapping is not None else None
+            if not raw_user_id and mapping is not None:
+                raw_user_id = self._identify_speaker(receiver, ssrc)
+                if encrypted:
+                    # Everything buffered so far was decoded before the
+                    # mapping existed: ciphertext through Opus. Drop it and
+                    # reset the host decoder for this stream so the first
+                    # real frame starts clean.
+                    del buf[:]
+                    decoders = getattr(receiver, "_decoders", None)
+                    if isinstance(decoders, dict):
+                        decoders.pop(ssrc, None)
+                    self._capture_remainder.pop(ssrc, None)
+                    if raw_user_id:
+                        self._unidentified_ssrcs.discard(ssrc)
+                        _log.info(
+                            "identified discord speaker ssrc=%s -> user=%s; "
+                            "E2EE audio flows from the next frame",
+                            ssrc,
+                            raw_user_id,
+                        )
+                    elif ssrc not in self._unidentified_ssrcs:
+                        self._unidentified_ssrcs.add(ssrc)
+                        _log.warning(
+                            "withholding E2EE audio from unidentified discord "
+                            "speaker ssrc=%s until Discord says who it is",
+                            ssrc,
+                        )
+                    continue
+            chunks.append((ssrc, raw_user_id, bytes(buf)))
+            del buf[:]
+        return chunks
+
+    def _identify_speaker(self, receiver: Any, ssrc: Any) -> Any:
+        """Map an unknown SSRC to a user the way the host's silence gate does.
+
+        The caller holds the receiver lock. Prefers the host's own inference
+        so the mapping (and its log line) stay the host's; falls back to the
+        same sole-allowed-member rule on a host build without it.
+        """
+
+        infer = getattr(receiver, "_infer_user_for_ssrc", None)
+        if callable(infer):
+            with suppress(Exception):
+                found = infer(ssrc)
+                if found:
+                    return found
+            return None
+        mapping = getattr(receiver, "_ssrc_to_user", None)
+        if not isinstance(mapping, dict):
+            return None
+        try:
+            voice_client = getattr(receiver, "_vc", None)
+            channel = getattr(voice_client, "channel", None)
+            bot_id = getattr(getattr(voice_client, "user", None), "id", None)
+            allowed = {str(uid) for uid in (getattr(receiver, "_allowed_user_ids", None) or ())}
+            candidates = [
+                member.id
+                for member in getattr(channel, "members", None) or ()
+                if member.id != bot_id and (not allowed or str(member.id) in allowed)
+            ]
+        except Exception:  # noqa: BLE001 - host objects, host thread
+            return None
+        if len(candidates) != 1:
+            return None
+        mapping[ssrc] = candidates[0]
+        _log.info(
+            "auto-mapped discord ssrc=%s -> user=%s (sole allowed member)", ssrc, candidates[0]
+        )
+        return candidates[0]
 
     def _bridge_identity_is_current(self, receiver: Any | None = None) -> bool:
         """Whether the adapter still publishes the exact bridge we borrowed."""

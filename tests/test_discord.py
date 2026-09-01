@@ -1420,6 +1420,129 @@ def test_drain_does_not_coerce_receiver_user_id_mappings(monkeypatch, raw_user_i
     bridge.stop()
 
 
+def test_e2ee_unmapped_speaker_is_identified_and_pre_mapping_audio_withheld(
+    monkeypatch, caplog
+):
+    """Sep 1 regression: DAVE on, Discord never sent SPEAKING, our drain
+    starved the host's silence gate, so the SSRC stayed unmapped, the host
+    skipped DAVE decrypt, and Opus turned ciphertext into white noise."""
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    _connection.dave_session = receiver._dave_session = object()
+    receiver._decoders = {11: object()}
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(events.append)
+
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(b"\x7f\x7f" * 8)  # decoded ciphertext
+    with caplog.at_level("INFO", logger="talk_discord"):
+        bridge._drain_receiver(receiver)
+
+    assert bridge._inbound.empty(), "pre-mapping E2EE frames must be dropped"
+    assert events == []
+    assert receiver._ssrc_to_user[11] == 101
+    assert 11 not in receiver._decoders, "host decoder reset so the next frame starts clean"
+    assert not receiver._buffers[11]
+    assert "ssrc=11 -> user=101" in caplog.text
+
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.speaker == {"ssrc": 11, "user_id": 101, "display_name": "Alice"}
+    assert events == [{"ssrc": 11, "user_id": 101, "display_name": "Alice"}]
+    bridge.stop()
+
+
+def test_e2ee_unmapped_speaker_prefers_the_host_inference(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[types.SimpleNamespace(id=101, display_name="Alice")]
+    )
+    _connection.dave_session = receiver._dave_session = object()
+    calls: list[int] = []
+
+    def _infer(ssrc: int) -> int:
+        calls.append(ssrc)
+        receiver._ssrc_to_user[ssrc] = 202
+        return 202
+
+    receiver._infer_user_for_ssrc = _infer
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(b"\x7f\x7f" * 8)
+    bridge._drain_receiver(receiver)
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    assert calls == [11], "host inference wins; the fallback rule must not overwrite it"
+    packet = bridge.read_input_packet()
+    assert packet is not None
+    assert packet.speaker["user_id"] == 202
+    bridge.stop()
+
+
+def test_e2ee_audio_from_an_unidentifiable_speaker_is_withheld_with_one_warning(
+    monkeypatch, caplog
+):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[
+            types.SimpleNamespace(id=101, display_name="Alice"),
+            types.SimpleNamespace(id=102, display_name="Bob"),
+        ]
+    )
+    _connection.dave_session = receiver._dave_session = object()
+    bridge = talk_discord.DiscordAudio(7)
+    events: list[dict] = []
+    bridge.start()
+    bridge.set_speaker_notifier(events.append)
+
+    with caplog.at_level("WARNING", logger="talk_discord"):
+        for _ in range(3):
+            with receiver._lock:
+                receiver._buffers[11] = bytearray(b"\x7f\x7f" * 8)
+            bridge._drain_receiver(receiver)
+
+    assert bridge._inbound.empty(), "nothing real forwarded; only synthesized silence"
+    assert events == []
+    assert 11 not in receiver._ssrc_to_user
+    warnings = [r for r in caplog.records if "withholding E2EE audio" in r.getMessage()]
+    assert len(warnings) == 1, "warn once per SSRC, not once per packet"
+    bridge.stop()
+
+
+def test_unencrypted_unmapped_speaker_audio_still_flows(monkeypatch):
+    _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
+    vc.channel = types.SimpleNamespace(
+        members=[
+            types.SimpleNamespace(id=101, display_name="Alice"),
+            types.SimpleNamespace(id=102, display_name="Bob"),
+        ]
+    )
+    assert receiver._dave_session is None
+    bridge = talk_discord.DiscordAudio(7)
+    bridge.start()
+
+    with receiver._lock:
+        receiver._buffers[11] = bytearray(b"\x01\x00" * 8)
+    bridge._drain_receiver(receiver)
+
+    packet = bridge.read_input_packet()
+    assert packet is not None, "passthrough audio never waits on a mapping"
+    assert packet.speaker == {"ssrc": 11, "user_id": None, "display_name": ""}
+    bridge.stop()
+
+
 def test_same_discord_speaker_chunks_and_ssrc_reorder_do_not_flood(monkeypatch):
     _connection, receiver, vc, _adapter = _wired_host(monkeypatch)
     vc.channel = types.SimpleNamespace(

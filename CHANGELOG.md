@@ -11,6 +11,39 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.15.1] — 2026-09-01
+
+Voice hears you again on end-to-end-encrypted Discord calls. 0.15.0's
+`/talk join` could forward white noise to the model for the whole session
+when the operator was already in the channel and had not spoken through
+`/voice` first — not a microphone problem, an identity one.
+
+### Fixed
+- **E2EE audio from an unmapped speaker no longer reaches the model as
+  static.** Discord voice is DAVE-encrypted; the host only decrypts an SSRC
+  it has already mapped to a user, and it learns that mapping from Discord's
+  SPEAKING event (which never arrives for someone already transmitting when
+  the bot joins) or from its own silence gate — which `/talk`'s continuous
+  drain starved, so the mapping never formed, decrypt was skipped, and Opus
+  decoded ciphertext. The bridge now identifies the speaker itself the way
+  the host's silence gate would (host inference preferred, sole-allowed-
+  member fallback), discards the frames decoded before the mapping existed,
+  resets the host decoder for that stream, and warns once per SSRC when a
+  speaker cannot be identified rather than forwarding noise. Unencrypted
+  (passthrough) audio flows exactly as before.
+- **Capability section reflects the live install.** The prompt's toolset
+  list is priority-ordered so high-agency tools (`computer_use`, browser,
+  terminal) survive the display cap instead of being truncated in catalog
+  order; the delegate line names only the categories whose tools actually
+  resolved; a category with no tool list is kept rather than silently
+  filtered out.
+
+### Added
+- One `INFO` receipt when the capture tap goes live —
+  `discord capture live: bot_ssrc=… e2ee=… mapped_ssrcs=…` — so the next
+  "it hears noise" report carries whether the call was encrypted and who
+  was mapped at the moment `/talk` attached.
+
 ## [0.15.0] — 2026-08-30
 
 The capability bridge: voice becomes the manager of Hermes's whole capability
