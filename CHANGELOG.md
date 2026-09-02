@@ -11,6 +11,12 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Fixed
+- Linux terminal calls now route default audio through PulseAudio's WebRTC
+  echo canceller and noise suppressor. Echo-cancelled input bypasses the
+  fallback amplitude/VAD gate so barge-in does not clip quiet words.
 ## [0.16.0] — 2026-09-01
 
 Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add
@@ -48,7 +54,6 @@ lane rides the Codex CLI's.
 - Reading Grok Build CLI's `~/.grok/auth.json`; a device-code login inside
   the plugin; any write to any auth store. The dashboard tab stays
   OpenAI-only.
-
 ## [0.15.1] — 2026-09-01
 
 Voice hears you again on end-to-end-encrypted Discord calls. 0.15.0's

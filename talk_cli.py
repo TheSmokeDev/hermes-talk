@@ -1267,16 +1267,20 @@ async def run_talk_session(
 
     def on_barge_in() -> None:
         played = audio.played_ms
-        audio.drain_playback()
+        boundary = audio.drain_playback()
+        played_item = None
+        if boundary is not None:
+            played_item, played = boundary
         if relay.response_active:
             # An approval question interrupted mid-ask is a question not fully
             # heard: the bridge denies it. Speech after the prompt's response
             # finished (response_active False) is an answer, never a barge-in.
             talk_approvals.note_barge_in()
-        if relay.last_audio_item_id and played > 0:
+        item_id = played_item or relay.last_audio_item_id
+        if item_id and played > 0:
             pending.append(
                 talk_realtime.TruncateOutput(
-                    item_id=relay.last_audio_item_id, audio_end_ms=played
+                    item_id=item_id, audio_end_ms=played
                 )
             )
 
