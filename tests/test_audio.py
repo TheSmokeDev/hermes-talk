@@ -51,6 +51,16 @@ def test_input_chunks_round_trip():
 def _pcm16(amplitude: int, frames: int = 32) -> bytes:
     return struct.pack(f"<{frames}h", *([amplitude] * frames))
 
+class _SpeechDetector:
+    def __init__(self, speech: bool):
+        self.speech = speech
+        self.calls = 0
+
+    def is_speech(self, _frame: bytes, sample_rate: int) -> bool:
+        assert sample_rate == 8_000
+        self.calls += 1
+        return self.speech
+
 
 def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
     audio = talk_audio.DuplexAudio()
@@ -64,15 +74,30 @@ def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
 
 
 def test_voice_above_omp_barge_in_threshold_interrupts_playback():
-    audio = talk_audio.DuplexAudio()
-    playback = _pcm16(20_000)
+    detector = _SpeechDetector(True)
+    audio = talk_audio.DuplexAudio(speech_detector=detector)
+    playback = _pcm16(20_000, 2_400)
     audio.queue_playback(playback)
-    audio._output_callback(_Buffer(len(playback)), 32, None, None)
-    barge_in = _pcm16(30_000)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    barge_in = _pcm16(30_000, 2_400)
 
-    audio._input_callback(barge_in, 32, None, None)
+    audio._input_callback(barge_in, 2_400, None, None)
 
     assert audio.read_input_chunk() == barge_in
+    assert detector.calls > 0
+
+
+def test_loud_room_noise_does_not_interrupt_playback():
+    detector = _SpeechDetector(False)
+    audio = talk_audio.DuplexAudio(speech_detector=detector)
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+
+    audio._input_callback(_pcm16(30_000, 2_400), 2_400, None, None)
+
+    assert detector.calls > 0
+    assert audio.read_input_chunk() is None
 
 
 def test_microphone_audio_passes_when_playback_is_silent():

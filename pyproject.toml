@@ -9,7 +9,7 @@ authors = [{ name = "SmokeDev" }]
 dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
 
 [project.optional-dependencies]
-audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
+audio = ["sounddevice>=0.4.6", "numpy>=1.26", "webrtcvad-wheels>=2.0.14"]
 dev = ["pytest>=8", "ruff>=0.4"]
 
 [build-system]
