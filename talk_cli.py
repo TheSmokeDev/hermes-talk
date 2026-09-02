@@ -1888,6 +1888,31 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
         return 0
 
     try:
+        try:
+            from . import talk_core_cli, talk_core_realtime
+        except ImportError:
+            import talk_core_cli
+            import talk_core_realtime
+        core_runner = (
+            talk_core_cli.run_core_talk_session
+            if talk_core_realtime.coordinator_contract_available()
+            and talk_core_realtime.configured_core_provider_supported()
+            else None
+        )
+    except ImportError:
+        core_runner = None
+
+    if core_runner is not None:
+        try:
+            code = asyncio.run(core_runner())
+        except KeyboardInterrupt:
+            print("\ntalk: hung up.")
+            return 0
+        if code:
+            raise SystemExit(code)
+        return 0
+
+    try:
         code = asyncio.run(run_talk_session())
     except KeyboardInterrupt:
         print("\ntalk: hung up.")

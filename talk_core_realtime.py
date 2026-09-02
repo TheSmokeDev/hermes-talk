@@ -129,6 +129,27 @@ try:
 except Exception as exc:  # noqa: BLE001 - optional core must never poison legacy imports
     _CORE_IMPORT_ERROR = exc
 
+_V1_PROVIDER = None
+_V1_CONFIGURED_PROVIDER = None
+try:
+    try:
+        from .talk_core_realtime_contract import (
+            TalkOpenAIRealtimeProvider as _V1_PROVIDER,
+        )
+        from .talk_core_realtime_contract import (
+            configured_provider as _V1_CONFIGURED_PROVIDER,
+        )
+    except ImportError:
+        from talk_core_realtime_contract import (
+            TalkOpenAIRealtimeProvider as _V1_PROVIDER,
+        )
+        from talk_core_realtime_contract import (
+            configured_provider as _V1_CONFIGURED_PROVIDER,
+        )
+except Exception:  # noqa: BLE001 - #95147 is optional on older Hermes hosts
+    _V1_PROVIDER = None
+    _V1_CONFIGURED_PROVIDER = None
+
 # Compatibility diagnostics intentionally distinguish the detected data surface
 # from the complete production capability (which also requires enum claims and
 # the concrete mapper/hook implemented below).
@@ -159,9 +180,37 @@ _PROVIDER_EOF_MESSAGE = "provider connection closed unexpectedly"
 
 
 def core_provider_available() -> bool:
-    """Return only whether the exact optional Hermes core API-v2 is importable."""
+    """Return whether either supported Hermes realtime contract is importable."""
 
-    return _CORE_IMPORT_ERROR is None
+    return _CORE_IMPORT_ERROR is None or _V1_PROVIDER is not None
+
+
+def coordinator_contract_available() -> bool:
+    """Return whether Hermes #95147 is the active optional core contract."""
+
+    return _CORE_IMPORT_ERROR is not None and _V1_PROVIDER is not None
+
+
+def configured_core_provider():
+    """Build the configured provider for the active Hermes core contract."""
+
+    if coordinator_contract_available():
+        return _V1_CONFIGURED_PROVIDER()
+    if TalkOpenAIRealtimeProvider is None:
+        raise RuntimeError("Hermes realtime voice provider contract is unavailable")
+    return TalkOpenAIRealtimeProvider()
+
+
+def configured_core_provider_supported() -> bool:
+    """Return whether the active core seam supports TALK_PROVIDER."""
+
+    try:
+        if coordinator_contract_available():
+            _V1_CONFIGURED_PROVIDER()
+            return True
+        return talk_config.talk_provider() == "openai"
+    except Exception:  # noqa: BLE001 - selection probes never break plugin loading
+        return False
 
 
 def explicit_output_available() -> bool:
@@ -172,12 +221,12 @@ def explicit_output_available() -> bool:
 
 def core_provider_diagnostic() -> dict[str, bool]:
     """Return passive contract/provider readiness without exposing credentials."""
-
     contract_available = core_provider_available()
     provider_available = False
-    if contract_available and TalkOpenAIRealtimeProvider is not None:
+
+    if contract_available:
         try:
-            provider_available = bool(TalkOpenAIRealtimeProvider().is_available())
+            provider_available = bool(configured_core_provider().is_available())
         except Exception:  # noqa: BLE001 - diagnostics must stay passive and bounded
             provider_available = False
     return {
@@ -1350,7 +1399,7 @@ else:
     SUPPORTED_INPUT_AUDIO_FORMAT = None
     SUPPORTED_OUTPUT_AUDIO_FORMAT = None
     CORE_CAPABILITIES = frozenset()
-    TalkOpenAIRealtimeProvider = None
+    TalkOpenAIRealtimeProvider = _V1_PROVIDER
 
 
 __all__ = [
@@ -1363,6 +1412,9 @@ __all__ = [
     "OpenAIWireEOF",
     "OpenAIWireError",
     "TalkOpenAIRealtimeProvider",
+    "configured_core_provider",
+    "configured_core_provider_supported",
+    "coordinator_contract_available",
     "core_provider_available",
     "core_provider_diagnostic",
     "explicit_output_available",

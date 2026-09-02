@@ -50,6 +50,8 @@ py-modules = [
   "talk_grok_realtime",
   "talk_gemini_realtime",
   "talk_core_realtime",
+  "talk_core_cli",
+  "talk_core_realtime_contract",
   "talk_core_session",
   "talk_discord",
   "talk_relay",

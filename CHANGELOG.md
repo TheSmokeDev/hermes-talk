@@ -13,10 +13,18 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- `hermes-talk` now implements the provider/session contract from Hermes
+  #95147. The plugin owns OpenAI transport while Hermes's coordinator owns
+  tool dispatch, heard-audio truncation, cancellation, and transcript memory.
+  Terminal sessions emit `listening`, `solving`, and `composing` lifecycle
+  phases for the TUI orb without introducing another core transport.
+
 ### Fixed
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
-  echo canceller and noise suppressor. Echo-cancelled input bypasses the
-  fallback amplitude/VAD gate so barge-in does not clip quiet words.
+  echo canceller and noise suppressor. The fallback path matches OMP's
+  output-relative amplitude gate, and heard-audio boundaries are captured
+  atomically with playback drain.
 ## [0.16.0] — 2026-09-01
 
 Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add

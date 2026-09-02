@@ -158,11 +158,12 @@ def test_realtime_registration_false_is_rejected_not_registered(plugin):
     assert len(ctx.realtime_providers) == 1
 
 
-def test_real_api_v2_context_accepts_the_talk_provider(plugin):
+def test_real_core_context_accepts_the_talk_provider(plugin):
     if not plugin.talk_core_realtime.core_provider_available():
-        pytest.skip("optional Hermes core API-v2 is absent")
+        pytest.skip("optional Hermes realtime voice contract is absent")
     try:
         from agent import realtime_voice_registry
+        from agent.realtime_voice import RealtimeVoiceProvider
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     except ImportError:
         pytest.skip("optional Hermes plugin API is absent")
@@ -179,8 +180,7 @@ def test_real_api_v2_context_accepts_the_talk_provider(plugin):
         )
         registered = realtime_voice_registry.get_provider("talk_openai_realtime")
         assert plugin.REGISTRATION_RECEIPTS["realtime_voice_provider"] == "registered"
-        assert registered is not None
-        assert registered.api_version == 2
+        assert isinstance(registered, RealtimeVoiceProvider)
     finally:
         realtime_voice_registry._reset_for_tests()
 

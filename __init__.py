@@ -93,7 +93,7 @@ def _attempt_registration(
 
 
 def _attempt_boolean_registration(ctx, method_name: str, surface: str, receipt: str, *args) -> None:
-    """Record exact acceptance for host registries with boolean receipts."""
+    """Record acceptance for boolean and handle-returning host registries."""
 
     method = getattr(ctx, method_name, None)
     if not callable(method):
@@ -104,7 +104,9 @@ def _attempt_boolean_registration(ctx, method_name: str, surface: str, receipt: 
     except Exception as exc:  # noqa: BLE001 - isolate optional registration
         _record(surface, receipt, exc)
         return
-    REGISTRATION_RECEIPTS[receipt] = "registered" if accepted is True else "rejected"
+    REGISTRATION_RECEIPTS[receipt] = (
+        "registered" if accepted is not None and accepted is not False else "rejected"
+    )
 
 
 def _register_talk_command(ctx) -> None:
@@ -212,13 +214,16 @@ def register(ctx) -> None:
     REGISTRATION_RECEIPTS.clear()
     talk_host.bind_ctx(ctx)
 
-    if talk_core_realtime.core_provider_available():
+    if (
+        talk_core_realtime.core_provider_available()
+        and talk_core_realtime.configured_core_provider_supported()
+    ):
         _attempt_boolean_registration(
             ctx,
             "register_realtime_voice_provider",
             "realtime voice provider",
             "realtime_voice_provider",
-            talk_core_realtime.TalkOpenAIRealtimeProvider(),
+            talk_core_realtime.configured_core_provider(),
         )
     else:
         _unsupported("realtime voice provider", "realtime_voice_provider")
