@@ -163,8 +163,18 @@ knob is fail-closed and never inferred from which keys exist — an operator
 holding several gets the provider they named or an error, not a silent
 switch.
 
-The Grok lane needs an xAI key (`TALK_XAI_API_KEY`, falling back to
-`XAI_API_KEY`; set-but-blank refuses), rides model `grok-voice-latest`
+The Grok lane runs on a **SuperGrok / X Premium+ subscription** — no key:
+`hermes auth add xai-oauth` once, then `TALK_PROVIDER=grok`. Talk consumes
+the host's `xai-oauth` login the way the OpenAI lane consumes the Codex
+CLI's (the host refreshes and stores; Talk never writes an auth store).
+Bring an xAI key instead if you'd rather (`TALK_XAI_API_KEY`, falling back
+to `XAI_API_KEY`; set-but-blank refuses). Keys win over the login unless
+`TALK_PREFER_XAI_OAUTH=true`, which requires the subscription and refuses
+metered fallback, fail-closed like its Codex twin. A rejected or
+tier-denied token gets a one-line remediation at connect, never a
+traceback; `hermes talk doctor --probe` makes two live calls to
+`api.x.ai` to prove the resolved bearer reaches realtime before you sit
+down to talk. The lane rides model `grok-voice-latest`
 (override: `TALK_GROK_MODEL`), and offers five voices — `ara`, `rex`, `sal`,
 `eve`, `leo` — via `TALK_GROK_VOICE` (fail-closed on unknown names). Same
 contract, same tools, same barge-in; terminal and Discord lanes both honor
@@ -518,7 +528,8 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini` (fail-closed; never inferred from which keys exist) |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model |
 | `TALK_GROK_VOICE` | `ara` | Grok voice: `ara`, `rex`, `sal`, `eve`, `leo` (fail-closed) |
-| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first; set-but-blank refuses |
+| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first; set-but-blank refuses; unset both to ride the `hermes auth add xai-oauth` subscription login |
+| `TALK_PREFER_XAI_OAUTH` | unset | `true` requires the xAI subscription login and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model (bare id; the adapter adds the wire prefix) |
 | `TALK_GEMINI_VOICE` | `Puck` | Gemini Live voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede` (fail-closed, case-sensitive) |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first; set-but-blank refuses; free-tier keys work |

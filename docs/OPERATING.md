@@ -179,7 +179,8 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 | `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
 | `TALK_GROK_VOICE` | `ara` | **Fail-closed** against the Grok voice list: `ara`, `rex`, `sal`, `eve`, `leo`. Friendly names only — the wire prefix is the adapter's job. |
-| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. xAI has no OAuth lane — key only. |
+| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. Unset both to ride the host's `xai-oauth` login (`hermes auth add xai-oauth`, a SuperGrok / X Premium+ subscription). |
+| `TALK_PREFER_XAI_OAUTH` | unset | Absent/`false` keeps keys ahead of the xAI login. `true` requires the login and ignores keys; a missing/unusable login refuses. Blank or invalid values refuse. |
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model. Configure the bare id — the adapter adds the `models/` wire prefix. Fallback line: `gemini-2.5-flash-native-audio-latest`. |
 | `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first (free-tier keys work). Set-but-blank is a hard refusal, same rule as the OpenAI keys. The key rides the WebSocket URL query on this lane, so the URL is treated as a secret: assembled at connect, never logged, scrubbed out of transport errors. The Live protocol has no client cancel/truncate command — barge-in degrades to local playback handling with a logged receipt. |
@@ -328,6 +329,16 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `CODEX_HOME` | `~/.codex` | Where the Codex OAuth lane (third in order) reads `auth.json` from. |
 | `TALK_PREFER_CODEX_OAUTH` | unset | Absent/`false` preserves the order above. `true` requires Codex OAuth and ignores API keys; missing/unusable OAuth refuses. Blank or invalid values also refuse. |
 
+Grok (`TALK_PROVIDER=grok`) resolves its own bearer the same shape:
+`TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` → `XAI_API_KEY` → the host
+`xai-oauth` login. When the host is importable its resolver owns refresh
+and quarantine; otherwise `HERMES_HOME/auth.json` is parsed read-only.
+Talk never writes either store. Doctor's auth check names the winning lane
+(`xai-oauth=valid|expired|invalid|missing`) without refreshing anything;
+`hermes talk doctor --probe` is the one opt-in network call — a `POST
+/v1/realtime/client_secrets` plus a socket handshake against `api.x.ai`
+that prints status codes and the first event type, never the token.
+
 ### Host
 
 | Variable | Default | Effect / failure mode |
@@ -390,6 +401,12 @@ spawned without a model config because yours lives in a profile. Set
 **"OpenAI Realtime auth failed (401)" on the Codex lane** — the OAuth
 token expired. Run `codex login` to refresh the ChatGPT sign-in, then
 start the session again.
+
+**"xAI OAuth token rejected" on the Grok lane** — the subscription login
+expired or was revoked. Run `hermes auth add xai-oauth` and start again.
+**"your xAI subscription tier does not include realtime API access"** —
+the login is valid but xAI answered 403 on the realtime surface; set
+`XAI_API_KEY` for Grok voice, or use another provider.
 
 **"401" with a key configured** — the key itself was rejected. Remember
 the order: `TALK_OPENAI_API_KEY` beats `OPENAI_API_KEY` beats Codex OAuth,

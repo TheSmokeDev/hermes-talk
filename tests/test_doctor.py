@@ -68,6 +68,7 @@ def _hermetic(monkeypatch, tmp_path):
         "TALK_GROK_VOICE",
         "TALK_XAI_API_KEY",
         "XAI_API_KEY",
+        "TALK_PREFER_XAI_OAUTH",
         "TALK_GEMINI_MODEL",
         "TALK_GEMINI_VOICE",
         "TALK_GEMINI_API_KEY",
@@ -484,7 +485,7 @@ def test_cli_parser_and_dispatch_make_doctor_a_native_subcommand(monkeypatch):
     )
 
     assert talk_cli.cli_entry(args) == 0
-    assert seen == [{"json_output": True}]
+    assert seen == [{"json_output": True, "probe": False}]
 
 
 def test_native_cli_json_path_emits_the_doctor_envelope(monkeypatch, capsys):
@@ -685,3 +686,359 @@ def test_human_report_renders_the_gemini_provider_receipt(monkeypatch):
     assert "[PASS] provider: gemini realtime provider is configured" in rendered
     assert "key-shared=present" in rendered
     assert "gemini-shared-test" not in rendered
+
+
+# -- grok: the xAI OAuth lane ---------------------------------------------------
+
+XAI_ACCESS = "xai-oauth-access-canary"
+XAI_REFRESH = "xai-oauth-refresh-canary"
+
+
+def _write_xai_oauth(home: Path, *, access: str, refresh: str = XAI_REFRESH) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "xai-oauth": {
+                        "auth_mode": "oauth_device_code",
+                        "tokens": {"access_token": access, "refresh_token": refresh},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def _no_host(monkeypatch):
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", None)
+
+
+def test_grok_provider_and_auth_pass_on_a_valid_xai_oauth_login(monkeypatch, tmp_path, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    store = _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
+    before = store.read_bytes()
+
+    checks = _checks(talk_doctor.collect_report())
+
+    assert checks["provider"]["status"] == "pass"
+    assert checks["provider"]["details"]["auth_lane"] == "xai-oauth"
+    assert checks["provider"]["details"]["xai_oauth"] == "valid"
+    assert checks["auth"]["status"] == "pass"
+    assert checks["auth"]["details"]["winning_lane"] == "xai-oauth"
+    assert checks["auth"]["summary"] == "xai-oauth is the winning auth lane"
+    assert store.read_bytes() == before
+    dumped = json.dumps(checks)
+    assert XAI_ACCESS not in dumped
+    assert XAI_REFRESH not in dumped
+    assert str(store) not in dumped
+
+
+def test_grok_provider_check_fails_without_a_key_or_a_login(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+
+    checks = _checks(talk_doctor.collect_report())
+
+    assert checks["provider"]["status"] == "fail"
+    assert "no xAI key or xAI OAuth login" in checks["provider"]["summary"]
+    assert "hermes auth add xai-oauth" in " ".join(checks["provider"]["remediation"])
+    assert checks["auth"]["status"] == "fail"
+    assert checks["auth"]["details"]["blocked_by"] == "no-usable-auth"
+
+
+def test_grok_auth_warns_when_a_metered_key_outranks_a_valid_login(monkeypatch, tmp_path, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
+    _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
+
+    check = _checks(talk_doctor.collect_report())["auth"]
+
+    assert check["status"] == "warn"
+    assert check["details"]["winning_lane"] == "env"
+    assert check["details"]["metered_key_wins_over_oauth"] is True
+    assert "TALK_PREFER_XAI_OAUTH=true" in " ".join(check["remediation"])
+
+
+def test_grok_auth_fails_closed_on_a_preferred_but_missing_login(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
+    monkeypatch.setenv("TALK_PREFER_XAI_OAUTH", "true")
+
+    check = _checks(talk_doctor.collect_report())["auth"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["winning_lane"] is None
+    assert "API keys are ignored" in check["summary"]
+    assert "hermes auth add xai-oauth" in " ".join(check["remediation"])
+
+
+def test_grok_auth_warns_when_the_login_needs_a_refresh(monkeypatch, tmp_path, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    # 50 minutes left: inside the host's one-hour refresh skew for a normal-lifetime token.
+    _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 50 * 60))
+
+    check = _checks(talk_doctor.collect_report())["auth"]
+
+    assert check["status"] == "warn"
+    assert check["details"]["refresh_required"] is True
+    assert "did not refresh or write it" in check["summary"]
+
+
+def test_human_report_renders_the_xai_oauth_receipt(monkeypatch, tmp_path, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    rendered = talk_doctor.render_human(talk_doctor.collect_report())
+
+    assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
+    assert "receipt: winner=xai-oauth, xai-oauth=valid, preference=absent" in rendered
+    assert XAI_ACCESS not in rendered
+
+
+def test_doctor_never_probes_unless_asked(monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-never-render-this")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    def forbidden():
+        raise AssertionError("doctor probed the network without --probe")
+
+    monkeypatch.setattr(talk_doctor, "_probe_grok", forbidden)
+
+    assert talk_doctor.cli_entry(json_output=True) == 0
+    assert "probe" not in json.loads(capsys.readouterr().out)
+
+
+# -- grok: the live probe, with a fake aiohttp --------------------------------
+
+
+class _ProbeContext:
+    def __init__(self, value=None, *, raises=None):
+        self.value = value
+        self.raises = raises
+
+    async def __aenter__(self):
+        if self.raises is not None:
+            raise self.raises
+        return self.value
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _ProbeSocket:
+    def __init__(self, first_event: str):
+        self.first_event = first_event
+
+    async def receive(self):
+        return types.SimpleNamespace(data=json.dumps({"type": self.first_event}))
+
+
+class _ProbeHttp:
+    def __init__(self, *, http_status: int, ws):
+        self.http_status = http_status
+        self.ws = ws
+        self.calls: list[tuple[str, dict]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _ProbeContext(types.SimpleNamespace(status=self.http_status))
+
+    def ws_connect(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if isinstance(self.ws, BaseException):
+            return _ProbeContext(raises=self.ws)
+        return _ProbeContext(self.ws)
+
+
+def _fake_aiohttp(http: _ProbeHttp):
+    return types.SimpleNamespace(
+        ClientSession=lambda: http,
+        ClientTimeout=lambda total: ("timeout", total),
+    )
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def test_grok_probe_passes_on_200_and_session_created():
+    http = _ProbeHttp(http_status=200, ws=_ProbeSocket("session.created"))
+
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="probe-token-canary",
+            auth_source="xai-oauth",
+            model="grok-voice-latest",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result == {
+        "auth_source": "xai-oauth",
+        "model": "grok-voice-latest",
+        "http_status": 200,
+        "ws_status": 101,
+        "first_event": "session.created",
+        "error": None,
+        "ok": True,
+    }
+    assert [url for url, _ in http.calls] == [
+        talk_doctor.PROBE_HTTP_URL,
+        f"{talk_doctor.talk_grok_realtime.XAI_REALTIME_WS_URL}?model=grok-voice-latest",
+    ]
+    expected = {"Authorization": "Bearer probe-token-canary"}
+    assert all(kw["headers"] == expected for _, kw in http.calls)
+    assert "probe-token-canary" not in talk_doctor.render_probe(result)
+    assert "Probe: PASS" in talk_doctor.render_probe(result)
+
+
+def test_grok_probe_reports_a_401_as_the_relogin_remediation():
+    class WSServerHandshakeError(Exception):
+        def __init__(self, status):
+            super().__init__("401, message=Invalid response status probe-token-canary")
+            self.status = status
+
+    http = _ProbeHttp(http_status=200, ws=WSServerHandshakeError(401))
+
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="probe-token-canary",
+            auth_source="xai-oauth",
+            model="grok-voice-latest",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["http_status"] == 200
+    assert result["ws_status"] == 401
+    assert result["error"] == "xAI OAuth token rejected — run `hermes auth add xai-oauth`"
+    rendered = talk_doctor.render_probe(result)
+    assert "WS /v1/realtime -> 401" in rendered
+    assert "Probe: FAIL" in rendered
+    assert "probe-token-canary" not in json.dumps(result)
+
+
+def test_grok_probe_reports_a_tier_denial_without_the_token():
+    class WSServerHandshakeError(Exception):
+        def __init__(self, status):
+            super().__init__("forbidden")
+            self.status = status
+
+    http = _ProbeHttp(http_status=403, ws=WSServerHandshakeError(403))
+
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="probe-token-canary",
+            auth_source="xai-oauth",
+            model="grok-voice-latest",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["http_status"] == 403
+    assert "does not include realtime API access" in result["error"]
+    assert "probe-token-canary" not in json.dumps(result)
+
+
+def test_grok_probe_flags_an_unexpected_first_event():
+    http = _ProbeHttp(http_status=200, ws=_ProbeSocket("error"))
+
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="probe-token-canary",
+            auth_source="env",
+            model="grok-voice-latest",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["first_event"] == "error"
+    assert result["error"] == "unexpected probe receipt (see http_status / first_event)"
+
+
+def test_probe_refuses_non_grok_providers(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-never-render-this")
+
+    result = talk_doctor._probe_grok()
+
+    assert result == {"ok": False, "error": "the live probe exists for TALK_PROVIDER=grok only"}
+
+
+def test_probe_reports_a_missing_lane_without_going_live(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setattr(talk_doctor, "run_grok_probe", None)
+
+    result = talk_doctor._probe_grok()
+
+    assert result["ok"] is False
+    assert "hermes auth add xai-oauth" in result["error"]
+
+
+def test_cli_entry_merges_the_probe_into_json_and_the_exit_code(monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-never-render-this")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+    monkeypatch.setattr(
+        talk_doctor,
+        "_probe_grok",
+        lambda: {"ok": False, "error": "the live probe exists for TALK_PROVIDER=grok only"},
+    )
+
+    assert talk_doctor.cli_entry(json_output=True, probe=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["ok"] is True
+    assert payload["probe"]["ok"] is False
+
+
+def test_cli_entry_prints_the_probe_receipt_in_human_mode(monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-never-render-this")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+    monkeypatch.setattr(
+        talk_doctor,
+        "_probe_grok",
+        lambda: {
+            "auth_source": "xai-oauth",
+            "model": "grok-voice-latest",
+            "http_status": 200,
+            "ws_status": 101,
+            "first_event": "session.created",
+            "error": None,
+            "ok": True,
+        },
+    )
+
+    assert talk_doctor.cli_entry(probe=True) == 0
+    out = capsys.readouterr().out
+
+    assert "Hermes Talk probe (live: two calls to api.x.ai)" in out
+    assert "auth lane: xai-oauth, model: grok-voice-latest" in out
+    assert "Probe: PASS: the resolved bearer reaches Grok realtime." in out
+
+
+def test_cli_parser_passes_the_probe_flag(monkeypatch):
+    parser = argparse.ArgumentParser()
+    talk_cli.setup_cli(parser)
+    seen = []
+    monkeypatch.setattr(
+        talk_cli.talk_doctor, "cli_entry", lambda **kwargs: seen.append(kwargs) or 0
+    )
+
+    assert talk_cli.cli_entry(parser.parse_args(["doctor", "--probe"])) == 0
+    assert seen == [{"json_output": False, "probe": True}]

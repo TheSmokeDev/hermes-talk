@@ -45,6 +45,7 @@ try:
         talk_config,
         talk_doctor,
         talk_gemini_realtime,
+        talk_grok_auth,
         talk_grok_realtime,
         talk_host,
         talk_identity,
@@ -71,6 +72,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_config
     import talk_doctor
     import talk_gemini_realtime
+    import talk_grok_auth
     import talk_grok_realtime
     import talk_host
     import talk_identity
@@ -1018,24 +1020,13 @@ def _mint_session(
 def _grok_auth() -> talk_auth.TalkAuth:
     """The xAI credential for the Grok lane, in the factory's auth shape.
 
-    xAI has no OAuth lane and no ephemeral mint — the resolved key itself is
-    the socket's bearer. Source names reuse the OpenAI receipt vocabulary so
-    receipts name lanes, never keys.
+    Metered key or the host's ``xai-oauth`` subscription login; there is no
+    ephemeral mint, so the resolved token itself is the socket's bearer.
+    Source names reuse the OpenAI receipt vocabulary so receipts name lanes,
+    never keys.
     """
 
-    scoped = (os.environ.get("TALK_XAI_API_KEY") or "").strip()
-    token = talk_config.resolve_xai_key()
-    if scoped:
-        return talk_auth.TalkAuth(
-            token=token,
-            source=talk_auth.SOURCE_CONFIGURED,
-            detail="TALK_XAI_API_KEY (Talk-scoped key)",
-        )
-    return talk_auth.TalkAuth(
-        token=token,
-        source=talk_auth.SOURCE_ENV,
-        detail="XAI_API_KEY environment variable",
-    )
+    return talk_grok_auth.resolve_grok_auth()
 
 
 def _gemini_auth() -> talk_auth.TalkAuth:
@@ -1855,6 +1846,15 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         dest="doctor_json",
         help="emit the versioned machine-readable report",
     )
+    doctor.add_argument(
+        "--probe",
+        action="store_true",
+        dest="doctor_probe",
+        help=(
+            "(grok only) make two live calls to api.x.ai to prove the resolved bearer "
+            "reaches realtime"
+        ),
+    )
     subparser.set_defaults(talk_command="session")
 
 
@@ -1875,7 +1875,10 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
             raise SystemExit(code)
         return 0
     if command == "doctor":
-        code = talk_doctor.cli_entry(json_output=bool(getattr(args, "doctor_json", False)))
+        code = talk_doctor.cli_entry(
+            json_output=bool(getattr(args, "doctor_json", False)),
+            probe=bool(getattr(args, "doctor_probe", False)),
+        )
         if code:
             raise SystemExit(code)
         return 0

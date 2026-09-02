@@ -9,6 +9,7 @@ sidecar, edits setup, or exposes the content it inspects.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -22,6 +23,8 @@ try:
         talk_auth,
         talk_config,
         talk_core_realtime,
+        talk_grok_auth,
+        talk_grok_realtime,
         talk_host,
         talk_identity,
         talk_tools,
@@ -31,6 +34,8 @@ except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_auth
     import talk_config
     import talk_core_realtime
+    import talk_grok_auth
+    import talk_grok_realtime
     import talk_host
     import talk_identity
     import talk_tools
@@ -287,7 +292,13 @@ def _provider_check() -> dict[str, Any]:
         voice_valid = False
     details["voice_valid"] = voice_valid
 
-    if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
+    # Read-only lane receipt: the host resolver (which may refresh and write
+    # the store) is never called from doctor. The auth check owns the lane
+    # verdict; the provider check only says whether ANY lane exists.
+    receipt = talk_grok_auth.grok_auth_diagnostic()
+    details["auth_lane"] = receipt["winning_lane"]
+    details["xai_oauth"] = receipt["xai_oauth"]
+    if receipt["blocked_by"] in ("blank-talk-key", "blank-xai-key"):
         return _check(
             "provider",
             "fail",
@@ -295,13 +306,16 @@ def _provider_check() -> dict[str, Any]:
             details,
             ("Set a real key in TALK_XAI_API_KEY or XAI_API_KEY, or unset the blank one.",),
         )
-    if "present" not in keys.values():
+    if receipt["blocked_by"] == "no-usable-auth":
         return _check(
             "provider",
             "fail",
-            "provider grok is selected but no xAI key is configured",
+            "provider grok is selected but no xAI key or xAI OAuth login is configured",
             details,
-            ("Set TALK_XAI_API_KEY or XAI_API_KEY.",),
+            (
+                "Set TALK_XAI_API_KEY or XAI_API_KEY, or run `hermes auth add xai-oauth` "
+                "(SuperGrok / X Premium+ subscription).",
+            ),
         )
     if not voice_valid:
         return _check(
@@ -320,7 +334,79 @@ def _provider_check() -> dict[str, Any]:
     )
 
 
+def _grok_auth_check() -> dict[str, Any]:
+    """The Grok lane's auth verdict, in the same envelope as the OpenAI one.
+
+    Mirrors ``_auth_check`` field for field (``xai_oauth`` where that one says
+    ``codex_oauth``) so the human renderer and any machine consumer can key on
+    which name is present instead of on the provider.
+    """
+
+    receipt = talk_grok_auth.grok_auth_diagnostic()
+    details = dict(receipt)
+    lane = receipt["winning_lane"]
+    remediation: list[str] = []
+    relogin = f"Run `{talk_grok_auth.RELOGIN_COMMAND}`"
+
+    if receipt["blocked_by"] == "invalid-preference":
+        remediation.append("Set TALK_PREFER_XAI_OAUTH to true or false, or unset it.")
+        return _check(
+            "auth",
+            "fail",
+            "auth selection is blocked by an invalid xAI OAuth preference",
+            details,
+            remediation,
+        )
+    if lane is None:
+        if receipt["blocked_by"] == "blank-talk-key":
+            remediation.append("Set a real TALK_XAI_API_KEY or unset it.")
+            summary = "TALK_XAI_API_KEY is set but blank and blocks later auth lanes"
+        elif receipt["blocked_by"] == "blank-xai-key":
+            remediation.append("Set a real XAI_API_KEY or unset it.")
+            summary = "XAI_API_KEY is set but blank and blocks xAI OAuth"
+        elif receipt["preference"] == "enabled":
+            remediation.append(f"{relogin} or unset TALK_PREFER_XAI_OAUTH.")
+            summary = "xAI OAuth is required but no usable login was found; API keys are ignored"
+        elif receipt["xai_oauth"] in ("invalid", "expired"):
+            remediation.append(f"{relogin} to replace the {receipt['xai_oauth']} login.")
+            summary = f"the xAI OAuth login is {receipt['xai_oauth']} and no API key is set"
+        else:
+            remediation.append(f"Set TALK_XAI_API_KEY or XAI_API_KEY, or {relogin.lower()}.")
+            summary = "no usable Grok authentication lane was found"
+        return _check("auth", "fail", summary, details, remediation)
+
+    if receipt["refresh_required"]:
+        remediation.append(
+            f"{relogin} if the host's session-start OAuth refresh does not succeed."
+        )
+        return _check(
+            "auth",
+            "warn",
+            "xAI OAuth wins but needs a refresh; doctor did not refresh or write it",
+            details,
+            remediation,
+        )
+    if receipt["metered_key_wins_over_oauth"]:
+        remediation.append(
+            "Set TALK_PREFER_XAI_OAUTH=true to require the xAI subscription login and "
+            "refuse metered key fallback."
+        )
+        summary = f"{lane} wins by legacy precedence while a usable xAI OAuth login is available"
+        return _check("auth", "warn", summary, details, remediation)
+    if receipt["metered_keys_ignored"]:
+        summary = "xAI OAuth wins by explicit preference; configured API key lanes are ignored"
+    else:
+        summary = f"{lane} is the winning auth lane"
+    return _check("auth", "pass", summary, details)
+
+
 def _auth_check() -> dict[str, Any]:
+    try:
+        provider = talk_config.talk_provider()
+    except talk_config.TalkConfigError:
+        provider = None
+    if provider == "grok":
+        return _grok_auth_check()
     receipt = talk_auth.auth_diagnostic()
     # Keep the complete diagnostic only because every field is a lane/state
     # receipt. It intentionally contains no paths, tokens, IDs, or env values.
@@ -778,10 +864,14 @@ def render_human(report: dict[str, Any]) -> str:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
         details = check["details"]
         if check["id"] == "auth":
+            if "xai_oauth" in details:
+                oauth = f"xai-oauth={details['xai_oauth']}"
+            else:
+                oauth = f"codex={details['codex_oauth']}"
             lines.append(
                 "  receipt: "
                 f"winner={details['winning_lane'] or 'none'}, "
-                f"codex={details['codex_oauth']}, preference={details['preference']}"
+                f"{oauth}, preference={details['preference']}"
             )
         elif check["id"] == "provider" and details.get("provider") in ("grok", "gemini"):
             keys = details.get("keys", {})
@@ -833,15 +923,132 @@ def render_human(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def cli_entry(*, json_output: bool = False) -> int:
-    """Print one doctor report and return nonzero only for failing checks."""
+PROBE_HTTP_URL = "https://api.x.ai/v1/realtime/client_secrets"
+PROBE_TIMEOUT_S = 20.0
+
+
+async def run_grok_probe(
+    *,
+    auth_token: str,
+    auth_source: str,
+    model: str,
+    aiohttp_module=None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Two live calls that prove the resolved bearer reaches Grok realtime.
+
+    The subscription question nobody can answer offline: does an ``xai-oauth``
+    access token work on ``wss://api.x.ai/v1/realtime``? This asks xAI. The
+    receipt carries status codes and the first server event type only — never
+    the token, never a store path. Opt-in (``--probe``), grok only.
+    """
+
+    if timeout_s is None:
+        timeout_s = PROBE_TIMEOUT_S
+    aiohttp = aiohttp_module or talk_grok_realtime._import_aiohttp()
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    result: dict[str, Any] = {
+        "auth_source": auth_source,
+        "model": model,
+        "http_status": None,
+        "ws_status": None,
+        "first_event": None,
+        "error": None,
+        "ok": False,
+    }
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                PROBE_HTTP_URL,
+                json={"model": model},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as response:
+                result["http_status"] = int(response.status)
+            async with http.ws_connect(
+                f"{talk_grok_realtime.XAI_REALTIME_WS_URL}?model={model}",
+                headers=headers,
+                timeout=timeout_s,
+            ) as ws:
+                result["ws_status"] = 101
+                message = await asyncio.wait_for(ws.receive(), timeout_s)
+                data = getattr(message, "data", None)
+                if isinstance(data, str):
+                    try:
+                        event = json.loads(data)
+                    except ValueError:
+                        event = None
+                    if isinstance(event, dict):
+                        result["first_event"] = str(event.get("type") or "") or None
+    except Exception as exc:  # noqa: BLE001 - a probe reports failure, never raises
+        remediation = talk_grok_realtime.handshake_remediation(exc, auth_source=auth_source)
+        status = getattr(exc, "status", None)
+        if isinstance(status, int) and result["ws_status"] is None:
+            result["ws_status"] = status
+        result["error"] = remediation or f"{type(exc).__name__}: {redact_text(str(exc))}"
+        return result
+    result["ok"] = result["http_status"] == 200 and result["first_event"] == "session.created"
+    if not result["ok"] and result["error"] is None:
+        result["error"] = "unexpected probe receipt (see http_status / first_event)"
+    return result
+
+
+def _probe_grok() -> dict[str, Any]:
+    """Resolve the lane (this MAY let the host refresh its own store) and probe."""
+
+    try:
+        provider = talk_config.talk_provider()
+    except talk_config.TalkConfigError:
+        provider = None
+    if provider != "grok":
+        return {"ok": False, "error": "the live probe exists for TALK_PROVIDER=grok only"}
+    try:
+        auth = talk_grok_auth.resolve_grok_auth()
+    except talk_auth.TalkAuthError as exc:
+        return {"ok": False, "error": redact_text(str(exc))}
+    return asyncio.run(
+        run_grok_probe(
+            auth_token=auth.token,
+            auth_source=auth.source,
+            model=talk_config.talk_grok_model(),
+        )
+    )
+
+
+def render_probe(result: dict[str, Any]) -> str:
+    result = redact_value(result)
+    lines = ["Hermes Talk probe (live: two calls to api.x.ai)"]
+    if "auth_source" in result:
+        lines.append(f"  auth lane: {result['auth_source']}, model: {result['model']}")
+        http = result["http_status"] or "no response"
+        lines.append(f"  POST /v1/realtime/client_secrets -> {http}")
+        ws = result["ws_status"] or "no handshake"
+        lines.append(f"  WS /v1/realtime -> {ws}, first event: {result['first_event'] or 'none'}")
+    if result.get("error"):
+        lines.append(f"  -> {result['error']}")
+    verdict = "PASS: the resolved bearer reaches Grok realtime" if result["ok"] else "FAIL"
+    lines.append(f"Probe: {verdict}.")
+    return "\n".join(lines)
+
+
+def cli_entry(*, json_output: bool = False, probe: bool = False) -> int:
+    """Print one doctor report and return nonzero only for failing checks.
+
+    ``probe`` is the one path that leaves the machine: it runs only when asked.
+    """
 
     report = redact_value(collect_report())
+    probe_result = redact_value(_probe_grok()) if probe else None
     if json_output:
+        if probe_result is not None:
+            report = dict(report, probe=probe_result)
         print(json.dumps(report, sort_keys=True))
     else:
         print(render_human(report))
-    return 0 if report["ok"] else 1
+        if probe_result is not None:
+            print(render_probe(probe_result))
+    ok = report["ok"] and (probe_result is None or probe_result["ok"])
+    return 0 if ok else 1
 
 
 __all__ = [
@@ -854,4 +1061,6 @@ __all__ = [
     "redact_text",
     "redact_value",
     "render_human",
+    "render_probe",
+    "run_grok_probe",
 ]

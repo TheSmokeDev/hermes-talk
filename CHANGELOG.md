@@ -11,6 +11,44 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.16.0] — 2026-09-01
+
+Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add
+xai-oauth` once, `TALK_PROVIDER=grok`, no API key — the last provider that
+still forced a metered key now rides the host login the way the OpenAI
+lane rides the Codex CLI's.
+
+### Added
+- **`xai-oauth` auth lane for Grok** (`talk_grok_auth.py`). Resolved
+  fail-closed: `TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` →
+  `XAI_API_KEY` → the host's `xai-oauth` login. The host resolver owns
+  refresh and quarantine when importable; otherwise `HERMES_HOME/auth.json`
+  is parsed read-only. Talk never writes an auth store and the bearer only
+  ever reaches `*.x.ai`.
+- **`TALK_PREFER_XAI_OAUTH`** — `true` requires the subscription login and
+  refuses metered fallback; blank or invalid values refuse, like the Codex
+  twin.
+- **`hermes talk doctor --probe`** (grok only, opt-in) — two live calls to
+  `api.x.ai` (`POST /v1/realtime/client_secrets` + the realtime handshake)
+  that print status codes and the first server event, never the token.
+- **Handshake remediation.** A 401/403 on the Grok socket becomes one
+  operator line (`run hermes auth add xai-oauth` / `your xAI subscription
+  tier does not include realtime API access; set XAI_API_KEY`) instead of
+  an aiohttp traceback. Every other failure keeps its original text.
+
+### Changed
+- `hermes talk doctor` on the Grok lane reports the winning auth lane and
+  `xai-oauth=valid|expired|invalid|missing` without refreshing anything;
+  "no xAI key" alone no longer fails when a usable login exists.
+- `hermes talk setup` offers the xAI subscription vs an xAI key for
+  `TALK_PROVIDER=grok`; without a login it names the command and writes
+  nothing.
+
+### Not in this release
+- Reading Grok Build CLI's `~/.grok/auth.json`; a device-code login inside
+  the plugin; any write to any auth store. The dashboard tab stays
+  OpenAI-only.
+
 ## [0.15.1] — 2026-09-01
 
 Voice hears you again on end-to-end-encrypted Discord calls. 0.15.0's

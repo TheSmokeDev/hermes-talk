@@ -29,6 +29,7 @@ PROVIDER_ENV_NAMES = (
     "TALK_GROK_VOICE",
     "TALK_XAI_API_KEY",
     "XAI_API_KEY",
+    "TALK_PREFER_XAI_OAUTH",
     "TALK_OPENAI_API_KEY",
     "OPENAI_API_KEY",
 )
@@ -707,3 +708,84 @@ def test_grok_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._grok_auth()
     assert auth.token == "xai-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+
+def test_grok_auth_delegates_to_the_grok_auth_resolver(clean_provider_env, monkeypatch):
+    sentinel = talk_auth.TalkAuth(token="sentinel", source="xai-oauth", detail="test")
+    monkeypatch.setattr(talk_cli.talk_grok_auth, "resolve_grok_auth", lambda: sentinel)
+    assert talk_cli._grok_auth() is sentinel
+
+
+# -- handshake remediation -----------------------------------------------------
+
+
+class WSServerHandshakeError(Exception):
+    """Same class NAME as aiohttp's; the helper matches by name + status."""
+
+    def __init__(self, status):
+        super().__init__(f"{status}, message='Invalid response status'")
+        self.status = status
+
+
+@pytest.mark.parametrize(
+    ("status", "source", "expected"),
+    [
+        (401, "xai-oauth", "xAI OAuth token rejected — run `hermes auth add xai-oauth`"),
+        (401, "env", "xAI API key rejected (401)"),
+        (401, "configured", "xAI API key rejected (401)"),
+        (
+            403,
+            "xai-oauth",
+            "your xAI subscription tier does not include realtime API access; "
+            "set `XAI_API_KEY` for Grok voice",
+        ),
+        (403, "env", "xAI refused this key for realtime (403)"),
+    ],
+)
+def test_handshake_remediation_names_the_lane(status, source, expected):
+    exc = WSServerHandshakeError(status)
+    assert grok_rt.handshake_remediation(exc, auth_source=source) == expected
+
+
+def test_handshake_remediation_leaves_other_failures_alone():
+    for exc in (WSServerHandshakeError(500), WSServerHandshakeError("401"), OSError("reset")):
+        assert grok_rt.handshake_remediation(exc, auth_source="xai-oauth") is None
+
+
+class _RejectingContext:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def __aenter__(self):
+        raise self.exc
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _RejectingClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def ws_connect(self, *_args, **_kwargs):
+        return _RejectingContext(WSServerHandshakeError(401))
+
+
+def test_connect_turns_an_oauth_401_into_the_relogin_remediation():
+    aiohttp = types.SimpleNamespace(
+        ClientSession=lambda: _RejectingClient(),
+        WSMsgType=types.SimpleNamespace(TEXT="text", ERROR="error"),
+    )
+    adapter = grok_rt.GrokRealtimeSession(
+        auth_token="oauth-canary", auth_source="xai-oauth", aiohttp_module=aiohttp
+    )
+
+    with pytest.raises(rt.RealtimeSessionError) as info:
+        asyncio.run(adapter.connect(_setup()))
+
+    assert str(info.value) == "xAI OAuth token rejected — run `hermes auth add xai-oauth`"
+    assert "oauth-canary" not in str(info.value)
+    assert adapter.state is rt.SessionState.FAILED

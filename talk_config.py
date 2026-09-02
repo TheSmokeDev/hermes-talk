@@ -513,7 +513,8 @@ def resolve_xai_key() -> str:
 
     Order: TALK_XAI_API_KEY (Talk-scoped) -> XAI_API_KEY. Same rule as
     :func:`resolve_openai_key`: a key that is SET but blank is a hard
-    refusal, not a fall-through. xAI has no OAuth lane — API key only.
+    refusal, not a fall-through. This is the metered-key half of Grok auth;
+    the subscription lane lives in ``talk_grok_auth.resolve_grok_auth``.
     """
 
     scoped = os.environ.get("TALK_XAI_API_KEY")

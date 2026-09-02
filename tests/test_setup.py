@@ -191,6 +191,9 @@ def _clean_setup_environment(monkeypatch):
         "TALK_OPENAI_API_KEY",
         "OPENAI_API_KEY",
         "TALK_PREFER_CODEX_OAUTH",
+        "TALK_XAI_API_KEY",
+        "XAI_API_KEY",
+        "TALK_PREFER_XAI_OAUTH",
         "TALK_MODEL",
         "TALK_VOICE",
     ):
@@ -550,6 +553,99 @@ def test_invalid_preference_key_choice_completes_real_doctor_setup_doctor_in_one
     assert "state=applied" in output
     assert "Verification: PASS" in output
     assert len([prompt for prompt in prompts if prompt.startswith("Write ")]) == 2
+
+
+def _grok_report(*, auth: dict) -> dict:
+    """A doctor report whose auth check is the Grok lane (``xai_oauth`` key)."""
+
+    base = {
+        "configured": True,
+        "winning_lane": None,
+        "blocked_by": None,
+        "preference": "absent",
+        "xai_oauth": "missing",
+        "metered_key_present": False,
+        "metered_key_wins_over_oauth": False,
+        "metered_keys_ignored": False,
+        "refresh_required": False,
+    }
+    return _report(auth={**base, **auth})
+
+
+def test_setup_records_the_xai_subscription_preference(monkeypatch, tmp_path, capsys):
+    reports = [
+        _grok_report(
+            auth={
+                "status": "warn",
+                "winning_lane": "env",
+                "xai_oauth": "valid",
+                "metered_key_present": True,
+                "metered_key_wins_over_oauth": True,
+            }
+        )
+    ]
+    doctor_calls = []
+
+    def collect_report():
+        doctor_calls.append(1)
+        if reports:
+            return reports.pop()
+        assert os.environ["TALK_PREFER_XAI_OAUTH"] == "true"
+        return _healthy_report()
+
+    monkeypatch.setattr(talk_setup.talk_doctor, "collect_report", collect_report)
+    monkeypatch.setattr(talk_setup.talk_doctor, "render_human", lambda _report: "doctor receipt")
+    monkeypatch.setattr(talk_setup.talk_config, "get_hermes_home", lambda: tmp_path)
+
+    prompts = []
+    answers = iter(["oauth", "yes"])
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    def unexpected_secret(_prompt: str) -> str:
+        raise AssertionError("the subscription choice must never ask for a key")
+
+    assert talk_setup.cli_entry(input_fn=answer, secret_input_fn=unexpected_secret) == 0
+    output = capsys.readouterr().out
+
+    assert doctor_calls == [1, 1]
+    assert len(prompts) == 2
+    assert "Which lane should Grok voice require?" in prompts[0]
+    assert "TALK_PREFER_XAI_OAUTH=true" in prompts[1]
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "TALK_PREFER_XAI_OAUTH=true\n"
+    assert "state=applied" in output
+    assert "Verification: PASS" in output
+
+
+def test_setup_prints_the_xai_login_when_no_login_exists(monkeypatch, tmp_path, capsys):
+    missing = _grok_report(auth={"status": "fail", "blocked_by": "no-usable-auth"})
+    reports = iter([missing, missing])
+    monkeypatch.setattr(talk_setup.talk_doctor, "collect_report", lambda: next(reports))
+    monkeypatch.setattr(talk_setup.talk_doctor, "render_human", lambda _report: "doctor receipt")
+    monkeypatch.setattr(talk_setup.talk_config, "get_hermes_home", lambda: tmp_path)
+
+    prompts = []
+    answers = iter(["subscription"])
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    def unexpected_secret(_prompt: str) -> str:
+        raise AssertionError("the subscription choice must never ask for a key")
+
+    # Setup cannot log in for the operator: it names the command and writes nothing.
+    assert talk_setup.cli_entry(input_fn=answer, secret_input_fn=unexpected_secret) == 1
+    output = capsys.readouterr().out
+
+    assert len(prompts) == 1
+    assert "`hermes auth add xai-oauth`" in prompts[0]
+    assert "Run `hermes auth add xai-oauth`, then rerun `hermes talk setup`" in output
+    assert "no file was changed" in output
+    assert not (tmp_path / ".env").exists()
+    assert "Verification: FAIL" in output
 
 
 def test_declined_write_is_not_applied_and_failed_verification_is_returned(

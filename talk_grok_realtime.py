@@ -581,6 +581,43 @@ class _GrokWireSession:
         task.result()
 
 
+#: The bearer is checked only at the WebSocket handshake. A token that dies
+#: mid-call keeps the socket; one that is already dead never gets a socket,
+#: and aiohttp reports that as a handshake error carrying the HTTP status.
+_HANDSHAKE_ERROR_NAMES = frozenset({"WSServerHandshakeError"})
+
+#: What xAI's handshake status means for each auth lane (source → status → text).
+_HANDSHAKE_REMEDIATION: dict[int, tuple[str, str]] = {
+    401: (
+        "xAI OAuth token rejected — run `hermes auth add xai-oauth`",
+        "xAI API key rejected (401)",
+    ),
+    403: (
+        "your xAI subscription tier does not include realtime API access; "
+        "set `XAI_API_KEY` for Grok voice",
+        "xAI refused this key for realtime (403)",
+    ),
+}
+
+
+def handshake_remediation(exc: BaseException, *, auth_source: str | None) -> str | None:
+    """A one-line operator remediation for an auth-shaped handshake failure.
+
+    Returns ``None`` for anything that is not a 401/403 WebSocket handshake
+    rejection, so every other failure keeps its original text. The check is
+    by class name and ``status`` so callers and tests need no aiohttp.
+    """
+
+    if type(exc).__name__ not in _HANDSHAKE_ERROR_NAMES:
+        return None
+    status = getattr(exc, "status", None)
+    texts = _HANDSHAKE_REMEDIATION.get(status) if isinstance(status, int) else None
+    if texts is None:
+        return None
+    oauth_text, key_text = texts
+    return oauth_text if auth_source == "xai-oauth" else key_text
+
+
 class GrokRealtimeSession:
     """Talk-neutral facade over the xAI realtime wire session."""
 
@@ -614,6 +651,9 @@ class GrokRealtimeSession:
             self.state = rt.SessionState.FAILED
             if isinstance(exc, rt.RealtimeSessionError):
                 raise
+            remediation = handshake_remediation(exc, auth_source=self.auth_source)
+            if remediation is not None:
+                raise rt.RealtimeSessionError(remediation) from exc
             raise rt.RealtimeSessionError(str(exc)) from exc
         self.state = rt.SessionState.CONNECTED
 
@@ -709,4 +749,5 @@ __all__ = [
     "build_session_update",
     "decode_event",
     "encode_command",
+    "handshake_remediation",
 ]
