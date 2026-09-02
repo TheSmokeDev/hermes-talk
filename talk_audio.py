@@ -49,10 +49,6 @@ MAX_PLAYBACK_BLOCKS = 200
 OUTPUT_ACTIVE_LEVEL = 0.015
 MIN_BARGE_IN_LEVEL = 0.04
 OUTPUT_ECHO_RATIO = 0.65
-VAD_SAMPLE_RATE = 8_000
-VAD_FRAME_SAMPLES = 240  # 30 ms
-VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * SAMPLE_WIDTH
-VAD_SPEECH_FRAMES = 2  # 60 ms filters transient room noise, stays under OMP's 150 ms target
 
 _INSTALL_HINT = (
     'audio support is not installed — run: pip install "hermes-talk[audio]" '
@@ -73,14 +69,6 @@ def import_sounddevice():
         raise TalkAudioError(f"{_INSTALL_HINT} ({exc})") from exc
     return sd
 
-def import_webrtcvad():
-    """Lazy-import the speech classifier shipped by the audio extra."""
-
-    try:
-        import webrtcvad
-    except (ImportError, OSError) as exc:
-        raise TalkAudioError(f"{_INSTALL_HINT} ({exc})") from exc
-    return webrtcvad
 
 
 def audio_available() -> bool:
@@ -88,7 +76,6 @@ def audio_available() -> bool:
 
     try:
         import_sounddevice()
-        import_webrtcvad()
     except TalkAudioError:
         return False
     return True
@@ -110,15 +97,6 @@ def _pcm16_rms(pcm: bytes) -> float:
     sum_squares = sum(sample * sample for sample in samples)
     return min(1.0, math.sqrt(sum_squares / len(samples)) / 32_768)
 
-def _downsample_24k_to_8k(pcm: bytes) -> bytes:
-    """Decimate PCM16 by three for WebRTC VAD's supported 8 kHz input."""
-
-    source = memoryview(pcm).cast("h")
-    target = bytearray((len(source) // 3) * SAMPLE_WIDTH)
-    samples = memoryview(target).cast("h")
-    for index in range(len(samples)):
-        samples[index] = source[index * 3]
-    return bytes(target)
 
 
 class _PulseWebRtcAudio:
@@ -243,15 +221,18 @@ class _PulseWebRtcAudio:
 class DuplexAudio:
     """Full-duplex pcm16 capture and playback over PortAudio."""
 
-    def __init__(self, speech_detector=None) -> None:
+    _startup_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def __init__(self) -> None:
         self._input: queue.Queue[bytes] = queue.Queue(maxsize=MAX_INPUT_BLOCKS)
-        self._playback: queue.Queue[bytes] = queue.Queue(maxsize=MAX_PLAYBACK_BLOCKS)
-        self._residual = b""
+        self._playback: queue.Queue[tuple[str | None, bytes]] = queue.Queue(
+            maxsize=MAX_PLAYBACK_BLOCKS
+        )
+        self._residual: tuple[str | None, bytes] | None = None
         self._lock = threading.Lock()
+        self._played_item_id: str | None = None
         self._played_frames = 0
         self._output_level = 0.0
-        self._speech_detector = speech_detector
-        self._speech_run_frames = 0
         self._in_stream = None
         self._out_stream = None
         self._pulse_webrtc = _PulseWebRtcAudio()
@@ -262,25 +243,26 @@ class DuplexAudio:
         """Open both streams. Raises :class:`TalkAudioError` when it cannot."""
 
         sd = import_sounddevice()
-        if self._speech_detector is None:
-            self._speech_detector = import_webrtcvad().Vad(3)
         original_input = _device(talk_config.audio_input_device())
         original_output = _device(talk_config.audio_output_device())
-        input_device, output_device = self._pulse_webrtc.start(
-            original_input, original_output
-        )
-        try:
-            self._open_streams(sd, input_device, output_device)
-        except Exception as routed_exc:  # PortAudio raises its own exception types
-            self._close_streams()
-            if not self._pulse_webrtc.active:
-                raise TalkAudioError(f"could not open audio devices: {routed_exc}") from routed_exc
-            self._pulse_webrtc.stop()
+        with self._startup_lock:
+            input_device, output_device = self._pulse_webrtc.start(
+                original_input, original_output
+            )
             try:
-                self._open_streams(sd, original_input, original_output)
-            except Exception as exc:
+                self._open_streams(sd, input_device, output_device)
+            except Exception as routed_exc:  # PortAudio raises its own exception types
                 self._close_streams()
-                raise TalkAudioError(f"could not open audio devices: {exc}") from exc
+                if not self._pulse_webrtc.active:
+                    raise TalkAudioError(
+                        f"could not open audio devices: {routed_exc}"
+                    ) from routed_exc
+                self._pulse_webrtc.stop()
+                try:
+                    self._open_streams(sd, original_input, original_output)
+                except Exception as exc:
+                    self._close_streams()
+                    raise TalkAudioError(f"could not open audio devices: {exc}") from exc
 
     def _open_streams(self, sd, input_device, output_device) -> None:
         self._in_stream = sd.RawInputStream(
@@ -320,20 +302,6 @@ class DuplexAudio:
         self._close_streams()
         self._pulse_webrtc.stop()
 
-    def _contains_speech(self, pcm: bytes) -> bool:
-        detector = self._speech_detector
-        if detector is None:
-            return True
-        downsampled = _downsample_24k_to_8k(pcm)
-        for offset in range(0, len(downsampled) - VAD_FRAME_BYTES + 1, VAD_FRAME_BYTES):
-            frame = downsampled[offset : offset + VAD_FRAME_BYTES]
-            if detector.is_speech(frame, VAD_SAMPLE_RATE):
-                self._speech_run_frames += 1
-                if self._speech_run_frames >= VAD_SPEECH_FRAMES:
-                    return True
-            else:
-                self._speech_run_frames = 0
-        return False
 
     # -- PortAudio callbacks (audio thread) -----------------------------------
 
@@ -344,12 +312,11 @@ class DuplexAudio:
             output_level = self._output_level
         if not self._pulse_webrtc.active:
             output_active = output_level > OUTPUT_ACTIVE_LEVEL
-            if output_active and self._contains_speech(pcm):
-                pass
-            elif output_active:
-                echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
-                if input_level < echo_threshold:
-                    return
+            echo_threshold = max(
+                MIN_BARGE_IN_LEVEL,
+                output_level * OUTPUT_ECHO_RATIO,
+            )
+            if output_active and input_level < echo_threshold:
                 return
         # Drop the block rather than stall the device: a blocked PortAudio
         # callback is a glitch the operator hears.
@@ -358,23 +325,42 @@ class DuplexAudio:
 
     def _output_callback(self, outdata, frames, _time, _status) -> None:
         wanted = frames * FRAME_BYTES
-        chunk = self._take_playback(wanted)
-        outdata[: len(chunk)] = chunk
-        if len(chunk) < wanted:
-            outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
         with self._lock:
+            chunk, segments = self._take_playback(wanted)
+            outdata[: len(chunk)] = chunk
+            if len(chunk) < wanted:
+                outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
             self._output_level = _pcm16_rms(chunk)
-            self._played_frames += len(chunk) // FRAME_BYTES
+            for item_id, played_frames in segments:
+                if item_id != self._played_item_id:
+                    self._played_item_id = item_id
+                    self._played_frames = 0
+                self._played_frames += played_frames
 
-    def _take_playback(self, wanted: int) -> bytes:
-        buf = self._residual
-        while len(buf) < wanted:
-            try:
-                buf += self._playback.get_nowait()
-            except queue.Empty:
-                break
-        self._residual = buf[wanted:]
-        return buf[:wanted]
+    def _take_playback(
+        self, wanted: int
+    ) -> tuple[bytes, list[tuple[str | None, int]]]:
+        parts: list[bytes] = []
+        segments: list[tuple[str | None, int]] = []
+        remaining = wanted
+        packet = self._residual
+        self._residual = None
+        while remaining > 0:
+            if packet is None:
+                try:
+                    packet = self._playback.get_nowait()
+                except queue.Empty:
+                    break
+            item_id, data = packet
+            taken = data[:remaining]
+            parts.append(taken)
+            frames = len(taken) // FRAME_BYTES
+            if frames:
+                segments.append((item_id, frames))
+            remaining -= len(taken)
+            packet = (item_id, data[len(taken) :]) if len(taken) < len(data) else None
+        self._residual = packet
+        return b"".join(parts), segments
 
     # -- session interface ----------------------------------------------------
 
@@ -386,23 +372,31 @@ class DuplexAudio:
         except queue.Empty:
             return None
 
-    def queue_playback(self, pcm: bytes) -> None:
+    def queue_playback(self, pcm: bytes, item_id: str | None = None) -> None:
         """Queue model audio for the speaker. Drops on overflow, never blocks."""
 
         if not pcm:
             return
-        with contextlib.suppress(queue.Full):
-            self._playback.put_nowait(pcm)
+        with self._lock, contextlib.suppress(queue.Full):
+            self._playback.put_nowait((item_id, pcm))
 
-    def drain_playback(self) -> None:
-        """Barge-in: stop speaking now. Everything not yet played is discarded."""
+    def drain_playback(self) -> tuple[str | None, int]:
+        """Discard unheard audio and atomically return the heard boundary."""
 
-        while True:
-            try:
-                self._playback.get_nowait()
-            except queue.Empty:
-                break
-        self._residual = b""
+        with self._lock:
+            while True:
+                try:
+                    self._playback.get_nowait()
+                except queue.Empty:
+                    break
+            self._residual = None
+            boundary = (
+                self._played_item_id,
+                int(self._played_frames * 1000 / SAMPLE_RATE),
+            )
+            self._played_item_id = None
+            self._played_frames = 0
+            return boundary
 
     @property
     def played_ms(self) -> int:
@@ -412,9 +406,10 @@ class DuplexAudio:
             return int(self._played_frames * 1000 / SAMPLE_RATE)
 
     def reset_played_ms(self) -> None:
-        """Zero the counter — called when a new response starts speaking."""
+        """Reset legacy callers that do not attach item identity to audio."""
 
         with self._lock:
+            self._played_item_id = None
             self._played_frames = 0
 
 
