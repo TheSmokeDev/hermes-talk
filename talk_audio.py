@@ -43,6 +43,7 @@ FRAME_BYTES = SAMPLE_WIDTH * CHANNELS
 #: the tighter of the two: stale microphone audio is worse than dropped audio.
 MAX_INPUT_BLOCKS = 50
 MAX_PLAYBACK_BLOCKS = 200
+MAX_PLAYBACK_BYTES = SAMPLE_RATE * FRAME_BYTES * 20
 
 # Match OMP's live controller: while model audio is playing, microphone blocks
 # below the acoustic echo floor are local playback leakage, not barge-in.
@@ -229,6 +230,7 @@ class DuplexAudio:
             maxsize=MAX_PLAYBACK_BLOCKS
         )
         self._residual: tuple[str | None, bytes] | None = None
+        self._queued_playback_bytes = 0
         self._lock = threading.Lock()
         self._played_item_id: str | None = None
         self._played_frames = 0
@@ -326,22 +328,16 @@ class DuplexAudio:
     def _output_callback(self, outdata, frames, _time, _status) -> None:
         wanted = frames * FRAME_BYTES
         with self._lock:
-            chunk, segments = self._take_playback(wanted)
-            outdata[: len(chunk)] = chunk
-            if len(chunk) < wanted:
-                outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
-            self._output_level = _pcm16_rms(chunk)
-            for item_id, played_frames in segments:
-                if item_id != self._played_item_id:
-                    self._played_item_id = item_id
-                    self._played_frames = 0
-                self._played_frames += played_frames
+            chunk = self._take_playback(wanted)
+        output_level = _pcm16_rms(chunk)
+        with self._lock:
+            self._output_level = output_level
+        outdata[: len(chunk)] = chunk
+        if len(chunk) < wanted:
+            outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
 
-    def _take_playback(
-        self, wanted: int
-    ) -> tuple[bytes, list[tuple[str | None, int]]]:
+    def _take_playback(self, wanted: int) -> bytes:
         parts: list[bytes] = []
-        segments: list[tuple[str | None, int]] = []
         remaining = wanted
         packet = self._residual
         self._residual = None
@@ -354,13 +350,17 @@ class DuplexAudio:
             item_id, data = packet
             taken = data[:remaining]
             parts.append(taken)
-            frames = len(taken) // FRAME_BYTES
-            if frames:
-                segments.append((item_id, frames))
+            self._queued_playback_bytes -= len(taken)
+            played_frames = len(taken) // FRAME_BYTES
+            if played_frames:
+                if item_id != self._played_item_id:
+                    self._played_item_id = item_id
+                    self._played_frames = 0
+                self._played_frames += played_frames
             remaining -= len(taken)
             packet = (item_id, data[len(taken) :]) if len(taken) < len(data) else None
         self._residual = packet
-        return b"".join(parts), segments
+        return b"".join(parts)
 
     # -- session interface ----------------------------------------------------
 
@@ -377,8 +377,14 @@ class DuplexAudio:
 
         if not pcm:
             return
-        with self._lock, contextlib.suppress(queue.Full):
-            self._playback.put_nowait((item_id, pcm))
+        with self._lock:
+            if self._queued_playback_bytes + len(pcm) > MAX_PLAYBACK_BYTES:
+                return
+            try:
+                self._playback.put_nowait((item_id, pcm))
+            except queue.Full:
+                return
+            self._queued_playback_bytes += len(pcm)
 
     def drain_playback(self) -> tuple[str | None, int]:
         """Discard unheard audio and atomically return the heard boundary."""
@@ -390,6 +396,7 @@ class DuplexAudio:
                 except queue.Empty:
                     break
             self._residual = None
+            self._queued_playback_bytes = 0
             boundary = (
                 self._played_item_id,
                 int(self._played_frames * 1000 / SAMPLE_RATE),

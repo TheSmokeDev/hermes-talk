@@ -374,6 +374,20 @@ def test_full_playback_queue_drops_instead_of_blocking():
     assert audio._playback.qsize() == talk_audio.MAX_PLAYBACK_BLOCKS
 
 
+def test_playback_queue_is_bounded_by_bytes_not_only_packet_count():
+    audio = talk_audio.DuplexAudio()
+
+    audio.queue_playback(b"\x00" * (talk_audio.MAX_PLAYBACK_BYTES + 2))
+
+    assert audio._playback.qsize() == 0
+    assert audio._queued_playback_bytes == 0
+    audio.queue_playback(b"\x01\x02\x03\x04")
+    audio._output_callback(_Buffer(2), 1, None, None)
+    assert audio._queued_playback_bytes == 2
+    audio.drain_playback()
+    assert audio._queued_playback_bytes == 0
+
+
 def test_stop_is_safe_before_start_and_twice():
     audio = talk_audio.DuplexAudio()
     audio.stop()
