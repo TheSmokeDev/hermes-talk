@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
@@ -78,6 +79,26 @@ def _progress_item_id(request_id: str, index: int) -> str:
 
     return f"p{index:x}-{request_id}"[:MAX_PROVIDER_ITEM_ID_LENGTH]
 
+async def _read_stdin_line() -> str:
+    """Read one TUI command without leaving a blocking executor task on POSIX."""
+
+    loop = asyncio.get_running_loop()
+    try:
+        descriptor = sys.stdin.fileno()
+        result: asyncio.Future[str] = loop.create_future()
+
+        def ready() -> None:
+            if not result.done():
+                result.set_result(sys.stdin.readline())
+
+        loop.add_reader(descriptor, ready)
+    except (AttributeError, io.UnsupportedOperation, NotImplementedError):
+        return await asyncio.to_thread(sys.stdin.readline)
+    try:
+        return await result
+    finally:
+        loop.remove_reader(descriptor)
+
 
 async def run_core_talk_session(audio=None) -> int:
     """Run duplex media through the registered provider and Hermes coordinator."""
@@ -123,7 +144,7 @@ async def run_core_talk_session(audio=None) -> int:
         progress_index = 0
         _emit_event({"type": "delegate", "id": request_id, "request": request})
         while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
+            line = await _read_stdin_line()
             if not line:
                 raise RuntimeError("Hermes TUI closed the live delegation channel")
             try:
@@ -233,8 +254,6 @@ async def run_core_talk_session(audio=None) -> int:
                     print("talk: state solving", flush=True)
                 elif event.role == "assistant":
                     print("talk: state listening", flush=True)
-                    last_audio_event = None
-                    active_item_id = None
                 continue
             if event.type is RealtimeEventType.TURN_STARTED:
                 if event.role == "assistant":
@@ -266,20 +285,21 @@ async def run_core_talk_session(audio=None) -> int:
         for task in done:
             try:
                 task.result()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - runtime boundary
+                message = f"{type(exc).__name__}: {exc}"
                 if event_stream:
-                    _emit_event(
-                        {
-                            "type": "error",
-                            "message": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
-                raise
+                    _emit_event({"type": "error", "message": message})
+                else:
+                    print(f"talk: {message}", file=sys.stderr)
+                return 1
         return 0
     finally:
         microphone.cancel()
         receiver.cancel()
         await asyncio.gather(microphone, receiver, return_exceptions=True)
+        if event_stream:
+            with contextlib.suppress(Exception):
+                sys.stdin.close()
         with contextlib.suppress(Exception):
             await coordinator.close()
         audio.stop()

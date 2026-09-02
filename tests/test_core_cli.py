@@ -97,6 +97,7 @@ class FakeCoordinator:
     async def events(self):
         await self.dispatch_tool("weather", {"city": "Paris"})
         yield RealtimeEvent.audio(b"speaker", item_id="item-1")
+        yield RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="assistant")
         yield RealtimeEvent.transcript("hello", final=True, role="user")
         yield RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user")
 
@@ -245,6 +246,7 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
         'talk: event {"type":"transcript","role":"assistant",'
         '"text":"I found the issue.","final":true}'
     ) in output
+    assert talk_core_cli.sys.stdin.closed is True
 
 
 def test_progress_item_ids_stay_within_provider_wire_limit():

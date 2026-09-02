@@ -112,6 +112,26 @@ def test_grok_provider_uses_xai_model_voice_and_registry_name(monkeypatch):
     assert core_v1.configured_provider_name() == core_v1.GROK_PROVIDER_NAME
 
 
+def test_grok_provider_uses_supported_oauth_resolver_by_default(monkeypatch):
+    harness = Harness()
+    monkeypatch.setattr(
+        core_v1.talk_grok_auth,
+        "resolve_grok_auth",
+        lambda: type("Auth", (), {"token": "oauth-token", "source": "xai-oauth"})(),
+    )
+    monkeypatch.setattr(core_v1.talk_config, "talk_grok_model", lambda: "grok-voice-test")
+    monkeypatch.setattr(core_v1.talk_config, "talk_grok_voice", lambda: "ara")
+    provider = core_v1.TalkGrokRealtimeProvider(
+        session_factory=harness.session_factory,
+    )
+
+    run(provider.open_session(instructions="Hermes owns policy", tools=[]))
+
+    assert harness.session.init == {
+        "auth_token": "oauth-token",
+        "auth_source": "xai-oauth",
+    }
+
 def test_session_maps_audio_transcript_turns_and_tool_calls():
     harness = Harness(
         (
@@ -148,12 +168,23 @@ def test_session_maps_audio_transcript_turns_and_tool_calls():
 
 
 def test_session_commands_preserve_host_authority_and_barge_in_boundary():
-    harness = Harness()
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-1"),
+            rt.FunctionCall(call_id="call-1", name="weather", arguments="{}"),
+            rt.ResponseFinished(response_id="response-1"),
+        )
+    )
     session = core_v1.TalkRealtimeSession(harness.session)
 
     async def scenario():
         await session.send_audio(b"mic")
+        events = session.events()
+        await anext(events)
+        await anext(events)
         await session.submit_tool_result("call-1", "sunny")
+        assert harness.session.sent == [rt.AppendInputAudio(b"mic")]
+        await anext(events)
         await session.truncate_response(HeardAudioBoundary("item-1", 420))
         await session.add_context("progress-1", "Checked the tests.")
         await session.cancel_response()
@@ -172,9 +203,70 @@ def test_session_commands_preserve_host_authority_and_barge_in_boundary():
             text="Checked the tests.",
             role=rt.ContextRole.SYSTEM,
         ),
-        rt.CancelResponse(),
     ]
     assert harness.session.closed == 1
+
+
+def test_tool_results_batch_in_call_order_after_response_finishes():
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-1"),
+            rt.FunctionCall(call_id="call-1", name="first", arguments="{}"),
+            rt.FunctionCall(call_id="call-2", name="second", arguments="{}"),
+            rt.ResponseFinished(response_id="response-1"),
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def scenario():
+        events = session.events()
+        for _ in range(4):
+            await anext(events)
+        await session.submit_tool_result("call-2", "second result")
+        assert harness.session.sent == []
+        await session.submit_tool_result("call-1", "first result")
+
+    run(scenario())
+
+    assert harness.session.sent == [
+        rt.SubmitToolResult(call_id="call-1", output="first result"),
+        rt.SubmitToolResult(call_id="call-2", output="second result"),
+        rt.StartResponse(),
+    ]
+
+
+def test_cancel_is_sent_only_while_provider_response_is_active():
+    harness = Harness((rt.ResponseStarted(response_id="response-1"),))
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def scenario():
+        await anext(session.events())
+        await session.cancel_response()
+
+    run(scenario())
+    assert harness.session.sent == [rt.CancelResponse()]
+
+
+def test_recoverable_provider_failure_does_not_end_the_session():
+    harness = Harness(
+        (
+            rt.ProviderFailure(detail="bad audio chunk", terminal=False),
+            rt.Transcript(
+                role=rt.TranscriptRole.USER,
+                text="still here",
+                final=True,
+                provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+            ),
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def collect():
+        return [event async for event in session.events()]
+
+    events = run(collect())
+
+    assert [event.text for event in events] == ["still here"]
 
 
 def test_invalid_tool_arguments_surface_error_without_dispatch():

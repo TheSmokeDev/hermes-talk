@@ -6,8 +6,8 @@ provider-neutral session onto Hermes's host-owned coordinator contract.
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
@@ -20,13 +20,14 @@ from agent.realtime_voice import (
 )
 
 try:
-    from . import talk_auth, talk_config
+    from . import talk_auth, talk_config, talk_grok_auth
     from . import talk_realtime as rt
     from .talk_grok_realtime import GrokRealtimeSession
     from .talk_openai_realtime import OpenAIRealtimeSession
 except ImportError:  # pragma: no cover - flat-module fallback
     import talk_auth
     import talk_config
+    import talk_grok_auth
     import talk_realtime as rt
     from talk_grok_realtime import GrokRealtimeSession
     from talk_openai_realtime import OpenAIRealtimeSession
@@ -61,6 +62,11 @@ class TalkRealtimeSession(RealtimeSession):
     def __init__(self, session) -> None:
         self._session = session
         self._closed = False
+        self._tool_lock = asyncio.Lock()
+        self._pending_tool_calls: list[str] = []
+        self._tool_outputs: dict[str, str] = {}
+        self._response_finished = False
+        self._response_active = False
 
     async def send_audio(self, pcm: bytes) -> None:
         await self._session.send((rt.AppendInputAudio(bytes(pcm)),))
@@ -68,6 +74,9 @@ class TalkRealtimeSession(RealtimeSession):
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         async for event in self._session:
             mapped = self._map_event(event)
+            if isinstance(event, rt.ResponseFinished):
+                async with self._tool_lock:
+                    await self._flush_tool_results()
             if mapped is not None:
                 yield mapped
 
@@ -81,6 +90,8 @@ class TalkRealtimeSession(RealtimeSession):
                 role=event.role.value,
             )
         if isinstance(event, rt.FunctionCall):
+            if event.call_id not in self._pending_tool_calls:
+                self._pending_tool_calls.append(event.call_id)
             try:
                 arguments = json.loads(event.arguments)
             except json.JSONDecodeError as exc:
@@ -99,22 +110,47 @@ class TalkRealtimeSession(RealtimeSession):
         if isinstance(event, rt.SpeechStopped):
             return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="user")
         if isinstance(event, rt.ResponseStarted):
+            self._response_active = True
+            self._response_finished = False
             return RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="assistant")
         if isinstance(event, rt.ResponseFinished):
+            self._response_active = False
+            self._response_finished = True
             return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="assistant")
-        if isinstance(event, rt.ProviderFailure):
+        if isinstance(event, rt.ProviderFailure) and event.terminal:
             return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
         if isinstance(event, rt.SessionTerminated) and event.state is rt.SessionState.FAILED:
             return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
         return None
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
-        await self._session.send(
-            (
-                rt.SubmitToolResult(call_id=call_id, output=output),
-                rt.StartResponse(),
-            )
+        async with self._tool_lock:
+            if call_id not in self._pending_tool_calls:
+                raise ValueError(f"unknown realtime tool call {call_id!r}")
+            self._tool_outputs[call_id] = output
+            await self._flush_tool_results()
+
+    async def _flush_tool_results(self) -> None:
+        if (
+            not self._response_finished
+            or not self._pending_tool_calls
+            or any(call_id not in self._tool_outputs for call_id in self._pending_tool_calls)
+        ):
+            return
+        commands = (
+            *(
+                rt.SubmitToolResult(
+                    call_id=call_id,
+                    output=self._tool_outputs[call_id],
+                )
+                for call_id in self._pending_tool_calls
+            ),
+            rt.StartResponse(),
         )
+        await self._session.send(commands)
+        self._pending_tool_calls.clear()
+        self._tool_outputs.clear()
+        self._response_finished = False
 
     async def add_context(self, item_id: str, text: str) -> None:
         await self._session.send(
@@ -138,7 +174,8 @@ class TalkRealtimeSession(RealtimeSession):
         )
 
     async def cancel_response(self) -> None:
-        await self._session.send((rt.CancelResponse(),))
+        if self._response_active:
+            await self._session.send((rt.CancelResponse(),))
 
     async def close(self) -> None:
         if self._closed:
@@ -234,28 +271,19 @@ class TalkOpenAIRealtimeProvider(_TalkRealtimeProvider):
         )
 
 
-def _grok_auth() -> talk_auth.TalkAuth:
-    scoped = bool((os.environ.get("TALK_XAI_API_KEY") or "").strip())
-    return talk_auth.TalkAuth(
-        token=talk_config.resolve_xai_key(),
-        source=talk_auth.SOURCE_CONFIGURED if scoped else talk_auth.SOURCE_ENV,
-        detail="TALK_XAI_API_KEY" if scoped else "XAI_API_KEY",
-    )
-
-
 class TalkGrokRealtimeProvider(_TalkRealtimeProvider):
     """Plugin-owned xAI Grok duplex transport for the Hermes #95147 seam."""
 
     def __init__(
         self,
         *,
-        auth_resolver: Callable[[], Any] = _grok_auth,
+        auth_resolver: Callable[[], Any] | None = None,
         session_factory: Callable[..., Any] = GrokRealtimeSession,
     ) -> None:
         super().__init__(
             name=GROK_PROVIDER_NAME,
             display_name="Hermes Talk Grok Realtime",
-            auth_resolver=auth_resolver,
+            auth_resolver=auth_resolver or talk_grok_auth.resolve_grok_auth,
             session_factory=session_factory,
             model_resolver=talk_config.talk_grok_model,
             voice_resolver=talk_config.talk_grok_voice,
