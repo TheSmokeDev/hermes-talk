@@ -18,6 +18,7 @@ already generated far more than the operator heard.
 from __future__ import annotations
 
 import contextlib
+import math
 import queue
 import threading
 
@@ -36,6 +37,12 @@ FRAME_BYTES = SAMPLE_WIDTH * CHANNELS
 #: the tighter of the two: stale microphone audio is worse than dropped audio.
 MAX_INPUT_BLOCKS = 50
 MAX_PLAYBACK_BLOCKS = 200
+
+# Match OMP's live controller: while model audio is playing, microphone blocks
+# below the acoustic echo floor are local playback leakage, not barge-in.
+OUTPUT_ACTIVE_LEVEL = 0.015
+MIN_BARGE_IN_LEVEL = 0.04
+OUTPUT_ECHO_RATIO = 0.65
 
 _INSTALL_HINT = (
     'audio support is not installed — run: pip install "hermes-talk[audio]" '
@@ -74,6 +81,15 @@ def _device(raw: str | None) -> str | int | None:
         return None
     return int(raw) if raw.lstrip("-").isdigit() else raw
 
+def _pcm16_rms(pcm: bytes) -> float:
+    """Normalized RMS for little-endian mono PCM16 without copying samples."""
+
+    if not pcm:
+        return 0.0
+    samples = memoryview(pcm).cast("h")
+    sum_squares = sum(sample * sample for sample in samples)
+    return min(1.0, math.sqrt(sum_squares / len(samples)) / 32_768)
+
 
 class DuplexAudio:
     """Full-duplex pcm16 capture and playback over PortAudio."""
@@ -84,6 +100,7 @@ class DuplexAudio:
         self._residual = b""
         self._lock = threading.Lock()
         self._played_frames = 0
+        self._output_level = 0.0
         self._in_stream = None
         self._out_stream = None
 
@@ -133,10 +150,18 @@ class DuplexAudio:
     # -- PortAudio callbacks (audio thread) -----------------------------------
 
     def _input_callback(self, indata, _frames, _time, _status) -> None:
+        pcm = bytes(indata)
+        input_level = _pcm16_rms(pcm)
+        with self._lock:
+            output_level = self._output_level
+        output_active = output_level > OUTPUT_ACTIVE_LEVEL
+        echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
+        if output_active and input_level < echo_threshold:
+            return
         # Drop the block rather than stall the device: a blocked PortAudio
         # callback is a glitch the operator hears.
         with contextlib.suppress(queue.Full):
-            self._input.put_nowait(bytes(indata))
+            self._input.put_nowait(pcm)
 
     def _output_callback(self, outdata, frames, _time, _status) -> None:
         wanted = frames * FRAME_BYTES
@@ -145,6 +170,7 @@ class DuplexAudio:
         if len(chunk) < wanted:
             outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
         with self._lock:
+            self._output_level = _pcm16_rms(chunk)
             self._played_frames += len(chunk) // FRAME_BYTES
 
     def _take_playback(self, wanted: int) -> bytes:

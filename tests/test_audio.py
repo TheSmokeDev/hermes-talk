@@ -7,6 +7,7 @@ real device is a canary step, not a CI step.
 
 from __future__ import annotations
 
+import struct
 import sys
 
 import pytest
@@ -46,6 +47,43 @@ def test_input_chunks_round_trip():
 
     assert audio.read_input_chunk() == b"\x01\x02"
     assert audio.read_input_chunk() is None
+
+def _pcm16(amplitude: int, frames: int = 32) -> bytes:
+    return struct.pack(f"<{frames}h", *([amplitude] * frames))
+
+
+def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
+    audio = talk_audio.DuplexAudio()
+    playback = _pcm16(20_000)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 32, None, None)
+
+    audio._input_callback(_pcm16(5_000), 32, None, None)
+
+    assert audio.read_input_chunk() is None
+
+
+def test_voice_above_omp_barge_in_threshold_interrupts_playback():
+    audio = talk_audio.DuplexAudio()
+    playback = _pcm16(20_000)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 32, None, None)
+    barge_in = _pcm16(30_000)
+
+    audio._input_callback(barge_in, 32, None, None)
+
+    assert audio.read_input_chunk() == barge_in
+
+
+def test_microphone_audio_passes_when_playback_is_silent():
+    audio = talk_audio.DuplexAudio()
+    silence = _Buffer(64)
+    audio._output_callback(silence, 32, None, None)
+    microphone = _pcm16(2_000)
+
+    audio._input_callback(microphone, 32, None, None)
+
+    assert audio.read_input_chunk() == microphone
 
 
 def test_full_input_queue_drops_instead_of_blocking():
