@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
+from typing import ClassVar
 
 try:
     from . import talk_config
@@ -82,10 +84,11 @@ def import_webrtcvad():
 
 
 def audio_available() -> bool:
-    """True when a duplex session could actually open devices."""
+    """True when all dependencies needed by a duplex session are importable."""
 
     try:
         import_sounddevice()
+        import_webrtcvad()
     except TalkAudioError:
         return False
     return True
@@ -121,11 +124,18 @@ def _downsample_24k_to_8k(pcm: bytes) -> bytes:
 class _PulseWebRtcAudio:
     """Process-local PulseAudio WebRTC AEC/NS route for default Linux devices."""
 
+    _environment_lock = threading.Lock()
+    _active_routes: ClassVar[list[_PulseWebRtcAudio]] = []
+    _baseline_source: object | str = object()
+    _baseline_sink: object | str = object()
+    _missing = object()
+
     def __init__(self) -> None:
         self._pactl: str | None = None
         self._module_id: str | None = None
-        self._previous_source: str | None = None
-        self._previous_sink: str | None = None
+        self._source_name: str | None = None
+        self._sink_name: str | None = None
+        self._changed_environment = False
 
     @property
     def active(self) -> bool:
@@ -144,7 +154,7 @@ class _PulseWebRtcAudio:
         if pactl is None:
             return input_device, output_device
 
-        suffix = str(os.getpid())
+        suffix = f"{os.getpid()}_{uuid.uuid4().hex}"
         source_name = f"hermes_talk_aec_{suffix}"
         sink_name = f"hermes_talk_aec_sink_{suffix}"
         try:
@@ -171,21 +181,49 @@ class _PulseWebRtcAudio:
 
         self._pactl = pactl
         self._module_id = module_id
-        self._previous_source = os.environ.get("PULSE_SOURCE")
-        self._previous_sink = os.environ.get("PULSE_SINK")
-        os.environ["PULSE_SOURCE"] = source_name
-        os.environ["PULSE_SINK"] = sink_name
+        self._source_name = source_name
+        self._sink_name = sink_name
+        with self._environment_lock:
+            if not self._active_routes:
+                type(self)._baseline_source = os.environ.get("PULSE_SOURCE", self._missing)
+                type(self)._baseline_sink = os.environ.get("PULSE_SINK", self._missing)
+            self._active_routes.append(self)
+            os.environ["PULSE_SOURCE"] = source_name
+            os.environ["PULSE_SINK"] = sink_name
+            self._changed_environment = True
         return "pulse", "pulse"
 
+    @classmethod
+    def _restore(cls, name: str, baseline: object | str) -> None:
+        if baseline is cls._missing:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = baseline
+
     def stop(self) -> None:
-        if self._previous_source is None:
-            os.environ.pop("PULSE_SOURCE", None)
-        else:
-            os.environ["PULSE_SOURCE"] = self._previous_source
-        if self._previous_sink is None:
-            os.environ.pop("PULSE_SINK", None)
-        else:
-            os.environ["PULSE_SINK"] = self._previous_sink
+        with self._environment_lock:
+            if self._changed_environment:
+                self._changed_environment = False
+                with contextlib.suppress(ValueError):
+                    self._active_routes.remove(self)
+                managed_values = {
+                    route._source_name
+                    for route in self._active_routes
+                } | {self._source_name}
+                if os.environ.get("PULSE_SOURCE") in managed_values:
+                    if self._active_routes:
+                        os.environ["PULSE_SOURCE"] = self._active_routes[-1]._source_name
+                    else:
+                        self._restore("PULSE_SOURCE", self._baseline_source)
+                managed_values = {
+                    route._sink_name
+                    for route in self._active_routes
+                } | {self._sink_name}
+                if os.environ.get("PULSE_SINK") in managed_values:
+                    if self._active_routes:
+                        os.environ["PULSE_SINK"] = self._active_routes[-1]._sink_name
+                    else:
+                        self._restore("PULSE_SINK", self._baseline_sink)
 
         if self._pactl is not None and self._module_id is not None:
             with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -198,6 +236,8 @@ class _PulseWebRtcAudio:
                 )
         self._pactl = None
         self._module_id = None
+        self._source_name = None
+        self._sink_name = None
 
 
 class DuplexAudio:
@@ -224,35 +264,45 @@ class DuplexAudio:
         sd = import_sounddevice()
         if self._speech_detector is None:
             self._speech_detector = import_webrtcvad().Vad(3)
-        input_device = _device(talk_config.audio_input_device())
-        output_device = _device(talk_config.audio_output_device())
-        input_device, output_device = self._pulse_webrtc.start(input_device, output_device)
+        original_input = _device(talk_config.audio_input_device())
+        original_output = _device(talk_config.audio_output_device())
+        input_device, output_device = self._pulse_webrtc.start(
+            original_input, original_output
+        )
         try:
-            self._in_stream = sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCKSIZE,
-                device=input_device,
-                channels=CHANNELS,
-                dtype="int16",
-                callback=self._input_callback,
-            )
-            self._out_stream = sd.RawOutputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCKSIZE,
-                device=output_device,
-                channels=CHANNELS,
-                dtype="int16",
-                callback=self._output_callback,
-            )
-            self._in_stream.start()
-            self._out_stream.start()
-        except Exception as exc:  # PortAudio raises its own exception types
-            self.stop()
-            raise TalkAudioError(f"could not open audio devices: {exc}") from exc
+            self._open_streams(sd, input_device, output_device)
+        except Exception as routed_exc:  # PortAudio raises its own exception types
+            self._close_streams()
+            if not self._pulse_webrtc.active:
+                raise TalkAudioError(f"could not open audio devices: {routed_exc}") from routed_exc
+            self._pulse_webrtc.stop()
+            try:
+                self._open_streams(sd, original_input, original_output)
+            except Exception as exc:
+                self._close_streams()
+                raise TalkAudioError(f"could not open audio devices: {exc}") from exc
 
-    def stop(self) -> None:
-        """Close both streams. Safe to call twice, and on a failed start."""
+    def _open_streams(self, sd, input_device, output_device) -> None:
+        self._in_stream = sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCKSIZE,
+            device=input_device,
+            channels=CHANNELS,
+            dtype="int16",
+            callback=self._input_callback,
+        )
+        self._out_stream = sd.RawOutputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCKSIZE,
+            device=output_device,
+            channels=CHANNELS,
+            dtype="int16",
+            callback=self._output_callback,
+        )
+        self._in_stream.start()
+        self._out_stream.start()
 
+    def _close_streams(self) -> None:
         for attr in ("_in_stream", "_out_stream"):
             stream = getattr(self, attr, None)
             if stream is None:
@@ -263,6 +313,11 @@ class DuplexAudio:
             except Exception:  # noqa: BLE001 — teardown is best-effort
                 pass
             setattr(self, attr, None)
+
+    def stop(self) -> None:
+        """Close both streams. Safe to call twice, and on a failed start."""
+
+        self._close_streams()
         self._pulse_webrtc.stop()
 
     def _contains_speech(self, pcm: bytes) -> bool:
@@ -289,10 +344,12 @@ class DuplexAudio:
             output_level = self._output_level
         if not self._pulse_webrtc.active:
             output_active = output_level > OUTPUT_ACTIVE_LEVEL
-            echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
-            if output_active and input_level < echo_threshold:
-                return
-            if output_active and not self._contains_speech(pcm):
+            if output_active and self._contains_speech(pcm):
+                pass
+            elif output_active:
+                echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
+                if input_level < echo_threshold:
+                    return
                 return
         # Drop the block rather than stall the device: a blocked PortAudio
         # callback is a glitch the operator hears.

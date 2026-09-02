@@ -32,6 +32,16 @@ def test_lazy_import_failure_names_the_extra(monkeypatch):
         talk_audio.import_sounddevice()
     assert talk_audio.audio_available() is False
 
+def test_audio_is_unavailable_without_webrtc_vad(monkeypatch):
+    monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: object())
+    monkeypatch.setattr(
+        talk_audio,
+        "import_webrtcvad",
+        lambda: (_ for _ in ()).throw(talk_audio.TalkAudioError("missing VAD")),
+    )
+
+    assert talk_audio.audio_available() is False
+
 
 def test_device_override_parses_index_or_name():
     assert talk_audio._device(None) is None
@@ -104,6 +114,41 @@ def test_linux_default_audio_uses_pulse_webrtc_echo_cancellation(monkeypatch):
     audio.stop()
 
     assert commands[-1] == ["/usr/bin/pactl", "unload-module", "42"]
+
+def test_pulse_device_open_failure_retries_original_devices(monkeypatch):
+    class FailingPulseSoundDevice(_SoundDevice):
+        def RawInputStream(self, **kwargs):
+            if kwargs["device"] == "pulse":
+                raise RuntimeError("Pulse route is unavailable")
+            return super().RawInputStream(**kwargs)
+
+    sd = FailingPulseSoundDevice()
+    commands = []
+    monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: sd)
+    monkeypatch.setattr(
+        talk_audio,
+        "import_webrtcvad",
+        lambda: type("V", (), {"Vad": lambda *_: _SpeechDetector(True)}),
+    )
+    monkeypatch.setattr(talk_audio.sys, "platform", "linux")
+    monkeypatch.setattr(talk_audio.shutil, "which", lambda _command: "/usr/bin/pactl")
+    monkeypatch.setattr(talk_audio.talk_config, "audio_input_device", lambda: None)
+    monkeypatch.setattr(talk_audio.talk_config, "audio_output_device", lambda: None)
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return _CompletedProcess("42\n")
+
+    monkeypatch.setattr(talk_audio.subprocess, "run", run)
+    audio = talk_audio.DuplexAudio()
+
+    audio.start()
+
+    assert sd.input_stream.kwargs["device"] is None
+    assert sd.output_stream.kwargs["device"] is None
+    assert commands[-1] == ["/usr/bin/pactl", "unload-module", "42"]
+    assert audio._pulse_webrtc.active is False
+    audio.stop()
 
 
 def test_pulse_echo_cancelled_input_is_never_amplitude_gated(monkeypatch):
@@ -184,14 +229,28 @@ class _SpeechDetector:
 
 
 def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
-    audio = talk_audio.DuplexAudio()
-    playback = _pcm16(20_000)
+    detector = _SpeechDetector(False)
+    audio = talk_audio.DuplexAudio(speech_detector=detector)
+    playback = _pcm16(20_000, 2_400)
     audio.queue_playback(playback)
-    audio._output_callback(_Buffer(len(playback)), 32, None, None)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
 
-    audio._input_callback(_pcm16(5_000), 32, None, None)
+    audio._input_callback(_pcm16(5_000, 2_400), 2_400, None, None)
 
     assert audio.read_input_chunk() is None
+
+def test_webrtc_speech_overrides_fallback_echo_amplitude_gate():
+    detector = _SpeechDetector(True)
+    audio = talk_audio.DuplexAudio(speech_detector=detector)
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    moderate_speech = _pcm16(5_000, 2_400)
+
+    audio._input_callback(moderate_speech, 2_400, None, None)
+
+    assert detector.calls > 0
+    assert audio.read_input_chunk() == moderate_speech
 
 
 def test_voice_above_omp_barge_in_threshold_interrupts_playback():
@@ -310,3 +369,57 @@ def test_stop_is_safe_before_start_and_twice():
     audio = talk_audio.DuplexAudio()
     audio.stop()
     audio.stop()
+
+
+def test_pulse_stop_preserves_environment_when_never_started_or_load_failed(monkeypatch):
+    monkeypatch.setenv("PULSE_SOURCE", "external-source")
+    monkeypatch.setenv("PULSE_SINK", "external-sink")
+    route = talk_audio._PulseWebRtcAudio()
+    route.stop()
+    route.stop()
+    assert talk_audio.os.environ["PULSE_SOURCE"] == "external-source"
+    assert talk_audio.os.environ["PULSE_SINK"] == "external-sink"
+
+    monkeypatch.setattr(talk_audio.sys, "platform", "linux")
+    monkeypatch.setattr(talk_audio.shutil, "which", lambda _command: "/usr/bin/pactl")
+    monkeypatch.setattr(
+        talk_audio.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("load failed")),
+    )
+    assert route.start(None, None) == (None, None)
+    route.stop()
+    assert talk_audio.os.environ["PULSE_SOURCE"] == "external-source"
+    assert talk_audio.os.environ["PULSE_SINK"] == "external-sink"
+
+
+@pytest.mark.parametrize("stop_order", [(0, 1), (1, 0)])
+def test_concurrent_pulse_routes_restore_environment_in_either_order(
+    monkeypatch, stop_order
+):
+    monkeypatch.setenv("PULSE_SOURCE", "original-source")
+    monkeypatch.setenv("PULSE_SINK", "original-sink")
+    monkeypatch.setattr(talk_audio.sys, "platform", "linux")
+    monkeypatch.setattr(talk_audio.shutil, "which", lambda _command: "/usr/bin/pactl")
+    module_ids = iter(("41\n", "42\n"))
+    monkeypatch.setattr(
+        talk_audio.subprocess,
+        "run",
+        lambda command, **_kwargs: _CompletedProcess(next(module_ids))
+        if command[1] == "load-module"
+        else _CompletedProcess(""),
+    )
+    routes = [talk_audio._PulseWebRtcAudio(), talk_audio._PulseWebRtcAudio()]
+    routes[0].start(None, None)
+    first_source = routes[0]._source_name
+    routes[1].start(None, None)
+    second_source = routes[1]._source_name
+    assert first_source != second_source
+
+    routes[stop_order[0]].stop()
+    survivor = routes[stop_order[1]]
+    assert talk_audio.os.environ["PULSE_SOURCE"] == survivor._source_name
+    routes[stop_order[1]].stop()
+
+    assert talk_audio.os.environ["PULSE_SOURCE"] == "original-source"
+    assert talk_audio.os.environ["PULSE_SINK"] == "original-sink"
