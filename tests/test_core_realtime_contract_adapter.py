@@ -247,6 +247,87 @@ def test_cancel_is_sent_only_while_provider_response_is_active():
     assert harness.session.sent == [rt.CancelResponse()]
 
 
+def test_cancelled_response_tail_and_late_finish_cannot_clear_new_response():
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-a"),
+            rt.OutputAudio(data=b"stale", item_id="item-a", response_id="response-a"),
+            rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text="stale transcript",
+                final=True,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+                response_id="response-a",
+            ),
+            rt.ResponseStarted(response_id="response-b"),
+            rt.ResponseFinished(response_id="response-a"),
+            rt.OutputAudio(data=b"current", item_id="item-b", response_id="response-b"),
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def scenario():
+        events = session.events()
+        assert (await anext(events)).type is RealtimeEventType.TURN_STARTED
+        await session.cancel_response()
+        started_b = await anext(events)
+        current_audio = await anext(events)
+        await session.cancel_response()
+        return started_b, current_audio
+
+    started_b, current_audio = run(scenario())
+
+    assert started_b.type is RealtimeEventType.TURN_STARTED
+    assert current_audio.audio_bytes == b"current"
+    assert harness.session.sent == [rt.CancelResponse(), rt.CancelResponse()]
+
+
+def test_completed_tool_call_replay_is_ignored_without_sticking_pending():
+    duplicate = rt.FunctionCall(
+        call_id="call-1",
+        name="weather",
+        arguments="{}",
+        response_id="response-1",
+    )
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-1"),
+            duplicate,
+            rt.ResponseFinished(response_id="response-1"),
+            duplicate,
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def scenario():
+        events = session.events()
+        for _ in range(3):
+            await anext(events)
+        await session.submit_tool_result("call-1", "sunny")
+        return [event async for event in events]
+
+    assert run(scenario()) == []
+    assert session._pending_tool_calls == []
+    assert harness.session.sent == [
+        rt.SubmitToolResult(call_id="call-1", output="sunny"),
+        rt.StartResponse(),
+    ]
+
+
+def test_unexpected_clean_provider_close_surfaces_terminal_error():
+    harness = Harness((rt.SessionTerminated(state=rt.SessionState.CLOSED),))
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def collect():
+        return [event async for event in session.events()]
+
+    events = run(collect())
+
+    assert len(events) == 1
+    assert events[0].type is RealtimeEventType.ERROR
+    assert events[0].text == "realtime voice provider closed unexpectedly"
+
+
 def test_recoverable_provider_failure_does_not_end_the_session():
     harness = Harness(
         (

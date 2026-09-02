@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - flat-module fallback
 OPENAI_PROVIDER_NAME = "talk_openai_realtime"
 GROK_PROVIDER_NAME = "talk_grok_realtime"
 PROVIDER_NAME = OPENAI_PROVIDER_NAME
+MAX_SETTLED_IDENTIFIERS = 256
 
 
 def _tool_definition(value: Mapping[str, Any]) -> rt.ToolDefinition:
@@ -64,9 +66,14 @@ class TalkRealtimeSession(RealtimeSession):
         self._closed = False
         self._tool_lock = asyncio.Lock()
         self._pending_tool_calls: list[str] = []
+        self._tool_call_responses: dict[str, str | None] = {}
         self._tool_outputs: dict[str, str] = {}
+        self._completed_tool_calls: OrderedDict[str, None] = OrderedDict()
         self._response_finished = False
-        self._response_active = False
+        self._response_in_flight = False
+        self._active_response_id: str | None = None
+        self._unnamed_response_cancelled = False
+        self._settled_response_ids: OrderedDict[str, None] = OrderedDict()
 
     async def send_audio(self, pcm: bytes) -> None:
         await self._session.send((rt.AppendInputAudio(bytes(pcm)),))
@@ -82,16 +89,27 @@ class TalkRealtimeSession(RealtimeSession):
 
     def _map_event(self, event: rt.RealtimeEvent) -> RealtimeEvent | None:
         if isinstance(event, rt.OutputAudio):
+            if not self._belongs_to_active(event.response_id):
+                return None
             return RealtimeEvent.audio(event.data, item_id=event.item_id)
         if isinstance(event, rt.Transcript):
+            if (
+                event.role is rt.TranscriptRole.ASSISTANT
+                and not self._belongs_to_active(event.response_id)
+            ):
+                return None
             return RealtimeEvent.transcript(
                 event.text,
                 final=event.final,
                 role=event.role.value,
             )
         if isinstance(event, rt.FunctionCall):
-            if event.call_id not in self._pending_tool_calls:
-                self._pending_tool_calls.append(event.call_id)
+            if (
+                event.call_id in self._completed_tool_calls
+                or event.call_id in self._pending_tool_calls
+                or not self._belongs_to_active(event.response_id)
+            ):
+                return None
             try:
                 arguments = json.loads(event.arguments)
             except json.JSONDecodeError as exc:
@@ -104,27 +122,38 @@ class TalkRealtimeSession(RealtimeSession):
                     type=RealtimeEventType.ERROR,
                     text="invalid tool arguments: expected an object",
                 )
+            self._pending_tool_calls.append(event.call_id)
+            self._tool_call_responses[event.call_id] = event.response_id
             return RealtimeEvent.tool_call(event.call_id, event.name, arguments)
         if isinstance(event, rt.SpeechStarted):
             return RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user")
         if isinstance(event, rt.SpeechStopped):
             return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="user")
         if isinstance(event, rt.ResponseStarted):
-            self._response_active = True
-            self._response_finished = False
+            if not self._start_response(event.response_id):
+                return None
             return RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="assistant")
         if isinstance(event, rt.ResponseFinished):
-            self._response_active = False
+            if not self._finish_response(event.response_id):
+                return None
             self._response_finished = True
             return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="assistant")
         if isinstance(event, rt.ProviderFailure) and event.terminal:
             return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
-        if isinstance(event, rt.SessionTerminated) and event.state is rt.SessionState.FAILED:
-            return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
+        if isinstance(event, rt.SessionTerminated):
+            if event.state is rt.SessionState.FAILED:
+                return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
+            if event.state is rt.SessionState.CLOSED and not self._closed:
+                return RealtimeEvent(
+                    type=RealtimeEventType.ERROR,
+                    text=event.detail or "realtime voice provider closed unexpectedly",
+                )
         return None
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         async with self._tool_lock:
+            if call_id in self._completed_tool_calls:
+                return
             if call_id not in self._pending_tool_calls:
                 raise ValueError(f"unknown realtime tool call {call_id!r}")
             self._tool_outputs[call_id] = output
@@ -148,7 +177,10 @@ class TalkRealtimeSession(RealtimeSession):
             rt.StartResponse(),
         )
         await self._session.send(commands)
+        for call_id in self._pending_tool_calls:
+            self._mark_tool_call_completed(call_id)
         self._pending_tool_calls.clear()
+        self._tool_call_responses.clear()
         self._tool_outputs.clear()
         self._response_finished = False
 
@@ -174,8 +206,85 @@ class TalkRealtimeSession(RealtimeSession):
         )
 
     async def cancel_response(self) -> None:
-        if self._response_active:
+        if self._cancel_active_response():
             await self._session.send((rt.CancelResponse(),))
+
+    def _belongs_to_active(self, response_id: str | None) -> bool:
+        if response_id is None:
+            return not self._unnamed_response_cancelled
+        if response_id in self._settled_response_ids:
+            return False
+        return self._active_response_id is None or response_id == self._active_response_id
+
+    def _settle_response(self, response_id: str) -> None:
+        if response_id in self._settled_response_ids:
+            return
+        self._settled_response_ids[response_id] = None
+        if len(self._settled_response_ids) > MAX_SETTLED_IDENTIFIERS:
+            self._settled_response_ids.popitem(last=False)
+
+    def _start_response(self, response_id: str | None) -> bool:
+        if response_id is not None and response_id in self._settled_response_ids:
+            return False
+        if (
+            response_id is None
+            and self._response_in_flight
+            and self._active_response_id is not None
+        ):
+            return False
+        self._unnamed_response_cancelled = False
+        self._response_in_flight = True
+        self._active_response_id = response_id
+        self._response_finished = False
+        return True
+
+    def _cancel_active_response(self) -> bool:
+        if not self._response_in_flight:
+            return False
+        if self._active_response_id is not None:
+            if self._active_response_id in self._settled_response_ids:
+                return False
+            self._settle_response(self._active_response_id)
+        elif self._unnamed_response_cancelled:
+            return False
+        else:
+            self._unnamed_response_cancelled = True
+        self._abandon_tool_calls(self._active_response_id)
+        self._response_finished = False
+        return True
+
+    def _finish_response(self, response_id: str | None) -> bool:
+        eligible = self._belongs_to_active(response_id)
+        if response_id is not None:
+            self._settle_response(response_id)
+        if (
+            response_id is not None
+            and self._active_response_id is not None
+            and response_id != self._active_response_id
+        ):
+            return False
+        self._response_in_flight = False
+        self._active_response_id = None
+        self._unnamed_response_cancelled = False
+        return eligible
+
+    def _abandon_tool_calls(self, response_id: str | None) -> None:
+        abandoned = [
+            call_id
+            for call_id in self._pending_tool_calls
+            if self._tool_call_responses.get(call_id) == response_id
+        ]
+        for call_id in abandoned:
+            self._pending_tool_calls.remove(call_id)
+            self._tool_call_responses.pop(call_id, None)
+            self._tool_outputs.pop(call_id, None)
+            self._mark_tool_call_completed(call_id)
+
+    def _mark_tool_call_completed(self, call_id: str) -> None:
+        self._completed_tool_calls[call_id] = None
+        self._completed_tool_calls.move_to_end(call_id)
+        if len(self._completed_tool_calls) > MAX_SETTLED_IDENTIFIERS:
+            self._completed_tool_calls.popitem(last=False)
 
     async def close(self) -> None:
         if self._closed:
