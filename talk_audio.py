@@ -47,9 +47,41 @@ MAX_PLAYBACK_BYTES = SAMPLE_RATE * FRAME_BYTES * 20
 
 # Match OMP's live controller: while model audio is playing, microphone blocks
 # below the acoustic echo floor are local playback leakage, not barge-in.
+# This software gate runs on every platform whenever PulseAudio WebRTC AEC is
+# not active (always on Windows/macOS). On headphones there is no echo to
+# suppress, so the operator can retune or disable it:
+#   TALK_ECHO_GATE=off                       disable the gate entirely
+#   TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL=0.015 playback RMS that counts as "active"
+#   TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL=0.04   floor a mic block must clear
+#   TALK_ECHO_GATE_RATIO=0.65                 fraction of playback RMS a block must clear
+# Read when DuplexAudio is constructed, not at import.
 OUTPUT_ACTIVE_LEVEL = 0.015
 MIN_BARGE_IN_LEVEL = 0.04
 OUTPUT_ECHO_RATIO = 0.65
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _echo_gate_settings() -> tuple[bool, float, float, float]:
+    """(enabled, output_active_level, min_barge_in_level, echo_ratio) from env."""
+
+    raw = (os.environ.get("TALK_ECHO_GATE") or "").strip().lower()
+    enabled = raw not in {"0", "off", "false", "no", "disabled"}
+    return (
+        enabled,
+        _env_float("TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL", OUTPUT_ACTIVE_LEVEL),
+        _env_float("TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL", MIN_BARGE_IN_LEVEL),
+        _env_float("TALK_ECHO_GATE_RATIO", OUTPUT_ECHO_RATIO),
+    )
 
 _INSTALL_HINT = (
     'audio support is not installed — run: pip install "hermes-talk[audio]" '
@@ -240,6 +272,12 @@ class DuplexAudio:
         self._in_stream = None
         self._out_stream = None
         self._pulse_webrtc = _PulseWebRtcAudio()
+        (
+            self._echo_gate_enabled,
+            self._output_active_level,
+            self._min_barge_in_level,
+            self._output_echo_ratio,
+        ) = _echo_gate_settings()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -314,11 +352,11 @@ class DuplexAudio:
         input_level = _pcm16_rms(pcm)
         with self._lock:
             output_level = self._output_level
-        if not self._pulse_webrtc.active:
-            output_active = output_level > OUTPUT_ACTIVE_LEVEL
+        if self._echo_gate_enabled and not self._pulse_webrtc.active:
+            output_active = output_level > self._output_active_level
             echo_threshold = max(
-                MIN_BARGE_IN_LEVEL,
-                output_level * OUTPUT_ECHO_RATIO,
+                self._min_barge_in_level,
+                output_level * self._output_echo_ratio,
             )
             if output_active and input_level < echo_threshold:
                 return

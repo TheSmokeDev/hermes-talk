@@ -17,6 +17,15 @@ named rather than smoothed.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.
+
+### Changed
+- The software echo gate (mic blocks below the playback echo floor are
+  dropped while model audio plays) now runs on every platform whenever
+  PulseAudio AEC is not active — that is always on Windows and macOS. On
+  headphones there is no echo to suppress, so it is tunable:
+  `TALK_ECHO_GATE=off` disables it; `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL`,
+  `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL`, and `TALK_ECHO_GATE_RATIO` retune it.
+  Read when the audio stream is constructed.
 ## [0.16.0] — 2026-09-01
 
 Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add

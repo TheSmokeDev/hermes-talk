@@ -284,6 +284,42 @@ def test_loud_input_above_omp_threshold_is_uploaded():
     assert audio.read_input_chunk() == loud_input
 
 
+def test_echo_gate_off_passes_quiet_input_during_playback(monkeypatch):
+    monkeypatch.setenv("TALK_ECHO_GATE", "off")
+    audio = talk_audio.DuplexAudio()
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    quiet_speech = _pcm16(5_000, 2_400)
+
+    audio._input_callback(quiet_speech, 2_400, None, None)
+
+    assert audio.read_input_chunk() == quiet_speech
+
+
+def test_echo_gate_thresholds_are_read_from_env_at_construction(monkeypatch):
+    monkeypatch.setenv("TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL", "0.001")
+    monkeypatch.setenv("TALK_ECHO_GATE_RATIO", "0.01")
+    audio = talk_audio.DuplexAudio()
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    moderate_speech = _pcm16(5_000, 2_400)
+
+    audio._input_callback(moderate_speech, 2_400, None, None)
+
+    assert audio.read_input_chunk() == moderate_speech
+
+
+def test_echo_gate_ignores_invalid_env_values(monkeypatch):
+    monkeypatch.setenv("TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL", "loud")
+    monkeypatch.setenv("TALK_ECHO_GATE_RATIO", "-1")
+    audio = talk_audio.DuplexAudio()
+
+    assert audio._min_barge_in_level == talk_audio.MIN_BARGE_IN_LEVEL
+    assert audio._output_echo_ratio == talk_audio.OUTPUT_ECHO_RATIO
+
+
 def test_microphone_audio_passes_when_playback_is_silent():
     audio = talk_audio.DuplexAudio()
     silence = _Buffer(64)
