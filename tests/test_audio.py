@@ -295,12 +295,21 @@ def test_microphone_audio_passes_when_playback_is_silent():
     assert audio.read_input_chunk() == microphone
 
 
-def test_full_input_queue_drops_instead_of_blocking():
+def test_full_input_queue_keeps_newest_audio_without_blocking():
     audio = talk_audio.DuplexAudio()
-    for _ in range(talk_audio.MAX_INPUT_BLOCKS + 10):
+    oldest = b"\x01\x00"
+    newest = b"\x02\x00"
+    audio._input_callback(oldest, 1, None, None)
+    for _ in range(talk_audio.MAX_INPUT_BLOCKS - 1):
         audio._input_callback(b"\x00\x00", 1, None, None)
 
+    audio._input_callback(newest, 1, None, None)
+
     assert audio._input.qsize() == talk_audio.MAX_INPUT_BLOCKS
+    assert audio.read_input_chunk() != oldest
+    queued = [audio.read_input_chunk() for _ in range(talk_audio.MAX_INPUT_BLOCKS - 1)]
+    assert queued[-1] == newest
+    assert audio.dropped_input_blocks == 1
 
 
 def test_playback_spans_queue_chunk_boundaries():
@@ -386,6 +395,7 @@ def test_playback_queue_is_bounded_by_bytes_not_only_packet_count():
     assert audio._queued_playback_bytes == 2
     audio.drain_playback()
     assert audio._queued_playback_bytes == 0
+    assert audio.dropped_playback_bytes == talk_audio.MAX_PLAYBACK_BYTES + 2
 
 
 def test_stop_is_safe_before_start_and_twice():

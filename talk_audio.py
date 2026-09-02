@@ -233,6 +233,8 @@ class DuplexAudio:
         self._queued_playback_bytes = 0
         self._lock = threading.Lock()
         self._played_item_id: str | None = None
+        self._dropped_input_blocks = 0
+        self._dropped_playback_bytes = 0
         self._played_frames = 0
         self._output_level = 0.0
         self._in_stream = None
@@ -320,10 +322,18 @@ class DuplexAudio:
             )
             if output_active and input_level < echo_threshold:
                 return
-        # Drop the block rather than stall the device: a blocked PortAudio
-        # callback is a glitch the operator hears.
-        with contextlib.suppress(queue.Full):
+        try:
             self._input.put_nowait(pcm)
+        except queue.Full:
+            # Capture is realtime: preserving a five-second-old block while
+            # discarding the operator's current speech corrupts the turn.
+            # Evict one oldest block and retain the newest available audio.
+            with contextlib.suppress(queue.Empty):
+                self._input.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._input.put_nowait(pcm)
+            with self._lock:
+                self._dropped_input_blocks += 1
 
     def _output_callback(self, outdata, frames, _time, _status) -> None:
         wanted = frames * FRAME_BYTES
@@ -379,10 +389,12 @@ class DuplexAudio:
             return
         with self._lock:
             if self._queued_playback_bytes + len(pcm) > MAX_PLAYBACK_BYTES:
+                self._dropped_playback_bytes += len(pcm)
                 return
             try:
                 self._playback.put_nowait((item_id, pcm))
             except queue.Full:
+                self._dropped_playback_bytes += len(pcm)
                 return
             self._queued_playback_bytes += len(pcm)
 
@@ -418,6 +430,20 @@ class DuplexAudio:
         with self._lock:
             self._played_item_id = None
             self._played_frames = 0
+
+    @property
+    def dropped_input_blocks(self) -> int:
+        """Count capture overflows handled with a newest-audio preference."""
+
+        with self._lock:
+            return self._dropped_input_blocks
+
+    @property
+    def dropped_playback_bytes(self) -> int:
+        """Count provider audio bytes rejected by playback capacity limits."""
+
+        with self._lock:
+            return self._dropped_playback_bytes
 
 
 __all__ = [
