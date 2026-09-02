@@ -39,6 +39,127 @@ def test_device_override_parses_index_or_name():
     assert talk_audio._device("Speakers (Realtek)") == "Speakers (Realtek)"
 
 
+class _Stream:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _SoundDevice:
+    def __init__(self):
+        self.input_stream = None
+        self.output_stream = None
+
+    def RawInputStream(self, **kwargs):
+        self.input_stream = _Stream(**kwargs)
+        return self.input_stream
+
+    def RawOutputStream(self, **kwargs):
+        self.output_stream = _Stream(**kwargs)
+        return self.output_stream
+
+
+class _CompletedProcess:
+    def __init__(self, stdout: str):
+        self.stdout = stdout
+
+
+def test_linux_default_audio_uses_pulse_webrtc_echo_cancellation(monkeypatch):
+    sd = _SoundDevice()
+    commands = []
+    monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: sd)
+    monkeypatch.setattr(
+        talk_audio,
+        "import_webrtcvad",
+        lambda: type("V", (), {"Vad": lambda *_: _SpeechDetector(True)}),
+    )
+    monkeypatch.setattr(talk_audio.sys, "platform", "linux")
+    monkeypatch.setattr(talk_audio.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(talk_audio.talk_config, "audio_input_device", lambda: None)
+    monkeypatch.setattr(talk_audio.talk_config, "audio_output_device", lambda: None)
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return _CompletedProcess("42\n")
+
+    monkeypatch.setattr(talk_audio.subprocess, "run", run)
+    audio = talk_audio.DuplexAudio()
+
+    audio.start()
+
+    assert commands[0][1:3] == ["load-module", "module-echo-cancel"]
+    assert sd.input_stream.kwargs["device"] == "pulse"
+    assert sd.output_stream.kwargs["device"] == "pulse"
+    assert talk_audio.os.environ["PULSE_SOURCE"].startswith("hermes_talk_aec_")
+    assert talk_audio.os.environ["PULSE_SINK"].startswith("hermes_talk_aec_sink_")
+
+    audio.stop()
+
+    assert commands[-1] == ["/usr/bin/pactl", "unload-module", "42"]
+
+
+def test_pulse_echo_cancelled_input_is_never_amplitude_gated(monkeypatch):
+    sd = _SoundDevice()
+    monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: sd)
+    monkeypatch.setattr(
+        talk_audio,
+        "import_webrtcvad",
+        lambda: type("V", (), {"Vad": lambda *_: _SpeechDetector(False)}),
+    )
+    monkeypatch.setattr(talk_audio.sys, "platform", "linux")
+    monkeypatch.setattr(talk_audio.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(talk_audio.talk_config, "audio_input_device", lambda: None)
+    monkeypatch.setattr(talk_audio.talk_config, "audio_output_device", lambda: None)
+    monkeypatch.setattr(
+        talk_audio.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _CompletedProcess("42\n"),
+    )
+    audio = talk_audio.DuplexAudio()
+    audio.start()
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    quiet_speech = _pcm16(2_000, 2_400)
+
+    audio._input_callback(quiet_speech, 2_400, None, None)
+
+    assert audio.read_input_chunk() == quiet_speech
+    audio.stop()
+
+
+def test_explicit_devices_skip_pulse_echo_module(monkeypatch):
+    sd = _SoundDevice()
+    monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: sd)
+    monkeypatch.setattr(
+        talk_audio,
+        "import_webrtcvad",
+        lambda: type("V", (), {"Vad": lambda *_: _SpeechDetector(True)}),
+    )
+    monkeypatch.setattr(talk_audio.talk_config, "audio_input_device", lambda: "microphone")
+    monkeypatch.setattr(talk_audio.talk_config, "audio_output_device", lambda: "speaker")
+    monkeypatch.setattr(
+        talk_audio.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("explicit devices must not load a PulseAudio module"),
+    )
+    audio = talk_audio.DuplexAudio()
+
+    audio.start()
+
+    assert sd.input_stream.kwargs["device"] == "microphone"
+    assert sd.output_stream.kwargs["device"] == "speaker"
+    audio.stop()
+
+
 def test_input_chunks_round_trip():
     audio = talk_audio.DuplexAudio()
     assert audio.read_input_chunk() is None

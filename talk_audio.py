@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 
 try:
@@ -114,6 +118,88 @@ def _downsample_24k_to_8k(pcm: bytes) -> bytes:
     return bytes(target)
 
 
+class _PulseWebRtcAudio:
+    """Process-local PulseAudio WebRTC AEC/NS route for default Linux devices."""
+
+    def __init__(self) -> None:
+        self._pactl: str | None = None
+        self._module_id: str | None = None
+        self._previous_source: str | None = None
+        self._previous_sink: str | None = None
+
+    @property
+    def active(self) -> bool:
+        """Whether capture already comes from PulseAudio's echo canceller."""
+
+        return self._module_id is not None
+
+    def start(
+        self,
+        input_device: str | int | None,
+        output_device: str | int | None,
+    ) -> tuple[str | int | None, str | int | None]:
+        if input_device is not None or output_device is not None or sys.platform != "linux":
+            return input_device, output_device
+        pactl = shutil.which("pactl")
+        if pactl is None:
+            return input_device, output_device
+
+        suffix = str(os.getpid())
+        source_name = f"hermes_talk_aec_{suffix}"
+        sink_name = f"hermes_talk_aec_sink_{suffix}"
+        try:
+            result = subprocess.run(
+                [
+                    pactl,
+                    "load-module",
+                    "module-echo-cancel",
+                    "aec_method=webrtc",
+                    f"source_name={source_name}",
+                    f"sink_name={sink_name}",
+                    "aec_args=analog_gain_control=0 digital_gain_control=1 noise_suppression=1",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            module_id = result.stdout.strip()
+            if not module_id.isdigit():
+                raise ValueError("pactl returned no module id")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return input_device, output_device
+
+        self._pactl = pactl
+        self._module_id = module_id
+        self._previous_source = os.environ.get("PULSE_SOURCE")
+        self._previous_sink = os.environ.get("PULSE_SINK")
+        os.environ["PULSE_SOURCE"] = source_name
+        os.environ["PULSE_SINK"] = sink_name
+        return "pulse", "pulse"
+
+    def stop(self) -> None:
+        if self._previous_source is None:
+            os.environ.pop("PULSE_SOURCE", None)
+        else:
+            os.environ["PULSE_SOURCE"] = self._previous_source
+        if self._previous_sink is None:
+            os.environ.pop("PULSE_SINK", None)
+        else:
+            os.environ["PULSE_SINK"] = self._previous_sink
+
+        if self._pactl is not None and self._module_id is not None:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    [self._pactl, "unload-module", self._module_id],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+        self._pactl = None
+        self._module_id = None
+
+
 class DuplexAudio:
     """Full-duplex pcm16 capture and playback over PortAudio."""
 
@@ -128,6 +214,7 @@ class DuplexAudio:
         self._speech_run_frames = 0
         self._in_stream = None
         self._out_stream = None
+        self._pulse_webrtc = _PulseWebRtcAudio()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -137,11 +224,14 @@ class DuplexAudio:
         sd = import_sounddevice()
         if self._speech_detector is None:
             self._speech_detector = import_webrtcvad().Vad(3)
+        input_device = _device(talk_config.audio_input_device())
+        output_device = _device(talk_config.audio_output_device())
+        input_device, output_device = self._pulse_webrtc.start(input_device, output_device)
         try:
             self._in_stream = sd.RawInputStream(
                 samplerate=SAMPLE_RATE,
                 blocksize=BLOCKSIZE,
-                device=_device(talk_config.audio_input_device()),
+                device=input_device,
                 channels=CHANNELS,
                 dtype="int16",
                 callback=self._input_callback,
@@ -149,7 +239,7 @@ class DuplexAudio:
             self._out_stream = sd.RawOutputStream(
                 samplerate=SAMPLE_RATE,
                 blocksize=BLOCKSIZE,
-                device=_device(talk_config.audio_output_device()),
+                device=output_device,
                 channels=CHANNELS,
                 dtype="int16",
                 callback=self._output_callback,
@@ -173,6 +263,7 @@ class DuplexAudio:
             except Exception:  # noqa: BLE001 — teardown is best-effort
                 pass
             setattr(self, attr, None)
+        self._pulse_webrtc.stop()
 
     def _contains_speech(self, pcm: bytes) -> bool:
         detector = self._speech_detector
@@ -196,12 +287,13 @@ class DuplexAudio:
         input_level = _pcm16_rms(pcm)
         with self._lock:
             output_level = self._output_level
-        output_active = output_level > OUTPUT_ACTIVE_LEVEL
-        echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
-        if output_active and input_level < echo_threshold:
-            return
-        if output_active and not self._contains_speech(pcm):
-            return
+        if not self._pulse_webrtc.active:
+            output_active = output_level > OUTPUT_ACTIVE_LEVEL
+            echo_threshold = max(MIN_BARGE_IN_LEVEL, output_level * OUTPUT_ECHO_RATIO)
+            if output_active and input_level < echo_threshold:
+                return
+            if output_active and not self._contains_speech(pcm):
+                return
         # Drop the block rather than stall the device: a blocked PortAudio
         # callback is a glitch the operator hears.
         with contextlib.suppress(queue.Full):
