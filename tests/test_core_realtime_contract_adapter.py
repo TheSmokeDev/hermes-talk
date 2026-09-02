@@ -117,6 +117,30 @@ def test_grok_provider_uses_xai_model_voice_and_registry_name(monkeypatch):
     assert core_v1.configured_provider_name() == core_v1.GROK_PROVIDER_NAME
 
 
+def test_gemini_provider_uses_live_model_voice_and_registry_name(monkeypatch):
+    harness = Harness()
+    monkeypatch.setattr(core_v1.talk_config, "talk_provider", lambda: "gemini")
+    monkeypatch.setattr(
+        core_v1.talk_config,
+        "talk_gemini_model",
+        lambda: "gemini-live-test",
+    )
+    monkeypatch.setattr(core_v1.talk_config, "talk_gemini_voice", lambda: "Kore")
+    provider = core_v1.TalkGeminiRealtimeProvider(
+        auth_resolver=harness.auth,
+        session_factory=harness.session_factory,
+    )
+
+    session = run(provider.open_session(instructions="Hermes owns policy", tools=[]))
+
+    assert isinstance(session, core_v1.TalkRealtimeSession)
+    assert provider.name == core_v1.GEMINI_PROVIDER_NAME
+    assert harness.session.setup.model == "gemini-live-test"
+    assert harness.session.setup.voice == "Kore"
+    assert isinstance(core_v1.configured_provider(), core_v1.TalkGeminiRealtimeProvider)
+    assert core_v1.configured_provider_name() == core_v1.GEMINI_PROVIDER_NAME
+
+
 def test_grok_provider_uses_supported_oauth_resolver_by_default(monkeypatch):
     harness = Harness()
     monkeypatch.setattr(
@@ -354,9 +378,10 @@ def test_unexpected_clean_provider_close_surfaces_terminal_error():
     assert events[0].text == "realtime voice provider closed unexpectedly"
 
 
-def test_recoverable_provider_failure_does_not_end_the_session():
+def test_readiness_and_recoverable_failure_are_preserved_without_ending_session():
     harness = Harness(
         (
+            rt.SessionReady(session_id="provider-session"),
             rt.ProviderFailure(detail="bad audio chunk", terminal=False),
             rt.Transcript(
                 role=rt.TranscriptRole.USER,
@@ -368,13 +393,18 @@ def test_recoverable_provider_failure_does_not_end_the_session():
     )
     session = core_v1.TalkRealtimeSession(harness.session)
 
-
     async def collect():
         return [event async for event in session.events()]
 
     events = run(collect())
 
-    assert [event.text for event in events] == ["still here"]
+    assert [event.type for event in events] == [
+        RealtimeEventType.SESSION_READY,
+        RealtimeEventType.WARNING,
+        RealtimeEventType.TRANSCRIPT,
+    ]
+    assert events[0].session_id == "provider-session"
+    assert [event.text for event in events[1:]] == ["bad audio chunk", "still here"]
 
 
 def test_real_coordinator_delegates_one_client_tool_through_adapter():

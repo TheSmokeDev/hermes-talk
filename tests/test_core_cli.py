@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 
 import pytest
 
@@ -95,6 +96,10 @@ class FakeCoordinator:
         self.cancelled += 1
 
     async def events(self):
+        yield RealtimeEvent(
+            type=RealtimeEventType.SESSION_READY,
+            session_id="provider-session",
+        )
         await self.dispatch_tool("weather", {"city": "Paris"})
         yield RealtimeEvent.audio(b"speaker", item_id="item-1")
         yield RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="assistant")
@@ -156,6 +161,14 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
             raise RuntimeError("provider rejected optional progress context")
 
         async def events(self):
+            yield RealtimeEvent(
+                type=RealtimeEventType.SESSION_READY,
+                session_id="provider-session",
+            )
+            yield RealtimeEvent(
+                type=RealtimeEventType.WARNING,
+                text="provider recovered from one malformed frame",
+            )
             self.result = await self.dispatch_tool(
                 "client_delegate",
                 {"request": SUM_REQUEST},
@@ -227,18 +240,26 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
     assert coordinator.opened["tools"] == [talk_core_cli.DELEGATE_TOOL]
     assert talk_core_cli.DELEGATE_INSTRUCTIONS in coordinator.opened["instructions"]
     assert coordinator.result == '"Agent Final Message":\n\nThe script returned 5050.'
-    assert (
-        'talk: event {"type":"delegate","id":"call-1",'
-        f'"request":"{SUM_REQUEST}"}}'
-    ) in output
-    assert (
-        'talk: event {"type":"transcript","role":"user",'
-        f'"text":"{SUM_REQUEST}","final":true}}'
-    ) in output
-    assert (
-        'talk: event {"type":"transcript","role":"assistant",'
-        '"text":"I found the issue.","final":true}'
-    ) in output
+    frames = [
+        json.loads(line.removeprefix(talk_core_cli.EVENT_PREFIX))
+        for line in output.splitlines()
+        if line.startswith(talk_core_cli.EVENT_PREFIX)
+    ]
+    assert {
+        (frame["type"], frame.get("role"), frame.get("text"), frame.get("message"))
+        for frame in frames
+    } >= {
+        ("delegate", None, None, None),
+        ("transcript", "user", SUM_REQUEST, None),
+        ("transcript", "assistant", "I found the issue.", None),
+        ("warning", None, None, "provider recovered from one malformed frame"),
+    }
+    assert {frame["protocol_version"] for frame in frames} == {
+        talk_core_cli.PROTOCOL_VERSION
+    }
+    assert {frame["surface_session_id"] for frame in frames} == {"call-1"}
+    assert [frame["sequence"] for frame in frames] == list(range(1, len(frames) + 1))
+    assert "talk: connected (realtime-test, voice cedar)" in output
     assert output.count("talk: state composing") == 1
     assert talk_core_cli.sys.stdin.closed is True
 
@@ -304,6 +325,7 @@ def test_stdin_reader_discards_queued_frames_after_parent_flood():
         )
         reader = talk_core_cli._StdinLineReader(io.StringIO(f"{payload}\n"))
         try:
+            await asyncio.wait_for(reader._eof.wait(), timeout=0.1)
             with pytest.raises(RuntimeError, match="flooded"):
                 await asyncio.wait_for(reader.readline(), timeout=0.1)
         finally:

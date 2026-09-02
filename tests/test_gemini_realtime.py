@@ -21,6 +21,7 @@ from fake_realtime import Recorder, build_relay, play_neutral
 import talk_auth
 import talk_cli
 import talk_config
+import talk_gemini_auth
 import talk_gemini_realtime as gemini_rt
 import talk_openai_realtime as openai_rt
 import talk_realtime as rt
@@ -1292,7 +1293,7 @@ def test_both_keys_set_uses_talk_provider_not_key_presence(clean_provider_env):
     auth = talk_auth.TalkAuth(token="openai-test", source="env", detail="test")
     assert isinstance(talk_cli._realtime_session(auth), openai_rt.OpenAIRealtimeSession)
     clean_provider_env.setenv("TALK_PROVIDER", "gemini")
-    gemini_auth = talk_cli._gemini_auth()
+    gemini_auth = talk_gemini_auth.resolve_gemini_auth()
     assert gemini_auth.token == "gemini-scoped"
     assert gemini_auth.source == talk_auth.SOURCE_CONFIGURED
     session = talk_cli._realtime_session(gemini_auth)
@@ -1302,6 +1303,6 @@ def test_both_keys_set_uses_talk_provider_not_key_presence(clean_provider_env):
 
 def test_gemini_auth_falls_back_to_the_shared_key(clean_provider_env):
     clean_provider_env.setenv("GEMINI_API_KEY", "gemini-shared")
-    auth = talk_cli._gemini_auth()
+    auth = talk_gemini_auth.resolve_gemini_auth()
     assert auth.token == "gemini-shared"
     assert auth.source == talk_auth.SOURCE_ENV

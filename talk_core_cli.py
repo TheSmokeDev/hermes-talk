@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import uuid
 
 from agent.realtime_voice import RealtimeEvent, RealtimeEventType
@@ -34,6 +35,7 @@ EVENT_STREAM_ENV = "HERMES_TALK_EVENT_STREAM"
 MAX_PROVIDER_ITEM_ID_LENGTH = 32
 MAX_CONTROL_FRAME_CHARS = 65_536
 MAX_PENDING_CONTROL_FRAMES = 64
+PROTOCOL_VERSION = 1
 EVENT_PREFIX = "talk: event "
 DELEGATE_TOOL = {
     "type": "function",
@@ -72,7 +74,7 @@ Answer greetings and ordinary conversation directly without delegation.
 """.strip()
 
 
-def _emit_event(payload: dict) -> None:
+def _write_event(payload: dict) -> None:
     print(f"{EVENT_PREFIX}{json.dumps(payload, separators=(',', ':'))}", flush=True)
 
 
@@ -224,16 +226,15 @@ async def run_core_talk_session(audio=None) -> int:
         instructions = f"{instructions}\n\n{DELEGATE_INSTRUCTIONS}"
         capture = talk_transcript.TranscriptCapture(talk_config.get_hermes_home())
         configured = talk_config.talk_provider()
-        model = (
-            talk_config.talk_grok_model()
-            if configured == "grok"
-            else talk_config.talk_model()
-        )
-        voice = (
-            talk_config.talk_grok_voice()
-            if configured == "grok"
-            else talk_config.talk_voice()
-        )
+        if configured == "grok":
+            model = talk_config.talk_grok_model()
+            voice = talk_config.talk_grok_voice()
+        elif configured == "gemini":
+            model = talk_config.talk_gemini_model()
+            voice = talk_config.talk_gemini_voice()
+        else:
+            model = talk_config.talk_model()
+            voice = talk_config.talk_voice()
         audio = audio or talk_audio.DuplexAudio()
     except Exception as exc:  # noqa: BLE001 - startup configuration boundary
         print(f"talk: {exc}", file=sys.stderr)
@@ -245,6 +246,21 @@ async def run_core_talk_session(audio=None) -> int:
     audio_started = False
     delegation_idle = asyncio.Event()
     delegation_idle.set()
+
+    surface_session_id = uuid.uuid4().hex
+    event_sequence = 0
+
+    def emit_event(payload: dict) -> None:
+        nonlocal event_sequence
+        event_sequence += 1
+        _write_event(
+            {
+                **payload,
+                "protocol_version": PROTOCOL_VERSION,
+                "surface_session_id": surface_session_id,
+                "sequence": event_sequence,
+            }
+        )
 
     async def dispatch_tool(name: str, arguments: dict) -> str:
         if name != "client_delegate":
@@ -258,7 +274,7 @@ async def run_core_talk_session(audio=None) -> int:
         request_id = uuid.uuid4().hex
         progress_index = 0
         delegation_idle.clear()
-        _emit_event({"type": "delegate", "id": request_id, "request": request})
+        emit_event({"type": "delegate", "id": request_id, "request": request})
         try:
             while True:
                 line = await stdin_reader.readline()
@@ -299,6 +315,46 @@ async def run_core_talk_session(audio=None) -> int:
     )
     last_audio_event: RealtimeEvent | None = None
     last_state: str | None = None
+    provider_ready = False
+    reported_input_drops = 0
+    reported_playback_drops = 0
+    user_endpoint_at: float | None = None
+    session_open_started = 0.0
+
+    def emit_metric(name: str, started_at: float) -> None:
+        emit_event(
+            {
+                "type": "metric",
+                "name": name,
+                "value_ms": round((time.monotonic() - started_at) * 1000, 3),
+            }
+        )
+
+    def report_audio_pressure() -> None:
+        nonlocal reported_input_drops, reported_playback_drops
+        input_drops = int(getattr(audio, "dropped_input_blocks", 0))
+        if input_drops > reported_input_drops and (
+            reported_input_drops == 0 or input_drops - reported_input_drops >= 100
+        ):
+            reported_input_drops = input_drops
+            emit_event(
+                {
+                    "type": "warning",
+                    "message": f"microphone queue dropped {input_drops} stale block(s)",
+                }
+            )
+        playback_drops = int(getattr(audio, "dropped_playback_bytes", 0))
+        if playback_drops > reported_playback_drops and (
+            reported_playback_drops == 0
+            or playback_drops - reported_playback_drops >= 24_000
+        ):
+            reported_playback_drops = playback_drops
+            emit_event(
+                {
+                    "type": "warning",
+                    "message": f"playback queue dropped {playback_drops} byte(s)",
+                }
+            )
 
     def emit_state(state: str) -> None:
         nonlocal last_state
@@ -314,21 +370,46 @@ async def run_core_talk_session(audio=None) -> int:
                 await asyncio.sleep(IDLE_POLL_S)
                 continue
             await coordinator.send_audio(chunk)
+            report_audio_pressure()
 
     async def receive_events() -> None:
-        nonlocal active_item_id, last_audio_event
+        nonlocal last_audio_event, provider_ready, user_endpoint_at
         async for event in coordinator.events():
+            if event.type is RealtimeEventType.SESSION_READY:
+                if provider_ready:
+                    continue
+                provider_ready = True
+                print(
+                    f"talk: connected ({model}, voice {voice}). "
+                    "Ctrl+C to hang up.\n",
+                    flush=True,
+                )
+                emit_metric("session_ready_ms", session_open_started)
+                emit_state("listening")
+                continue
+            if event.type is RealtimeEventType.WARNING:
+                emit_event(
+                    {
+                        "type": "warning",
+                        "message": event.text or "realtime voice provider warning",
+                    }
+                )
+                continue
             if event.type is RealtimeEventType.AUDIO:
                 if not event.audio_bytes:
                     continue
                 emit_state("composing")
                 audio.queue_playback(event.audio_bytes, item_id=event.item_id)
+                report_audio_pressure()
+                if user_endpoint_at is not None:
+                    emit_metric("endpoint_to_first_audio_ms", user_endpoint_at)
+                    user_endpoint_at = None
                 last_audio_event = event
                 continue
             if event.type is RealtimeEventType.TRANSCRIPT:
                 if event.text:
                     if event.role in {"user", "assistant"}:
-                        _emit_event(
+                        emit_event(
                             {
                                 "type": "transcript",
                                 "role": event.role,
@@ -341,6 +422,7 @@ async def run_core_talk_session(audio=None) -> int:
                 continue
             if event.type is RealtimeEventType.TURN_ENDED:
                 if event.role == "user":
+                    user_endpoint_at = time.monotonic()
                     emit_state("solving")
                 elif event.role == "assistant":
                     emit_state("listening")
@@ -349,14 +431,21 @@ async def run_core_talk_session(audio=None) -> int:
                 if event.role == "assistant":
                     emit_state("composing")
                 elif event.role == "user" and last_audio_event is not None:
-                    coordinator.report_audio_heard(
-                        last_audio_event,
-                        audio_end_ms=audio.played_ms,
-                    )
-                    audio.drain_playback()
+                    interruption_started_at = time.monotonic()
+                    played_item, played_ms = audio.drain_playback()
+                    if (
+                        played_item is not None
+                        and played_item == last_audio_event.item_id
+                        and played_ms > 0
+                    ):
+                        coordinator.report_audio_heard(
+                            last_audio_event,
+                            audio_end_ms=played_ms,
+                        )
                     await coordinator.cancel_response()
                     last_audio_event = None
                     emit_state("listening")
+                    emit_metric("interruption_to_local_silence_ms", interruption_started_at)
                 continue
             if event.type is RealtimeEventType.ERROR:
                 raise RuntimeError(event.text or "realtime voice provider failed")
@@ -366,17 +455,12 @@ async def run_core_talk_session(audio=None) -> int:
         audio.start()
         audio_started = True
         stdin_reader = _StdinLineReader()
+        session_open_started = time.monotonic()
         await coordinator.open(
             instructions=instructions,
             tools=tools,
             voice=voice,
         )
-        print(
-            f"talk: connected ({model}, voice {voice}). "
-            "Ctrl+C to hang up.\n",
-            flush=True,
-        )
-        emit_state("listening")
 
         runtime_tasks = [
             asyncio.create_task(send_microphone()),
@@ -398,7 +482,7 @@ async def run_core_talk_session(audio=None) -> int:
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - terminal runtime boundary
-        _emit_event(
+        emit_event(
             {
                 "type": "error",
                 "message": f"{type(exc).__name__}: {exc}",
@@ -420,4 +504,4 @@ async def run_core_talk_session(audio=None) -> int:
         talk_transcript.sweep_transcripts(talk_config.get_hermes_home())
 
 
-__all__ = ["IDLE_POLL_S", "run_core_talk_session"]
+__all__ = ["IDLE_POLL_S", "PROTOCOL_VERSION", "run_core_talk_session"]

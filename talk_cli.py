@@ -44,6 +44,7 @@ try:
         talk_cascade_voice,
         talk_config,
         talk_doctor,
+        talk_gemini_auth,
         talk_gemini_realtime,
         talk_grok_auth,
         talk_grok_realtime,
@@ -71,6 +72,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_cascade_voice
     import talk_config
     import talk_doctor
+    import talk_gemini_auth
     import talk_gemini_realtime
     import talk_grok_auth
     import talk_grok_realtime
@@ -1029,27 +1031,6 @@ def _grok_auth() -> talk_auth.TalkAuth:
     return talk_grok_auth.resolve_grok_auth()
 
 
-def _gemini_auth() -> talk_auth.TalkAuth:
-    """The Gemini credential for the Gemini Live lane, in the factory's shape.
-
-    Gemini has no OAuth lane and no ephemeral mint — the resolved key rides
-    the socket URL query. Source names reuse the OpenAI receipt vocabulary so
-    receipts name lanes, never keys.
-    """
-
-    scoped = (os.environ.get("TALK_GEMINI_API_KEY") or "").strip()
-    token = talk_config.resolve_gemini_key()
-    if scoped:
-        return talk_auth.TalkAuth(
-            token=token,
-            source=talk_auth.SOURCE_CONFIGURED,
-            detail="TALK_GEMINI_API_KEY (Talk-scoped key)",
-        )
-    return talk_auth.TalkAuth(
-        token=token,
-        source=talk_auth.SOURCE_ENV,
-        detail="GEMINI_API_KEY environment variable",
-    )
 
 
 def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
@@ -1176,7 +1157,7 @@ async def run_talk_session(
             model = talk_config.talk_grok_model()
             voice = talk_config.talk_grok_voice()
         elif provider == "gemini":
-            auth = _gemini_auth()
+            auth = talk_gemini_auth.resolve_gemini_auth()
             model = talk_config.talk_gemini_model()
             voice = talk_config.talk_gemini_voice()
         else:

@@ -21,15 +21,18 @@ from agent.realtime_voice import (
 )
 
 try:
-    from . import talk_auth, talk_config, talk_grok_auth
+    from . import talk_auth, talk_config, talk_gemini_auth, talk_grok_auth
     from . import talk_realtime as rt
+    from .talk_gemini_realtime import GeminiRealtimeSession
     from .talk_grok_realtime import GrokRealtimeSession
     from .talk_openai_realtime import OpenAIRealtimeSession
 except ImportError:  # pragma: no cover - flat-module fallback
     import talk_auth
     import talk_config
+    import talk_gemini_auth
     import talk_grok_auth
     import talk_realtime as rt
+    from talk_gemini_realtime import GeminiRealtimeSession
     from talk_grok_realtime import GrokRealtimeSession
     from talk_openai_realtime import OpenAIRealtimeSession
 
@@ -37,6 +40,7 @@ OPENAI_PROVIDER_NAME = "talk_openai_realtime"
 GROK_PROVIDER_NAME = "talk_grok_realtime"
 PROVIDER_NAME = OPENAI_PROVIDER_NAME
 MAX_SETTLED_IDENTIFIERS = 256
+GEMINI_PROVIDER_NAME = "talk_gemini_realtime"
 
 
 def _tool_definition(value: Mapping[str, Any]) -> rt.ToolDefinition:
@@ -88,6 +92,11 @@ class TalkRealtimeSession(RealtimeSession):
                 yield mapped
 
     def _map_event(self, event: rt.RealtimeEvent) -> RealtimeEvent | None:
+        if isinstance(event, rt.SessionReady):
+            return RealtimeEvent(
+                type=RealtimeEventType.SESSION_READY,
+                session_id=event.session_id,
+            )
         if isinstance(event, rt.OutputAudio):
             if not self._belongs_to_active(event.response_id):
                 return None
@@ -138,8 +147,15 @@ class TalkRealtimeSession(RealtimeSession):
                 return None
             self._response_finished = True
             return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="assistant")
-        if isinstance(event, rt.ProviderFailure) and event.terminal:
-            return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
+        if isinstance(event, rt.ProviderFailure):
+            return RealtimeEvent(
+                type=(
+                    RealtimeEventType.ERROR
+                    if event.terminal
+                    else RealtimeEventType.WARNING
+                ),
+                text=event.detail,
+            )
         if isinstance(event, rt.SessionTerminated):
             if event.state is rt.SessionState.FAILED:
                 return RealtimeEvent(type=RealtimeEventType.ERROR, text=event.detail)
@@ -399,6 +415,25 @@ class TalkGrokRealtimeProvider(_TalkRealtimeProvider):
         )
 
 
+class TalkGeminiRealtimeProvider(_TalkRealtimeProvider):
+    """Plugin-owned Gemini Live transport for the Hermes #95147 seam."""
+
+    def __init__(
+        self,
+        *,
+        auth_resolver: Callable[[], Any] = talk_gemini_auth.resolve_gemini_auth,
+        session_factory: Callable[..., Any] = GeminiRealtimeSession,
+    ) -> None:
+        super().__init__(
+            name=GEMINI_PROVIDER_NAME,
+            display_name="Hermes Talk Gemini Live",
+            auth_resolver=auth_resolver,
+            session_factory=session_factory,
+            model_resolver=talk_config.talk_gemini_model,
+            voice_resolver=talk_config.talk_gemini_voice,
+        )
+
+
 def configured_provider() -> RealtimeVoiceProvider:
     """Build the provider selected by TALK_PROVIDER for this invocation."""
 
@@ -407,6 +442,8 @@ def configured_provider() -> RealtimeVoiceProvider:
         return TalkOpenAIRealtimeProvider()
     if provider == "grok":
         return TalkGrokRealtimeProvider()
+    if provider == "gemini":
+        return TalkGeminiRealtimeProvider()
     raise talk_config.TalkConfigError(
         f"Hermes #95147 terminal voice does not support provider {provider!r}"
     )
@@ -420,15 +457,19 @@ def configured_provider_name() -> str:
         return OPENAI_PROVIDER_NAME
     if provider == "grok":
         return GROK_PROVIDER_NAME
+    if provider == "gemini":
+        return GEMINI_PROVIDER_NAME
     raise talk_config.TalkConfigError(
         f"Hermes #95147 terminal voice does not support provider {provider!r}"
     )
 
 
 __all__ = [
+    "GEMINI_PROVIDER_NAME",
     "GROK_PROVIDER_NAME",
     "OPENAI_PROVIDER_NAME",
     "PROVIDER_NAME",
+    "TalkGeminiRealtimeProvider",
     "TalkGrokRealtimeProvider",
     "TalkOpenAIRealtimeProvider",
     "TalkRealtimeSession",
