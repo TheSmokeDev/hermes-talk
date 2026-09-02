@@ -1895,7 +1895,8 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
             import talk_core_realtime
         core_runner = (
             talk_core_cli.run_core_talk_session
-            if talk_core_realtime.coordinator_contract_available()
+            if os.environ.get(talk_core_cli.EVENT_STREAM_ENV) == "jsonl"
+            and talk_core_realtime.coordinator_contract_available()
             and talk_core_realtime.configured_core_provider_supported()
             else None
         )

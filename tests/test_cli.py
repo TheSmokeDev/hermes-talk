@@ -16,6 +16,7 @@ import pytest
 import talk_audio
 import talk_capabilities
 import talk_cli
+import talk_core_realtime
 import talk_host
 import talk_identity
 import talk_operator_auth
@@ -1542,6 +1543,32 @@ def test_keyboard_interrupt_hangs_up_cleanly(monkeypatch, capsys):
 
     assert talk_cli.cli_entry() == 0
     assert "hung up" in capsys.readouterr().out
+
+
+def test_standalone_cli_keeps_mature_talk_runner_when_core_is_available(
+    monkeypatch
+):
+    called = []
+
+    async def mature_runner():
+        called.append("mature")
+        return 0
+
+    monkeypatch.delenv("HERMES_TALK_EVENT_STREAM", raising=False)
+    monkeypatch.setattr(talk_cli, "run_talk_session", mature_runner)
+    monkeypatch.setattr(
+        talk_core_realtime,
+        "coordinator_contract_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        talk_core_realtime,
+        "configured_core_provider_supported",
+        lambda: True,
+    )
+
+    assert talk_cli.cli_entry() == 0
+    assert called == ["mature"]
 
 
 def test_setup_cli_adds_no_required_arguments():

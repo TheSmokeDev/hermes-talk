@@ -9,12 +9,12 @@ import json
 import logging
 import os
 import sys
+import threading
 import uuid
 
 from agent.realtime_voice import RealtimeEvent, RealtimeEventType
 from agent.realtime_voice_coordinator import RealtimeVoiceCoordinator
 from agent.realtime_voice_registry import get_provider
-from model_tools import get_tool_definitions
 
 try:
     from . import talk_audio, talk_config, talk_host, talk_identity, talk_transcript
@@ -79,136 +79,200 @@ def _progress_item_id(request_id: str, index: int) -> str:
 
     return f"p{index:x}-{request_id}"[:MAX_PROVIDER_ITEM_ID_LENGTH]
 
-async def _read_stdin_line() -> str:
-    """Read one TUI command without leaving a blocking executor task on POSIX."""
+class _StdinLineReader:
+    """One owner for stdin buffering; POSIX stays event-driven."""
 
-    loop = asyncio.get_running_loop()
-    try:
-        descriptor = sys.stdin.fileno()
-        result: asyncio.Future[str] = loop.create_future()
+    def __init__(self, stream=None) -> None:
+        self._stream = stream or sys.stdin
+        self._loop = asyncio.get_running_loop()
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self._buffered_lines = 0
+        self._eof = asyncio.Event()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._descriptor: int | None = None
+        self._text_buffer = ""
+        self._thread: threading.Thread | None = None
+        try:
+            self._descriptor = self._stream.fileno()
+            self._loop.add_reader(self._descriptor, self._read_ready)
+        except (AttributeError, io.UnsupportedOperation, NotImplementedError):
+            self._descriptor = None
+            self._thread = threading.Thread(
+                target=self._read_lines,
+                name="hermes-talk-stdin",
+                daemon=True,
+            )
+            self._thread.start()
 
-        def ready() -> None:
-            if not result.done():
-                result.set_result(sys.stdin.readline())
+    def _read_ready(self) -> None:
+        assert self._descriptor is not None
+        try:
+            chunk = os.read(self._descriptor, 65_536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._mark_eof()
+            return
+        self._feed_text(chunk.decode("utf-8", errors="replace"))
 
-        loop.add_reader(descriptor, ready)
-    except (AttributeError, io.UnsupportedOperation, NotImplementedError):
-        return await asyncio.to_thread(sys.stdin.readline)
-    try:
-        return await result
-    finally:
-        loop.remove_reader(descriptor)
+    def _read_lines(self) -> None:
+        try:
+            for line in self._stream:
+                self._loop.call_soon_threadsafe(self._feed_text, line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._mark_eof)
+
+    def _feed_text(self, text: str) -> None:
+        self._text_buffer += text
+        lines = self._text_buffer.split("\n")
+        self._text_buffer = lines.pop()
+        for line in lines:
+            self._buffered_lines += 1
+            self._drained.clear()
+            self._lines.put_nowait(line.removesuffix("\r"))
+
+    def _mark_eof(self) -> None:
+        if self._eof.is_set():
+            return
+        if self._descriptor is not None:
+            self._loop.remove_reader(self._descriptor)
+        if self._text_buffer:
+            self._buffered_lines += 1
+            self._drained.clear()
+            self._lines.put_nowait(self._text_buffer)
+            self._text_buffer = ""
+        self._eof.set()
+        self._lines.put_nowait(None)
+
+    async def readline(self) -> str:
+        line = await self._lines.get()
+        if line is None:
+            return ""
+        self._buffered_lines -= 1
+        if self._buffered_lines == 0:
+            self._drained.set()
+        return line
+
+    async def wait_for_parent_close(self, delegation_idle: asyncio.Event) -> None:
+        await self._eof.wait()
+        await self._drained.wait()
+        await delegation_idle.wait()
+        raise RuntimeError("Hermes TUI closed the live delegation channel")
+
+    def close(self) -> None:
+        if self._descriptor is not None:
+            with contextlib.suppress(Exception):
+                self._loop.remove_reader(self._descriptor)
+        if self._thread is not None:
+            with contextlib.suppress(Exception):
+                self._stream.close()
 
 
 async def run_core_talk_session(audio=None) -> int:
-    """Run duplex media through the registered provider and Hermes coordinator."""
+    """Run the TUI's client-delegated duplex session through Hermes core."""
 
-    event_stream = os.environ.get(EVENT_STREAM_ENV) == "jsonl"
-    provider = get_provider(configured_provider_name())
+    if os.environ.get(EVENT_STREAM_ENV) != "jsonl":
+        print("talk: core realtime mode is reserved for the Hermes TUI", file=sys.stderr)
+        return 1
+
+    try:
+        provider = get_provider(configured_provider_name())
+    except Exception as exc:  # noqa: BLE001 - configuration boundary
+        print(f"talk: {exc}", file=sys.stderr)
+        return 1
     if provider is None:
         print("talk: no registered realtime voice provider", file=sys.stderr)
         return 1
-    ctx = talk_host.get_ctx()
-    if not event_stream and (
-        ctx is None or not callable(getattr(ctx, "dispatch_tool", None))
-    ):
-        print("talk: Hermes tool authority is unavailable", file=sys.stderr)
-        return 1
 
-    tools = [DELEGATE_TOOL] if event_stream else (get_tool_definitions(quiet_mode=True) or [])
-    instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections(),
-        tools=tools,
-        host_execution=True,
-        lane="cli",
-    )
-    if event_stream:
-        instructions = f"{instructions}\n\n{DELEGATE_INSTRUCTIONS}"
-    if audio is None:
-        audio = talk_audio.DuplexAudio()
+    tools = [DELEGATE_TOOL]
     try:
-        audio.start()
-    except talk_audio.TalkAudioError as exc:
+        instructions = talk_identity.build_instructions(
+            talk_host.host().identity_sections(),
+            tools=tools,
+            host_execution=True,
+            lane="cli",
+        )
+        instructions = f"{instructions}\n\n{DELEGATE_INSTRUCTIONS}"
+        capture = talk_transcript.TranscriptCapture(talk_config.get_hermes_home())
+        configured = talk_config.talk_provider()
+        model = (
+            talk_config.talk_grok_model()
+            if configured == "grok"
+            else talk_config.talk_model()
+        )
+        voice = (
+            talk_config.talk_grok_voice()
+            if configured == "grok"
+            else talk_config.talk_voice()
+        )
+        audio = audio or talk_audio.DuplexAudio()
+    except Exception as exc:  # noqa: BLE001 - startup configuration boundary
         print(f"talk: {exc}", file=sys.stderr)
         return 1
 
+    coordinator: RealtimeVoiceCoordinator | None = None
+    stdin_reader: _StdinLineReader | None = None
+    runtime_tasks: list[asyncio.Task] = []
+    audio_started = False
+    delegation_idle = asyncio.Event()
+    delegation_idle.set()
+
     async def dispatch_tool(name: str, arguments: dict) -> str:
-        if not event_stream:
-            return await asyncio.to_thread(ctx.dispatch_tool, name, arguments)
         if name != "client_delegate":
             return f"Error: unsupported live voice tool {name!r}"
         request = str(arguments.get("request") or "").strip()
         if not request:
             return "Error: client_delegate requires a non-empty request"
+        if stdin_reader is None or coordinator is None:
+            raise RuntimeError("Hermes TUI delegation channel is unavailable")
+
         request_id = uuid.uuid4().hex
         progress_index = 0
+        delegation_idle.clear()
         _emit_event({"type": "delegate", "id": request_id, "request": request})
-        while True:
-            line = await _read_stdin_line()
-            if not line:
-                raise RuntimeError("Hermes TUI closed the live delegation channel")
-            try:
-                command = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(command, dict) or command.get("id") != request_id:
-                continue
-            if command.get("type") == "delegate.progress":
-                progress = str(command.get("text") or "").strip()
-                if progress:
-                    progress_index += 1
-                    try:
-                        await coordinator.add_context(
-                            _progress_item_id(request_id, progress_index),
-                            f"Silent Hermes text-agent progress:\n\n{progress}",
-                        )
-                    except Exception as exc:  # noqa: BLE001 - progress is optional
-                        logger.warning(
-                            "Realtime voice progress context was rejected; "
-                            "continuing to await the final text-agent result: %s",
-                            exc,
-                        )
-                continue
-            if command.get("type") == "delegate.result":
-                output = str(command.get("output") or "").strip()
-                return f'"Agent Final Message":\n\n{output}'
+        try:
+            while True:
+                line = await stdin_reader.readline()
+                if not line:
+                    raise RuntimeError("Hermes TUI closed the live delegation channel")
+                try:
+                    command = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(command, dict) or command.get("id") != request_id:
+                    continue
+                if command.get("type") == "delegate.progress":
+                    progress = str(command.get("text") or "").strip()
+                    if progress:
+                        progress_index += 1
+                        try:
+                            await coordinator.add_context(
+                                _progress_item_id(request_id, progress_index),
+                                f"Silent Hermes text-agent progress:\n\n{progress}",
+                            )
+                        except Exception as exc:  # noqa: BLE001 - progress is optional
+                            logger.warning(
+                                "Realtime voice progress context was rejected; "
+                                "continuing to await the final text-agent result: %s",
+                                exc,
+                            )
+                    continue
+                if command.get("type") == "delegate.result":
+                    output = str(command.get("output") or "").strip()
+                    return f'"Agent Final Message":\n\n{output}'
+        finally:
+            delegation_idle.set()
 
     coordinator = RealtimeVoiceCoordinator(
         provider,
         dispatch_tool=dispatch_tool,
-        max_in_flight_tool_calls=1 if event_stream else 16,
-    )
-    capture = talk_transcript.TranscriptCapture(talk_config.get_hermes_home())
-    configured = talk_config.talk_provider()
-    model = (
-        talk_config.talk_grok_model()
-        if configured == "grok"
-        else talk_config.talk_model()
-    )
-    voice = (
-        talk_config.talk_grok_voice()
-        if configured == "grok"
-        else talk_config.talk_voice()
-    )
-    try:
-        await coordinator.open(
-            instructions=instructions,
-            tools=tools,
-            voice=voice,
-        )
-    except Exception as exc:  # noqa: BLE001 - provider startup is a voice boundary
-        audio.stop()
-        capture.finish()
-        print(f"talk: {exc}", file=sys.stderr)
-        return 1
-
-    print(
-        f"talk: connected ({model}, voice {voice}). "
-        "Ctrl+C to hang up.\n",
-        flush=True,
+        max_in_flight_tool_calls=1,
     )
     last_audio_event: RealtimeEvent | None = None
-    print("talk: state listening", flush=True)
     active_item_id: str | None = None
 
     async def send_microphone() -> None:
@@ -235,7 +299,7 @@ async def run_core_talk_session(audio=None) -> int:
                 continue
             if event.type is RealtimeEventType.TRANSCRIPT:
                 if event.text:
-                    if event_stream and event.role in {"user", "assistant"}:
+                    if event.role in {"user", "assistant"}:
                         _emit_event(
                             {
                                 "type": "transcript",
@@ -244,8 +308,6 @@ async def run_core_talk_session(audio=None) -> int:
                                 "final": event.final,
                             }
                         )
-                    elif not event_stream:
-                        print(event.text, end="\n" if event.final else "", flush=True)
                     if event.final and event.role in {"user", "assistant"}:
                         capture.append_turn(event.role, event.text)
                 continue
@@ -271,38 +333,62 @@ async def run_core_talk_session(audio=None) -> int:
                 continue
             if event.type is RealtimeEventType.ERROR:
                 raise RuntimeError(event.text or "realtime voice provider failed")
+        raise RuntimeError("realtime voice provider closed unexpectedly")
 
-    microphone = asyncio.create_task(send_microphone())
-    receiver = asyncio.create_task(receive_events())
     try:
+        audio.start()
+        audio_started = True
+        stdin_reader = _StdinLineReader()
+        await coordinator.open(
+            instructions=instructions,
+            tools=tools,
+            voice=voice,
+        )
+        print(
+            f"talk: connected ({model}, voice {voice}). "
+            "Ctrl+C to hang up.\n",
+            flush=True,
+        )
+        print("talk: state listening", flush=True)
+
+        runtime_tasks = [
+            asyncio.create_task(send_microphone()),
+            asyncio.create_task(receive_events()),
+            asyncio.create_task(
+                stdin_reader.wait_for_parent_close(delegation_idle)
+            ),
+        ]
         done, pending = await asyncio.wait(
-            (microphone, receiver),
+            runtime_tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
-            try:
-                task.result()
-            except Exception as exc:  # noqa: BLE001 - runtime boundary
-                message = f"{type(exc).__name__}: {exc}"
-                if event_stream:
-                    _emit_event({"type": "error", "message": message})
-                else:
-                    print(f"talk: {message}", file=sys.stderr)
-                return 1
+            task.result()
         return 0
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - terminal runtime boundary
+        _emit_event(
+            {
+                "type": "error",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return 1
     finally:
-        microphone.cancel()
-        receiver.cancel()
-        await asyncio.gather(microphone, receiver, return_exceptions=True)
-        if event_stream:
-            with contextlib.suppress(Exception):
-                sys.stdin.close()
+        for task in runtime_tasks:
+            task.cancel()
+        if runtime_tasks:
+            await asyncio.gather(*runtime_tasks, return_exceptions=True)
+        if stdin_reader is not None:
+            stdin_reader.close()
         with contextlib.suppress(Exception):
             await coordinator.close()
-        audio.stop()
+        if audio_started:
+            audio.stop()
         capture.finish()
         talk_transcript.sweep_transcripts(talk_config.get_hermes_home())
 

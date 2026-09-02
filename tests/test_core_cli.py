@@ -105,56 +105,46 @@ class FakeCoordinator:
         self.closed = True
 
 
-def test_terminal_runtime_composes_audio_provider_and_hermes_authority(monkeypatch):
-    audio = FakeAudio()
-    capture = FakeCapture(None)
-    ctx = FakeContext()
-    provider = object()
-    monkeypatch.setattr(talk_core_cli, "get_provider", lambda _name: provider)
-    monkeypatch.setattr(talk_core_cli, "RealtimeVoiceCoordinator", FakeCoordinator)
-    monkeypatch.setattr(talk_core_cli.talk_host, "get_ctx", lambda: ctx)
+def configure_event_stream(monkeypatch, capture, coordinator=FakeCoordinator):
+    monkeypatch.setenv(talk_core_cli.EVENT_STREAM_ENV, "jsonl")
+    monkeypatch.setattr(talk_core_cli, "get_provider", lambda _name: object())
+    monkeypatch.setattr(talk_core_cli, "RealtimeVoiceCoordinator", coordinator)
     monkeypatch.setattr(
-        talk_core_cli.talk_host.host(),
-        "identity_sections",
-        lambda: {},
-    )
-    monkeypatch.setattr(
-        talk_core_cli,
-        "get_tool_definitions",
-        lambda **_kwargs: [{"name": "weather"}],
+        talk_core_cli.talk_host.host(), "identity_sections", lambda: {}
     )
     monkeypatch.setattr(
         talk_core_cli.talk_identity,
         "build_instructions",
-        lambda *_args, **_kwargs: "rules",
+        lambda *_args, **_kwargs: "identity rules",
     )
-    monkeypatch.setattr(talk_core_cli.talk_config, "talk_model", lambda: "realtime-test")
+    monkeypatch.setattr(
+        talk_core_cli.talk_config, "talk_model", lambda: "realtime-test"
+    )
     monkeypatch.setattr(talk_core_cli.talk_config, "talk_voice", lambda: "cedar")
-    monkeypatch.setattr(talk_core_cli.talk_config, "get_hermes_home", lambda: "/tmp/hermes")
-    monkeypatch.setattr(talk_core_cli.talk_transcript, "TranscriptCapture", lambda _home: capture)
-    monkeypatch.setattr(talk_core_cli.talk_transcript, "sweep_transcripts", lambda _home: None)
+    monkeypatch.setattr(
+        talk_core_cli.talk_config, "get_hermes_home", lambda: "/tmp/hermes"
+    )
+    monkeypatch.setattr(
+        talk_core_cli.talk_transcript,
+        "TranscriptCapture",
+        lambda _home: capture,
+    )
+    monkeypatch.setattr(
+        talk_core_cli.talk_transcript, "sweep_transcripts", lambda _home: None
+    )
+
+def test_core_runner_rejects_standalone_mode_before_starting_audio(
+    monkeypatch, capsys
+):
+    audio = FakeAudio()
+    monkeypatch.delenv(talk_core_cli.EVENT_STREAM_ENV, raising=False)
 
     result = asyncio.run(talk_core_cli.run_core_talk_session(audio))
 
-    coordinator = FakeCoordinator.instance
-    assert result == 0
-    assert audio.started is True
-    assert audio.stopped is True
-    assert audio.queued == [b"speaker"]
-    assert audio.drained == 1
-    assert coordinator.provider is provider
-    assert coordinator.opened == {
-        "instructions": "rules",
-        "tools": [{"name": "weather"}],
-        "voice": "cedar",
-    }
-    assert coordinator.heard[0][1] == 360
-    assert coordinator.cancelled == 1
-    assert coordinator.max_in_flight_tool_calls == 16
-    assert coordinator.closed is True
-    assert ctx.calls == [("weather", {"city": "Paris"})]
-    assert capture.turns == [("user", "hello")]
-    assert capture.finished is True
+    assert result == 1
+    assert audio.started is False
+    assert audio.stopped is False
+    assert "reserved for the Hermes TUI" in capsys.readouterr().err
 
 
 def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
@@ -223,7 +213,7 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
 
     output = capsys.readouterr().out
     coordinator = FakeCoordinator.instance
-    assert result == 0
+    assert result == 1
     assert coordinator.max_in_flight_tool_calls == 1
     assert coordinator.contexts == [
         (
@@ -258,3 +248,58 @@ def test_progress_item_ids_stay_within_provider_wire_limit():
     assert first == f"p1-{request_id}"[:32]
     assert len(first) == talk_core_cli.MAX_PROVIDER_ITEM_ID_LENGTH
     assert first != second
+
+
+def test_stdin_reader_consumes_prefetched_lines_without_deadlock():
+    async def scenario():
+        reader = talk_core_cli._StdinLineReader(io.StringIO("progress\nresult\n"))
+        try:
+            return (
+                await asyncio.wait_for(reader.readline(), timeout=0.1),
+                await asyncio.wait_for(reader.readline(), timeout=0.1),
+            )
+        finally:
+            reader.close()
+
+    assert asyncio.run(scenario()) == ("progress", "result")
+
+
+def test_parent_stdin_eof_stops_an_idle_session(monkeypatch, capsys):
+    class IdleCoordinator(FakeCoordinator):
+        async def events(self):
+            await asyncio.Event().wait()
+            if False:  # pragma: no cover - make this an async iterator
+                yield None
+
+    audio = FakeAudio()
+    capture = FakeCapture(None)
+    configure_event_stream(monkeypatch, capture, IdleCoordinator)
+    monkeypatch.setattr(talk_core_cli.sys, "stdin", io.StringIO(""))
+
+    result = asyncio.run(talk_core_cli.run_core_talk_session(audio))
+
+    assert result == 1
+    assert "closed the live delegation channel" in capsys.readouterr().out
+    assert audio.stopped is True
+    assert capture.finished is True
+    assert FakeCoordinator.instance.closed is True
+
+
+def test_startup_cancellation_still_closes_every_owned_resource(monkeypatch):
+    class CancelledOpenCoordinator(FakeCoordinator):
+        async def open(self, **kwargs):
+            self.opened = kwargs
+            raise asyncio.CancelledError
+
+    audio = FakeAudio()
+    capture = FakeCapture(None)
+    configure_event_stream(monkeypatch, capture, CancelledOpenCoordinator)
+    monkeypatch.setattr(talk_core_cli.sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(talk_core_cli.run_core_talk_session(audio))
+
+    assert audio.started is True
+    assert audio.stopped is True
+    assert capture.finished is True
+    assert FakeCoordinator.instance.closed is True
