@@ -169,6 +169,10 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
                 type=RealtimeEventType.WARNING,
                 text="provider recovered from one malformed frame",
             )
+            yield RealtimeEvent(
+                type=RealtimeEventType.TURN_ENDED,
+                role="user",
+            )
             self.result = await self.dispatch_tool(
                 "client_delegate",
                 {"request": SUM_REQUEST},
@@ -259,6 +263,12 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
     }
     assert {frame["surface_session_id"] for frame in frames} == {"call-1"}
     assert [frame["sequence"] for frame in frames] == list(range(1, len(frames) + 1))
+    metrics = [frame for frame in frames if frame["type"] == "metric"]
+    assert [metric["name"] for metric in metrics] == [
+        "session_ready_ms",
+        "endpoint_to_first_audio_ms",
+    ]
+    assert all(metric["value_ms"] >= 0 for metric in metrics)
     assert "talk: connected (realtime-test, voice cedar)" in output
     assert output.count("talk: state composing") == 1
     assert talk_core_cli.sys.stdin.closed is True
@@ -373,3 +383,50 @@ def test_startup_cancellation_still_closes_every_owned_resource(monkeypatch):
     assert audio.stopped is True
     assert capture.finished is True
     assert FakeCoordinator.instance.closed is True
+
+
+def test_core_barge_in_uses_atomic_boundary_for_latest_played_item(
+    monkeypatch, capsys
+):
+    class BoundaryCoordinator(FakeCoordinator):
+        async def events(self):
+            yield RealtimeEvent.audio(b"old", item_id="old-item")
+            yield RealtimeEvent.audio(b"new", item_id="new-item")
+            yield RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user")
+
+    class OpenParent:
+        async def wait_for_parent_close(self, _delegation_idle):
+            await asyncio.Event().wait()
+
+        def close(self):
+            pass
+
+    audio = FakeAudio()
+    audio.played_boundary = ("new-item", 75)
+    capture = FakeCapture(None)
+    configure_event_stream(monkeypatch, capture, BoundaryCoordinator)
+    monkeypatch.setattr(talk_core_cli, "_StdinLineReader", OpenParent)
+
+    assert asyncio.run(talk_core_cli.run_core_talk_session(audio)) == 1
+    output = capsys.readouterr().out
+    frames = [
+        json.loads(line.removeprefix(talk_core_cli.EVENT_PREFIX))
+        for line in output.splitlines()
+        if line.startswith(talk_core_cli.EVENT_PREFIX)
+    ]
+    interruption_metrics = [
+        frame
+        for frame in frames
+        if frame.get("name") == "interruption_to_local_silence_ms"
+    ]
+    assert len(interruption_metrics) == 1
+    assert interruption_metrics[0]["value_ms"] >= 0
+
+    coordinator = FakeCoordinator.instance
+    assert audio.queued == [
+        ("old-item", b"old"),
+        ("new-item", b"new"),
+    ]
+    assert len(coordinator.heard) == 1
+    assert coordinator.heard[0][0].item_id == "new-item"
+    assert coordinator.heard[0][1] == 75
