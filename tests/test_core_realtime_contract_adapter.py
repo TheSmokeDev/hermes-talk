@@ -7,7 +7,12 @@ import asyncio
 import pytest
 
 pytest.importorskip("agent.realtime_voice", reason="Hermes #95147 contract is optional")
-from agent.realtime_voice import HeardAudioBoundary, RealtimeEventType
+from agent.realtime_voice import (
+    HeardAudioBoundary,
+    RealtimeEventType,
+    RealtimeVoiceProvider,
+)
+from agent.realtime_voice_coordinator import RealtimeVoiceCoordinator
 
 import talk_core_realtime_contract as core_v1
 import talk_realtime as rt
@@ -247,6 +252,27 @@ def test_cancel_is_sent_only_while_provider_response_is_active():
     assert harness.session.sent == [rt.CancelResponse()]
 
 
+def test_cancel_is_not_sent_while_provider_is_idle_or_after_finish():
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-1"),
+            rt.ResponseFinished(response_id="response-1"),
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def scenario():
+        await session.cancel_response()
+        events = session.events()
+        await anext(events)
+        await anext(events)
+        await session.cancel_response()
+
+    run(scenario())
+
+    assert harness.session.sent == []
+
+
 def test_cancelled_response_tail_and_late_finish_cannot_clear_new_response():
     harness = Harness(
         (
@@ -342,12 +368,78 @@ def test_recoverable_provider_failure_does_not_end_the_session():
     )
     session = core_v1.TalkRealtimeSession(harness.session)
 
+
     async def collect():
         return [event async for event in session.events()]
 
     events = run(collect())
 
     assert [event.text for event in events] == ["still here"]
+
+
+def test_real_coordinator_delegates_one_client_tool_through_adapter():
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-1"),
+            rt.FunctionCall(
+                call_id="call-1",
+                name="client_delegate",
+                arguments='{"request":"search for current weather"}',
+                response_id="response-1",
+            ),
+            rt.ResponseFinished(response_id="response-1"),
+        )
+    )
+    adapter = core_v1.TalkRealtimeSession(harness.session)
+    dispatched = []
+
+    class Provider(RealtimeVoiceProvider):
+        @property
+        def name(self):
+            return "test"
+
+        @property
+        def display_name(self):
+            return "Test"
+
+        def is_available(self):
+            return True
+
+        def get_setup_schema(self):
+            return {}
+
+        async def open_session(self, **_kwargs):
+            return adapter
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, arguments))
+        return "72°F and clear"
+
+    async def scenario():
+        coordinator = RealtimeVoiceCoordinator(Provider(), dispatch_tool=dispatch)
+        await coordinator.open(instructions="delegate", tools=[])
+        observed = [event async for event in coordinator.events()]
+        pending = tuple(coordinator._tool_tasks.values())
+        if pending:
+            await asyncio.gather(*pending)
+        await coordinator.close()
+        return observed
+
+    observed = run(scenario())
+
+    assert dispatched == [
+        ("client_delegate", {"request": "search for current weather"})
+    ]
+    assert [event.type for event in observed] == [
+        RealtimeEventType.TURN_STARTED,
+        RealtimeEventType.TOOL_CALL,
+        RealtimeEventType.TURN_ENDED,
+    ]
+    assert harness.session.sent == [
+        rt.SubmitToolResult(call_id="call-1", output="72°F and clear"),
+        rt.StartResponse(),
+    ]
+
 
 
 def test_invalid_tool_arguments_surface_error_without_dispatch():
