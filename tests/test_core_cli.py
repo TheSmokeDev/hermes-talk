@@ -22,8 +22,7 @@ class FakeAudio:
         self.stopped = False
         self.queued = []
         self.drained = 0
-        self.resets = 0
-        self.played_ms = 360
+        self.played_boundary = ("item-1", 360)
 
     def start(self):
         self.started = True
@@ -34,14 +33,12 @@ class FakeAudio:
     def read_input_chunk(self):
         return None
 
-    def queue_playback(self, pcm):
-        self.queued.append(pcm)
+    def queue_playback(self, pcm, item_id=None):
+        self.queued.append((item_id, pcm))
 
     def drain_playback(self):
         self.drained += 1
-
-    def reset_played_ms(self):
-        self.resets += 1
+        return self.played_boundary
 
 
 class FakeCapture:
