@@ -160,6 +160,9 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
                 "client_delegate",
                 {"request": SUM_REQUEST},
             )
+            yield RealtimeEvent.audio(b"speaker-1", item_id="item-1")
+            yield RealtimeEvent.audio(b"speaker-2", item_id="item-1")
+            yield RealtimeEvent.audio(b"speaker-3", item_id="item-1")
             yield RealtimeEvent.transcript(
                 SUM_REQUEST,
                 final=True,
@@ -236,6 +239,7 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
         'talk: event {"type":"transcript","role":"assistant",'
         '"text":"I found the issue.","final":true}'
     ) in output
+    assert output.count("talk: state composing") == 1
     assert talk_core_cli.sys.stdin.closed is True
 
 
@@ -262,6 +266,50 @@ def test_stdin_reader_consumes_prefetched_lines_without_deadlock():
             reader.close()
 
     assert asyncio.run(scenario()) == ("progress", "result")
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("x" * (talk_core_cli.MAX_CONTROL_FRAME_CHARS + 1), "oversized"),
+        (
+            "\n".join(
+                "x" for _ in range(talk_core_cli.MAX_PENDING_CONTROL_FRAMES + 1)
+            ),
+            "flooded",
+        ),
+    ],
+)
+def test_stdin_reader_bounds_parent_protocol(payload, message):
+    async def scenario():
+        reader = talk_core_cli._StdinLineReader(io.StringIO(f"{payload}\n"))
+        idle = asyncio.Event()
+        idle.set()
+        try:
+            with pytest.raises(RuntimeError, match=message):
+                await asyncio.wait_for(
+                    reader.wait_for_parent_close(idle),
+                    timeout=0.1,
+                )
+        finally:
+            reader.close()
+
+    asyncio.run(scenario())
+
+
+def test_stdin_reader_discards_queued_frames_after_parent_flood():
+    async def scenario():
+        payload = "\n".join(
+            "x" for _ in range(talk_core_cli.MAX_PENDING_CONTROL_FRAMES + 1)
+        )
+        reader = talk_core_cli._StdinLineReader(io.StringIO(f"{payload}\n"))
+        try:
+            with pytest.raises(RuntimeError, match="flooded"):
+                await asyncio.wait_for(reader.readline(), timeout=0.1)
+        finally:
+            reader.close()
+
+    asyncio.run(scenario())
 
 
 def test_parent_stdin_eof_stops_an_idle_session(monkeypatch, capsys):

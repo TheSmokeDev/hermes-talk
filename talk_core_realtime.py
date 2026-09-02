@@ -129,26 +129,26 @@ try:
 except Exception as exc:  # noqa: BLE001 - optional core must never poison legacy imports
     _CORE_IMPORT_ERROR = exc
 
-_V1_PROVIDER = None
-_V1_CONFIGURED_PROVIDER = None
+_COORDINATOR_PROVIDER = None
+_CONFIGURED_COORDINATOR_PROVIDER = None
 try:
     try:
         from .talk_core_realtime_contract import (
-            TalkOpenAIRealtimeProvider as _V1_PROVIDER,
+            TalkOpenAIRealtimeProvider as _COORDINATOR_PROVIDER,
         )
         from .talk_core_realtime_contract import (
-            configured_provider as _V1_CONFIGURED_PROVIDER,
+            configured_provider as _CONFIGURED_COORDINATOR_PROVIDER,
         )
     except ImportError:
         from talk_core_realtime_contract import (
-            TalkOpenAIRealtimeProvider as _V1_PROVIDER,
+            TalkOpenAIRealtimeProvider as _COORDINATOR_PROVIDER,
         )
         from talk_core_realtime_contract import (
-            configured_provider as _V1_CONFIGURED_PROVIDER,
+            configured_provider as _CONFIGURED_COORDINATOR_PROVIDER,
         )
 except Exception:  # noqa: BLE001 - #95147 is optional on older Hermes hosts
-    _V1_PROVIDER = None
-    _V1_CONFIGURED_PROVIDER = None
+    _COORDINATOR_PROVIDER = None
+    _CONFIGURED_COORDINATOR_PROVIDER = None
 
 # Compatibility diagnostics intentionally distinguish the detected data surface
 # from the complete production capability (which also requires enum claims and
@@ -182,20 +182,20 @@ _PROVIDER_EOF_MESSAGE = "provider connection closed unexpectedly"
 def core_provider_available() -> bool:
     """Return whether either supported Hermes realtime contract is importable."""
 
-    return _CORE_IMPORT_ERROR is None or _V1_PROVIDER is not None
+    return _CORE_IMPORT_ERROR is None or _COORDINATOR_PROVIDER is not None
 
 
 def coordinator_contract_available() -> bool:
     """Return whether Hermes #95147 is the active optional core contract."""
 
-    return _CORE_IMPORT_ERROR is not None and _V1_PROVIDER is not None
+    return _CORE_IMPORT_ERROR is not None and _COORDINATOR_PROVIDER is not None
 
 
 def configured_core_provider():
     """Build the configured provider for the active Hermes core contract."""
 
     if coordinator_contract_available():
-        return _V1_CONFIGURED_PROVIDER()
+        return _CONFIGURED_COORDINATOR_PROVIDER()
     if TalkOpenAIRealtimeProvider is None:
         raise RuntimeError("Hermes realtime voice provider contract is unavailable")
     return TalkOpenAIRealtimeProvider()
@@ -206,7 +206,7 @@ def configured_core_provider_supported() -> bool:
 
     try:
         if coordinator_contract_available():
-            _V1_CONFIGURED_PROVIDER()
+            _CONFIGURED_COORDINATOR_PROVIDER()
             return True
         return talk_config.talk_provider() == "openai"
     except Exception:  # noqa: BLE001 - selection probes never break plugin loading
@@ -1399,7 +1399,7 @@ else:
     SUPPORTED_INPUT_AUDIO_FORMAT = None
     SUPPORTED_OUTPUT_AUDIO_FORMAT = None
     CORE_CAPABILITIES = frozenset()
-    TalkOpenAIRealtimeProvider = _V1_PROVIDER
+    TalkOpenAIRealtimeProvider = _COORDINATOR_PROVIDER
 
 
 __all__ = [

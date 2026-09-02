@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 IDLE_POLL_S = 0.01
 EVENT_STREAM_ENV = "HERMES_TALK_EVENT_STREAM"
 MAX_PROVIDER_ITEM_ID_LENGTH = 32
+MAX_CONTROL_FRAME_CHARS = 65_536
+MAX_PENDING_CONTROL_FRAMES = 64
 EVENT_PREFIX = "talk: event "
 DELEGATE_TOOL = {
     "type": "function",
@@ -85,11 +87,11 @@ class _StdinLineReader:
     def __init__(self, stream=None) -> None:
         self._stream = stream or sys.stdin
         self._loop = asyncio.get_running_loop()
-        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
-        self._buffered_lines = 0
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue(
+            maxsize=MAX_PENDING_CONTROL_FRAMES + 1
+        )
         self._eof = asyncio.Event()
-        self._drained = asyncio.Event()
-        self._drained.set()
+        self._failure: RuntimeError | None = None
         self._descriptor: int | None = None
         self._text_buffer = ""
         self._thread: threading.Thread | None = None
@@ -127,12 +129,21 @@ class _StdinLineReader:
                 self._loop.call_soon_threadsafe(self._mark_eof)
 
     def _feed_text(self, text: str) -> None:
+        if self._eof.is_set():
+            return
         self._text_buffer += text
         lines = self._text_buffer.split("\n")
         self._text_buffer = lines.pop()
+        if self._text_buffer and len(self._text_buffer) > MAX_CONTROL_FRAME_CHARS:
+            self._fail("Hermes TUI sent an oversized live delegation frame")
+            return
         for line in lines:
-            self._buffered_lines += 1
-            self._drained.clear()
+            if len(line) > MAX_CONTROL_FRAME_CHARS:
+                self._fail("Hermes TUI sent an oversized live delegation frame")
+                return
+            if self._lines.qsize() >= MAX_PENDING_CONTROL_FRAMES:
+                self._fail("Hermes TUI flooded the live delegation channel")
+                return
             self._lines.put_nowait(line.removesuffix("\r"))
 
     def _mark_eof(self) -> None:
@@ -141,26 +152,40 @@ class _StdinLineReader:
         if self._descriptor is not None:
             self._loop.remove_reader(self._descriptor)
         if self._text_buffer:
-            self._buffered_lines += 1
-            self._drained.clear()
-            self._lines.put_nowait(self._text_buffer)
+            if len(self._text_buffer) > MAX_CONTROL_FRAME_CHARS:
+                self._failure = RuntimeError(
+                    "Hermes TUI sent an oversized live delegation frame"
+                )
+            elif self._lines.qsize() >= MAX_PENDING_CONTROL_FRAMES:
+                self._failure = RuntimeError(
+                    "Hermes TUI flooded the live delegation channel"
+                )
+            else:
+                self._lines.put_nowait(self._text_buffer)
             self._text_buffer = ""
         self._eof.set()
         self._lines.put_nowait(None)
 
+    def _fail(self, message: str) -> None:
+        self._failure = RuntimeError(message)
+        self._text_buffer = ""
+        while not self._lines.empty():
+            self._lines.get_nowait()
+        self._mark_eof()
+
     async def readline(self) -> str:
         line = await self._lines.get()
         if line is None:
+            if self._failure is not None:
+                raise self._failure
             return ""
-        self._buffered_lines -= 1
-        if self._buffered_lines == 0:
-            self._drained.set()
         return line
 
     async def wait_for_parent_close(self, delegation_idle: asyncio.Event) -> None:
         await self._eof.wait()
-        await self._drained.wait()
         await delegation_idle.wait()
+        if self._failure is not None:
+            raise self._failure
         raise RuntimeError("Hermes TUI closed the live delegation channel")
 
     def close(self) -> None:
@@ -273,7 +298,14 @@ async def run_core_talk_session(audio=None) -> int:
         max_in_flight_tool_calls=1,
     )
     last_audio_event: RealtimeEvent | None = None
-    active_item_id: str | None = None
+    last_state: str | None = None
+
+    def emit_state(state: str) -> None:
+        nonlocal last_state
+        if state == last_state:
+            return
+        last_state = state
+        print(f"talk: state {state}", flush=True)
 
     async def send_microphone() -> None:
         while True:
@@ -289,12 +321,8 @@ async def run_core_talk_session(audio=None) -> int:
             if event.type is RealtimeEventType.AUDIO:
                 if not event.audio_bytes:
                     continue
-                if event.item_id != active_item_id:
-                    active_item_id = event.item_id
-                    last_audio_event = None
-                    audio.reset_played_ms()
-                print("talk: state composing", flush=True)
-                audio.queue_playback(event.audio_bytes)
+                emit_state("composing")
+                audio.queue_playback(event.audio_bytes, item_id=event.item_id)
                 last_audio_event = event
                 continue
             if event.type is RealtimeEventType.TRANSCRIPT:
@@ -313,13 +341,13 @@ async def run_core_talk_session(audio=None) -> int:
                 continue
             if event.type is RealtimeEventType.TURN_ENDED:
                 if event.role == "user":
-                    print("talk: state solving", flush=True)
+                    emit_state("solving")
                 elif event.role == "assistant":
-                    print("talk: state listening", flush=True)
+                    emit_state("listening")
                 continue
             if event.type is RealtimeEventType.TURN_STARTED:
                 if event.role == "assistant":
-                    print("talk: state composing", flush=True)
+                    emit_state("composing")
                 elif event.role == "user" and last_audio_event is not None:
                     coordinator.report_audio_heard(
                         last_audio_event,
@@ -328,8 +356,7 @@ async def run_core_talk_session(audio=None) -> int:
                     audio.drain_playback()
                     await coordinator.cancel_response()
                     last_audio_event = None
-                    active_item_id = None
-                    print("talk: state listening", flush=True)
+                    emit_state("listening")
                 continue
             if event.type is RealtimeEventType.ERROR:
                 raise RuntimeError(event.text or "realtime voice provider failed")
@@ -349,7 +376,7 @@ async def run_core_talk_session(audio=None) -> int:
             "Ctrl+C to hang up.\n",
             flush=True,
         )
-        print("talk: state listening", flush=True)
+        emit_state("listening")
 
         runtime_tasks = [
             asyncio.create_task(send_microphone()),

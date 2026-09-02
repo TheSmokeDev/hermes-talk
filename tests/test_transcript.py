@@ -227,6 +227,23 @@ def test_next_start_recovers_a_claim_left_by_a_killed_sweeper(tmp_path):
     assert not orphaned_claim.exists()
 
 
+def test_recovered_claim_name_does_not_grow_past_filesystem_limit(tmp_path):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("orphan user"))
+    capture.append_turn("assistant", _long_turn("orphan assistant"))
+    capture.finish()
+    orphaned_claim = capture.path.with_name(
+        f"{'x' * 195}.jsonl.claimed-deadgateway"
+    )
+    os.rename(capture.path, orphaned_claim)
+    prompts = []
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+
+    assert len(prompts) == 1
+    assert not orphaned_claim.exists()
+
+
 def test_sweep_drops_a_symlink_that_escapes_the_transcript_directory(tmp_path):
     root = tmp_path / "state" / "talk-transcripts"
     root.mkdir(parents=True)
