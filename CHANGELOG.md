@@ -14,6 +14,19 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- Run admission control on `delegate_task` (#101). The model may declare
+  `execution_mode` (`exclusive`, the default, or `parallel_read_only`) and up
+  to eight normalized `resource_keys` naming what a task touches — a repo
+  checkout, a deployment target. Two live runs that share a key never overlap
+  unless both are read-only; the check runs before a run id is minted or an
+  acceptance record is written, so a refused job burns nothing and can never
+  surface as `lost`. The refusal is a spoken tool result naming the run in
+  the way and the shared key, never a hang or a silent queue, and
+  `check_work` reads out what each running job holds. New knob
+  `TALK_TRUST_DECLARED_READ_ONLY`, default off: until the operator sets it,
+  `parallel_read_only` is downgraded to `exclusive` and recorded that way,
+  because the declaration is the delegating model's own claim, not a
+  sandbox. A task that names no keys is exactly the task Talk always ran.
 - The contributor experience, written down. `CONTRIBUTING.md` now ranks
   what we take first (bug fixes on live lanes, then provider and host
   compatibility, security hardening, cross-platform, new providers behind
