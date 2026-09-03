@@ -74,6 +74,11 @@ named rather than smoothed.
   the identity it would have been authorized under. One helper answers for
   both, and it returns `""` — which cannot collide with a registered tool, a
   classification set, or a permit's recorded action.
+- The README demo GIF is re-rendered from the original 1280x582 screen
+  recording instead of the 640x291 downscale it shipped as, so the
+  transcript and the agent's brief in the runs panel are readable rather
+  than grey mush (#79). `docs/render-dashboard-gif.py` regenerates it from
+  the published release asset.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.
