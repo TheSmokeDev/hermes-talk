@@ -9,6 +9,13 @@ on:
   # created). This lets an operator run the suite against any ref by hand.
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN. The suite only checks out the tree, installs
+# from PyPI, and runs pytest/ruff — it writes nothing back to GitHub, so
+# contents:read (what actions/checkout needs) is the whole grant. Without this
+# block the token inherits the repository default, which can be read/write.
+permissions:
+  contents: read
+
 jobs:
   test:
     # No secrets, no network: the suite runs against scripted Realtime

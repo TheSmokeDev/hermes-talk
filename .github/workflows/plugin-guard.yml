@@ -8,6 +8,15 @@ on:
   # ref by hand when event delivery drops.
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads two
+# files from a PUBLIC upstream repository through `gh api`; a token scoped to
+# contents:read on this repository can still read public repositories, and
+# the authenticated call is only there for the rate limit. Nothing is written
+# back to GitHub. Without this block the token inherits the repository
+# default, which can be read/write.
+permissions:
+  contents: read
+
 jobs:
   scan:
     # The upstream plugin scanner (tools/plugin_guard.py in
