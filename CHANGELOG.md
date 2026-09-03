@@ -33,6 +33,26 @@ named rather than smoothed.
   code. Session credential/model/voice resolution moved into one
   `talk_cli.resolve_provider_lane()` so the check proves the session's real
   path rather than a copy of it.
+- `hermes talk diagnostics` writes a redacted support bundle for issue
+  reports (#98). Most "it doesn't work" reports could not be reproduced from
+  what the reporter pasted. The bundle carries versions (Python, hermes-talk,
+  the Hermes host, the OS), the NAMES of the `TALK_*` / `HERMES_*` variables
+  that are set plus a fixed list of shared ones (presence only — values are
+  never read), audio device counts and default device names, host capability
+  facts, and every doctor check's outcome with an allowlisted subset of its
+  details. No logs, prompts, transcripts, task results, audio, secret values,
+  or paths. The serializer is default-deny: `BUNDLE_ALLOWLIST` names every
+  key and the shape its value must have, identifier-shaped leaves are dropped
+  outright if secret redaction would change them, free-text leaves pass
+  redaction plus a path scrub and a length cap, and anything not on the list
+  is dropped — a key doctor grows later cannot leak by inheritance (a test
+  plants secret-shaped values at every level and proves none reach the file).
+  `--bundle [PATH]` writes it owner-only (POSIX `0600`; the setup wizard's
+  protected owner-only DACL on Windows, applied to the empty temp before any
+  bytes land) and verifies the permissions after the move, deleting the file
+  if they cannot be proven; `--json` prints it instead. The bug-report issue
+  template now asks for the bundle first. Ported idea from
+  bielcarpi/hermes-live-voice's `diagnostics` (MIT) — idea only, no code.
 - hermes-talk's three realtime lanes now register on the Hermes core
   `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
   NousResearch/hermes-agent#101808) as `hermes-talk/openai`,

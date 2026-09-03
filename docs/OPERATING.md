@@ -192,6 +192,42 @@ WebSocket is open and held. That is a live session waiting for a voice.
 Hang it up cleanly (Ctrl+C in its terminal, or stop that specific process
 — only that one).
 
+### 7. `hermes talk diagnostics` — the redacted support bundle
+
+```bash
+hermes talk diagnostics            # human summary: versions, variable NAMES, devices, doctor outcomes
+hermes talk diagnostics --json     # the same bundle as JSON on stdout
+hermes talk diagnostics --bundle   # write it owner-only to the Talk state dir and print the path
+hermes talk diagnostics --bundle ./talk-bundle.json   # or to a path you choose
+```
+
+When filing an issue, run `--bundle` and paste the file: it is the one
+artifact that makes "it doesn't work" reproducible, and it is safe to
+attach to a public issue by construction. It carries versions (Python,
+hermes-talk, the Hermes host, the OS), the **names** of the `TALK_*` and
+`HERMES_*` variables you have set plus a fixed list of shared ones
+(`OPENAI_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`,
+`CODEX_HOME`, …) — presence only, values are never read — audio device
+counts and default device names, host capability facts, and every doctor
+check's id, status, summary, remediation, and an allowlisted subset of its
+details. No logs, prompts, transcripts, task results, audio, or secret
+values, and no paths: the doctor identity check's resolved home and root
+are not on the list.
+
+The serializer is **default-deny**: `talk_diagnostics.BUNDLE_ALLOWLIST`
+names every key the bundle may carry and the shape its value must have —
+identifier-shaped `token` leaves are dropped outright if secret redaction
+would have changed them, `text` leaves (summaries, remediations) pass secret
+redaction, a path scrub, and a length cap, and anything not on the list is
+dropped. A key doctor grows next year cannot leak by inheritance.
+
+`--bundle` writes with the same owner-only discipline as the setup wizard's
+secret files — POSIX `0600`, a protected owner-only DACL on Windows, applied
+to the empty temp before any bytes land — and verifies the permissions after
+the move; a bundle whose permissions cannot be proven is deleted, not left
+behind. Exit status is 1 only when a requested write failed: a bundle that
+documents a broken install is the successful outcome.
+
 ## Configuration — every knob
 
 All variables are resolved at call time, never cached at import. The

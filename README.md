@@ -72,6 +72,13 @@ credential resolution exactly as a session does it, and nothing else
 changed. Paste `hermes talk check --json` into a bug report — it says which
 half is broken.
 
+**Filing an issue?** `hermes talk diagnostics --bundle` writes one redacted,
+owner-only file — versions, the *names* of the variables you have set,
+device and host facts, and every doctor outcome; no values, logs, prompts,
+transcripts, audio, or paths — through a default-deny allowlist, so it is
+safe to paste into a public issue and it is what the
+[bug template](.github/ISSUE_TEMPLATE/bug_report.yml) asks for.
+
 **Upgrade** with `hermes plugins update hermes-talk` — not a second
 `install` (it refuses on an existing plugin) — then **restart the
 gateway**: a running process keeps executing the old code until you do.
@@ -361,6 +368,7 @@ hermes talk       # terminal duplex voice session
 hermes talk setup # detect → ask only missing decisions → confirm/write → verify
 hermes talk doctor # strictly read-only configuration and host diagnostics
 hermes talk check  # doctor + one live provider turn + one bounded Hermes run; exit 0 = proven
+hermes talk diagnostics --bundle  # redacted support bundle for issue reports, written owner-only
 ```
 
 Setup commits all individually confirmed settings to the active Hermes home's
