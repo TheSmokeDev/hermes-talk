@@ -119,6 +119,34 @@ start services, or probe an api-server sidecar. Remediations are instructions
 only. Identity content, credentials, and Discord IDs are never included; only
 section/operator counts and lane/state receipts are emitted.
 
+### 3b. `hermes talk check` — the live proof
+
+```bash
+hermes talk check            # doctor + one live provider turn + one bounded Hermes run
+hermes talk check --json     # per-step pass/fail/skip + durations; exit 0 only if every step passed
+hermes talk check --no-run   # provider session only
+```
+
+Three steps in order: `static` (the doctor checks, ids/statuses/summaries
+only — details are dropped because they name the Hermes home), `provider_session`
+(a real session on `TALK_PROVIDER` through the same adapter and credential
+resolution a voice session uses: connect → `SessionReady` → one text turn →
+`ResponseFinished`), and `hermes_run` (one task through the same delegation
+path the voice uses; the agent's output must contain `HERMES_TALK_CHECK_OK`).
+A failing doctor check skips the live steps. Every live step is wall-clock
+bounded (provider turn 60s; run step `--timeout`, default 180s, and a run
+that outlives it is stopped through the same verb the voice uses). The
+report carries no tokens and no paths.
+
+Unlike doctor it is **not** read-only: it spends one short provider turn
+and one short agent run (recorded in the run history under a check-owned
+ticket with no Hermes session id, so no later voice session adopts or
+speaks it), and resolves credentials exactly as a session would. A mock
+cannot go green: `--provider` accepts only live lanes, the report's provider
+is validated against the same fail-closed list `TALK_PROVIDER` uses, and the
+live steps refuse under a test harness. When filing an issue, paste
+`hermes talk check --json` — it says which half is broken.
+
 ### 4. `talk_status` — the in-session command
 
 In any session (voice, or the dashboard's tool relay), ask for a status

@@ -32,6 +32,7 @@ hermes talk --help         # → registration proof: the command only exists if 
 hermes talk setup          # → guided, confirmation-gated setup plus doctor verification
 hermes talk doctor         # → read-only diagnostics: auth lane, provider, model/voice, audio, host lanes
 hermes talk doctor --json  # → the same versioned receipt for scripts and issue reports
+hermes talk check          # → prove it: doctor + one live provider turn + one bounded Hermes run
 # then, in any session: say "status report" — talk_status answers with
 # version, auth lane, agent lane, and audio state.
 ```
@@ -39,9 +40,37 @@ hermes talk doctor --json  # → the same versioned receipt for scripts and issu
 Doctor is read-only by design: it names which lane came up and what is
 missing, and never writes, probes, or refreshes a token (the one exception is
 `--probe`, Grok-only, which makes two live calls to `api.x.ai` and says so).
-`hermes talk check` — next release — goes one step further: a real provider
-session plus one bounded Hermes run that must echo a token, so a green report
-proves the live path and not just the configuration.
+
+### Prove it in one command — `hermes talk check`
+
+A green doctor can still hide a dead mint, a refused socket, or a
+delegation lane that never starts. `check` is the other half: it runs the
+doctor checks, then opens a **real** session on your configured provider
+through the same adapter and credential path the voice uses (connect →
+`SessionReady` → one text turn → `ResponseFinished`), then hands **one**
+bounded task to a real Hermes agent through the same delegation path the
+voice uses, and only passes if the agent's output contains
+`HERMES_TALK_CHECK_OK`.
+
+```bash
+hermes talk check              # three steps, one verdict, exit 0 only if every step passed
+hermes talk check --json       # per-step pass/fail/skip with durations, for issues and scripts
+hermes talk check --no-run     # provider session only; skip the Hermes run
+hermes talk check --timeout 60 # budget for the run step (default 180s; provider turn 60s)
+hermes talk check --provider grok  # check a live lane other than TALK_PROVIDER (this process only)
+```
+
+What it guarantees: every live step has a hard wall-clock bound (a run that
+outlives its budget is stopped, not abandoned); the report carries no
+tokens and no paths; a failing doctor check skips the live steps rather
+than spending a session on a known-broken config; and a mock can never go
+green — `--provider` accepts only live lanes, the report's provider is
+validated against the same fail-closed list, and the live steps refuse
+under a test harness. It is *not* read-only: expect one short provider turn
+and one short agent run (recorded in the run history like any other),
+credential resolution exactly as a session does it, and nothing else
+changed. Paste `hermes talk check --json` into a bug report — it says which
+half is broken.
 
 **Upgrade** with `hermes plugins update hermes-talk` — not a second
 `install` (it refuses on an existing plugin) — then **restart the
@@ -331,6 +360,7 @@ The cascade speaks on every Talk surface:
 hermes talk       # terminal duplex voice session
 hermes talk setup # detect → ask only missing decisions → confirm/write → verify
 hermes talk doctor # strictly read-only configuration and host diagnostics
+hermes talk check  # doctor + one live provider turn + one bounded Hermes run; exit 0 = proven
 ```
 
 Setup commits all individually confirmed settings to the active Hermes home's
