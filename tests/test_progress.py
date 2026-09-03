@@ -797,3 +797,149 @@ def test_the_same_phase_detail_only_update_rides_the_run_path(monkeypatch):
     finally:
         release.set()
     _wait_terminal(run_id)
+
+
+# -- progress-speech micro coverage (hermes-talk#61) -----------------------------
+
+
+def _child_spoken(**event) -> str:
+    return _spoken_text(talk_cli.subagent_phase_commands(event))
+
+
+def test_subagent_phase_speech_names_the_agent_its_role_and_its_phase():
+    """The child milestone sentences themselves.
+
+    The run-side wording is pinned above; the child side only had "terminal
+    phases build nothing". These are the three sentences an operator actually
+    hears, including the two shapes that are easy to get wrong: an executing
+    child with no tool detail yet (the sentence must still end), and a child
+    with no role (no empty parentheses).
+    """
+
+    base = {"subagent_id": "sa-0-aaaa", "role": "researcher"}
+    assert (
+        "Background agent sa-0-aaaa (researcher) was accepted."
+        in _child_spoken(**base, phase="accepted")
+    )
+    assert (
+        "Background agent sa-0-aaaa (researcher) is executing \u2014 Reading files."
+        in _child_spoken(**base, phase="executing", detail="Reading files")
+    )
+    assert "is executing." in _child_spoken(**base, phase="executing")
+    assert "waiting on an approval" in _child_spoken(**base, phase="blocked")
+    assert (
+        "Background agent sa-0-aaaa was accepted."
+        in _child_spoken(subagent_id="sa-0-aaaa", phase="accepted")
+    )
+    # No id is no subject: nothing is spoken rather than a nameless sentence.
+    assert talk_cli.subagent_phase_commands({"phase": "accepted"}) == []
+
+
+def test_subagent_phase_speech_carries_no_routing_metadata():
+    """Positional redaction, child side: only id, role and a safe label ride."""
+
+    text = _child_spoken(
+        subagent_id="sa-0-aaaa",
+        role="researcher",
+        phase="executing",
+        detail="Reading files",
+        parent_session_id="sess-secret",
+        child_goal="exfiltrate the secrets",
+        tool_name="read_file",
+        tool_input={"path": "C:/secret.env"},
+    )
+    for leaked in ("sess-secret", "exfiltrate", "C:/secret.env", "read_file"):
+        assert leaked not in text
+
+
+def test_an_unknown_phase_is_refused_by_the_run_projection():
+    """The guard is exact membership in PHASES, not a shape or a case fold.
+
+    A phase that is not in the bounded vocabulary must not reach meta at all
+    — the vocabulary is what bounds what can ever be spoken.
+    """
+
+    run_id, release = _start_live_run()
+    try:
+        for bogus in ("gibberish", "", "EXECUTING", "running", "Accepted", None, 7):
+            assert talk_progress.set_run_phase(run_id, bogus) is False
+        assert "phase" not in talk_runs.get_run(run_id)["meta"]
+    finally:
+        release.set()
+    _wait_terminal(run_id)
+
+
+def test_spoken_labels_are_truncated_to_the_progress_label_cap():
+    """Operator-supplied run labels and tool labels are bounded before speech."""
+
+    cap = talk_cli._PROGRESS_LABEL_CHARS
+    long_label = "L" * (cap + 40)
+    long_detail = "D" * (cap + 40)
+
+    run = _run_snapshot(7, "executing", long_detail)
+    run["label"] = long_label
+    text = _spoken_text(talk_cli.run_phase_commands(run, "executing"))
+    assert "L" * cap in text and "L" * (cap + 1) not in text
+    assert "D" * cap in text and "D" * (cap + 1) not in text
+
+    # The heartbeat carries the label too, on the same cap.
+    beat = _spoken_text(talk_cli.run_phase_commands(run, "heartbeat"))
+    assert "L" * cap in beat and "L" * (cap + 1) not in beat
+
+    child = _child_spoken(subagent_id="sa-0-aaaa", phase="executing", detail=long_detail)
+    assert "D" * cap in child and "D" * (cap + 1) not in child
+
+
+def test_concurrent_producers_never_corrupt_the_progress_indexes():
+    """Both indexes are written from the poll loop AND the host's hook threads.
+
+    The caps evict while other threads insert, so this drives every producer
+    at once past both caps and asserts the invariants that a torn write would
+    break: bounded size, whole entries, and a phase still inside the bounded
+    vocabulary.
+    """
+
+    events: list[dict] = []
+    _attach(events)
+    workers = 6
+    errors: list[Exception] = []
+    barrier = threading.Barrier(workers)
+
+    def hammer(worker: int) -> None:
+        try:
+            barrier.wait(timeout=10.0)
+            for index in range(60):
+                key = f"{worker}-{index}"
+                talk_progress.note_run_session(worker * 1000 + index, f"sess-{key}")
+                _child_start(csid=f"cs-{key}", sid=f"sa-{worker}-{index}")
+                talk_progress.on_post_tool_call(session_id=f"cs-{key}", tool_name="read_file")
+                talk_progress.on_pre_approval_request(session_id=f"cs-{key}")
+                if index % 3 == 0:
+                    talk_lifecycle.on_subagent_stop(
+                        child_session_id=f"cs-{key}", child_status="ok", child_summary="done"
+                    )
+        except Exception as exc:  # noqa: BLE001 - the thread's failure IS the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(worker,)) for worker in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert errors == []
+    assert len(talk_progress._RUN_BY_SESSION) <= talk_progress._MAX_RUN_SESSIONS
+    assert len(talk_progress._CHILDREN) <= talk_progress._MAX_CHILDREN
+    for entry in list(talk_progress._CHILDREN.values()):
+        assert set(entry) == {
+            "subagent_id",
+            "parent_session_id",
+            "role",
+            "top_level",
+            "phase",
+            "detail",
+        }
+        assert entry["phase"] in talk_progress.PHASES
+    for phase in [event.get("phase") for event in list(events)]:
+        assert phase in talk_progress.PHASES
