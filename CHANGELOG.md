@@ -13,6 +13,18 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Added a deterministic, content-free endpointing trace evaluator that reports
+  nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
+  and false-activation counts without retaining audio or transcripts.
+- Provider-neutral semantic endpointing controls for the core realtime
+  contract: `RealtimeTurnDetection` with native/server/semantic modes and
+  `RealtimeSemanticEagerness` are mirrored through the setup and live-update
+  paths, Grok advertises native/server support and Gemini native-only with
+  fail-fast refusals on unsupported modes, and the semantic names are probed
+  as an optional capability so pre-semantic core heads keep the full lane
+  with provider-native turn detection instead of losing it.
+
 ## [0.17.3] — 2026-09-09
 
 One fix, for the dashboard tab. Ending a session could strand it: if any
@@ -32,6 +44,7 @@ surface on the dashboard transport, the second outside fix to a live lane.
   swallows its own failure, so teardown always completes and a repeated
   call is a no-op. Regression test drives the real bundle through `node`
   with a throwing `abortCascade()` and asserts every wire is closed. (#130)
+
 
 ## [0.17.2] — 2026-09-07
 
@@ -283,9 +296,6 @@ contract adapter, a security policy, and a contributing guide.
   `--json` prints it instead. The bug-report issue template now asks for the
   bundle first. Ported idea from bielcarpi/hermes-live-voice's `diagnostics`
   (MIT) — idea only, no code.
-- Added a deterministic, content-free endpointing trace evaluator that reports
-  nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
-  and false-activation counts without retaining audio or transcripts.
 - hermes-talk's three realtime lanes now register on the Hermes core
   `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
   NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
