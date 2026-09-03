@@ -196,6 +196,55 @@ logged receipt — never a faked upstream call. The Discord lane refuses
 Gemini for now: its gated-response authorization flow has no Live wire
 equivalent, so connect fails closed rather than answering unvetted speakers.
 
+## Hermes core realtime contract
+
+Hermes core now defines its own provider-neutral speech-to-speech contract
+(`agent/realtime_voice_provider.py`, API v2 — NousResearch/hermes-agent#101808)
+and drives any registered backend from `hermes realtime`. hermes-talk publishes
+all three of its lanes there, so the same OpenAI, Grok, and Gemini sessions this
+plugin already speaks are available to core's own orchestrator:
+
+```bash
+hermes realtime --list
+# hermes-talk/openai   ready        OpenAI Realtime (hermes-talk)
+# hermes-talk/grok     needs setup  xAI Grok Realtime (hermes-talk)
+# hermes-talk/gemini   ready        Gemini Live (hermes-talk)
+
+hermes realtime --provider hermes-talk/gemini
+```
+
+There is nothing to configure. The registration is feature-detected: on a
+Hermes that does not expose the contract — every released version today —
+hermes-talk loads exactly as it always has, with one debug line and no warning.
+The names are namespaced so they can never shadow core's bundled `openai`.
+
+**Capabilities are declared, never faked.** Core asks each session what it can
+do and degrades explicitly rather than being told a comfortable lie:
+
+| | OpenAI | Grok | Gemini Live |
+|---|---|---|---|
+| tool calling | yes | yes | yes |
+| input / output transcripts | yes | yes | yes |
+| explicit response | yes | yes | — |
+| cancel response | yes | yes | — |
+| truncate output | yes | yes¹ | — |
+| dynamic context | yes | yes | — |
+| tool-call cancellation | — | — | yes |
+
+¹ Grok does put `conversation.item.truncate` on the wire; if the server answers
+that it is unimplemented, that session degrades to cancel-only and says so once.
+
+Gemini Live has no client-side cancel, no output truncate, and no
+conversation-item delete, so it advertises none of them and core drops playback
+locally on barge-in instead of being handed a truncation that never happened.
+What it has and the others do not is `toolCallCancellation`, which now reaches
+the host as a real cancelled-tool event — so results for a call the server
+retracted are never submitted.
+
+Auth is unchanged, and readiness stays offline: `hermes realtime --list` reads
+each lane's own read-only diagnostic and never opens a socket, refreshes a
+token, or writes an auth store.
+
 ## Custom voice — the cascade lane (ElevenLabs)
 
 Native mode speaks with the provider's own voices, and those voices are

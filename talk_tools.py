@@ -75,6 +75,7 @@ REGISTRATION_REQUIREMENTS: dict[str, str] = {
     "tts_provider": "optional",
     "transcription_provider": "optional",
     "realtime_voice_provider": "optional",
+    "core_realtime_providers": "optional",
 }
 
 _TOOL_SEARCH_MEMORY: dict = {
