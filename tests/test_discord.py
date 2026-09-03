@@ -444,6 +444,145 @@ def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(m
     asyncio.run(scenario())
 
 
+def _refusing_legacy_join(monkeypatch, reason):
+    """Drive one legacy join whose session refuses at startup for ``reason``.
+
+    Returns ``(receipt, status, delivered)`` — the join's own reply, the
+    ``talk status`` line afterwards, and every message pushed to the channel.
+    """
+
+    _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+    delivered: list[str] = []
+
+    class _Channel:
+        async def send(self, content):
+            delivered.append(content)
+
+    adapter._voice_text_channels = {7: 123}
+    adapter._client = types.SimpleNamespace(get_channel=lambda channel_id: _Channel())
+
+    async def refuse(audio, *, on_refusal=None, **_kwargs):
+        if reason is not None:
+            on_refusal(reason)
+        return 1
+
+    monkeypatch.setattr(talk_cli, "run_talk_session", refuse)
+    return delivered
+
+
+def test_a_startup_refusal_is_spoken_with_its_reason_and_the_core_join_route(monkeypatch):
+    """hermes-talk#58: every startup failure read 'exited unsuccessfully'.
+
+    The session already knew which knob refused — it printed it to the
+    gateway's stderr and returned a bare 1 — so the one operator who needed
+    the reason was the one who never got it.
+    """
+
+    async def scenario():
+        delivered = _refusing_legacy_join(monkeypatch, talk_cli.STARTUP_REFUSAL_CONFIGURATION)
+
+        receipt = talk_discord.start_session(7)
+        assert "limited legacy provider-owned" in receipt.lower()
+        for _ in range(20):
+            if not talk_discord._SESSION:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):  # let the done callback's notification task run
+            await asyncio.sleep(0)
+
+        assert len(delivered) == 1
+        failure = delivered[0]
+        assert "voice is not configured" in failure
+        assert "/talk core join" in failure
+        assert "hermes talk doctor" in failure
+        assert "exited unsuccessfully" not in failure
+        # A refusal is a sentence, never a traceback.
+        assert "Traceback" not in failure and "Error" not in failure
+
+    asyncio.run(scenario())
+
+
+def test_an_audio_refusal_does_not_send_the_operator_to_core_join(monkeypatch):
+    """Core voice opens the SAME channel, so pointing there would waste a try."""
+
+    async def scenario():
+        delivered = _refusing_legacy_join(monkeypatch, talk_cli.STARTUP_REFUSAL_AUDIO)
+
+        talk_discord.start_session(7)
+        for _ in range(20):
+            if not talk_discord._SESSION:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert len(delivered) == 1
+        assert "the voice channel would not open" in delivered[0]
+        assert "core join" not in delivered[0].lower()
+
+    asyncio.run(scenario())
+
+
+def test_a_refusal_without_a_reason_keeps_the_generic_receipt(monkeypatch):
+    """An un-reported failure must degrade to the old line, never crash."""
+
+    async def scenario():
+        delivered = _refusing_legacy_join(monkeypatch, None)
+
+        talk_discord.start_session(7)
+        for _ in range(20):
+            if not talk_discord._SESSION:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert len(delivered) == 1
+        assert "session exited unsuccessfully" in delivered[0]
+
+    asyncio.run(scenario())
+
+
+def test_a_clean_legacy_session_never_delivers_a_failure_receipt(monkeypatch):
+    """The success path: exit 0 says nothing and leaves no failure on status."""
+
+    async def scenario():
+        delivered = _refusing_legacy_join(monkeypatch, None)
+
+        async def succeed(audio, *, on_refusal=None, **_kwargs):
+            assert on_refusal is not None, "the receipt lane lost its refusal sink"
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", succeed)
+
+        receipt = talk_discord.start_session(7)
+        assert "limited legacy provider-owned" in receipt.lower()
+        for _ in range(20):
+            if not talk_discord._SESSION:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert delivered == []
+        assert "No live voice session" in talk_discord.session_status()
+
+    asyncio.run(scenario())
+
+
+def test_every_startup_refusal_reason_has_exactly_one_speakable_line():
+    """The mapping is keyed by literal (talk_cli imports lazily) — pin it."""
+
+    assert set(talk_discord._STARTUP_REFUSAL_FAILURES) == set(
+        talk_cli.STARTUP_REFUSAL_REASONS
+    )
+    for reason, line in talk_discord._STARTUP_REFUSAL_FAILURES.items():
+        assert talk_discord._startup_refusal_failure(reason) == line
+        assert line and len(line) < 200
+    assert talk_discord._startup_refusal_failure(None) is None
+    assert talk_discord._startup_refusal_failure("not-a-reason") is None
+
+
 def test_both_session_call_sites_pass_the_discord_lane(monkeypatch):
     """The lane line is only true if every path names its own room (#64)."""
 
