@@ -5,31 +5,23 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks — one paste does most of the work here. In a session, say
-        "status report" (the `talk_status` tool), or hit
-        `GET /api/plugins/hermes-talk/status` on the dashboard, and paste
-        the output below. It answers version, auth lane, agent lane, and
-        audio in one go.
+        Thanks — one paste does most of the work here. Run
+
+        ```bash
+        hermes talk diagnostics --bundle
+        ```
+
+        and paste the file it wrote below. The bundle is redacted by
+        construction: versions, the NAMES of the variables you have set, device
+        and host facts, and every `hermes talk doctor` outcome — no values, no
+        logs, no prompts, no transcripts, no audio. Nothing else in this
+        template is worth more than that one file.
   - type: textarea
-    id: talk_status
+    id: diagnostics_bundle
     attributes:
-      label: talk_status output
-      description: Paste the JSON. Identity is reported as section names and sizes only — no content leaves your machine.
+      label: Diagnostics bundle
+      description: Paste the JSON that `hermes talk diagnostics --bundle` wrote (the path is printed). If you cannot run it, say why here instead.
       render: json
-    validations:
-      required: true
-  - type: input
-    id: host_version
-    attributes:
-      label: Hermes host version
-      placeholder: "hermes --version"
-    validations:
-      required: true
-  - type: input
-    id: os
-    attributes:
-      label: OS
-      placeholder: "Windows 11 / Ubuntu 24.04 / macOS 15"
     validations:
       required: true
   - type: dropdown
@@ -39,6 +31,7 @@ body:
       options:
         - Terminal (hermes talk)
         - /talk inside a session
+        - Discord voice channel
         - Dashboard tab
     validations:
       required: true
@@ -54,9 +47,17 @@ body:
     validations:
       required: true
   - type: textarea
+    id: talk_status
+    attributes:
+      label: talk_status output (optional)
+      description: In a session, say "status report" (the `talk_status` tool), or hit `GET /api/plugins/hermes-talk/status` on the dashboard. Identity is reported as section names and sizes only — no content leaves your machine.
+      render: json
+    validations:
+      required: false
+  - type: textarea
     id: extra
     attributes:
       label: Anything else
-      description: Logs, tracebacks, relevant knobs you've set (names only — never paste keys).
+      description: Tracebacks, relevant knobs you've set (names only — never paste keys). Logs only if you have read them yourself first.
     validations:
       required: false

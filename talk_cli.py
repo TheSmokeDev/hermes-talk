@@ -45,6 +45,7 @@ try:
         talk_cascade_voice,
         talk_check,
         talk_config,
+        talk_diagnostics,
         talk_doctor,
         talk_gemini_realtime,
         talk_grok_auth,
@@ -73,6 +74,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_cascade_voice
     import talk_check
     import talk_config
+    import talk_diagnostics
     import talk_doctor
     import talk_gemini_realtime
     import talk_grok_auth
@@ -2019,7 +2021,7 @@ async def run_talk_session(
 
 
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
-    """Build the native ``hermes talk`` session/setup/doctor/check argparse tree."""
+    """Build the native ``hermes talk`` session/setup/doctor/check/diagnostics tree."""
 
     commands = subparser.add_subparsers(dest="talk_command")
     commands.add_parser(
@@ -2078,6 +2080,31 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         default=None,
         help="check this live provider instead of TALK_PROVIDER (this process only)",
     )
+    diagnostics = commands.add_parser(
+        "diagnostics",
+        help=(
+            "Redacted support bundle for issue reports: versions, variable NAMES, "
+            "device/host facts, doctor outcomes"
+        ),
+    )
+    diagnostics.add_argument(
+        "--json",
+        action="store_true",
+        dest="diagnostics_json",
+        help="print the bundle as JSON instead of the human summary",
+    )
+    diagnostics.add_argument(
+        "--bundle",
+        nargs="?",
+        const="",
+        default=None,
+        dest="diagnostics_bundle",
+        metavar="PATH",
+        help=(
+            "write the bundle owner-only to PATH (default: a timestamped file in the "
+            "Talk state directory) and print where it went"
+        ),
+    )
     subparser.set_defaults(talk_command="session")
 
 
@@ -2113,6 +2140,16 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
             provider=getattr(args, "check_provider", None),
             session_factory=_realtime_session,
             lane_resolver=resolve_provider_lane,
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "diagnostics":
+        bundle = getattr(args, "diagnostics_bundle", None)
+        code = talk_diagnostics.cli_entry(
+            json_output=bool(getattr(args, "diagnostics_json", False)),
+            write=bundle is not None,
+            bundle_path=bundle or None,
         )
         if code:
             raise SystemExit(code)

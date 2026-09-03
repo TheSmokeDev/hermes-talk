@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Make a diagnostics bundle first (hermes talk diagnostics --bundle)
+    url: https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/OPERATING.md#7-hermes-talk-diagnostics--the-redacted-support-bundle
+    about: One redacted file — versions, variable names, device/host facts, doctor outcomes — turns "it doesn't work" into something reproducible.
   - name: How the run-control surface works (steer / redirect / receipts)
     url: https://github.com/TheSmokeDev/hermes-talk#redirecting-work-thats-already-running
     about: The receipt states and the artifacts behind them — worth a read before filing "it said queued but…"
