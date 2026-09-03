@@ -18,19 +18,38 @@ handler table.
 
 - `__init__.py` — `register(ctx)`; captures the host's realtime execution
   attachment via `capture_realtime_execution_attachment` on the session
-  invocation (~line 185).
+  invocation (in `_talk_command`, ~line 237).
 - `talk_core_realtime.py` / `talk_core_session.py` — provider-neutral
   realtime session core; batches provider function calls into ONE canonical
   Hermes execution, returns ordered durable tool results, requests one
   continuation. Response-local cancellation + barge-in boundaries preserved.
 - `talk_openai_realtime.py` — OpenAI Realtime provider (`gpt-realtime-2.1`,
   voice `cedar` on this machine).
-- `talk_tools.py` — the curated Talk verbs that remain: `search_memory`,
-  `search_vault`, `delegate_task`, `check_work`, `list_agents`,
-  `steer_agent`, `redirect_agent`, `stop_work`, `talk_status`,
-  `talk_capabilities`.
+- `talk_tools.py` — the curated Talk verbs that remain. `default_talk_tools()`
+  advertises ten unconditionally: `search_memory`, `delegate_task`,
+  `check_work`, `list_agents`, `steer_agent`, `redirect_agent`, `stop_work`,
+  `resolve_approval`, `talk_status`, `talk_capabilities`. Two are
+  CONDITIONAL, because advertising a verb that cannot be served is the same
+  defect as passing through a provider block: `search_vault` only when a
+  memory provider is loadable in this process, and `pause_voice_input` only
+  when this process pumps the microphone AND the operator has a guaranteed
+  way back (`pausable=True`).
   (`talk_identity.py` renders the exact schema names into the session prompt
   so the persona knows its real surface.)
+- `talk_core_provider.py` — the OTHER direction. The modules above make the
+  provider drive Hermes; this one publishes all three lanes on Hermes core's
+  own provider-neutral contract (`agent/realtime_voice_provider.py`, API v2)
+  as `hermes-talk/openai`, `hermes-talk/grok`, `hermes-talk/gemini`, so
+  core's orchestrator can drive them. Registration is feature-detected on
+  both sides (`core_contract_available()` → `build_providers()` →
+  `ctx.register_realtime_voice_provider`); a host without the hook loads
+  hermes-talk exactly as before, with one debug line. Capabilities are
+  DECLARED per lane (`OPENAI_CAPABILITIES` / `GROK_CAPABILITIES` /
+  `GEMINI_CAPABILITIES`) rather than assumed, so core degrades explicitly
+  instead of calling an operation the wire cannot perform. This lane is
+  deliberately input-only — it never executes provider tools; the duplex
+  lane described above still owns those, and `talk_status` labels it
+  `legacy-provider-executor` to keep the two apart.
 - `talk_discord.py` — Discord `/talk join` runs the SAME `run_talk_session`
   with `DiscordAudio` swapped in; identical tools/instructions. Mutating
   tools are gated by an immutable-ID operator allowlist.
@@ -74,13 +93,20 @@ handler table.
 ## Verify (no talking required)
 
 ```bash
-hermes plugins list          # hermes-talk · enabled · 0.8.0
-hermes talk doctor --json    # 8/8 pass, incl. "host exposes every Talk capability"
+hermes plugins list          # hermes-talk · enabled · <the version you installed>
+hermes talk doctor --json    # 10/10 pass, incl. "host exposes every Talk capability"
+hermes talk check --json     # the live proof: doctor + one provider turn + one bounded run
 hermes talk &                # wire canary: established TLS :443 = session mints+connects
 ```
 
-Test gate: in `C:\Users\Degen\hermes-talk` — `.venv/Scripts/python -m pytest -q`
-(834 passed / 7 skipped at wiring time) + `ruff check`.
+Doctor's check set is fixed by `talk_doctor.CHECK_ORDER` and asserted against
+the report it builds, so the denominator is ten: plugin, provider, auth,
+model, voice, cascade, audio, identity, discord, host.
+
+Test gate: `uv run --extra dev pytest -q` + `uv run --extra dev ruff check .`
+in a clone. (This page was written at 834 passed / 7 skipped; the suite has
+grown well past that — see CONTRIBUTING for the current baseline and the #93
+known failures.)
 
 ## Known limits
 

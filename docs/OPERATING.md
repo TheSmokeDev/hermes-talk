@@ -274,6 +274,31 @@ cancels the answer's TTS rather than flushing it.
 |---|---|---|
 | `TALK_INPUT_DEVICE` | auto | sounddevice input override. List devices: `python -c "import sounddevice; print(sounddevice.query_devices())"` |
 | `TALK_OUTPUT_DEVICE` | auto | sounddevice output override. |
+| `TALK_ECHO_GATE` | on | The software echo gate: while model audio is playing, microphone blocks below the echo floor are treated as playback leakage and dropped. `0`, `off`, `false`, `no`, or `disabled` (case-insensitive) turns it off; **anything else, junk included, leaves it on** — this gate is the default, not an opt-in. Turn it off on headphones, where there is no echo to suppress and the gate can only cost you a quiet word. |
+| `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL` | `0.015` | Playback RMS above which the gate considers the speaker "active" at all. Below it nothing is dropped. |
+| `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL` | `0.04` | Absolute floor a microphone block must clear to count as barge-in, however quiet the playback is. |
+| `TALK_ECHO_GATE_RATIO` | `0.65` | Fraction of the current playback RMS a block must also clear. The effective threshold is the **larger** of this and the floor above, so raising either only makes the gate stricter. |
+
+All four are read when the audio stream is CONSTRUCTED — once per session, not
+per block and not at import — so a change lands on the next call, never the
+live one. The three numeric knobs fail soft: blank, unparseable, or negative
+silently takes the default (`0` is honored, and on the ratio it means "the
+floor decides alone"). There is no receipt for a typo, so read them back with
+`hermes talk diagnostics` — it reports the NAMES you have set.
+
+**Linux gets a real canceller first, and then skips the gate.** On Linux,
+when both device overrides are unset and `pactl` is on `PATH`, a terminal
+call loads
+PulseAudio's own `module-echo-cancel` (`aec_method=webrtc`, with noise
+suppression on) into a per-process source/sink and routes through it. While
+that route is active the software gate above is **bypassed entirely** — the
+canceller has already removed the echo, and gating cancelled input again is
+what clipped quiet words (#81, [@kvnloo](https://github.com/kvnloo)). Every
+failure is silent and non-fatal: no `pactl`, a refused module, a five-second
+timeout, or a device that will not open through the route all fall back to
+your original devices and the software gate. Pinning either
+`TALK_INPUT_DEVICE` or `TALK_OUTPUT_DEVICE` opts out of the route by
+construction — an explicit device is an explicit device.
 
 ### Identity
 
@@ -363,6 +388,27 @@ allowlist returns a non-sensitive spoken denial without running the handler.
 | `TALK_CATALOG_STARTUP_WAIT_S` | `2.5` | Bounded head start a session start gives the first capability-catalog read, so a cold process still mints the live-catalog prompt section deterministically. `0` is honored and disables the wait (fire-and-forget); on expiry the session starts with the section omitted — logged, never a stall. Junk or negative silently takes the default. |
 | `TALK_MEMORY_SEARCH_TIMEOUT_S` | `10.0` | Wait bound for the in-process remembered-context (Honcho) tier of `search_memory`. On timeout the model speaks a retryable failure instead of the tool pipeline blocking; the transcript tier (`session_search`, a local FTS5 read) is not bounded. Junk or ≤0 silently takes the default. |
 
+#### Admission declarations — arguments, not variables
+
+`TALK_TRUST_DECLARED_READ_ONLY` above is the operator half of a two-part
+contract; the other half is two OPTIONAL arguments the model may attach to
+`delegate_task`, which no environment variable sets:
+
+| Argument | Values | What it does |
+|---|---|---|
+| `resource_keys` | up to 8 strings | Names what the task touches — an absolute repo path, a deployment target, a service name. Whitespace-collapsed and case-folded, so two spellings of one path are one key. **Omitted means no fence in either direction**: a run naming nothing is exactly the run Talk always did. More than eight after normalization is refused, never truncated — a key dropped on the floor would be a silent hole. |
+| `execution_mode` | `exclusive` (default) / `parallel_read_only` | Whether this run may share its keys. Two live runs sharing any key never overlap unless BOTH are read-only *and* the trust knob is on; `parallel_read_only` is otherwise downgraded to `exclusive` and recorded that way. |
+
+The check runs before a run id is minted and before an acceptance record is
+written, so a refused job burns nothing and can never surface later as
+`lost`. The refusal is a spoken tool result naming the run in the way and the
+shared key ("wait for it, stop it, or re-delegate without that key") — never a
+hang, never a silent queue. The fence is per PROCESS: it covers the
+api-server and detached lanes whose runs this registry owns, and inside
+`/talk` a job is still checked against the keys this registry holds but holds
+none itself afterwards. Model-facing contract:
+[README](../README.md#two-jobs-one-checkout--admission-control).
+
 ### api-server lane
 
 | Variable | Default | Effect / failure mode |
@@ -419,9 +465,12 @@ run-history tee so test suites can't write into a real Hermes home.)
 
 Inside the gateway, `/talk join` runs the call in the Discord voice
 channel the host is already sitting in. `/talk leave` ends it, `/talk
-status` reports whether a session is live. Outside the gateway (a plain
-terminal) `/talk` still means the terminal session, and those
-subcommands say so.
+status` reports whether a session is live. `/talk pause` (or `mute`) stops
+the session listening without leaving the channel, and `/talk resume` (or
+`unmute`) brings it back — typed, not spoken, because a paused session
+hears nobody, and `/talk status` says so while it is paused. Outside the
+gateway (a plain terminal) `/talk` still means the terminal session, and
+those subcommands say so.
 
 Before inviting Talk into a shared voice room, set the operator list in the
 gateway environment and restart the gateway:
@@ -496,6 +545,18 @@ job. Set the token on the gateway and present it from the browser.
 detached child may well have finished its work; what died was the watcher
 that would have spoken the result. `lost` means "this process cannot know
 either way" — an honest answer, not a failure.
+
+**`[talk] an update has been waiting 30s for a safe opening`** — an
+announcement (a finished run, a landed note) is queued and being held back
+because the model is mid-response or the speaker has not finished the
+previous answer. Deferring is correct — the alternative is two voices at
+once — and the update is delayed, never dropped. The warning fires once per
+held update, after `ANNOUNCE_STARVATION_WARN_S`. That is a module constant
+in `talk_cli.py` (30 seconds; `0` disables the warning, not the deferral),
+**not an environment variable** — there is no knob to set here. Seeing it
+repeatedly means a gate that is not clearing: check whether a tool call is
+stuck or playback is wedged, because a pump that never opens is otherwise
+indistinguishable from a quiet session.
 
 **"I can't watch for delivery on this build"** — the steer queued fine,
 but neither delivery artifact is observable in this process, so
