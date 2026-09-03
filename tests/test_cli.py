@@ -93,6 +93,131 @@ def test_missing_audio_stack_exits_one_before_dialling(monkeypatch, capsys):
     assert "hermes-talk[audio]" in capsys.readouterr().err
 
 
+def _reasons(monkeypatch, **env):
+    """Run one session to refusal and return (exit_code, reasons_recorded)."""
+
+    seen: list[str] = []
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    code = asyncio.run(talk_cli.run_talk_session(on_refusal=seen.append))
+    assert set(seen) <= talk_cli.STARTUP_REFUSAL_REASONS, seen
+    return code, seen
+
+
+def test_a_configuration_refusal_names_itself(monkeypatch):
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE="not-a-voice")
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_CONFIGURATION]
+
+
+def test_an_audio_refusal_names_itself(monkeypatch):
+    def fail(_self):
+        raise talk_audio.TalkAudioError('run: pip install "hermes-talk[audio]"')
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", fail)
+
+    def never():  # pragma: no cover - must not be reached
+        raise AssertionError("dialled the provider without a working audio device")
+
+    monkeypatch.setattr(talk_cli, "_import_aiohttp", never)
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE=None)
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_AUDIO]
+
+
+def test_a_provider_refusal_names_itself(monkeypatch):
+    class _Audio:
+        played_ms = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def read_input_chunk(self):  # pragma: no cover - connect never lands
+            raise AssertionError("read the microphone after a refused connect")
+
+        def queue_playback(self, _pcm):  # pragma: no cover - nothing plays
+            raise AssertionError("played audio after a refused connect")
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("provider said no")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    seen: list[str] = []
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=_Audio(),
+            session_factory=lambda _auth: _RefusingSession(),
+            on_refusal=seen.append,
+        )
+    )
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_PROVIDER]
+
+
+def test_a_legacy_tool_setup_failure_refuses_instead_of_crashing(monkeypatch, capsys):
+    """hermes-talk#58: the legacy lane has NO attachment to close.
+
+    The handler closed ``host_execution_attachment`` unconditionally, so on
+    the one lane that reaches it with ``None`` a tool-setup failure raised
+    ``AttributeError`` out of the session — and the operator's receipt named
+    that crash instead of the tool problem that actually refused.
+    """
+
+    def boom():
+        raise RuntimeError("tool catalog is unreadable")
+
+    monkeypatch.setattr(talk_cli.talk_tools, "default_talk_tools", boom)
+
+    def never(_self):  # pragma: no cover - must not be reached
+        raise AssertionError("opened audio after the tools refused")
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", never)
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE=None)
+
+    assert code == 1, "a legacy tool-setup failure must refuse, not raise"
+    assert seen == [talk_cli.STARTUP_REFUSAL_TOOLS]
+    assert "host tool setup failed" in capsys.readouterr().err
+
+
+def test_a_raising_refusal_hook_cannot_turn_a_refusal_into_a_crash(monkeypatch):
+    def explode(_reason):
+        raise RuntimeError("the receipt lane is broken")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_VOICE", "not-a-voice")
+
+    assert asyncio.run(talk_cli.run_talk_session(on_refusal=explode)) == 1
+
+
+def test_a_session_with_no_refusal_hook_still_exits_one(monkeypatch):
+    """The exit-code contract is unchanged; the hook is purely additive."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_VOICE", "not-a-voice")
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+
+
 def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
     """Receive and cancel keep moving while the serialized tool worker is busy."""
 

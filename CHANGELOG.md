@@ -14,6 +14,18 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Fixed
+- A Discord `talk join` that refuses before going live now says WHAT
+  refused instead of "session exited unsuccessfully". The session already
+  knew — it printed the reason to the gateway's stderr and returned a bare
+  exit code — so the operator, the one person who could act on it, was the
+  only one who never saw it. Configuration and provider-connect refusals
+  also point at `/talk core join`, which resolves its provider through the
+  host and so routes around exactly those two. An audio refusal does not:
+  core voice opens the same channel and would fail the same way.
+- A tool-setup failure on the legacy Discord lane raised
+  `AttributeError` out of the session instead of refusing. That lane has no
+  host execution attachment, and the handler closed one unconditionally, so
+  the crash — not the tool problem — was what reached the operator.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.

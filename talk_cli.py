@@ -215,6 +215,23 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
 #: How the announcement pump waits for the wire to go idle. Session teardown
 #: cancels the pump; an active response is never overlapped just to meet a timer.
 ANNOUNCE_IDLE_POLL_S = 0.05
+#: Why a session refused BEFORE it went live. A lane that shows the operator a
+#: receipt (Discord) renders these; they are bounded codes, never exception
+#: text, because that receipt lands in a chat channel where a token, a path, or
+#: a provider payload must never appear. The terminal keeps the detail: every
+#: call site still prints its own stderr line first.
+STARTUP_REFUSAL_CONFIGURATION = "configuration"
+STARTUP_REFUSAL_TOOLS = "tools"
+STARTUP_REFUSAL_AUDIO = "audio"
+STARTUP_REFUSAL_PROVIDER = "provider"
+STARTUP_REFUSAL_REASONS = frozenset(
+    {
+        STARTUP_REFUSAL_CONFIGURATION,
+        STARTUP_REFUSAL_TOOLS,
+        STARTUP_REFUSAL_AUDIO,
+        STARTUP_REFUSAL_PROVIDER,
+    }
+)
 TOOL_SESSION_QUEUE_SIZE = 1
 TOOL_CLEANUP_WAIT_S = 6.0
 MAX_SPEAKER_DISPLAY_NAME_CHARS = 256
@@ -1149,6 +1166,7 @@ async def run_talk_session(
     session_factory=None,
     host_execution_attachment=None,
     lane: str = "cli",
+    on_refusal=None,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -1161,7 +1179,24 @@ async def run_talk_session(
     CLI lane composes a host summary: it is the lane whose session setup may
     spend an in-process read, and even there a cold or failed catalog yields
     no line rather than a stalled start.
+
+    ``on_refusal`` is an optional sink for the ONE bounded reason
+    (:data:`STARTUP_REFUSAL_REASONS`) a session refused before going live.
+    The exit code is unchanged either way; a lane that only exits a process
+    (the terminal) ignores it, and a lane that owes the operator a spoken
+    receipt (Discord) uses it to say what actually refused instead of
+    collapsing every startup failure into "exited unsuccessfully".
     """
+
+    def refuse(reason: str) -> int:
+        """Record a bounded refusal reason and return the session exit code."""
+
+        if on_refusal is not None:
+            # A caller's receipt hook must never turn a clean refusal into a
+            # crash the lane then reports as an unrelated session error.
+            with suppress(Exception):
+                on_refusal(reason)
+        return 1
 
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
@@ -1196,7 +1231,7 @@ async def run_talk_session(
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
     try:
         tools = (
@@ -1206,8 +1241,13 @@ async def run_talk_session(
         )
     except Exception as exc:  # noqa: BLE001 - host attachment startup boundary
         print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
-        host_execution_attachment.close()
-        return 1
+        # The legacy lane reaches this handler with NO attachment (its tools
+        # come from talk_tools.default_talk_tools). Closing unconditionally
+        # raised AttributeError out of the session, so a tool-setup refusal
+        # surfaced to the operator as an unrelated crash instead of a reason.
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+        return refuse(STARTUP_REFUSAL_TOOLS)
     # The live-catalog section rides every lane. A cold process used to lose
     # the race between the background warm above and this mint — the FIRST
     # session then permanently lacked the section — so the warm gets a
@@ -1250,7 +1290,7 @@ async def run_talk_session(
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_AUDIO)
 
     setup = talk_realtime.SessionSetup(
         model=model,
@@ -1357,7 +1397,7 @@ async def run_talk_session(
         talk_transcript.sweep_transcripts(hermes_home)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_PROVIDER)
 
     try:
         send_lock = asyncio.Lock()
@@ -1900,6 +1940,11 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
 __all__ = [
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
+    "STARTUP_REFUSAL_AUDIO",
+    "STARTUP_REFUSAL_CONFIGURATION",
+    "STARTUP_REFUSAL_PROVIDER",
+    "STARTUP_REFUSAL_REASONS",
+    "STARTUP_REFUSAL_TOOLS",
     "WATCH_OUTPUT_TAIL_CHARS",
     "WATCH_POLL_S",
     "WORK_STARTED_RE",

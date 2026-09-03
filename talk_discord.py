@@ -1211,6 +1211,43 @@ def _public_exception_failure(error: BaseException) -> str:
     return f"session error ({_safe_exception_name(error)})"
 
 
+#: One speakable sentence per bounded startup-refusal reason from
+#: :data:`talk_cli.STARTUP_REFUSAL_REASONS`. Fixed text, never exception text:
+#: this lands in a Discord channel, and the refusing exception can carry a
+#: token, a path, or a provider payload.
+#:
+#: `/talk core join` is offered ONLY where the canonical core lane is genuinely
+#: a different path. Core voice resolves its provider through the HOST, so a
+#: plugin-side configuration or connect refusal is exactly what it routes
+#: around. An audio refusal is the voice channel itself — core join opens the
+#: same channel and fails the same way — so pointing there would just waste the
+#: operator's next attempt.
+#: Keyed by literal so this module keeps its lazy ``talk_cli`` import (the
+#: import runs inside :func:`start_session` to avoid a cycle). The keys are
+#: pinned to ``talk_cli.STARTUP_REFUSAL_REASONS`` by a test, so a new reason
+#: cannot ship without a sentence and every sentence has a live reason.
+_STARTUP_REFUSAL_FAILURES = {
+    "configuration": (
+        "voice is not configured on this host — try `/talk core join`, or run "
+        "`hermes talk doctor` to see which setting is missing"
+    ),
+    "provider": (
+        "the voice provider refused the connection — try `/talk core join`, or "
+        "run `hermes talk doctor` to check the provider is reachable"
+    ),
+    "audio": "the voice channel would not open",
+    "tools": "the session's tools could not be prepared",
+}
+
+
+def _startup_refusal_failure(reason: str | None) -> str | None:
+    """Map a bounded refusal reason to its speakable line, or None."""
+
+    if reason is None:
+        return None
+    return _STARTUP_REFUSAL_FAILURES.get(reason)
+
+
 JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
 
 
@@ -1441,6 +1478,12 @@ def start_session(
 
     audio = DiscordAudio(bridge["guild_id"])
     generation = None
+    # Written by the session before it returns its exit code, read by _done
+    # after. Both run on this loop, so the write happens-before the read.
+    refusal: dict[str, str] = {}
+
+    def _note_refusal(reason: str) -> None:
+        refusal["reason"] = reason
 
     def _done(finished) -> None:
         global _LAST_FAILURE, _LAST_FAILURE_GENERATION
@@ -1465,10 +1508,18 @@ def start_session(
                             "the Discord voice connection liveness could not be verified",
                             "the Discord voice connection disconnected while I was listening",
                         }
+                        # A startup refusal knows exactly what refused; the
+                        # catch-all below is what an operator saw for every
+                        # one of them before (hermes-talk#58). A live bridge
+                        # failure still wins: it is the more specific cause
+                        # and it is the one that happens mid-session.
                         failure = (
                             bridge_failure
                             if bridge_failure in safe_bridge_failures
-                            else "session exited unsuccessfully"
+                            else (
+                                _startup_refusal_failure(refusal.get("reason"))
+                                or "session exited unsuccessfully"
+                            )
                         )
         except Exception as exc:  # noqa: BLE001 — a receipt must not raise
             failure = "session outcome unavailable"
@@ -1534,12 +1585,15 @@ def start_session(
         _SESSION_GENERATION += 1
         generation = _SESSION_GENERATION
         if host_execution_attachment is None:
-            session = talk_cli.run_talk_session(audio=audio, lane="discord")
+            session = talk_cli.run_talk_session(
+                audio=audio, lane="discord", on_refusal=_note_refusal
+            )
         else:
             session = talk_cli.run_talk_session(
                 audio=audio,
                 host_execution_attachment=host_execution_attachment,
                 lane="discord",
+                on_refusal=_note_refusal,
             )
         task = loop.create_task(session)
         task.add_done_callback(_done)
