@@ -26,6 +26,18 @@ named rather than smoothed.
   `AttributeError` out of the session instead of refusing. That lane has no
   host execution attachment, and the handler closed one unconditionally, so
   the crash — not the tool problem — was what reached the operator.
+- Proactive announcements now wait for the SPEAKER to drain, not just for the
+  server's `response.done`. The model streams far faster than realtime, so the
+  terminal event can arrive with a second of the previous answer still queued
+  locally — and the announcement started on top of it, overlapping two
+  responses at the only surface the operator actually has. `DuplexAudio` and
+  the Discord bridge gained a non-destructive `playback_pending`; the
+  announcement gate now consults it both in the pump's poll and in the
+  re-check inside the send lock, so the wire and the room are decided
+  together. A deferred announcement is delayed, never dropped.
+- An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
+  (30s, 0 disables) now tells the operator once. Deferring is correct, but a
+  gate that never opens was previously a silent slow poll with nothing to see.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.

@@ -46,14 +46,17 @@ def _tone(samples: int, *, rate: int, freq: float = 440.0, stereo: bool = False)
 
 
 def test_bridge_wears_the_audio_device_surface():
-    # The session calls exactly these seven. If DuplexAudio grows an eighth,
+    # The session calls exactly these eight. If DuplexAudio grows a ninth,
     # this test is what tells us the Discord room needs it too.
+    # playback_pending joined in hermes-talk#50: the announcement gate needs
+    # to ask whether the room is still speaking WITHOUT draining it.
     surface = (
         "start",
         "stop",
         "read_input_chunk",
         "queue_playback",
         "drain_playback",
+        "playback_pending",
         "played_ms",
         "reset_played_ms",
     )
@@ -231,6 +234,39 @@ def test_source_reassembles_across_chunk_boundaries():
     first = source.read()
     assert len(first) == talk_discord.DISCORD_FRAME_BYTES
     assert source.frames_served == 1
+
+
+def test_playback_pending_covers_the_queue_and_the_held_partial_frame():
+    """The room's own drain signal, non-destructive (hermes-talk#50)."""
+
+    bridge = talk_discord.DiscordAudio()
+    assert bridge.playback_pending is False
+
+    bridge.queue_playback(b"\x01\x02" * 600)
+    assert bridge.playback_pending is True
+    assert bridge.playback_pending is True  # reading it consumes nothing
+
+    bridge.drain_playback()
+    assert bridge.playback_pending is False
+
+
+def test_playback_pending_sees_a_partial_frame_the_source_still_holds():
+    frames: queue.Queue = queue.Queue()
+    source = talk_discord._RealtimeSource(frames)
+    assert source.carrying is False
+
+    frames.put(b"\x01\x02" * 10)  # far less than one Discord frame
+    assert source.read() == talk_discord.SILENCE_FRAME  # underrun; carry kept
+    assert source.carrying is True
+
+    source.cleanup()
+    assert source.carrying is False
+
+
+def test_a_capture_only_bridge_is_never_pending():
+    """Capture-only never plays, so it can never hold the gate shut."""
+
+    assert talk_discord.DiscordAudio(capture_only=True).playback_pending is False
 
 
 def test_source_is_not_opus():
