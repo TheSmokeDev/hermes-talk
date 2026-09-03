@@ -14,6 +14,30 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Fixed
+- A Discord `talk join` that refuses before going live now says WHAT
+  refused instead of "session exited unsuccessfully". The session already
+  knew — it printed the reason to the gateway's stderr and returned a bare
+  exit code — so the operator, the one person who could act on it, was the
+  only one who never saw it. Configuration and provider-connect refusals
+  also point at `/talk core join`, which resolves its provider through the
+  host and so routes around exactly those two. An audio refusal does not:
+  core voice opens the same channel and would fail the same way.
+- A tool-setup failure on the legacy Discord lane raised
+  `AttributeError` out of the session instead of refusing. That lane has no
+  host execution attachment, and the handler closed one unconditionally, so
+  the crash — not the tool problem — was what reached the operator.
+- Proactive announcements now wait for the SPEAKER to drain, not just for the
+  server's `response.done`. The model streams far faster than realtime, so the
+  terminal event can arrive with a second of the previous answer still queued
+  locally — and the announcement started on top of it, overlapping two
+  responses at the only surface the operator actually has. `DuplexAudio` and
+  the Discord bridge gained a non-destructive `playback_pending`; the
+  announcement gate now consults it both in the pump's poll and in the
+  re-check inside the send lock, so the wire and the room are decided
+  together. A deferred announcement is delayed, never dropped.
+- An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
+  (30s, 0 disables) now tells the operator once. Deferring is correct, but a
+  gate that never opens was previously a silent slow poll with nothing to see.
 - The README demo GIF is re-rendered from the original 1280x582 screen
   recording instead of the 640x291 downscale it shipped as, so the
   transcript and the agent's brief in the runs panel are readable rather

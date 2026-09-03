@@ -456,6 +456,26 @@ class DuplexAudio:
             return boundary
 
     @property
+    def playback_pending(self) -> bool:
+        """Whether model audio is still waiting to reach the speaker.
+
+        The non-destructive companion to :meth:`drain_playback`: it answers
+        "is the speaker still busy?" without discarding anything, which is
+        what an announcement needs. ``drain_playback`` is the barge-in verb —
+        asking it this question would throw away the audio being asked about.
+
+        The residual it CANNOT see is the device's own buffer: bytes already
+        handed to PortAudio in ``_output_callback`` are subtracted here but
+        have not physically been heard yet. That is one output block of
+        latency, not the seconds of queued response this exists to fence.
+        ``_residual`` (a partially consumed packet) is still counted, because
+        its bytes were never subtracted.
+        """
+
+        with self._lock:
+            return self._queued_playback_bytes > 0
+
+    @property
     def played_ms(self) -> int:
         """Milliseconds of the current response actually sent to the speaker."""
 
