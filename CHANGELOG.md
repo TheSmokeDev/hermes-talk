@@ -14,6 +14,25 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- `hermes talk check` proves the whole voice path end to end, right now
+  (#97). Doctor is read-only by design, so a green doctor could still hide a
+  dead mint, a refused socket, or a delegation lane that never starts. The
+  check runs the doctor checks, then a REAL session on the configured
+  provider through the same adapter and credential resolution the voice
+  uses (connect, `SessionReady`, one text turn, `ResponseFinished`), then
+  ONE bounded Hermes run through the same delegation path the voice uses
+  whose output must contain `HERMES_TALK_CHECK_OK`. `--json` reports every
+  step as pass/fail/skip with its duration and the exit code is 0 only when
+  every non-skipped step passed; `--no-run` skips the agent step; `--timeout`
+  budgets it (a run that outlives its budget is stopped, not abandoned).
+  The report never carries tokens or paths. A mock cannot go green:
+  `--provider` accepts only live lanes, the report's provider is validated
+  against the same fail-closed list `TALK_PROVIDER` uses, and the live steps
+  refuse under the test harness unless a test opts in by name. Ported idea
+  from bielcarpi/hermes-live-voice's `launch-check` (MIT) — idea only, no
+  code. Session credential/model/voice resolution moved into one
+  `talk_cli.resolve_provider_lane()` so the check proves the session's real
+  path rather than a copy of it.
 - hermes-talk's three realtime lanes now register on the Hermes core
   `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
   NousResearch/hermes-agent#101808) as `hermes-talk/openai`,

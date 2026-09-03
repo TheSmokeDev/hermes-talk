@@ -33,6 +33,7 @@ import sys
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 
 try:
     from . import (
@@ -42,6 +43,7 @@ try:
         talk_auth,
         talk_capabilities,
         talk_cascade_voice,
+        talk_check,
         talk_config,
         talk_doctor,
         talk_gemini_realtime,
@@ -69,6 +71,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_auth
     import talk_capabilities
     import talk_cascade_voice
+    import talk_check
     import talk_config
     import talk_doctor
     import talk_gemini_realtime
@@ -1124,6 +1127,49 @@ def _gemini_auth() -> talk_auth.TalkAuth:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderLane:
+    """One session's provider pick with the credential, model, and voice it uses."""
+
+    provider: str
+    auth: talk_auth.TalkAuth
+    model: str
+    voice: str
+
+
+def resolve_provider_lane() -> ProviderLane:
+    """Resolve the configured provider's credential, model, and voice at call time.
+
+    The one place the provider pick meets its lane: ``run_talk_session`` and
+    ``hermes talk check`` both call it, so the check proves the session's
+    real resolution path rather than a copy of it. Raises
+    :class:`talk_config.TalkConfigError` or :class:`talk_auth.TalkAuthError`
+    exactly as the session start does.
+    """
+
+    provider = talk_config.talk_provider()
+    if provider == "grok":
+        return ProviderLane(
+            provider=provider,
+            auth=_grok_auth(),
+            model=talk_config.talk_grok_model(),
+            voice=talk_config.talk_grok_voice(),
+        )
+    if provider == "gemini":
+        return ProviderLane(
+            provider=provider,
+            auth=_gemini_auth(),
+            model=talk_config.talk_gemini_model(),
+            voice=talk_config.talk_gemini_voice(),
+        )
+    return ProviderLane(
+        provider=provider,
+        auth=talk_host.host().resolve_auth(),
+        model=talk_config.talk_model(),
+        voice=talk_config.talk_voice(),
+    )
+
+
 def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
     """Build the configured provider adapter behind the neutral session contract.
 
@@ -1260,19 +1306,11 @@ async def run_talk_session(
     talk_capabilities.warm_in_background()
 
     try:
-        provider = talk_config.talk_provider()
-        if provider == "grok":
-            auth = _grok_auth()
-            model = talk_config.talk_grok_model()
-            voice = talk_config.talk_grok_voice()
-        elif provider == "gemini":
-            auth = _gemini_auth()
-            model = talk_config.talk_gemini_model()
-            voice = talk_config.talk_gemini_voice()
-        else:
-            auth = talk_host.host().resolve_auth()
-            model = talk_config.talk_model()
-            voice = talk_config.talk_voice()
+        lane_pick = resolve_provider_lane()
+        provider = lane_pick.provider
+        auth = lane_pick.auth
+        model = lane_pick.model
+        voice = lane_pick.voice
         # Cascade voice mode: the provider thinks in text, ElevenLabs speaks.
         # Resolved HERE, next to the provider pick, so every fail-closed knob
         # (mode, TTS provider, key, voice id) refuses before a single secret
@@ -1981,7 +2019,7 @@ async def run_talk_session(
 
 
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
-    """Build the native ``hermes talk`` session/setup/doctor argparse tree."""
+    """Build the native ``hermes talk`` session/setup/doctor/check argparse tree."""
 
     commands = subparser.add_subparsers(dest="talk_command")
     commands.add_parser(
@@ -2003,6 +2041,42 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
             "(grok only) make two live calls to api.x.ai to prove the resolved bearer "
             "reaches realtime"
         ),
+    )
+    check = commands.add_parser(
+        "check",
+        help=(
+            "Prove the whole voice path right now: doctor, one live provider turn, "
+            "one bounded Hermes run"
+        ),
+    )
+    check.add_argument(
+        "--json",
+        action="store_true",
+        dest="check_json",
+        help="emit the versioned machine-readable report",
+    )
+    check.add_argument(
+        "--no-run",
+        action="store_true",
+        dest="check_no_run",
+        help="skip the Hermes run step (provider session only)",
+    )
+    check.add_argument(
+        "--timeout",
+        type=float,
+        dest="check_timeout",
+        default=None,
+        metavar="SECONDS",
+        help=f"budget for the Hermes run step (default {talk_check.RUN_STEP_TIMEOUT_S:.0f})",
+    )
+    check.add_argument(
+        "--provider",
+        dest="check_provider",
+        # Live lanes only, enforced by the parser AND by talk_check: a mock
+        # or stub is structurally unable to produce a green report.
+        choices=talk_check.LIVE_PROVIDERS,
+        default=None,
+        help="check this live provider instead of TALK_PROVIDER (this process only)",
     )
     subparser.set_defaults(talk_command="session")
 
@@ -2031,6 +2105,18 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
         if code:
             raise SystemExit(code)
         return 0
+    if command == "check":
+        code = talk_check.cli_entry(
+            json_output=bool(getattr(args, "check_json", False)),
+            no_run=bool(getattr(args, "check_no_run", False)),
+            timeout_s=getattr(args, "check_timeout", None),
+            provider=getattr(args, "check_provider", None),
+            session_factory=_realtime_session,
+            lane_resolver=resolve_provider_lane,
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
 
     try:
         code = asyncio.run(run_talk_session())
@@ -2055,12 +2141,14 @@ __all__ = [
     "WATCH_OUTPUT_TAIL_CHARS",
     "WATCH_POLL_S",
     "WORK_STARTED_RE",
+    "ProviderLane",
     "QueuedAnnouncement",
     "SpeakerPacketLane",
     "build_session_update",
     "cli_entry",
     "landed_note_messages",
     "pump_announcements",
+    "resolve_provider_lane",
     "run_finished_messages",
     "run_phase_messages",
     "run_talk_session",
