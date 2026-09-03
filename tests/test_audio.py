@@ -492,3 +492,42 @@ def test_concurrent_pulse_routes_restore_environment_in_either_order(
 
     assert talk_audio.os.environ["PULSE_SOURCE"] == "original-source"
     assert talk_audio.os.environ["PULSE_SINK"] == "original-sink"
+
+
+def test_playback_pending_tracks_unheard_audio_without_discarding_it():
+    """The non-destructive companion to drain_playback (hermes-talk#50).
+
+    Asking `drain_playback` "is the speaker busy?" would throw away the very
+    audio being asked about, so the announcement gate needs its own signal.
+    """
+
+    audio = talk_audio.DuplexAudio()
+    assert audio.playback_pending is False
+
+    audio.queue_playback(b"\x01\x02" * 480, "item-1")
+    assert audio.playback_pending is True
+    # Reading it again must not have consumed anything.
+    assert audio.playback_pending is True
+
+    # Nothing was PLAYED, so the heard boundary is empty — drain still clears
+    # the queue, which is exactly what playback_pending must then report.
+    assert audio.drain_playback() == (None, 0)
+    assert audio.playback_pending is False
+
+
+def test_playback_pending_stays_true_while_a_partial_packet_is_held():
+    """A residual is unheard audio too — it must not read as drained."""
+
+    audio = talk_audio.DuplexAudio()
+    audio.queue_playback(b"\x01\x02" * 480, "item-1")
+
+    with audio._lock:  # take less than one packet, as the output callback does
+        taken = audio._take_playback(talk_audio.FRAME_BYTES * 10)
+
+    assert len(taken) == talk_audio.FRAME_BYTES * 10
+    assert audio._residual is not None
+    assert audio.playback_pending is True
+
+    with audio._lock:  # drain the rest
+        audio._take_playback(talk_audio.MAX_PLAYBACK_BYTES)
+    assert audio.playback_pending is False

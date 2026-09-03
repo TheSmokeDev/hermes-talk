@@ -215,6 +215,11 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
 #: How the announcement pump waits for the wire to go idle. Session teardown
 #: cancels the pump; an active response is never overlapped just to meet a timer.
 ANNOUNCE_IDLE_POLL_S = 0.05
+#: How long one announcement may sit deferred before the operator is told.
+#: The busy predicate is a superset of the decline condition, so a predicate
+#: that never clears (a stuck continuation, a speaker that never drains)
+#: starves the pump as a silent slow poll with nothing to see. Zero disables.
+ANNOUNCE_STARVATION_WARN_S = 30.0
 #: Why a session refused BEFORE it went live. A lane that shows the operator a
 #: receipt (Discord) renders these; they are bounded codes, never exception
 #: text, because that receipt lands in a chat channel where a token, a path, or
@@ -685,8 +690,17 @@ def _announcement_sent(on_sent) -> None:
         on_sent()
 
 
+def _announcement_starved(on_starved, waited: float) -> None:
+    """Report a long deferral; reporting it must never take down the pump."""
+
+    if on_starved is None:
+        return
+    with suppress(Exception):
+        on_starved(waited)
+
+
 async def pump_announcements(
-    announce_queue, relay, ws, send_batch=None, response_busy=None
+    announce_queue, relay, ws, send_batch=None, response_busy=None, on_starved=None
 ) -> None:
     """Serialize every out-of-band announcement (Codex v0.6.1 finding 3).
 
@@ -703,6 +717,11 @@ async def pump_announcements(
     kept for tests — it has no such lock, so it remains check-then-act, and
     it drops a failed batch; provider-session sends surface failure to the
     supervisor.
+
+    ``on_starved`` is called at most once per batch when that deferral passes
+    :data:`ANNOUNCE_STARVATION_WARN_S`. Deferring is correct behaviour, so
+    this is not an error — but a predicate that never clears is
+    indistinguishable from a quiet session unless something says so.
     """
 
     while True:
@@ -711,8 +730,19 @@ async def pump_announcements(
             batch, on_sent = queued.commands, queued.on_sent
         else:
             batch, on_sent = queued, None
+        # Per BATCH, not per wait loop: a batch declined by send_batch goes
+        # round again, and its clock must keep running across that retry.
+        waiting_since: float | None = None
+        starved = False
         while True:
             while response_busy() if response_busy is not None else relay.response_active:
+                if waiting_since is None:
+                    waiting_since = time.monotonic()
+                elif not starved and ANNOUNCE_STARVATION_WARN_S > 0:
+                    waited = time.monotonic() - waiting_since
+                    if waited >= ANNOUNCE_STARVATION_WARN_S:
+                        starved = True
+                        _announcement_starved(on_starved, waited)
                 await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
             try:
                 if send_batch is None:
@@ -1324,6 +1354,26 @@ async def run_talk_session(
                 )
             )
 
+    def speaker_busy() -> bool:
+        """Whether the previous answer is still coming out of the speaker.
+
+        ``response.done`` says the SERVER stopped generating. It says nothing
+        about the audio already queued locally, so an announcement gated on it
+        alone can start while the last second of the previous response is
+        still playing — two responses overlapping at the only surface the
+        operator actually has (hermes-talk#50). This is the local half of that
+        gate; the protocol half stays exactly as it was.
+
+        Fails OPEN. An audio object without the property is treated as idle,
+        so an unfamiliar device degrades to the old timing rather than
+        starving announcements forever.
+        """
+
+        try:
+            return bool(audio.playback_pending)
+        except Exception:  # noqa: BLE001 — a gate, never a session boundary
+            return False
+
     def on_caption(text: str) -> None:
         print(text, end="", flush=True)
 
@@ -1417,11 +1467,16 @@ async def run_talk_session(
             """Serialize every provider write; keep multi-command batches contiguous.
 
             False means an announcement reached the front of the lock while a
-            response was open or about to be (``relay.response_active``) or a
+            response was open or about to be (``relay.response_active``), a
             ``StartResponse`` was sent but not yet confirmed
-            (``continuation_pending``), so it was not written. The caller
-            defers it instead of speaking over the model or racing an
-            in-flight continuation.
+            (``continuation_pending``), or the speaker had not finished the
+            previous answer (``speaker_busy``), so it was not written. The
+            caller defers it instead of speaking over the model, racing an
+            in-flight continuation, or overlapping audio at the speaker.
+
+            The speaker check belongs HERE and not only in the pump poll: the
+            poll is check-then-act, and this lock is the point where the write
+            actually happens, so the wire and the room are decided together.
             """
 
             nonlocal continuation_pending
@@ -1430,7 +1485,9 @@ async def run_talk_session(
                 # pump_announcements decides "the model is idle" BEFORE queuing
                 # for this lock, and a response can start while it waits there.
                 # Re-check at the point the write actually happens.
-                if is_announcement and (relay.response_active or continuation_pending):
+                if is_announcement and (
+                    relay.response_active or continuation_pending or speaker_busy()
+                ):
                     return False
                 if any(
                     isinstance(command, talk_realtime.StartResponse)
@@ -1771,6 +1828,10 @@ async def run_talk_session(
                     relay.response_active
                     or continuation_pending
                     or bool(tool_coordinator.outputs)
+                    or speaker_busy()
+                ),
+                lambda waited: on_error(
+                    f"an update has been waiting {waited:.0f}s for a safe opening"
                 ),
             )
         )
@@ -1938,6 +1999,7 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
 
 
 __all__ = [
+    "ANNOUNCE_STARVATION_WARN_S",
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
     "STARTUP_REFUSAL_AUDIO",

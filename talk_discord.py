@@ -1,10 +1,11 @@
-"""Discord voice as an audio device — the same seven methods, a different room.
+"""Discord voice as an audio device — the same eight methods, a different room.
 
 :class:`DiscordAudio` implements exactly the surface
 :class:`talk_audio.DuplexAudio` exposes (``start`` / ``stop`` /
 ``read_input_chunk`` / ``queue_playback`` / ``drain_playback`` /
-``played_ms`` / ``reset_played_ms``), so the Realtime session, its tool
-calls, the steering ledger, and the announcement pump all run unchanged.
+``playback_pending`` / ``played_ms`` / ``reset_played_ms``), so the Realtime
+session, its tool calls, the steering ledger, and the announcement pump all
+run unchanged.
 Only the room changes: instead of a microphone and a speaker, the frames
 come from and go to a Discord voice channel.
 
@@ -269,6 +270,13 @@ class _RealtimeSource:
     def frames_served(self) -> int:
         with self._served_lock:
             return self._frames_served
+
+    @property
+    def carrying(self) -> bool:
+        """Whether a partial frame is still held back from the player."""
+
+        with self._carry_lock:
+            return bool(self._carry)
 
     def read(self) -> bytes:
         with self._carry_lock:
@@ -1132,6 +1140,27 @@ class DiscordAudio:
         if source is not None:
             source.cleanup()
         self._carry_sample = None
+
+    @property
+    def playback_pending(self) -> bool:
+        """Whether model audio is still waiting to reach the voice channel.
+
+        The same non-destructive question :attr:`talk_audio.DuplexAudio.
+        playback_pending` answers for the terminal, asked of the room the
+        host owns: frames still queued for the player thread, plus a partial
+        frame the source is holding back. What it cannot see is the host's
+        own player buffer — the same one-block residual the terminal has,
+        not the seconds of queued response this exists to fence.
+
+        Capture-only bridges never play, so they are never pending.
+        """
+
+        if self._capture_only:
+            return False
+        if not self._outbound.empty():
+            return True
+        source = self._source
+        return source is not None and source.carrying
 
     @property
     def played_ms(self) -> int:
