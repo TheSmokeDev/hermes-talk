@@ -44,6 +44,23 @@ named rather than smoothed.
   majors to current releases. The README header gained CodeQL, Scorecard, and
   PyPI badges.
 
+### Changed
+- README leads with what works today (#96). The first screen is now: what it
+  is, the three surfaces and three providers as facts, a one-line install,
+  the demo GIF with the with-sound cut on its own line, a full badge row (CI,
+  CodeQL, Scorecard, PyPI version and downloads, license), and an "Is it
+  working?" block that puts `hermes talk doctor` before any narrative. New
+  Surfaces and Providers tables, a "Current boundaries" section that states
+  the no-self-hosted-lane limit and the other honest gaps ourselves, and a
+  "Where this sits upstream" section for RFC #77111, core PR #101808, and
+  docs PR #97325. The stale "650+ offline tests" receipt is now 1,400+ across
+  46 files, and the Status block no longer hardcodes a stale version — the
+  PyPI badge carries it.
+  Every existing section survives — reorganized, none deleted. CONTRIBUTING
+  gains the `uv sync --extra dev` path, the `ruff==0.16.5` pin's reason, the
+  #93 twelve-test baseline on a box where Hermes is importable, and the
+  module table now lists every shipped module.
+
 ### Fixed
 - CI lints against a pinned ruff. The dev extra asked for `ruff>=0.4` and CI
   installed whatever was current, so ruff 0.16 arrived on its own and failed
