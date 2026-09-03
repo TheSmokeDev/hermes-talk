@@ -1,5 +1,11 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Security vulnerability — report privately
+    url: https://github.com/TheSmokeDev/hermes-talk/security/advisories/new
+    about: Credential leakage, auth-store writes, tool-authority bypass, redaction failures, supply chain. Never in a public issue — SECURITY.md has the classes and the 72-hour acknowledgement promise.
+  - name: Questions, ideas, design sketches — Discussions
+    url: https://github.com/TheSmokeDev/hermes-talk/discussions
+    about: Not sure it is a bug, or want to talk through a provider, surface, or tool before writing it? Start here.
   - name: Make a diagnostics bundle first (hermes talk diagnostics --bundle)
     url: https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/OPERATING.md#7-hermes-talk-diagnostics--the-redacted-support-bundle
     about: One redacted file — versions, variable names, device/host facts, doctor outcomes — turns "it doesn't work" into something reproducible.
@@ -9,3 +15,6 @@ contact_links:
   - name: Operating manual — install, upgrade, verify, every knob, troubleshooting
     url: https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/OPERATING.md
     about: Most "is this broken?" questions are answered by the verify runbook.
+  - name: Contributing guide — priorities, paths, setup, the merge bar
+    url: https://github.com/TheSmokeDev/hermes-talk/blob/main/CONTRIBUTING.md
+    about: Read before opening a PR. First response within 24 hours.

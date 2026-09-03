@@ -1,0 +1,111 @@
+name: Provider compatibility report
+description: A live provider works — or stopped working — on your setup. A pass is as useful as a fail.
+title: "[provider] <provider> / <model> on hermes-talk <version>: PASS | FAIL"
+labels: [provider]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The test suite is offline by design, so a provider changing its wire
+        under us reaches us through you. This form collects the evidence in
+        a fixed shape. The how-to, and the table it mirrors, is
+        [docs/PROVIDER-RECEIPT.md](https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/PROVIDER-RECEIPT.md).
+
+        **Do not paste audio, transcripts, prompts, task results, or any
+        credential.** `hermes talk check --json` and `hermes talk doctor --json`
+        redact by construction and are all the detail a report needs.
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: Verdict
+      options:
+        - PASS — a full turn worked (connect, SessionReady, a spoken reply, a tool round-trip)
+        - PARTIAL — connected, but one or more events below failed
+        - FAIL — the session never reached SessionReady
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - openai
+        - grok
+        - gemini
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: As `hermes talk doctor` reports it (the `model` check), e.g. `gpt-realtime-2.1`, `grok-voice-latest`, `gemini-3.1-flash-live-preview`.
+    validations:
+      required: true
+  - type: dropdown
+    id: auth_lane
+    attributes:
+      label: Credential lane
+      description: Which lane the doctor's `auth` check names — never the credential itself.
+      options:
+        - Codex CLI OAuth (ChatGPT subscription)
+        - xAI OAuth (SuperGrok / X Premium+)
+        - API key (TALK_*_API_KEY or the shared variable)
+        - Not sure — the doctor `auth` check is pasted below
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Terminal (hermes talk)
+        - /talk inside a session
+        - Discord voice channel
+        - Dashboard tab
+        - hermes realtime --provider hermes-talk/… (the core contract lane)
+        - hermes talk check only
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "hermes-talk version, Hermes host version, Python, OS — e.g. `hermes-talk 0.16.0 · hermes 0.21.0 · Python 3.12.6 · Windows 11`. `hermes plugins list` and `hermes --version` have the first two."
+    validations:
+      required: true
+  - type: checkboxes
+    id: events
+    attributes:
+      label: Events observed
+      description: Tick what you saw happen. Leave unticked what did not — that is the finding.
+      options:
+        - label: Connected (the session opened; `check` reports `session_ready`)
+        - label: SessionReady (the provider acknowledged the session setup)
+        - label: SpeechStarted (the provider heard you start talking)
+        - label: A spoken reply came back (ResponseStarted → OutputAudio → ResponseFinished)
+        - label: FunctionCall round-trip (say "status report" — the tool ran and the reply used its result)
+        - label: Barge-in (you spoke over the reply and playback cut)
+        - label: A clean hang-up (Ctrl+C / leave ended the session without an error)
+  - type: textarea
+    id: check_json
+    attributes:
+      label: hermes talk check --json (or doctor --json)
+      description: Paste the report. `check` proves the live path with per-step pass/fail; `doctor --json` if the session cannot be reached at all. Both carry no tokens and no paths — still read what you paste.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: wire_error
+    attributes:
+      label: The provider's error, verbatim (if any)
+      description: The error TYPE and MESSAGE the provider or the plugin printed — e.g. a close code, an HTTP status, a `ProviderFailure` reason. Redact anything that looks like a key or a session id.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: "Last version it worked on, if you know it. Regional or account-tier facts that might matter (free-tier key, enterprise account, a proxy in the path). Names of knobs you have set — never their values."
+    validations:
+      required: false

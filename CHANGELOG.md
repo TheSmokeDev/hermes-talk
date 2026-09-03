@@ -14,6 +14,35 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- The contributor experience, written down. `CONTRIBUTING.md` now ranks
+  what we take first (bug fixes on live lanes, then provider and host
+  compatibility, security hardening, cross-platform, new providers behind
+  the contract, new surfaces, docs), maps the common paths — a new realtime
+  provider, a new surface, a new talk tool, a fix, a docs change — to the
+  exact files each one touches and ships with, and states the merge bar
+  (live-verified before merge on a provider wire; offline tests and fake
+  sessions otherwise; no auth-store writes; tokens only to the provider's
+  own host; nothing secret in logs or receipts), the branch and
+  Conventional-Commit scope conventions derived from the history, a
+  first-response-within-24-hours review promise, and how merged work is
+  credited. A pull request template carries the same contract (what and
+  why, how to test, platforms, a `check --json` receipt when a lane is
+  touched, `Fixes #N`). Two new issue forms — a feature request that asks
+  for the problem before the proposal and which surfaces and providers it
+  reaches, and a **provider compatibility report** that collects a
+  provider's PASS/PARTIAL/FAIL as a fixed table (provider, model,
+  credential lane, versions, which of `SessionReady` / `SpeechStarted` /
+  `FunctionCall` round-trip / barge-in were observed, the `check --json`
+  report, the wire error verbatim) with no audio, transcripts, or secrets;
+  `docs/PROVIDER-RECEIPT.md` is the how-to behind it and says how
+  maintainers act on each verdict. The bug form gained the core-contract
+  lane and the check/doctor/diagnostics commands as places a bug can
+  happen, and the issue chooser now links private security reporting and
+  Discussions. Labels `provider`, `surface`, `security`, and `docs` join
+  `good first issue` / `help wanted`. The README credits the people who
+  showed up: @kvnloo, @TheAngryPit, @webdevtodayjason. Ported idea from
+  bielcarpi/hermes-live-voice's provider-compatibility receipt (MIT) — idea
+  only, no text.
 - `SECURITY.md`: supported versions (the latest PyPI release and `main`),
   private reporting through GitHub security advisories (private vulnerability
   reporting is enabled on the repository), a 72-hour acknowledgement target,

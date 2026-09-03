@@ -1,0 +1,81 @@
+name: Feature request
+description: Something the voice should be able to do, hear, or reach that it cannot today.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The problem first, the proposal second. The ranked list of what we
+        take first is in
+        [CONTRIBUTING.md](https://github.com/TheSmokeDev/hermes-talk/blob/main/CONTRIBUTING.md#what-we-want-most);
+        a new provider or a new surface has a mapped path there. Check the
+        [open issues](https://github.com/TheSmokeDev/hermes-talk/issues) and
+        the [Current boundaries](https://github.com/TheSmokeDev/hermes-talk#current-boundaries)
+        section of the README first — several gaps are already named and
+        tracked.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do that you cannot today
+      description: The situation on the call, in your words. What did you say or want to say, and what happened instead?
+      placeholder: |
+        On a Discord call I want to hand a task to an agent and have it
+        answer in the channel's text chat instead of out loud, because…
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What the voice should do, say, or reach. If a spoken sentence is involved, write the sentence — the wording is part of the design here.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - A new realtime provider (behind talk_realtime.py)
+        - A new surface (another room the session can be in)
+        - A new or changed talk tool
+        - Session / relay behaviour (turn-taking, barge-in, announcements)
+        - Delegation, steering, approvals (background work)
+        - Auth / credentials
+        - Dashboard tab
+        - doctor / check / diagnostics / setup
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: surfaces
+    attributes:
+      label: Surfaces it applies to
+      options:
+        - label: Terminal (hermes talk)
+        - label: /talk inside a session
+        - label: Discord voice channel
+        - label: Dashboard tab
+        - label: hermes realtime (core contract lane)
+  - type: checkboxes
+    id: providers
+    attributes:
+      label: Providers it applies to
+      options:
+        - label: OpenAI Realtime
+        - label: xAI Grok
+        - label: Gemini Live
+        - label: All of them / provider-neutral
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "do it in Hermes core instead" — some things belong upstream, and saying so early saves a PR.
+    validations:
+      required: false
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to build this myself and open the PR
