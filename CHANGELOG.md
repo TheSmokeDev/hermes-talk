@@ -56,6 +56,13 @@ named rather than smoothed.
 - Added a deterministic, content-free endpointing trace evaluator that reports
   nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
   and false-activation counts without retaining audio or transcripts.
+- Provider-neutral semantic endpointing controls for the core realtime
+  contract: `RealtimeTurnDetection` with native/server/semantic modes and
+  `RealtimeSemanticEagerness` are mirrored through the setup and live-update
+  paths, Grok advertises native/server support and Gemini native-only with
+  fail-fast refusals on unsupported modes, and the semantic names are probed
+  as an optional capability so pre-semantic core heads keep the full lane
+  with provider-native turn detection instead of losing it.
 - hermes-talk's three realtime lanes now register on the Hermes core
   `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
   NousResearch/hermes-agent#101808) as `hermes-talk/openai`,

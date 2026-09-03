@@ -1111,3 +1111,95 @@ def test_the_setup_schema_names_an_env_var_and_never_a_value(core):
         assert provider.default_model()
         assert provider.default_voice()
         assert provider.list_voices()
+
+
+def _synthetic_old_head_contract():
+    """Minimal #101808-shaped core: API v2 with every base name, no turn-detection names.
+
+    Binds the exact head the maintainer reviewed against: the three semantic
+    turn-detection symbols are absent, so the adapter must degrade to native
+    instead of dropping the whole core lane.
+    """
+
+    module = types.ModuleType("agent.realtime_voice_provider")
+    module.REALTIME_VOICE_PROVIDER_API_VERSION = 2
+    module.PCM16_24K = object()
+    capability_members = (
+        "TOOL_CALLING",
+        "INPUT_TRANSCRIPTION",
+        "OUTPUT_TRANSCRIPTION",
+        "EXPLICIT_RESPONSE",
+        "RESPONSE_CANCELLATION",
+        "OUTPUT_TRUNCATION",
+        "DYNAMIC_CONTEXT",
+        "TOOL_CALL_CANCELLATION",
+    )
+    module.RealtimeCapability = type(
+        "RealtimeCapability", (), {name: object() for name in capability_members}
+    )
+    for name in (
+        "InputAudioCommitted",
+        "InputSpeechStarted",
+        "InputSpeechStopped",
+        "InputTranscript",
+        "OutputAudio",
+        "OutputTranscript",
+        "RealtimeAudioFormat",
+        "RealtimeToolResult",
+        "RealtimeVoiceEvent",
+        "RealtimeVoiceProvider",
+        "RealtimeVoiceSession",
+        "RealtimeVoiceSetup",
+        "ResponseCompleted",
+        "ResponseStarted",
+        "SessionClosed",
+        "SessionFailure",
+        "SessionReady",
+        "ToolCall",
+        "ToolCallCancelled",
+    ):
+        setattr(module, name, type(name, (), {}))
+    assert not hasattr(module, "RealtimeTurnDetectionMode")
+    return module
+
+
+def test_old_head_contract_keeps_core_lane_with_native_only_turn_detection():
+    """The #101808 head must not take the whole core lane down with it."""
+
+    contract = _synthetic_old_head_contract()
+    saved = {
+        name: sys.modules.get(name)
+        for name in ("agent", "agent.realtime_voice_provider", "talk_core_provider")
+    }
+    package = types.ModuleType("agent")
+    package.__path__ = []
+    package.realtime_voice_provider = contract
+    sys.modules["agent"] = package
+    sys.modules["agent.realtime_voice_provider"] = contract
+    sys.modules.pop("talk_core_provider", None)
+    try:
+        module = importlib.import_module("talk_core_provider")
+        assert module.core_contract_available()
+        assert not module.turn_detection_available()
+        providers = module.build_providers()
+        assert len(providers) == 3
+        assert all(p.supported_turn_detection_modes == frozenset() for p in providers)
+        native = providers[0]._talk_turn_detection(None)
+        assert native == rt.RealtimeTurnDetection()
+        assert native.mode == rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+        class _UnsupportedMode:
+            value = "semantic_vad"
+
+        semantic = types.SimpleNamespace(mode=_UnsupportedMode(), semantic_eagerness=None)
+        with pytest.raises(ValueError, match="does not support turn detection mode"):
+            providers[0]._talk_turn_detection(semantic)
+        diagnostic = module.core_contract_diagnostic()
+        assert diagnostic["contract_available"] is True
+        assert diagnostic["turn_detection_available"] is False
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+        importlib.import_module("talk_core_provider")
