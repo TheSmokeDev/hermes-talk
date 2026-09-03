@@ -681,3 +681,119 @@ def test_the_phase_replays_off_history_after_a_restart(history_env):
     assert mine[0]["fromHistory"] is True
     assert mine[0]["status"] == "done"
     assert mine[0]["meta"]["phase"] == "complete"
+
+
+# -- eviction caps + the same-phase detail-only run path (hermes-talk#60) ---------
+
+
+def test_run_session_eviction_drops_the_oldest_not_the_newest():
+    """FIFO, not LIFO: at the cap, the FIRST id recorded is the one that goes.
+
+    Popping the wrong end would evict the id that just arrived — so the run
+    actually executing right now would stop being findable by its session id
+    and go silent under load, which is the precise failure the cap exists to
+    prevent.
+    """
+
+    cap = talk_progress._MAX_RUN_SESSIONS
+    for index in range(cap):
+        talk_progress.note_run_session(index, f"sess-{index:04d}")
+    assert len(talk_progress._RUN_BY_SESSION) == cap
+
+    talk_progress.note_run_session(cap, "sess-newest")
+
+    assert len(talk_progress._RUN_BY_SESSION) == cap
+    assert "sess-0000" not in talk_progress._RUN_BY_SESSION  # oldest, evicted
+    assert talk_progress._RUN_BY_SESSION["sess-newest"] == cap  # newest, kept
+    assert talk_progress._RUN_BY_SESSION["sess-0001"] == 1  # runner-up, kept
+
+
+def test_re_noting_a_session_does_not_refresh_its_eviction_position():
+    """The cap is insertion-ordered, not least-recently-used.
+
+    Re-noting an id already in the index rebinds its run in place; it must not
+    move the entry to the back of the queue, or a chatty session could hold a
+    slot forever while quieter live runs are evicted around it.
+    """
+
+    cap = talk_progress._MAX_RUN_SESSIONS
+    for index in range(cap):
+        talk_progress.note_run_session(index, f"sess-{index:04d}")
+
+    talk_progress.note_run_session(999, "sess-0000")
+    assert talk_progress._RUN_BY_SESSION["sess-0000"] == 999  # rebound
+
+    talk_progress.note_run_session(cap, "sess-newest")
+    assert "sess-0000" not in talk_progress._RUN_BY_SESSION  # still first out
+
+
+def test_child_eviction_drops_the_oldest_not_the_newest():
+    """Same FIFO property for the attached-child index, and its consequence.
+
+    An evicted child stops being a progress subject, so its later tool call
+    finds no entry and speaks nothing — which is why evicting the NEWEST would
+    silence the child that just started.
+    """
+
+    events: list[dict] = []
+    _attach(events)
+    cap = talk_progress._MAX_CHILDREN
+    for index in range(cap):
+        _child_start(csid=f"cs-{index:04d}", sid=f"sa-0-{index:04d}")
+    assert len(talk_progress._CHILDREN) == cap
+
+    _child_start(csid="cs-newest", sid="sa-0-newest")
+
+    assert len(talk_progress._CHILDREN) == cap
+    assert "cs-0000" not in talk_progress._CHILDREN
+    assert "cs-newest" in talk_progress._CHILDREN
+
+    spoken = len(events)
+    talk_progress.on_post_tool_call(session_id="cs-0000", tool_name="read_file")
+    assert len(events) == spoken  # the evicted child has no subject to phase
+    talk_progress.on_post_tool_call(session_id="cs-newest", tool_name="read_file")
+    assert len(events) == spoken + 1  # the newest one still speaks
+
+
+def test_the_same_phase_detail_only_update_rides_the_run_path(monkeypatch):
+    """The run path's detail-only branch, exercised directly on a run.
+
+    The child path already covers "finer detail, same phase, no second
+    speech"; this is the same branch in ``set_run_phase``. The evidence is the
+    written FIELD SET, not the resulting meta: within a phase only
+    ``phase_detail`` may be rewritten, so ``phase_at`` keeps marking when the
+    PHASE changed instead of being pushed forward by every tool label.
+    Asserting on ``phase_at``'s value instead would prove nothing here - two
+    ``time.time()`` calls inside one phase can return the same float.
+    """
+
+    calls: list[dict] = []
+    real_annotate = talk_runs.annotate_run
+    monkeypatch.setattr(
+        talk_runs,
+        "annotate_run",
+        lambda *args, **kwargs: real_annotate(*args, **kwargs) or calls.append(kwargs),
+    )
+    run_id, release = _start_live_run()
+    try:
+        assert talk_progress.set_run_phase(run_id, "executing", detail="Reading files")
+        meta = talk_runs.get_run(run_id)["meta"]
+        assert (meta["phase"], meta["phase_detail"]) == ("executing", "Reading files")
+        assert set(calls[0]) == {"durable", "phase", "phase_at", "phase_detail"}
+
+        # Same phase, different detail: the label is replaced, and it is the
+        # ONLY field the write carries.
+        assert talk_progress.set_run_phase(run_id, "executing", detail="Searching the web")
+        assert len(calls) == 2
+        assert calls[1] == {"durable": False, "phase_detail": "Searching the web"}
+        assert talk_runs.get_run(run_id)["meta"]["phase"] == "executing"
+
+        # Same phase, same detail: not a write at all.
+        assert not talk_progress.set_run_phase(run_id, "executing", detail="Searching the web")
+        # Same phase, no detail: the tier-2 poll's blank must not erase it.
+        assert not talk_progress.set_run_phase(run_id, "executing")
+        assert len(calls) == 2
+        assert talk_runs.get_run(run_id)["meta"]["phase_detail"] == "Searching the web"
+    finally:
+        release.set()
+    _wait_terminal(run_id)
