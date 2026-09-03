@@ -1,17 +1,72 @@
 # hermes-talk
 
-**Realtime voice as an orchestrator for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
+**Realtime duplex voice for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
 
 <p>
+  <a href="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/codeql.yml/badge.svg"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/TheSmokeDev/hermes-talk"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/TheSmokeDev/hermes-talk/badge"></a>
   <a href="https://pypi.org/project/hermes-talk/"><img alt="PyPI" src="https://img.shields.io/pypi/v/hermes-talk"></a>
+  <a href="https://pypi.org/project/hermes-talk/"><img alt="PyPI downloads" src="https://img.shields.io/pypi/dw/hermes-talk"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
+
+Works today: a native mic session in the terminal (`hermes talk`), a Discord voice channel (`/talk join`), and a **Talk** tab in the Hermes dashboard — on OpenAI Realtime, xAI Grok Voice, or Gemini Live. The voice model calls Hermes's own tools, hands work to real background agents while you keep talking, and when a delegated run hits an approval gate it asks you out loud and your spoken answer resolves it. A ChatGPT or SuperGrok subscription is enough — no API key required.
+
+```bash
+hermes plugins install TheSmokeDev/hermes-talk --enable && pip install "hermes-talk[audio]" && hermes talk
+```
 
 <!-- Regenerate this GIF (needs ffmpeg): python docs/render-dashboard-gif.py -->
 ![The Talk tab in the Hermes dashboard — a live voice session, a background agent delegated mid-conversation, its result landing in the runs panel (8× speed)](docs/dashboard.gif)
 
-*Real session, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — 2:27: delegate, keep talking, hear the result land. This is a voice demo; the sound is the point. Recorded at v0.3.0 — the flow is unchanged.*
+### 🔊 [Watch the 2:27 cut with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — delegate, keep talking, hear the result land.
+
+*Real session, 8× speed in the GIF. This is a voice demo; the sound is the point. Recorded at v0.3.0 — the flow is unchanged.*
+
+## Is it working?
+
+```bash
+hermes plugins list        # → hermes-talk · enabled · current version
+hermes talk --help         # → registration proof: the command only exists if the plugin loaded
+hermes talk setup          # → guided, confirmation-gated setup plus doctor verification
+hermes talk doctor         # → read-only diagnostics: auth lane, provider, model/voice, audio, host lanes
+hermes talk doctor --json  # → the same versioned receipt for scripts and issue reports
+# then, in any session: say "status report" — talk_status answers with
+# version, auth lane, agent lane, and audio state.
+```
+
+Doctor is read-only by design: it names which lane came up and what is
+missing, and never writes, probes, or refreshes a token (the one exception is
+`--probe`, Grok-only, which makes two live calls to `api.x.ai` and says so).
+`hermes talk check` — next release — goes one step further: a real provider
+session plus one bounded Hermes run that must echo a token, so a green report
+proves the live path and not just the configuration.
+
+**Upgrade** with `hermes plugins update hermes-talk` — not a second
+`install` (it refuses on an existing plugin) — then **restart the
+gateway**: a running process keeps executing the old code until you do.
+Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify--the-receipts).
+
+## Surfaces
+
+| Surface | Start it | Audio | Providers |
+|---|---|---|---|
+| Terminal | `hermes talk` | native duplex mic + speaker (`sounddevice`, the `[audio]` extra) | OpenAI, Grok, Gemini; cascade voice |
+| Inside a Hermes session | `/talk` | same as terminal | the one surface with an **attached** agent loop — memory lookups and delegation answer inline |
+| Discord voice channel | `/voice join`, then `/talk join` | borrows the host's own voice connection — never opens a second one | OpenAI, Grok; speaker-bound authority via `TALK_DISCORD_OPERATOR_USER_IDS` |
+| Dashboard **Talk** tab | `hermes dashboard` | browser-native WebRTC, no mic drivers | OpenAI only today; loopback-only until `TALK_DASHBOARD_TOKEN` is set |
+
+## Providers
+
+| Provider | `TALK_PROVIDER` | Auth | Notes |
+|---|---|---|---|
+| OpenAI Realtime | `openai` (default) | your ChatGPT subscription through the Codex CLI login (`codex login`) — **no API key** — or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | every surface; the only lane the dashboard tab and the cascade voice speak today |
+| xAI Grok Voice | `grok` | SuperGrok / X Premium+ login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | terminal + Discord; five voices |
+| Gemini Live | `gemini` | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | terminal + `hermes realtime`; no client-side cancel/truncate on the wire, so barge-in drops playback locally; Discord refuses it for now |
+
+The knob is fail-closed and never inferred from which keys exist. Full
+per-lane detail: [Provider details](#provider-details--openai-default-grok-or-gemini).
 
 ## What this actually is
 
@@ -46,12 +101,6 @@ integrations don't have:
    and the first thing you say lands on an agent that already has context. No
    tool call, no "let me look that up", no warm-up turn.
 
-**Why this exists:** OpenAI shipped this exact pattern for Codex on 2026-07-23
-— voice as a control layer over concurrent agents. It's excellent, and it's
-closed: paid ChatGPT plans only, and GPT-Live has no developer API. Their own
-docs point builders back at the Realtime API. So that's what this is built on,
-for an agent you actually own.
-
 Hermes's built-in voice mode is good and this doesn't replace it — turn-based
 STT → inference → TTS is the right shape for plenty of work. This is the other
 shape.
@@ -69,12 +118,13 @@ that property, announcements are suppressed rather than guessed. Details are in
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable
-pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice)
+pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 hermes talk
 ```
 
 Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 650+ offline tests, CI on ubuntu + windows × py3.11–3.13.
+v0.17.0 install. 1,400+ offline tests across 46 files in [`tests/`](tests/),
+CI on ubuntu + windows × py3.11–3.13.
 
 ## Quickstart — your first call on each surface
 
@@ -108,28 +158,6 @@ In every case, `hermes talk doctor` (or saying "status report" on the call)
 tells you which lane came up and what is missing. If a surface shows
 nothing, run doctor first — it names the gap.
 
-## Verify your install
-
-```bash
-hermes plugins list    # → hermes-talk · enabled · current version
-hermes talk --help     # → registration proof: the command only exists if the plugin loaded
-hermes talk setup      # → guided, confirmation-gated setup plus doctor verification
-hermes talk doctor     # → read-only human diagnostics
-hermes talk doctor --json  # → the same versioned receipt for scripts/issues
-# then, in any session: say "status report" — talk_status answers with
-# version, auth lane, agent lane, and audio state.
-```
-
-**Upgrade** with `hermes plugins update hermes-talk` — not a second
-`install` (it refuses on an existing plugin) — then **restart the
-gateway**: a running process keeps executing the old code until you do.
-Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify--the-receipts).
-
-Contributors adapting The Homie's v1.7.0 capability-plugin lessons to Hermes
-should use the [capability-kernel port plan](docs/CAPABILITY-KERNEL-PORT.md).
-It maps the reusable safety and lifecycle contracts onto Hermes-owned APIs;
-it does not claim that hot lifecycle support already exists here.
-
 ## Auth — no API key needed if you have ChatGPT
 
 Signed into the [Codex CLI](https://github.com/openai/codex) (`codex login`)?
@@ -162,7 +190,7 @@ Whatever the lane, the session is minted server-side into an **ephemeral
 client secret** — the raw key or OAuth token touches exactly one OpenAI
 endpoint and never reaches the socket, a log line, or a client.
 
-## Providers — OpenAI (default), Grok, or Gemini
+## Provider details — OpenAI (default), Grok, or Gemini
 
 `TALK_PROVIDER` picks the realtime voice transport: `openai` (default,
 everything above), `grok` (xAI Grok Voice), or `gemini` (Gemini Live). The
@@ -680,19 +708,82 @@ The three that shaped everything else:
 - **Hermes owns the tools and the session.** The Realtime layer is ears, mouth,
   and turn-taking. It never owns the agent loop.
 
+## Current boundaries
+
+Stated here so nobody has to discover them on a call:
+
+- **No self-hosted realtime lane.** All three providers are hosted. The
+  provider contract (`talk_realtime.py`) is where a local model plugs in, and
+  the core registration already declares capabilities per lane — so a local
+  lane can ship honestly as talk-without-tools the day a model can carry it.
+  Today none is shipped.
+- **The dashboard tab is OpenAI-only**, and the cascade voice is OpenAI-only.
+  Grok has no WebRTC offer endpoint; only OpenAI's text-output mode is wired
+  and verified for the cascade.
+- **Discord refuses Gemini.** The gated-response authorization flow has no
+  Live wire equivalent, so connect fails closed rather than answering
+  unvetted speakers.
+- **Memory writeback covers terminal and Discord, not the dashboard tab**
+  (its Realtime events stay in the browser).
+- **Result delivery is bound to the session that started the work.** Same
+  Hermes session reconnecting: spoken exactly once. A different session, or a
+  run from a previous process: reported `lost`, never "still running".
+- **Steering reaches subagents only.** api-server and detached runs are
+  stop-only; the refusal says so and offers the stop that works.
+- **Open mic with server-side turn detection.** No wake word, no push-to-talk.
+  `TALK_SESSION_KEY` is a shared memory scope, not a speaker boundary — leave
+  it unset in multi-user channels.
+- **No latency instrumentation.** The plugin emits no first-audio metric; the
+  timings quoted in the cascade section are not something it measures for you
+  on a call.
+
+## Where this sits upstream
+
+- [RFC NousResearch/hermes-agent#77111](https://github.com/NousResearch/hermes-agent/issues/77111)
+  — filed from this repo: a `RealtimeVoiceProvider` ABC for Hermes core, because
+  four open PRs were building duplex voice independently and the category
+  deserves an interface rather than a merge queue. This plugin is the working
+  reference implementation for that discussion, not a bid to be merged.
+- [PR NousResearch/hermes-agent#101808](https://github.com/NousResearch/hermes-agent/pull/101808)
+  — the core contract, orchestrator, and first built-in provider, ported from
+  this plugin's orchestrator and OpenAI transport. hermes-talk already
+  publishes its three lanes on that contract (see
+  [Hermes core realtime contract](#hermes-core-realtime-contract)).
+- [PR NousResearch/hermes-agent#97325](https://github.com/NousResearch/hermes-agent/pull/97325)
+  — a pointer to this plugin on the official Voice Mode docs page.
+
+## Background — why this exists
+
+OpenAI shipped this exact pattern for Codex on 2026-07-23 — voice as a control
+layer over concurrent agents. It's excellent, and it's closed: paid ChatGPT
+plans only, and GPT-Live has no developer API. Their own docs point builders
+back at the Realtime API. So that's what this is built on, for an agent you
+actually own.
+
 ## Status
 
-v0.7.0 — under active development. Changes, all seven versions with their
-receipts: [CHANGELOG.md](CHANGELOG.md). Roadmap: barge-in latch + spoken-text
-normalizer, Gemini Live backend
-([#3](https://github.com/TheSmokeDev/hermes-talk/issues/3)), `computer_use`
-relay, session-end memory debrief, gateway platform adapter.
+Under active development; the PyPI badge above is the released version.
+Every version with its receipts: [CHANGELOG.md](CHANGELOG.md). Open epics and
+threads:
+[#19](https://github.com/TheSmokeDev/hermes-talk/issues/19) provider-neutral
+Realtime voice platform,
+[#32](https://github.com/TheSmokeDev/hermes-talk/issues/32) operator-grade
+orchestration UX,
+[#43](https://github.com/TheSmokeDev/hermes-talk/issues/43) Talk over the Bot
+Mode roster,
+[#44](https://github.com/TheSmokeDev/hermes-talk/issues/44) channel-neutral
+voice transport.
 
-Related: [RFC #77111](https://github.com/NousResearch/hermes-agent/issues/77111)
-proposes a `RealtimeVoiceProvider` ABC in Hermes core — four open PRs are
-building duplex voice independently, and the category deserves an interface
-rather than a merge queue. This plugin is a working reference implementation
-for that discussion, not a bid to be merged.
+## Contributing
+
+Clone, `pip install -e ".[dev]"` (or `uv sync --extra dev`), `pytest -q`,
+`ruff check .` — the whole thing is in [CONTRIBUTING.md](CONTRIBUTING.md),
+including the one test trap on a box that has Hermes installed.
+
+Contributors adapting The Homie's v1.7.0 capability-plugin lessons to Hermes
+should use the [capability-kernel port plan](docs/CAPABILITY-KERNEL-PORT.md).
+It maps the reusable safety and lifecycle contracts onto Hermes-owned APIs;
+it does not claim that hot lifecycle support already exists here.
 
 ## License
 
