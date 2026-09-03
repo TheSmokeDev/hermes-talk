@@ -120,7 +120,10 @@ class _Client:
         return _Context(self.socket, lambda: setattr(self.socket, "exited", True))
 
 
-def _setup(*, automatic_response=True):
+def _setup(*, automatic_response=True, turn_detection=None):
+    kwargs = {}
+    if turn_detection is not None:
+        kwargs["turn_detection"] = turn_detection
     return rt.SessionSetup(
         model="gemini-live-test",
         voice="Puck",
@@ -139,6 +142,7 @@ def _setup(*, automatic_response=True):
             ),
         ),
         automatic_response=automatic_response,
+        **kwargs,
     )
 
 
@@ -210,6 +214,42 @@ def test_connect_sends_setup_with_key_in_url_and_models_prefix():
     ]
     assert socket.exited and client.exited
     assert adapter.state is rt.SessionState.CLOSED
+
+
+def test_provider_native_turn_detection_keeps_realtime_input_config_omitted():
+    message = gemini_rt.build_setup_message(
+        _setup(
+            turn_detection=rt.RealtimeTurnDetection(
+                mode=rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+            )
+        )
+    )
+
+    assert "realtimeInputConfig" not in message["setup"]
+
+
+@pytest.mark.parametrize(
+    "turn_detection",
+    [
+        rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SERVER_VAD),
+        rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.MEDIUM,
+        ),
+    ],
+)
+def test_explicit_non_native_turn_detection_is_refused_before_connection(
+    turn_detection,
+):
+    socket = _Socket()
+    adapter, client = _adapter(socket)
+
+    with pytest.raises(rt.RealtimeSessionError, match="supports only provider-native"):
+        asyncio.run(adapter.connect(_setup(turn_detection=turn_detection)))
+
+    assert client.connect_args is None
+    assert socket.sent == []
+    assert adapter.state is rt.SessionState.FAILED
 
 
 def test_wire_model_prefix_is_applied_exactly_once():
