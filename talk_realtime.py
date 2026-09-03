@@ -186,6 +186,29 @@ class FunctionCall(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallsCancelled(RealtimeEvent):
+    """Calls the provider retracted; their results must never be submitted.
+
+    Emitted by providers whose wire can discard a pending call mid-turn
+    (Gemini Live's ``toolCallCancellation``). Without it a cancellation is
+    only observable on the send path, as a dropped result — which tells
+    policy nothing until it has already produced work nobody wants.
+    """
+
+    call_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.call_ids, (str, bytes)):
+            raise ValueError("call_ids must be a sequence of identifiers")
+        call_ids = tuple(self.call_ids)
+        if not call_ids:
+            raise ValueError("call_ids must contain at least one identifier")
+        for call_id in call_ids:
+            _identifier(call_id, "call_id")
+        object.__setattr__(self, "call_ids", call_ids)
+
+
+@dataclass(frozen=True, slots=True)
 class ResponseFinished(RealtimeEvent):
     response_id: str | None = None
 
@@ -320,6 +343,7 @@ __all__ = [
     "SpeechStopped",
     "StartResponse",
     "SubmitToolResult",
+    "ToolCallsCancelled",
     "ToolDefinition",
     "Transcript",
     "TranscriptProvenance",
