@@ -11,6 +11,7 @@ import pytest
 
 import talk_cli
 import talk_operator_auth
+import talk_realtime
 import talk_relay
 
 OPERATOR_ID = 586638048133906576
@@ -1119,3 +1120,142 @@ def test_integral_float_reserialization_is_not_a_changed_argument(monkeypatch):
     event["arguments"] = '{"count": 1.0, "task": "ship it"}'
 
     assert ledger.authorize_tool("delegate_task", event) is None
+
+
+# -- spoken-target cross-check hardening (hermes-talk#55) -----------------------
+#
+# Items 1 and 2 are live weaknesses, so they assert the hardening the issue
+# asks for and fail today, marked xfail(strict). Item 3 is a documented scope
+# boundary rather than a gap, so it is pinned as passing behavior instead.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "hermes-talk#55 item 1: _target_was_spoken is a plain substring test "
+        "over an alphanumeric collapse, so a short target is ratified by any "
+        "longer target that contains it"
+    ),
+)
+def test_a_short_target_is_not_ratified_by_a_longer_one_that_contains_it(monkeypatch):
+    """stop_work targets are run numbers, so short targets are the normal case.
+
+    The operator named run 142. The model emitted 42 — a different run that
+    was never mentioned — and "42" is a substring of "142", so the cross-check
+    ratifies it and the permit mints. The same flaw reaches across words as
+    well as inside them, because the normalizer strips spaces before matching:
+    the haystack a target is tested against is one unbroken string.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    _speak(ledger, "Stop run 142 for me.", response_id="resp_0")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "stop_work",
+            "arguments": '{"target": "42"}',
+        }
+    )
+
+    assert event["_talk_call_permit"] is None
+    assert ledger.authorize_tool("stop_work", event) is not None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "hermes-talk#55 item 2: the ledger's spoken window has no barge-in or "
+        "settlement awareness, and talk_cli feeds it every transcript before "
+        "the relay fences the cancelled response's tail - so a target the "
+        "operator never heard still ratifies a permit"
+    ),
+)
+def test_a_barged_in_response_tail_does_not_ratify_a_target(monkeypatch):
+    """The two halves disagree about what the operator heard.
+
+    A cancelled response keeps emitting transcript deltas — the relay says so
+    itself, and fences them by response id so they are never played or
+    captioned. The ledger has no such fence, and in ``receive_events`` it is
+    fed FIRST, so the tail the operator was cut off from still counts as
+    spoken. This drives the real relay to prove the text was unheard, then
+    feeds that same text to the ledger exactly as the CLI does.
+    """
+
+    heard: list[tuple[str, str]] = []
+    captions: list[str] = []
+    relay = talk_relay.RealtimeRelay(
+        on_transcript_turn=lambda role, text: heard.append((role, text)),
+        on_caption=captions.append,
+    )
+    target = "sa-0-a1b2c3d4"
+    tail = talk_realtime.Transcript(
+        role=talk_realtime.TranscriptRole.ASSISTANT,
+        text=f"steer agent {target} to focus on pricing",
+        final=True,
+        provenance=talk_realtime.TranscriptProvenance.OUTPUT_AUDIO,
+        response_id="resp_0",
+    )
+
+    relay.handle_realtime_event(talk_realtime.ResponseStarted(response_id="resp_0"))
+    relay.handle_realtime_event(talk_realtime.SpeechStarted(input_id="input_1", offset_ms=0))
+    relay.handle_realtime_event(tail)
+
+    # The operator was cut off before this: never played, never captioned.
+    assert heard == []
+    assert captions == []
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+    _speak(ledger, tail.text, response_id=tail.response_id)
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "steer_agent",
+            "arguments": f'{{"agent_id": "{target}", "text": "focus on pricing"}}',
+        }
+    )
+
+    assert event["_talk_call_permit"] is None
+
+
+def test_free_text_arguments_are_outside_the_cross_check_by_design(monkeypatch):
+    """Item 3 is a documented boundary, not a gap — so it is pinned, not fixed.
+
+    The cross-check can only see divergence for tools that NAME a target;
+    CHANGELOG 0.10.0 and the _CallPermit docstring both say free text is out
+    of scope. This exists so that boundary cannot move silently: a task
+    nobody ever spoke still authorizes, and the set of target-bearing tools
+    is exactly three.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(ledger)
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+    # Deliberately nothing spoken at all.
+
+    event = ledger.bind_tool_event(
+        {
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "name": "delegate_task",
+            "arguments": '{"task": "a task the operator was never read back"}',
+        }
+    )
+
+    assert event["_talk_call_permit"] is not None
+    assert ledger.authorize_tool("delegate_task", event) is None
+    assert set(talk_operator_auth._TARGET_ARGUMENT_KEYS) == {
+        "steer_agent",
+        "redirect_agent",
+        "stop_work",
+    }
