@@ -212,6 +212,15 @@ def _tool_wire(tool: rt.ToolDefinition) -> dict[str, Any]:
     }
 
 
+def _validate_turn_detection(setup: rt.SessionSetup) -> None:
+    turn_detection = setup.turn_detection
+    if turn_detection.mode is not rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE:
+        raise rt.RealtimeSessionError(
+            "Gemini Live supports only provider-native turn detection; "
+            f"{turn_detection.mode.value} is refused rather than degraded"
+        )
+
+
 def build_setup_message(setup: rt.SessionSetup) -> dict[str, Any]:
     """Map neutral setup to the Live ``setup`` message.
 
@@ -221,6 +230,7 @@ def build_setup_message(setup: rt.SessionSetup) -> dict[str, Any]:
     deliberately absent because touching it can only narrow detection, never
     reproduce the OpenAI lane's ``create_response`` gating.
     """
+    _validate_turn_detection(setup)
 
     payload: dict[str, Any] = {
         "model": _wire_model(setup.model),
@@ -520,6 +530,11 @@ class GeminiRealtimeSession:
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
+        try:
+            _validate_turn_detection(setup)
+        except rt.RealtimeSessionError:
+            self.state = rt.SessionState.FAILED
+            raise
         self.state = rt.SessionState.CONNECTING
         if not setup.automatic_response:
             # The gated-response flow (Discord's authorization ledger) needs

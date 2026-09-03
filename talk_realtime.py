@@ -43,6 +43,42 @@ class SessionState(StrEnum):
     FAILED = "failed"
 
 
+class RealtimeTurnDetectionMode(StrEnum):
+    """Provider-neutral input-turn detection strategy."""
+
+    PROVIDER_NATIVE = "provider_native"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+
+
+class RealtimeSemanticEagerness(StrEnum):
+    """How readily semantic endpointing should close an input turn."""
+
+    AUTO = "auto"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeTurnDetection:
+    mode: RealtimeTurnDetectionMode = RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    semantic_eagerness: RealtimeSemanticEagerness | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, RealtimeTurnDetectionMode):
+            raise TypeError("mode must be RealtimeTurnDetectionMode")
+        if self.semantic_eagerness is not None and not isinstance(
+            self.semantic_eagerness, RealtimeSemanticEagerness
+        ):
+            raise TypeError("semantic_eagerness must be None or RealtimeSemanticEagerness")
+        if (
+            self.semantic_eagerness is not None
+            and self.mode is not RealtimeTurnDetectionMode.SEMANTIC_VAD
+        ):
+            raise ValueError("semantic_eagerness is valid only for semantic_vad")
+
+
 class TranscriptRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -82,11 +118,14 @@ class SessionSetup:
     #: an external TTS speaks; providers that cannot do text-only output
     #: refuse at their own boundary rather than silently speaking anyway.
     text_output: bool = False
+    turn_detection: RealtimeTurnDetection = RealtimeTurnDetection()
 
     def __post_init__(self) -> None:
         _identifier(self.model, "model")
         _identifier(self.voice, "voice")
         object.__setattr__(self, "tools", tuple(self.tools))
+        if not isinstance(self.turn_detection, RealtimeTurnDetection):
+            raise TypeError("turn_detection must be RealtimeTurnDetection")
 
 
 class RealtimeEvent:
@@ -330,8 +369,11 @@ __all__ = [
     "ProviderFailure",
     "RealtimeCommand",
     "RealtimeEvent",
+    "RealtimeSemanticEagerness",
     "RealtimeSession",
     "RealtimeSessionError",
+    "RealtimeTurnDetection",
+    "RealtimeTurnDetectionMode",
     "RemoveContext",
     "ResponseFinished",
     "ResponseStarted",

@@ -92,6 +92,15 @@ def _tool_wire(tool: rt.ToolDefinition) -> dict[str, Any]:
     }
 
 
+def _validate_turn_detection(setup: rt.SessionSetup) -> None:
+    turn_detection = setup.turn_detection
+    if turn_detection.mode is rt.RealtimeTurnDetectionMode.SEMANTIC_VAD:
+        raise rt.RealtimeSessionError(
+            "Grok realtime does not support semantic VAD; supported turn detection "
+            "modes are provider-native and server VAD"
+        )
+
+
 def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
     """Map neutral setup to the OpenAI-GA-shaped update xAI accepts.
 
@@ -99,6 +108,7 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
     ``?model=`` query, same split as the OpenAI lane. ``session.type`` stays:
     the GA shape requires it and the live endpoint accepted it.
     """
+    _validate_turn_detection(setup)
 
     session: dict[str, Any] = {
         "type": "realtime",
@@ -638,6 +648,11 @@ class GrokRealtimeSession:
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
+        try:
+            _validate_turn_detection(setup)
+        except rt.RealtimeSessionError:
+            self.state = rt.SessionState.FAILED
+            raise
         self.state = rt.SessionState.CONNECTING
         try:
             await self._wire.connect(

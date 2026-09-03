@@ -107,7 +107,10 @@ class _Client:
         return _Context(self.socket, lambda: setattr(self.socket, "exited", True))
 
 
-def _setup(*, automatic_response=True):
+def _setup(*, automatic_response=True, turn_detection=None):
+    kwargs = {}
+    if turn_detection is not None:
+        kwargs["turn_detection"] = turn_detection
     return rt.SessionSetup(
         model="grok-voice-test",
         voice="ara",
@@ -120,6 +123,7 @@ def _setup(*, automatic_response=True):
             ),
         ),
         automatic_response=automatic_response,
+        **kwargs,
     )
 
 
@@ -183,6 +187,48 @@ def test_connect_sends_grok_session_update_with_prefixed_voice_and_url_model():
     assert session["tool_choice"] == "auto"
     assert socket.exited and client.exited
     assert adapter.state is rt.SessionState.CLOSED
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+        rt.RealtimeTurnDetectionMode.SERVER_VAD,
+    ],
+)
+def test_supported_turn_detection_modes_keep_exact_ga_server_vad_payload(mode):
+    setup = _setup(
+        automatic_response=False,
+        turn_detection=rt.RealtimeTurnDetection(mode=mode),
+    )
+
+    turn_detection = grok_rt.build_session_update(setup)["session"]["audio"]["input"][
+        "turn_detection"
+    ]
+
+    assert turn_detection == {
+        "type": "server_vad",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+
+
+def test_semantic_vad_is_refused_before_websocket_connection():
+    socket = _Socket()
+    adapter, client = _adapter(socket)
+    setup = _setup(
+        turn_detection=rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.HIGH,
+        )
+    )
+
+    with pytest.raises(rt.RealtimeSessionError, match="does not support semantic VAD"):
+        asyncio.run(adapter.connect(setup))
+
+    assert client.connect_args is None
+    assert socket.sent == []
+    assert adapter.state is rt.SessionState.FAILED
 
 
 def test_wire_voice_prefix_is_applied_exactly_once():

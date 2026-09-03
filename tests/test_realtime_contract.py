@@ -111,6 +111,28 @@ def test_setup_events_and_commands_cover_one_ordinary_turn():
     assert all(isinstance(command, rt.RealtimeCommand) for command in commands)
 
 
+def test_turn_detection_defaults_preserve_provider_native_behavior():
+    setup = rt.SessionSetup(model="provider-model", voice="provider-voice", instructions="")
+
+    assert setup.turn_detection == rt.RealtimeTurnDetection()
+    assert setup.turn_detection.mode is rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    assert setup.turn_detection.semantic_eagerness is None
+
+
+def test_semantic_eagerness_is_valid_only_for_semantic_endpointing():
+    semantic = rt.RealtimeTurnDetection(
+        mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        semantic_eagerness=rt.RealtimeSemanticEagerness.HIGH,
+    )
+    assert semantic.semantic_eagerness is rt.RealtimeSemanticEagerness.HIGH
+
+    with pytest.raises(ValueError, match="only for semantic_vad"):
+        rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SERVER_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.LOW,
+        )
+
+
 @pytest.mark.parametrize(
     ("factory", "match"),
     [
