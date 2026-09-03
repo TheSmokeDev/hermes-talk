@@ -8,6 +8,11 @@ from subprocess import run
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_JS = ROOT / "dashboard" / "dist" / "index.js"
 
+#: Outer guard on the `node` subprocess. Every script below bounds its own
+#: waits at 1s (`waitFor`), so this only has to cover node's cold start — which
+#: on a cold windows-latest runner has exceeded 10s and failed main for nothing.
+NODE_TIMEOUT_S = 60
+
 
 def test_dashboard_serializes_tool_calls_and_continues_once_after_response_done():
     script = r"""
@@ -86,7 +91,7 @@ const waitFor = async (predicate, timeoutMs = 1000) => {
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=NODE_TIMEOUT_S,
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -254,7 +259,7 @@ const respond = (pcmChunks) => {
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=NODE_TIMEOUT_S,
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
