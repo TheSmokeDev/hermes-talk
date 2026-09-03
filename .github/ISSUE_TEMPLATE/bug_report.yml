@@ -16,6 +16,11 @@ body:
         and host facts, and every `hermes talk doctor` outcome — no values, no
         logs, no prompts, no transcripts, no audio. Nothing else in this
         template is worth more than that one file.
+
+        If the session connected fine before and a provider now refuses,
+        drops events, or changed shape under us, the
+        [provider compatibility report](https://github.com/TheSmokeDev/hermes-talk/issues/new?template=provider_compatibility_report.yml)
+        is the better form — it asks for exactly the events that pin the break.
   - type: textarea
     id: diagnostics_bundle
     attributes:
@@ -33,6 +38,8 @@ body:
         - /talk inside a session
         - Discord voice channel
         - Dashboard tab
+        - hermes realtime --provider hermes-talk/… (the core contract lane)
+        - hermes talk check / doctor / diagnostics / setup
     validations:
       required: true
   - type: textarea

@@ -814,14 +814,34 @@ voice transport.
 
 ## Contributing
 
-Clone, `pip install -e ".[dev]"` (or `uv sync --extra dev`), `pytest -q`,
-`ruff check .` — the whole thing is in [CONTRIBUTING.md](CONTRIBUTING.md),
-including the one test trap on a box that has Hermes installed.
+`uv sync --extra dev` (or `pip install -e ".[dev]"`), `pytest -q`, `ruff check .`
+— offline, no keys, seconds. Priorities, the path for each kind of change
+(a provider, a surface, a tool, a fix), the merge bar, and the one test trap
+on a box that has Hermes installed: [CONTRIBUTING.md](CONTRIBUTING.md).
+First response within 24 hours;
+[`good first issue`](https://github.com/TheSmokeDev/hermes-talk/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+fits in one sitting; a provider that works or broke for you is a
+contribution too ([docs/PROVIDER-RECEIPT.md](docs/PROVIDER-RECEIPT.md)).
 
 Contributors adapting The Homie's v1.7.0 capability-plugin lessons to Hermes
 should use the [capability-kernel port plan](docs/CAPABILITY-KERNEL-PORT.md).
 It maps the reusable safety and lifecycle contracts onto Hermes-owned APIs;
 it does not claim that hot lifecycle support already exists here.
+
+### Contributors
+
+[@kvnloo](https://github.com/kvnloo) — PulseAudio WebRTC echo cancellation
+on Linux, and the fix that stopped quiet words being clipped during
+playback ([#81](https://github.com/TheSmokeDev/hermes-talk/pull/81));
+semantic turn-detection controls across the three lanes
+([#107](https://github.com/TheSmokeDev/hermes-talk/pull/107), in review).
+[@TheAngryPit](https://github.com/TheAngryPit) — a renderer-owned Realtime
+transport for the Hermes desktop app that keeps core as the single chat
+authority ([#80](https://github.com/TheSmokeDev/hermes-talk/pull/80), in
+review). [@webdevtodayjason](https://github.com/webdevtodayjason) —
+field-tested feedback from a second live consumer on the upstream
+`RealtimeVoiceProvider` contract these lanes register on
+([hermes-agent#81404](https://github.com/NousResearch/hermes-agent/pull/81404)).
 
 ## License
 
