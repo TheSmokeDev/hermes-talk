@@ -2,6 +2,12 @@
 
 **Realtime voice as an orchestrator for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
 
+<p>
+  <a href="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/codeql.yml/badge.svg"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/TheSmokeDev/hermes-talk"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/TheSmokeDev/hermes-talk/badge"></a>
+  <a href="https://pypi.org/project/hermes-talk/"><img alt="PyPI" src="https://img.shields.io/pypi/v/hermes-talk"></a>
+</p>
+
 <!-- Regenerate this GIF (needs ffmpeg): python docs/render-dashboard-gif.py -->
 ![The Talk tab in the Hermes dashboard — a live voice session, a background agent delegated mid-conversation, its result landing in the runs panel (8× speed)](docs/dashboard.gif)
 
