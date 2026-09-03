@@ -47,6 +47,9 @@ _REAL_CONTRACT_MARKERS = (
     "OutputAudio",
     "OutputTranscript",
     "RealtimeAudioFormat",
+    "RealtimeSemanticEagerness",
+    "RealtimeTurnDetection",
+    "RealtimeTurnDetectionMode",
     "RealtimeCapability",
     "RealtimeToolResult",
     "RealtimeVoiceProvider",
@@ -859,6 +862,91 @@ def test_the_setup_the_provider_gets_is_the_hosts_setup(core):
     assert json.loads(json.dumps(dict(got.tools[0].parameters)))["properties"] == {
         "q": {"type": "string"}
     }
+
+
+def test_provider_turn_detection_capability_matrix_is_exact(core):
+    mode = core.contract.RealtimeTurnDetectionMode
+
+    assert core.TalkOpenAICoreProvider.supported_turn_detection_modes == frozenset(mode)
+    assert core.TalkGrokCoreProvider.supported_turn_detection_modes == frozenset(
+        {mode.PROVIDER_NATIVE, mode.SERVER_VAD}
+    )
+    assert core.TalkGeminiCoreProvider.supported_turn_detection_modes == frozenset(
+        {mode.PROVIDER_NATIVE}
+    )
+
+
+@pytest.mark.parametrize(
+    ("core_mode_name", "talk_mode", "eagerness_name"),
+    [
+        ("PROVIDER_NATIVE", rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE, None),
+        ("SERVER_VAD", rt.RealtimeTurnDetectionMode.SERVER_VAD, None),
+        (
+            "SEMANTIC_VAD",
+            rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            "HIGH",
+        ),
+    ],
+)
+def test_openai_turn_detection_bridge_is_exhaustive(
+    core, core_mode_name, talk_mode, eagerness_name
+):
+    c = core.contract
+    session = FakeTalkSession()
+    provider = core.TalkOpenAICoreProvider(
+        auth_resolver=lambda: types.SimpleNamespace(token="t", source="test"),
+        session_factory=lambda auth: session,
+    )
+    eagerness = (
+        None if eagerness_name is None else getattr(c.RealtimeSemanticEagerness, eagerness_name)
+    )
+    setup = c.RealtimeVoiceSetup(
+        instructions="hi",
+        turn_detection=c.RealtimeTurnDetection(
+            mode=getattr(c.RealtimeTurnDetectionMode, core_mode_name),
+            semantic_eagerness=eagerness,
+        ),
+    )
+
+    async def run():
+        opened = await provider.open_session(setup)
+        await opened.close()
+
+    asyncio.run(run())
+    assert session.connected_with.turn_detection.mode is talk_mode
+    expected_eagerness = (
+        None if eagerness_name is None else getattr(rt.RealtimeSemanticEagerness, eagerness_name)
+    )
+    assert session.connected_with.turn_detection.semantic_eagerness is expected_eagerness
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "mode_name"),
+    [
+        ("TalkGrokCoreProvider", "SEMANTIC_VAD"),
+        ("TalkGeminiCoreProvider", "SERVER_VAD"),
+        ("TalkGeminiCoreProvider", "SEMANTIC_VAD"),
+    ],
+)
+def test_unsupported_turn_detection_is_refused_before_auth_or_session_factory(
+    core, provider_name, mode_name
+):
+    calls = []
+    provider = getattr(core, provider_name)(
+        auth_resolver=lambda: calls.append("auth"),
+        session_factory=lambda auth: calls.append("session"),
+    )
+    c = core.contract
+    setup = c.RealtimeVoiceSetup(
+        instructions="hi",
+        turn_detection=c.RealtimeTurnDetection(
+            mode=getattr(c.RealtimeTurnDetectionMode, mode_name)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported turn detection mode"):
+        asyncio.run(provider.open_session(setup))
+    assert calls == []
 
 
 def test_an_unset_model_or_voice_falls_back_to_the_lanes_default(core):

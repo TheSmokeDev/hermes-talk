@@ -94,6 +94,47 @@ def _setup(*, automatic_response=True):
     )
 
 
+def test_semantic_endpointing_mint_and_update_use_the_same_exact_wire_object(monkeypatch):
+    setup = _setup(automatic_response=False)
+    setup = rt.SessionSetup(
+        model=setup.model,
+        voice=setup.voice,
+        instructions=setup.instructions,
+        tools=setup.tools,
+        automatic_response=setup.automatic_response,
+        turn_detection=rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.MEDIUM,
+        ),
+    )
+    minted = {}
+
+    def fake_post(_auth_token, session):
+        minted.update(session)
+        return {"value": "ephemeral"}
+
+    monkeypatch.setattr(openai_rt.talk_wire, "post_client_secret", fake_post)
+    openai_rt.talk_wire.mint_ephemeral_session(
+        auth_token="secret",
+        model=setup.model,
+        voice=setup.voice,
+        instructions=setup.instructions,
+        tools=[openai_rt._tool_wire(tool) for tool in setup.tools],
+        automatic_response=setup.automatic_response,
+        turn_detection=setup.turn_detection,
+    )
+    update = openai_rt.build_session_update(setup)
+    expected = {
+        "type": "semantic_vad",
+        "eagerness": "medium",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+    assert minted["audio"]["input"]["turn_detection"] == expected
+    assert update["session"]["audio"]["input"]["turn_detection"] == expected
+    assert update["session"] == {key: value for key, value in minted.items() if key != "model"}
+
+
 def _adapter(socket):
     client = _Client(socket)
     aiohttp = types.SimpleNamespace(
@@ -224,6 +265,7 @@ def test_wire_credentials_are_private_one_shot_and_cleared_on_every_terminal_pat
         "instructions": "Be brief.",
         "tools": None,
         "automatic_response": False,
+        "turn_detection": rt.RealtimeTurnDetection(),
         "session_update": {"type": "session.update", "session": {}},
     }
 

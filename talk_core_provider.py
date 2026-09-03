@@ -85,7 +85,10 @@ try:
         OutputTranscript,
         RealtimeAudioFormat,
         RealtimeCapability,
+        RealtimeSemanticEagerness,
         RealtimeToolResult,
+        RealtimeTurnDetection,
+        RealtimeTurnDetectionMode,
         RealtimeVoiceEvent,
         RealtimeVoiceProvider,
         RealtimeVoiceSession,
@@ -355,6 +358,8 @@ if _CORE_IMPORT_ERROR is None:
         input_audio = PCM16_24K
         output_audio = PCM16_24K
 
+        supported_turn_detection_modes = frozenset({RealtimeTurnDetectionMode.PROVIDER_NATIVE})
+
         def __init__(
             self,
             *,
@@ -390,6 +395,33 @@ if _CORE_IMPORT_ERROR is None:
                 ),
             }
 
+        def _talk_turn_detection(
+            self, turn_detection: RealtimeTurnDetection
+        ) -> rt.RealtimeTurnDetection:
+            if turn_detection.mode not in self.supported_turn_detection_modes:
+                raise ValueError(
+                    f"{self.display_name} does not support turn detection mode "
+                    f"{turn_detection.mode.value}"
+                )
+            modes = {
+                RealtimeTurnDetectionMode.PROVIDER_NATIVE: (
+                    rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+                ),
+                RealtimeTurnDetectionMode.SERVER_VAD: (rt.RealtimeTurnDetectionMode.SERVER_VAD),
+                RealtimeTurnDetectionMode.SEMANTIC_VAD: (rt.RealtimeTurnDetectionMode.SEMANTIC_VAD),
+            }
+            eagerness = {
+                None: None,
+                RealtimeSemanticEagerness.AUTO: rt.RealtimeSemanticEagerness.AUTO,
+                RealtimeSemanticEagerness.LOW: rt.RealtimeSemanticEagerness.LOW,
+                RealtimeSemanticEagerness.MEDIUM: rt.RealtimeSemanticEagerness.MEDIUM,
+                RealtimeSemanticEagerness.HIGH: rt.RealtimeSemanticEagerness.HIGH,
+            }
+            return rt.RealtimeTurnDetection(
+                mode=modes[turn_detection.mode],
+                semantic_eagerness=eagerness[turn_detection.semantic_eagerness],
+            )
+
         def _talk_setup(self, setup: RealtimeVoiceSetup) -> Any:
             for label, requested, expected in (
                 ("input", setup.input_audio, self.input_audio),
@@ -413,11 +445,13 @@ if _CORE_IMPORT_ERROR is None:
                     for tool in setup.tools
                 ),
                 automatic_response=setup.automatic_response,
+                turn_detection=self._talk_turn_detection(setup.turn_detection),
             )
 
         async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
             # Shape first: an unusable setup is refused before any credential is
             # resolved and before a socket is opened.
+            self.validate_setup(setup)
             talk_setup = self._talk_setup(setup)
             resolver = self._auth_resolver or self._resolve_auth
             auth = resolver()
@@ -466,6 +500,7 @@ if _CORE_IMPORT_ERROR is None:
         provider_tag = "gpt-realtime speech-to-speech"
         env_key = "OPENAI_API_KEY"
         env_url = "https://platform.openai.com/api-keys"
+        supported_turn_detection_modes = frozenset(RealtimeTurnDetectionMode)
 
         def default_model(self) -> str | None:
             return talk_config.talk_model() or talk_config.DEFAULT_TALK_MODEL
@@ -527,6 +562,12 @@ if _CORE_IMPORT_ERROR is None:
         provider_tag = "grok-voice speech-to-speech"
         env_key = "XAI_API_KEY"
         env_url = "https://console.x.ai"
+        supported_turn_detection_modes = frozenset(
+            {
+                RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+                RealtimeTurnDetectionMode.SERVER_VAD,
+            }
+        )
 
         def default_model(self) -> str | None:
             return talk_config.talk_grok_model() or talk_config.DEFAULT_GROK_MODEL

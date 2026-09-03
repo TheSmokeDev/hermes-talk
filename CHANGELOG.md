@@ -53,6 +53,9 @@ named rather than smoothed.
   if they cannot be proven; `--json` prints it instead. The bug-report issue
   template now asks for the bundle first. Ported idea from
   bielcarpi/hermes-live-voice's `diagnostics` (MIT) — idea only, no code.
+- Added a deterministic, content-free endpointing trace evaluator that reports
+  nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
+  and false-activation counts without retaining audio or transcripts.
 - hermes-talk's three realtime lanes now register on the Hermes core
   `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
   NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
