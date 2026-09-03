@@ -258,6 +258,7 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the other provider keys. The key rides the `xi-api-key` WebSocket header — never the URL, never a log line, never an error string. |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
 | `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane. `eleven_flash_v2_5` probed at ~490ms to first audio on PCM 24kHz (2026-08-28), which is the cascade's latency trade: roughly one extra half-second on the first sentence versus native; later sentences pipeline under playback. |
+| `TALK_CASCADE_SPEED` | unset | Delivery pace for the cascade voice, `0.7`–`1.2` (`1.0` is normal). **Fail-closed**: junk and out-of-range values refuse with the range rather than clamping, because a silently clamped pace is audible on every word and never says why. Unset sends no `speed` field at all — the wire frame stays byte-identical to a cascade that never had the knob, so turning it on is the only thing that changes what ElevenLabs receives. The bounds are the stream-input `RealtimeVoiceSettings` schema's own; the REST endpoint's wider `0.25`–`4.0` belongs to a different schema this lane never speaks. |
 
 Cascade mode applies to every Talk surface — terminal, Discord, and the
 dashboard tab share the same knobs and the same fail-closed resolution. On the
@@ -267,6 +268,26 @@ deltas to `POST /api/plugins/hermes-talk/cascade-tts` (same
 streams back. One NDJSON `{"delta": ...}` line per text delta, one terminal
 `{"done": ...}` line per response; an aborted stream (barge-in, tab closed)
 cancels the answer's TTS rather than flushing it.
+
+Generation is triggered once per TURN, not once per sentence: chunks go out as
+bare text and the turn's final frame carries the flush. That is what lets
+ElevenLabs buffer enough context to carry intonation across a sentence
+boundary — forcing a generation per chunk is documented as producing lower
+quality audio, and it is why a multi-sentence answer used to read as a series
+of unrelated fragments. Latency where it is audible is unchanged: the final
+frame already ended the turn. SSML parsing is enabled explicitly on the
+socket, so `<break time="0.4s" />` in an answer is a real pause (up to 3s)
+instead of being silently dropped.
+
+One trap that is not fixable here: `eleven_flash_v2_5` ships with number
+normalization DISABLED for latency, and re-enabling it
+(`apply_text_normalization: "on"`) is Enterprise-gated on v2.5 models. Their
+own worked example is `$1,000,000` read as "one thousand thousand dollars". A
+lane that speaks currency, phone numbers, or times should tell the model to
+emit number-words in its instructions, or run `eleven_multilingual_v2` where
+latency matters less. Tracked in
+[#116](https://github.com/TheSmokeDev/hermes-talk/issues/116) — it needs a
+live listen, not a code change.
 
 ### Audio (terminal lane)
 
