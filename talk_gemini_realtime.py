@@ -843,21 +843,26 @@ class GeminiRealtimeSession:
         if isinstance(handle, str) and handle:
             self.resumption_handle = handle
 
-    def _note_cancelled_call_ids(self, ids: list) -> None:
+    def _note_cancelled_call_ids(self, ids: list) -> tuple[str, ...]:
         """Remember server-cancelled tool calls so their results never send.
 
         Ids for calls this session never saw are recorded all the same — a
         late result for one must still be dropped. Bounded by
-        MAX_CANCELLED_CALL_IDS, oldest forgotten first.
+        MAX_CANCELLED_CALL_IDS, oldest forgotten first. Returns the ids that
+        were actually recorded, so the caller can report the retraction as an
+        event; malformed entries are filtered out rather than reported.
         """
 
+        recorded: list[str] = []
         for call_id in ids:
             if not isinstance(call_id, str) or not call_id:
                 continue
             self._call_names.pop(call_id, None)
             self._cancelled_call_ids[call_id] = False
+            recorded.append(call_id)
         while len(self._cancelled_call_ids) > MAX_CANCELLED_CALL_IDS:
             self._cancelled_call_ids.pop(next(iter(self._cancelled_call_ids)))
+        return tuple(recorded)
 
     def _decode(self, message: dict[str, Any]) -> list[rt.RealtimeEvent]:
         """Map one Live server message to zero or more neutral events.
@@ -878,7 +883,12 @@ class GeminiRealtimeSession:
             if isinstance(cancellation, dict):
                 ids = cancellation.get("ids")
                 if isinstance(ids, list):
-                    self._note_cancelled_call_ids(ids)
+                    # Report the retraction as well as recording it: policy
+                    # that already dispatched these calls needs to hear it,
+                    # not just find out later that its results went nowhere.
+                    cancelled = self._note_cancelled_call_ids(ids)
+                    if cancelled:
+                        events.append(rt.ToolCallsCancelled(call_ids=cancelled))
             tool_call = message.get("toolCall")
             if isinstance(tool_call, dict):
                 # A tool call continues the turn past generationComplete.

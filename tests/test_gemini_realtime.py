@@ -772,7 +772,13 @@ def test_cancellation_of_unknown_ids_is_tolerated_silently(caplog):
 
     events = asyncio.run(scenario())
 
-    assert [type(event) for event in events] == [rt.SessionTerminated]
+    # The retraction is now reported as an event so policy hears it, but the
+    # malformed ids are still filtered out and nothing is logged.
+    assert [type(event) for event in events] == [
+        rt.ToolCallsCancelled,
+        rt.SessionTerminated,
+    ]
+    assert events[0].call_ids == ("fc-never-seen",)
     assert not [r for r in caplog.records if r.name == "talk_gemini_realtime"]
 
 

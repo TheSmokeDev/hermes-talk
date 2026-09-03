@@ -13,6 +13,24 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- hermes-talk's three realtime lanes now register on the Hermes core
+  `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
+  NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
+  `hermes-talk/grok`, and `hermes-talk/gemini`, so `hermes realtime --provider
+  <name>` drives them through core's own orchestrator. Registration is
+  feature-detected on both sides: a host without the hook, or with a different
+  contract version, loads hermes-talk exactly as before — one debug line, no
+  warning, every other surface intact. Capabilities are declared per lane
+  rather than assumed, so core degrades explicitly instead of calling an
+  operation the wire cannot perform. Availability stays offline and read-only
+  on all three lanes: no socket, no token refresh, no auth-store write.
+- The neutral session contract gained `ToolCallsCancelled`, and the Gemini Live
+  adapter emits it for `toolCallCancellation`. The server can discard a pending
+  tool call mid-turn; until now that was recorded silently and only visible as a
+  dropped result on the send path, which told policy nothing until it had
+  already produced work nobody wanted.
+
 ### Fixed
 - A Discord `talk join` that refuses before going live now says WHAT
   refused instead of "session exited unsuccessfully". The session already
