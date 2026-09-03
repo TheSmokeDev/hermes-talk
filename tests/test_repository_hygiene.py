@@ -37,3 +37,30 @@ def test_every_version_surface_matches_pyproject():
     assert manifest["version"] == version, (
         f"dashboard/manifest.json version drifted from pyproject ({version})"
     )
+
+
+def test_the_ruff_version_is_pinned_not_floating():
+    """A floating ruff makes every upstream release a possible red build.
+
+    The rule set was already pinned; the VERSION was not, and CI installs
+    ruff from this extra (`pip install -e ".[dev]"`). ruff 0.16 narrowed
+    BLE001 to bound handlers, which retired three directives and failed CI on
+    RUF100 while older dev boxes still required them — the two versions
+    wanted opposite source, so only a pin makes one answer correct.
+    """
+
+    import re
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    dev = re.search(r"^dev = \[(?P<deps>[^\]]*)\]", pyproject, re.MULTILINE)
+    assert dev is not None, "the dev extra moved; this guard needs updating"
+
+    ruff = re.search(r'"ruff(?P<spec>[^"]*)"', dev.group("deps"))
+    assert ruff is not None, "ruff left the dev extra; CI installs it from here"
+    assert ruff.group("spec").startswith("=="), (
+        f'ruff must be pinned exactly, found "ruff{ruff.group("spec")}"'
+    )
+
+    # And CI must still be installing from that extra, or the pin is decorative.
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert 'pip install -e ".[dev]"' in ci

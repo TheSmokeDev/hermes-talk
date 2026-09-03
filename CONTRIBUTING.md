@@ -15,7 +15,9 @@ pip install -e ".[dev]"        # add ,audio if you want a real mic locally
 
 ```bash
 pytest -q          # the whole suite — seconds, not minutes
-ruff check .       # the exact check CI runs
+ruff check .       # the exact check CI runs, on the pinned ruff
+                   # (`pip install -e ".[dev]"` gets that version; a
+                   # different ruff can disagree in BOTH directions)
 ```
 
 **The suite is offline by design**: no secrets, no network, no audio
@@ -70,7 +72,12 @@ the fix is usually the sentence, sometimes the code, never the standard.
   `pytest -q` and `ruff check .`).
 - One logical change per PR; tests ride with the change, not behind it.
 - Broad `except` clauses are house style at the voice boundary (a live
-  call must not die on a stack trace) — each carries a `noqa: BLE001`
-  with the reason. Don't "fix" them; do justify new ones.
+  call must not die on a stack trace) — each states its reason. Don't
+  "fix" them; do justify new ones. Whether the reason also needs a
+  `noqa: BLE001` depends on the pinned ruff and, surprisingly, on what the
+  module calls its logger: since 0.16 ruff drops BLE001 when the handler
+  logs the exception through a name it treats as a logger (`logger` yes,
+  `_log` no), and a directive it no longer needs fails `RUF100`. Let
+  `ruff check .` decide rather than copying a neighbouring handler.
 - Bug reports: the issue form asks for your `talk_status` output — that
   one paste answers version, auth lane, agent lane, and audio in one go.

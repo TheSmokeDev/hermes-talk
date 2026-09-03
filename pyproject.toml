@@ -10,7 +10,7 @@ dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
-dev = ["pytest>=8", "ruff>=0.4"]
+dev = ["pytest>=8", "ruff==0.16.5"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -69,10 +69,19 @@ pythonpath = ["."]
 line-length = 100
 target-version = "py311"
 
-# Pinned explicitly: CI installs whatever ruff is current, and an implicit
-# default set turns every ruff release into a possible red build. BLE is on
-# because this codebase catches broadly on purpose (a live voice call must not
-# die on a stack trace) — each one carries a noqa stating why.
+# Two pins, because either one alone still lets a ruff release turn the build
+# red. The RULE SET is pinned here so a new default rule cannot arrive
+# unannounced; the ruff VERSION is pinned in the dev extra above, because the
+# same rule set does not mean the same thing across versions. ruff 0.16 stopped
+# reporting BLE001 when the handler logs the exception through a name it
+# recognises as a logger — it recognises `logger`, not `_log` — so the three
+# handlers in talk_core_provider.py (the only module here that both names its
+# logger `logger` and carries BLE001 directives) had their `noqa` retired and
+# failed CI on RUF100, while every dev box on 0.15.x still required them. Bump
+# both pins together, in their own PR, and expect directives to move. BLE stays
+# on because this codebase catches broadly on purpose (a live voice call must
+# not die on a stack trace) — each one says why, whether or not the current
+# ruff still needs a directive to allow it.
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 

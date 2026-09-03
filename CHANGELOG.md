@@ -32,6 +32,18 @@ named rather than smoothed.
   already produced work nobody wanted.
 
 ### Fixed
+- CI lints against a pinned ruff. The dev extra asked for `ruff>=0.4` and CI
+  installed whatever was current, so ruff 0.16 arrived on its own and failed
+  the build on `RUF100`: it stopped reporting `BLE001` where the handler logs
+  the exception through a name it treats as a logger, which retired three
+  `noqa: BLE001` directives in `talk_core_provider.py` — the only module that
+  both names its logger `logger` (the other fourteen use `_log`, which ruff
+  does not recognise) and carries those directives. The trap was that the two
+  versions wanted opposite source: deleting the directives fixed CI and broke
+  every dev box still on 0.15.x. `ruff==0.16.5` is now pinned in the dev extra
+  (which is what CI installs), the three retired directives are gone with
+  their reasons kept as plain comments, and the `[tool.ruff]` comment no
+  longer claims CI runs whatever ruff is current.
 - A Discord `talk join` that refuses before going live now says WHAT
   refused instead of "session exited unsuccessfully". The session already
   knew — it printed the reason to the gateway's stderr and returned a bare
