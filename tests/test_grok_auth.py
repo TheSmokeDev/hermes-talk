@@ -338,6 +338,249 @@ def test_file_fallback_reads_a_bom_prefixed_store(tmp_path):
     assert talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path).token == token
 
 
+# -- the credential pool: where a current host writes a device-code login -------
+#
+# The host reads two shapes for xai-oauth (hermes_cli/auth.py:5287-5321):
+# providers["xai-oauth"]["tokens"] first, then credential_pool["xai-oauth"] --
+# a LIST whose rows carry the tokens FLAT. These tests pin the second shape and
+# the order between them.
+
+
+def _pool_row(access: str, refresh: str = REFRESH, **overrides) -> dict:
+    """One pool row shaped the way the host writes a device-code login."""
+
+    row = {
+        "id": "cce4f6",
+        "label": "xai-oauth-oauth-1",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": access,
+        "refresh_token": refresh,
+        "last_status": None,
+        "last_error_code": None,
+        "last_error_reason": None,
+        "base_url": "https://api.x.ai/v1",
+        "last_refresh": "2026-09-03T23:11:21.553382Z",
+        "request_count": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _write_pool_store(home: Path, pool, *, providers=None) -> Path:
+    """A store whose xai-oauth login lives in the credential pool."""
+
+    body = {
+        "version": 1,
+        "providers": {} if providers is None else providers,
+        "credential_pool": {"xai-oauth": pool},
+    }
+    return _write_xai_store(home, access="ignored", raw=json.dumps(body))
+
+
+def test_pool_only_login_is_valid_and_names_the_pool(tmp_path):
+    """The regression: providers is empty, the login is in the pool.
+
+    Against the pre-fix parse this store read as ``missing`` and doctor told
+    the operator to log in again while the lane worked.
+    """
+
+    token = _jwt(time.time() + 7200)
+    path = _write_pool_store(tmp_path, [_pool_row(token)])
+    snap = _Snapshot(path)
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+
+    assert receipt["xai_oauth"] == "valid"
+    assert receipt["xai_oauth_source"] == talk_grok_auth.STORE_CREDENTIAL_POOL
+    assert receipt["winning_lane"] == talk_grok_auth.SOURCE_XAI_OAUTH
+    assert receipt["configured"] is True
+    assert receipt["blocked_by"] is None
+    snap.assert_untouched()
+
+
+def test_pool_only_login_resolves_without_touching_the_store(tmp_path):
+    token = _jwt(time.time() + 7200)
+    path = _write_pool_store(tmp_path, [_pool_row(token)])
+    snap = _Snapshot(path)
+
+    auth = talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+
+    assert auth.token == token
+    assert auth.source == talk_grok_auth.SOURCE_XAI_OAUTH
+    snap.assert_untouched()
+
+
+def test_legacy_providers_login_still_wins_and_names_providers(tmp_path):
+    """Older hosts keep the login under ``providers``; that path is unchanged."""
+
+    token = _jwt(time.time() + 7200)
+    _write_xai_store(tmp_path, access=token)
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+
+    assert receipt["xai_oauth"] == "valid"
+    assert receipt["xai_oauth_source"] == talk_grok_auth.STORE_PROVIDERS
+
+
+def test_providers_is_read_before_the_pool_like_the_host(tmp_path):
+    """Both shapes present: the host takes providers first (auth.py:5289-5295)."""
+
+    legacy = _jwt(time.time() + 7200, marker="legacy-provider-token")
+    pooled = _jwt(time.time() + 7200, marker="pooled-token")
+    _write_pool_store(
+        tmp_path,
+        [_pool_row(pooled)],
+        providers={"xai-oauth": {"tokens": {"access_token": legacy, "refresh_token": REFRESH}}},
+    )
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    auth = talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+
+    assert receipt["xai_oauth_source"] == talk_grok_auth.STORE_PROVIDERS
+    assert auth.token == legacy
+
+
+def test_unusable_providers_entry_falls_through_to_the_pool(tmp_path):
+    """A providers block the host would refuse must not mask a usable pool row."""
+
+    token = _jwt(time.time() + 7200)
+    _write_pool_store(
+        tmp_path,
+        [_pool_row(token)],
+        providers={"xai-oauth": {"tokens": {"access_token": "", "refresh_token": ""}}},
+    )
+
+    auth = talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+
+    assert auth.token == token
+
+
+def test_empty_pool_is_missing_not_invalid(tmp_path):
+    """No login at all: fall through to the other lanes, do not refuse."""
+
+    path = _write_pool_store(tmp_path, [])
+    snap = _Snapshot(path)
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "missing"
+    assert receipt["xai_oauth_source"] is None
+
+    with pytest.raises(talk_auth.TalkAuthError) as info:
+        talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+    assert str(info.value) == talk_grok_auth.GROK_AUTH_REQUIRED_MESSAGE
+    snap.assert_untouched()
+
+
+def test_quarantined_pool_row_is_invalid(tmp_path):
+    """The host quarantines by popping both tokens (auth.py:7891-7896).
+
+    A row with the tokens gone is a login that exists and is unusable, which
+    is the ``invalid`` verdict -- not ``missing``.
+    """
+
+    row = _pool_row("unused", last_status="dead", last_error_reason="token_revoked")
+    row.pop("access_token")
+    row.pop("refresh_token")
+    path = _write_pool_store(tmp_path, [row])
+    snap = _Snapshot(path)
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "invalid"
+    assert receipt["xai_oauth_source"] is None
+
+    with pytest.raises(talk_auth.TalkAuthError, match="unreadable"):
+        talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+    snap.assert_untouched()
+
+
+def test_expired_pool_token_is_expired(tmp_path):
+    path = _write_pool_store(tmp_path, [_pool_row(_jwt(time.time() - 10))])
+    snap = _Snapshot(path)
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "expired"
+    assert receipt["xai_oauth_source"] == talk_grok_auth.STORE_CREDENTIAL_POOL
+
+    with pytest.raises(talk_auth.TalkAuthError, match="has expired"):
+        talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+    snap.assert_untouched()
+
+
+def test_malformed_rows_are_skipped_for_the_first_usable_one(tmp_path):
+    """The host skips non-dict rows and rows missing either token (auth.py:5304-5311)."""
+
+    token = _jwt(time.time() + 7200)
+    _write_pool_store(
+        tmp_path,
+        [
+            "not-a-row",
+            None,
+            _pool_row("has-access", refresh="   "),
+            _pool_row("   ", refresh=REFRESH),
+            _pool_row(token),
+        ],
+    )
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    auth = talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path)
+
+    assert receipt["xai_oauth"] == "valid"
+    assert auth.token == token
+
+
+def test_pool_row_without_a_refresh_token_is_refused(tmp_path):
+    """Both tokens are required on a pool row, exactly as on a providers block."""
+
+    _write_pool_store(tmp_path, [_pool_row(_jwt(time.time() + 7200), refresh="")])
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "invalid"
+
+
+def test_a_non_list_pool_slice_yields_no_login_like_the_host(tmp_path):
+    """The host type-checks for a list (auth.py:5303) and ignores anything else."""
+
+    body = {
+        "providers": {},
+        "credential_pool": {"xai-oauth": _pool_row(_jwt(time.time() + 7200))},
+    }
+    _write_xai_store(tmp_path, access="ignored", raw=json.dumps(body))
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "missing"
+    assert receipt["xai_oauth_source"] is None
+
+
+def test_a_pool_login_survives_a_non_dict_providers_block(tmp_path):
+    """``providers`` of the wrong type is not a reason to skip the pool."""
+
+    body = {
+        "providers": ["not", "a", "mapping"],
+        "credential_pool": {"xai-oauth": [_pool_row(_jwt(time.time() + 7200))]},
+    }
+    _write_xai_store(tmp_path, access="ignored", raw=json.dumps(body))
+
+    receipt = talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path)
+    assert receipt["xai_oauth"] == "valid"
+    assert receipt["xai_oauth_source"] == talk_grok_auth.STORE_CREDENTIAL_POOL
+
+
+def test_the_pool_receipt_never_carries_the_token(tmp_path):
+    token = _jwt(time.time() + 7200)
+    _write_pool_store(tmp_path, [_pool_row(token)])
+
+    for receipt in (
+        talk_grok_auth.grok_auth_diagnostic(env={}, hermes_home=tmp_path),
+        talk_grok_auth.grok_auth_status(env={}, hermes_home=tmp_path),
+    ):
+        blob = json.dumps(receipt, default=str)
+        assert token not in blob
+        assert ACCESS not in blob
+        assert REFRESH not in blob
+
+
 # -- the read-only diagnostic ---------------------------------------------------
 
 

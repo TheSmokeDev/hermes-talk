@@ -866,6 +866,10 @@ def render_human(report: dict[str, Any]) -> str:
         if check["id"] == "auth":
             if "xai_oauth" in details:
                 oauth = f"xai-oauth={details['xai_oauth']}"
+                # Name the store shape that answered, so a "missing" verdict
+                # can be told apart from a login the parse never reached.
+                if details.get("xai_oauth_source"):
+                    oauth += f" (via {details['xai_oauth_source']})"
             else:
                 oauth = f"codex={details['codex_oauth']}"
             lines.append(

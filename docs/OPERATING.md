@@ -446,8 +446,14 @@ Grok (`TALK_PROVIDER=grok`) resolves its own bearer the same shape:
 `TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` → `XAI_API_KEY` → the host
 `xai-oauth` login. When the host is importable its resolver owns refresh
 and quarantine; otherwise `HERMES_HOME/auth.json` is parsed read-only.
+That parse reads both shapes the host keeps a login in, in the host's own
+order: a `providers` block with the tokens under `tokens`, then the
+`credential_pool` list — where a current host writes a device-code login,
+with the tokens flat on the row. Both tokens are required either way, which
+is also what rejects a quarantined login.
 Talk never writes either store. Doctor's auth check names the winning lane
-(`xai-oauth=valid|expired|invalid|missing`) without refreshing anything;
+(`xai-oauth=valid|expired|invalid|missing`, plus `(via providers)` or
+`(via credential_pool)` when a login was found) without refreshing anything;
 `hermes talk doctor --probe` is the one opt-in network call — a `POST
 /v1/realtime/client_secrets` plus a socket handshake against `api.x.ai`
 that prints status codes and the first event type, never the token.

@@ -713,6 +713,36 @@ def _write_xai_oauth(home: Path, *, access: str, refresh: str = XAI_REFRESH) -> 
     return path
 
 
+def _write_xai_pool(home: Path, *, access: str, refresh: str = XAI_REFRESH) -> Path:
+    """The other shape: a device-code login in the pool, tokens flat on the row."""
+
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "cce4f6",
+                            "label": "xai-oauth-oauth-1",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": access,
+                            "refresh_token": refresh,
+                            "base_url": "https://api.x.ai/v1",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.fixture
 def _no_host(monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_cli", None)
@@ -797,7 +827,31 @@ def test_human_report_renders_the_xai_oauth_receipt(monkeypatch, tmp_path, _no_h
     rendered = talk_doctor.render_human(talk_doctor.collect_report())
 
     assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
-    assert "receipt: winner=xai-oauth, xai-oauth=valid, preference=absent" in rendered
+    assert (
+        "receipt: winner=xai-oauth, xai-oauth=valid (via providers), preference=absent"
+        in rendered
+    )
+    assert XAI_ACCESS not in rendered
+
+
+def test_human_report_names_the_credential_pool_as_the_source(monkeypatch, tmp_path, _no_host):
+    """A device-code login lives in the pool; the receipt says so.
+
+    Before the pool was read at all this store rendered
+    ``xai-oauth=missing`` while the lane worked.
+    """
+
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    _write_xai_pool(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    rendered = talk_doctor.render_human(talk_doctor.collect_report())
+
+    assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
+    assert (
+        "receipt: winner=xai-oauth, xai-oauth=valid (via credential_pool), preference=absent"
+        in rendered
+    )
     assert XAI_ACCESS not in rendered
 
 

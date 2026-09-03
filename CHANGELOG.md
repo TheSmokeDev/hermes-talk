@@ -170,6 +170,23 @@ named rather than smoothed.
   `docs/OPERATING.md`'s Audio table.
 
 ### Fixed
+- `talk doctor` no longer reports a working Grok lane as unconfigured. The
+  read-only parse of the host store knew one of the two shapes a Hermes
+  `xai-oauth` login lives in — a `providers` block with the tokens nested
+  under `tokens` — and a current host writes a device-code login into
+  `credential_pool` instead, as a list whose rows carry the tokens FLAT. So
+  every operator who logged in on a current Hermes was told
+  `no usable Grok authentication lane was found` while the lane resolved and
+  connected fine; only the read-only diagnostic was blind, never the call.
+  The parse now mirrors the host's own resolver
+  (`hermes_cli.auth._xai_oauth_state_from_store`) end to end: `providers`
+  first, then the pool in stored order, both tokens required on either — the
+  same pair check that rejects a quarantined login, since the host
+  quarantines by popping the tokens. A non-list pool slice still yields
+  nothing, because the host would not read one either. The receipt gained
+  `xai_oauth_source`, and `talk doctor` now prints
+  `xai-oauth=valid (via credential_pool)`, so the next person to debug this
+  can tell an empty store from an unread one.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.
