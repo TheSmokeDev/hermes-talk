@@ -4,13 +4,16 @@ What is being proved: a paused capture surface feeds the session nothing
 while playback, the barge-in boundary and the announcement gate carry on;
 both rooms (terminal microphone, Discord channel) honour the same flag;
 the model's tool, the operator's key and the ``/talk`` command all flip
-the one attached surface and get the receipt they were promised; and a
+the one attached surface and get the receipt they were promised; a
 surface that is not attached refuses instead of arming a pause against
-the next session.
+the next session; and a pause is never offered — nor armed — where the
+operator has no key or command to undo it, so Ctrl+C is never the only
+way back.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import sys
@@ -56,6 +59,10 @@ def test_pause_stops_terminal_capture_and_resume_restores_it():
     audio.pause_input()
     assert audio.input_paused is True
     audio._input_callback(_block(), talk_audio.BLOCKSIZE, None, None)
+    # Dropped in the CALLBACK, not queued and skipped by the reader: a queue
+    # that fills through a long pause overflows into dropped_input_blocks,
+    # which talk_status reports as capacity trouble.
+    assert audio._input.qsize() == 0, "paused capture was queued, not dropped"
     assert audio.read_input_chunk() is None, "paused capture reached the reader"
     # Dropped-while-paused is not an overflow: the counter reports capacity
     # trouble, and a pause is the operator's choice.
@@ -137,6 +144,8 @@ def test_pause_drops_channel_audio_but_keeps_the_host_drained_and_armed(monkeypa
     connection.deliver(frame)
     assert not receiver._buffers[1], "the host's buffer grew while paused"
     assert adapter.__dict__.get("timer_resets") == [7, 7]
+    # Dropped in the drain loop, not queued for the reader to skip.
+    assert bridge._inbound.qsize() == 0, "paused channel audio was queued, not dropped"
     assert bridge.read_input_chunk() is None
     assert bridge.read_input_packet() is None, "silence must not be synthesized while paused"
 
@@ -205,18 +214,47 @@ class _Surface:
 
 def test_nothing_attached_refuses_instead_of_arming_a_pause():
     assert talk_pause.is_paused() is None
+    assert talk_pause.resume_control() is None
     assert talk_pause.set_paused(True, source=talk_pause.SOURCE_TOOL) == talk_pause.NO_SESSION
     assert talk_pause.set_paused(False, source=talk_pause.SOURCE_TOOL) == talk_pause.NO_SESSION
 
     surface = _Surface()
-    talk_pause.attach_session(surface)
+    talk_pause.attach_session(surface, resume_control=talk_pause.RESUME_KEYBOARD)
     assert surface.input_paused is False, "a refused pause must not carry into the next attach"
+
+
+def test_a_pause_needs_a_registered_way_back():
+    """A paused microphone cannot hear "resume". A session that registered
+    no operator control is refused every pause — from any source — because
+    the only way back would be Ctrl+C, the exit this feature exists to
+    avoid. Resuming is always allowed: it only widens listening back."""
+
+    surface = _Surface()
+    changes: list = []
+    talk_pause.attach_session(surface, lambda p, s: changes.append((p, s)))
+    assert talk_pause.resume_control() is None
+
+    for source in talk_pause.SOURCES:
+        assert talk_pause.set_paused(True, source=source) == talk_pause.NO_RESUME_PATH
+    assert surface.input_paused is False and surface.calls == [] and changes == []
+
+    surface.input_paused = True  # paused some other way; the way back is open
+    assert talk_pause.set_paused(False, source=talk_pause.SOURCE_TOOL) == talk_pause.RESUMED
+    assert surface.calls == ["resume"]
+
+    talk_pause.attach_session(surface, resume_control=talk_pause.RESUME_COMMAND)
+    assert talk_pause.resume_control() == talk_pause.RESUME_COMMAND
+    assert talk_pause.set_paused(True, source=talk_pause.SOURCE_TOOL) == talk_pause.PAUSED
+    talk_pause.detach_session(surface)
+    assert talk_pause.resume_control() is None
 
 
 def test_set_paused_flips_once_and_reports_no_ops():
     surface = _Surface()
     changes: list[tuple[bool, str]] = []
-    talk_pause.attach_session(surface, lambda p, s: changes.append((p, s)))
+    talk_pause.attach_session(
+        surface, lambda p, s: changes.append((p, s)), resume_control=talk_pause.RESUME_KEYBOARD
+    )
 
     tool, key, command = (
         talk_pause.SOURCE_TOOL,
@@ -241,7 +279,7 @@ def test_a_raising_receipt_callback_never_undoes_the_flip():
     def boom(_paused, _source):
         raise RuntimeError("loop is gone")
 
-    talk_pause.attach_session(surface, boom)
+    talk_pause.attach_session(surface, boom, resume_control=talk_pause.RESUME_KEYBOARD)
     assert talk_pause.set_paused(True, source=talk_pause.SOURCE_TOOL) == talk_pause.PAUSED
     assert surface.input_paused is True
 
@@ -260,8 +298,9 @@ def test_an_unknown_source_is_a_caller_bug():
 
 def test_detach_only_drops_the_surface_it_names():
     first, second = _Surface(), _Surface()
-    talk_pause.attach_session(first)
-    talk_pause.attach_session(second)  # a later session took the slot
+    talk_pause.attach_session(first, resume_control=talk_pause.RESUME_KEYBOARD)
+    # A later session took the slot, with its own way back.
+    talk_pause.attach_session(second, resume_control=talk_pause.RESUME_COMMAND)
     talk_pause.detach_session(first)  # the earlier session tears down
     assert talk_pause.set_paused(True, source=talk_pause.SOURCE_TOOL) == talk_pause.PAUSED
     assert second.input_paused is True
@@ -276,7 +315,9 @@ def test_concurrent_controls_resolve_to_one_flip():
 
     surface = _Surface()
     changes: list = []
-    talk_pause.attach_session(surface, lambda p, s: changes.append(s))
+    talk_pause.attach_session(
+        surface, lambda p, s: changes.append(s), resume_control=talk_pause.RESUME_KEYBOARD
+    )
     outcomes: list[str] = []
     go = threading.Barrier(2)
 
@@ -302,7 +343,7 @@ def test_concurrent_controls_resolve_to_one_flip():
 
 
 def test_the_tool_is_advertised_handled_and_classified_read_only():
-    tools = talk_tools.default_talk_tools()
+    tools = talk_tools.default_talk_tools(pausable=True)
     schema = next(tool for tool in tools if tool["name"] == "pause_voice_input")
     assert schema["parameters"]["properties"]["paused"]["type"] == "boolean"
     assert "pause_voice_input" in talk_tools._HANDLERS
@@ -314,18 +355,19 @@ def test_the_tool_is_advertised_handled_and_classified_read_only():
     assert "pause_voice_input" not in talk_operator_auth.MUTATING_TALK_TOOLS
 
 
-def test_the_tool_is_offered_only_where_this_process_owns_the_microphone():
-    """The dashboard tab's microphone lives in the browser; a pause tool
-    there could only ever answer "nothing here to pause"."""
+def test_the_tool_is_offered_only_with_a_guaranteed_way_back():
+    """``pausable`` is the session's word that an operator control exists.
+    Default off: the dashboard tab's microphone lives in the browser, and a
+    terminal without a tty has no key — a pause tool there would be a pause
+    only Ctrl+C could end."""
 
-    def names(lane: str) -> list[str]:
-        return [tool["name"] for tool in talk_tools.default_talk_tools(lane=lane)]
+    def names(**kwargs) -> list[str]:
+        return [tool["name"] for tool in talk_tools.default_talk_tools(**kwargs)]
 
-    assert "pause_voice_input" in names("cli")
-    assert "pause_voice_input" in names("discord")
-    assert "pause_voice_input" not in names("dashboard")
-    assert "pause_voice_input" not in names("some-future-lane")
-    assert names("dashboard") == names("cli")[:-1], "only the pause tool may differ by lane"
+    assert "pause_voice_input" in names(pausable=True)
+    assert "pause_voice_input" not in names(pausable=False)
+    assert "pause_voice_input" not in names()
+    assert names() == names(pausable=True)[:-1], "only the pause tool may differ"
 
 
 def test_the_tool_refuses_when_no_microphone_is_attached():
@@ -336,11 +378,15 @@ def test_the_tool_refuses_when_no_microphone_is_attached():
 
 def test_the_tool_pauses_says_how_to_resume_and_resumes():
     audio = talk_audio.DuplexAudio()
-    talk_pause.attach_session(audio)
+    talk_pause.attach_session(audio, resume_control=talk_pause.RESUME_KEYBOARD)
 
     paused = talk_tools.execute_talk_tool("pause_voice_input", {})
-    assert paused == talk_tools.PAUSE_RECEIPTS[talk_pause.PAUSED]
-    assert "Enter in the terminal" in paused and "/talk resume" in paused
+    assert paused == talk_tools.PAUSE_RECEIPTS[talk_pause.PAUSED].format(
+        resume=talk_pause.RESUME_KEYBOARD
+    )
+    # The receipt names THIS room's control, never the other room's.
+    assert paused.endswith("Tell them how to resume: Enter in the terminal.")
+    assert "/talk resume" not in paused
     assert audio.input_paused is True
 
     again = talk_tools.execute_talk_tool("pause_voice_input", {"paused": True})
@@ -354,11 +400,34 @@ def test_the_tool_pauses_says_how_to_resume_and_resumes():
     assert listening == talk_tools.PAUSE_RECEIPTS[talk_pause.ALREADY_LISTENING]
 
 
+def test_the_tool_names_the_discord_control_in_a_discord_room():
+    audio = talk_audio.DuplexAudio()
+    talk_pause.attach_session(audio, resume_control=talk_pause.RESUME_COMMAND)
+
+    paused = talk_tools.execute_talk_tool("pause_voice_input", {})
+    assert paused.endswith("Tell them how to resume: /talk resume in Discord.")
+    assert "Enter" not in paused
+
+
+def test_the_tool_refuses_to_pause_a_session_with_no_way_back():
+    """The execution-side half of the advertisement gate: a pause call that
+    arrives anyway — a relayed tool name, a stale schema — cannot arm a pause
+    nobody can undo."""
+
+    audio = talk_audio.DuplexAudio()
+    talk_pause.attach_session(audio)
+
+    refused = talk_tools.execute_talk_tool("pause_voice_input", {})
+    assert refused == talk_tools.PAUSE_RECEIPTS[talk_pause.NO_RESUME_PATH]
+    assert "was not paused" in refused and "Ctrl+C" in refused
+    assert audio.input_paused is False
+
+
 @pytest.mark.parametrize("raw", ["false", "No", "0", "off", "resume"])
 def test_a_provider_that_serializes_the_flag_as_text_still_resumes(raw):
     audio = talk_audio.DuplexAudio()
     audio.pause_input()
-    talk_pause.attach_session(audio)
+    talk_pause.attach_session(audio, resume_control=talk_pause.RESUME_KEYBOARD)
 
     assert talk_tools.execute_talk_tool("pause_voice_input", {"paused": raw}) == (
         talk_tools.PAUSE_RECEIPTS[talk_pause.RESUMED]
@@ -373,6 +442,7 @@ def test_every_outcome_has_a_receipt():
         talk_pause.ALREADY_PAUSED,
         talk_pause.ALREADY_LISTENING,
         talk_pause.NO_SESSION,
+        talk_pause.NO_RESUME_PATH,
         talk_pause.UNSUPPORTED,
     }
     assert set(talk_tools.PAUSE_RECEIPTS) == outcomes
@@ -410,10 +480,59 @@ def test_the_keyboard_watcher_needs_a_terminal():
     assert talk_cli.start_keyboard_pause_control(None) is None
 
 
+def _raising_isatty():
+    raise ValueError("I/O operation on closed file")
+
+
+@pytest.mark.parametrize(
+    "stdin",
+    [
+        types.SimpleNamespace(isatty=lambda: True),
+        types.SimpleNamespace(isatty=lambda: False),
+        types.SimpleNamespace(isatty=_raising_isatty),
+        object(),
+        None,
+    ],
+)
+def test_the_advertisement_predicate_is_the_watchers_own(stdin):
+    """One predicate decides both whether the pause tool is offered on the
+    terminal lane and whether the watcher starts — so the tool can never be
+    offered on a terminal where Enter would not be read."""
+
+    available = talk_cli.keyboard_pause_control_available(stdin)
+    stop = talk_cli.start_keyboard_pause_control(stdin, read_key=lambda _s, e: e.wait(0.01))
+    assert available is (stop is not None)
+    if stop is not None:
+        stop()
+
+
+def test_windows_extended_keys_are_consumed_whole_and_never_read_as_letters(monkeypatch):
+    """``msvcrt.getwch()`` hands an arrow, Insert or an F-key as a prefix
+    ('\\xe0' or '\\x00') and THEN the scan code. Read alone, Down-Arrow's scan
+    code is 'P' and Insert's is 'R' — a stray arrow key paused the microphone
+    and Insert resumed it. Both bytes go together now."""
+
+    down_arrow, insert, f1 = "\xe0P", "\xe0R", "\x00;"
+    chars = list(down_arrow + insert + f1 + "x" + "\xe9" + "\r" + "p" + "R")
+    fake_msvcrt = types.SimpleNamespace(kbhit=lambda: bool(chars), getwch=lambda: chars.pop(0))
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    actions = []
+    while chars:
+        actions.append(talk_cli._read_control_key(None, threading.Event()))
+
+    # Three extended keys → three Nones, each eating both bytes; 'x' unknown;
+    # 'é' alphabetic but not a control; then Enter, p, R do their jobs.
+    assert actions == [None, None, None, None, None, "toggle", "pause", "resume"]
+
+
 def test_the_keyboard_watcher_flips_the_attached_surface_and_stops_on_request():
     surface = _Surface()
     sources: list[str] = []
-    talk_pause.attach_session(surface, lambda _p, s: sources.append(s))
+    talk_pause.attach_session(
+        surface, lambda _p, s: sources.append(s), resume_control=talk_pause.RESUME_KEYBOARD
+    )
     keys = iter(["toggle", "toggle", "pause", "resume", "resume", "x", "pause"])
     seen = threading.Event()
 
@@ -465,7 +584,9 @@ def test_discord_commands_route_to_the_live_session_and_refuse_without_one():
 
     audio = talk_audio.DuplexAudio()
     sources: list[str] = []
-    talk_pause.attach_session(audio, lambda _p, s: sources.append(s))
+    talk_pause.attach_session(
+        audio, lambda _p, s: sources.append(s), resume_control=talk_pause.RESUME_COMMAND
+    )
     assert talk_discord.pause_session() == talk_discord._PAUSE_COMMAND_RECEIPTS[talk_pause.PAUSED]
     assert audio.input_paused is True
     assert "microphone is paused" in talk_discord.session_status()
@@ -525,10 +646,17 @@ class _PausableAudio:
         pass
 
 
-def _run_session_with_operator_pause(monkeypatch, *, keyboard: bool):
+def _run_session(monkeypatch, *, keyboard_control: bool, tty: bool, lane: str = "cli", probe=None):
+    """One fake session on ``lane``. After the microphone has streamed once,
+    ``probe`` runs on the wire's side and its return value is kept; the wire
+    then waits briefly for an operator-flip announcement and hangs up."""
+
     sent: list[dict] = []
     marks: list[str] = []
+    started: list[bool] = []
     stopped: list[bool] = []
+    minted: dict = {}
+    probed: dict = {}
 
     class _Message:
         type = "text"
@@ -556,22 +684,20 @@ def _run_session_with_operator_pause(monkeypatch, *, keyboard: bool):
             if self.step == 2:
                 return _Message({"type": "response.done", "response": {"id": "r1"}})
             if self.step == 3:
-                # Let the microphone stream first, then the operator pauses
-                # it from their own control while the wire is idle.
+                # Let the microphone stream first, then run the probe while
+                # the wire is idle.
                 for _ in range(300):
                     if "append" in marks:
                         break
                     await asyncio.sleep(0.01)
                 assert talk_pause.is_paused() is False, "the session never attached its audio"
-                marks.append("PAUSED")
-                outcome = talk_pause.set_paused(True, source=talk_pause.SOURCE_COMMAND)
-                assert outcome == talk_pause.PAUSED
-                for _ in range(500):
+                marks.append("PROBE")
+                if probe is not None:
+                    probed["result"] = probe()
+                for _ in range(50):
                     await asyncio.sleep(0.01)
-                    if any("paused your microphone" in json.dumps(m) for m in sent):
+                    if any("your microphone" in json.dumps(m) for m in sent):
                         break
-                else:
-                    raise AssertionError("the operator's pause was never announced")
                 await asyncio.sleep(0.05)
                 raise StopAsyncIteration
             raise StopAsyncIteration
@@ -591,14 +717,20 @@ def _run_session_with_operator_pause(monkeypatch, *, keyboard: bool):
         def ws_connect(self, *_args, **_kwargs):
             return _WS()
 
+    def fake_mint(*_args, **kwargs):
+        minted.update(kwargs)
+        return types.SimpleNamespace(client_secret="x")
+
+    def fake_start(*_args, **_kwargs):
+        started.append(True)
+        return lambda: stopped.append(True)
+
     host = types.SimpleNamespace(
         resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
         identity_sections=lambda: {},
     )
     monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
-    monkeypatch.setattr(
-        talk_cli, "_mint_session", lambda *a, **k: types.SimpleNamespace(client_secret="x")
-    )
+    monkeypatch.setattr(talk_cli, "_mint_session", fake_mint)
     monkeypatch.setattr(
         talk_cli,
         "_import_aiohttp",
@@ -607,25 +739,54 @@ def _run_session_with_operator_pause(monkeypatch, *, keyboard: bool):
             WSMsgType=types.SimpleNamespace(TEXT="text"),
         ),
     )
-    monkeypatch.setattr(
-        talk_cli,
-        "start_keyboard_pause_control",
-        (lambda *a, **k: (lambda: stopped.append(True))) if keyboard else (lambda *a, **k: None),
-    )
+    # The real predicate reads sys.stdin; the session must consult it (and
+    # only it) to decide whether a key exists on this terminal.
+    monkeypatch.setattr(talk_cli, "keyboard_pause_control_available", lambda *a, **k: tty)
+    monkeypatch.setattr(talk_cli, "start_keyboard_pause_control", fake_start)
     audio = _PausableAudio()
-    assert asyncio.run(talk_cli.run_talk_session(audio=audio)) == 0
-    return sent, marks, stopped, audio
+    code = asyncio.run(
+        talk_cli.run_talk_session(audio=audio, lane=lane, keyboard_control=keyboard_control)
+    )
+    assert code == 0
+    return types.SimpleNamespace(
+        sent=sent,
+        marks=marks,
+        started=started,
+        stopped=stopped,
+        audio=audio,
+        tools=[tool["name"] for tool in minted["tools"]],
+        probe=probed.get("result"),
+    )
 
 
-def test_the_session_attaches_its_microphone_and_speaks_an_operator_pause(monkeypatch, capsys):
-    sent, marks, _stopped, audio = _run_session_with_operator_pause(monkeypatch, keyboard=False)
+def _pause_by_tool():
+    return talk_tools.execute_talk_tool("pause_voice_input", {})
 
-    assert "append" in marks[: marks.index("PAUSED")], "the microphone never streamed"
-    assert "append" not in marks[marks.index("PAUSED") + 1 :], "audio flowed after the pause"
-    assert audio.input_paused is True
+
+def test_the_standalone_terminal_offers_the_pause_and_watches_its_own_keyboard(
+    monkeypatch, capsys
+):
+    """``hermes talk`` on a real tty: the key exists, so the tool is offered,
+    the watcher runs, the connected line says so, and an operator flip from
+    the keyboard is announced in the contained shape and printed with the
+    way back."""
+
+    run = _run_session(
+        monkeypatch,
+        keyboard_control=True,
+        tty=True,
+        probe=lambda: talk_pause.set_paused(True, source=talk_pause.SOURCE_KEYBOARD),
+    )
+
+    assert "pause_voice_input" in run.tools
+    assert run.started == [True] and run.stopped == [True], "watcher not started+stopped once"
+    assert run.probe == talk_pause.PAUSED
+    assert "append" in run.marks[: run.marks.index("PROBE")], "the microphone never streamed"
+    assert "append" not in run.marks[run.marks.index("PROBE") + 1 :], "audio flowed after the pause"
+    assert run.audio.input_paused is True
 
     announcement = next(
-        m for m in sent if "paused your microphone from a /talk command" in json.dumps(m)
+        m for m in run.sent if "paused your microphone from the keyboard" in json.dumps(m)
     )
     assert announcement["item"]["role"] == "system"
     assert "playback and background work continue" in announcement["item"]["content"][0]["text"]
@@ -633,19 +794,101 @@ def test_the_session_attaches_its_microphone_and_speaks_an_operator_pause(monkey
     assert talk_pause.is_paused() is None
 
     out = capsys.readouterr().out
-    assert "talk: microphone paused" in out
-    assert "Ctrl+C to hang up." in out and "Enter to pause" not in out
-
-
-def test_the_terminal_control_is_offered_only_when_it_exists_and_is_stopped(monkeypatch, capsys):
-    _sent, _marks, stopped, _audio = _run_session_with_operator_pause(monkeypatch, keyboard=True)
-
-    out = capsys.readouterr().out
     assert "Ctrl+C to hang up, Enter to pause or resume the microphone." in out
     assert "talk: microphone paused (Enter to resume)" in out
-    assert stopped == [True], "the keyboard watcher was never stopped"
+
+
+@pytest.mark.parametrize(
+    ("keyboard_control", "tty", "why"),
+    [
+        (True, False, "hermes talk with a piped or non-tty stdin (mintty, a launcher wrapper)"),
+        (False, True, "/talk at the Hermes prompt — prompt_toolkit owns the tty"),
+        (False, False, "neither"),
+    ],
+)
+def test_a_terminal_with_no_way_back_offers_no_pause_and_refuses_one(
+    monkeypatch, capsys, keyboard_control, tty, why
+):
+    """Must-fix from the #105 review: the tool used to be advertised before
+    the session knew whether a key existed, so a non-tty stdin — or the
+    Hermes prompt's own terminal — got a pause only Ctrl+C could end. Now
+    the decision is made once, before the tools are built, and the registry
+    refuses the pause even if the call arrives anyway."""
+
+    run = _run_session(
+        monkeypatch, keyboard_control=keyboard_control, tty=tty, probe=_pause_by_tool
+    )
+
+    assert "pause_voice_input" not in run.tools, why
+    assert run.started == [], f"the watcher must not start: {why}"
+    assert run.probe == talk_tools.PAUSE_RECEIPTS[talk_pause.NO_RESUME_PATH]
+    assert run.audio.input_paused is False
+    # The microphone kept streaming after the refused pause.
+    assert "append" in run.marks[run.marks.index("PROBE") + 1 :]
+    assert not any("your microphone" in json.dumps(m) for m in run.sent)
+
+    out = capsys.readouterr().out
+    assert "Ctrl+C to hang up." in out and "Enter to pause" not in out
+    assert "microphone paused" not in out
+
+
+def test_the_discord_room_offers_the_pause_with_the_command_as_the_way_back(monkeypatch, capsys):
+    """The Discord lane has no keyboard and needs none: `/talk resume` is
+    text, typed, and always there. The tool is offered, the receipt names
+    that command, and a command flip is announced as one."""
+
+    run = _run_session(
+        monkeypatch,
+        keyboard_control=False,
+        tty=False,
+        lane="discord",
+        # The model pauses; the operator types `/talk resume`.
+        probe=lambda: (
+            _pause_by_tool(),
+            talk_pause.set_paused(False, source=talk_pause.SOURCE_COMMAND),
+        ),
+    )
+
+    assert "pause_voice_input" in run.tools
+    assert run.started == [], "a gateway has no keyboard to watch"
+    tool_receipt, resumed = run.probe
+    assert tool_receipt.endswith("Tell them how to resume: /talk resume in Discord.")
+    assert "Enter" not in tool_receipt
+    assert resumed == talk_pause.RESUMED
+    assert run.audio.input_paused is False
+    # The model's own flip is not announced (it speaks its tool result); the
+    # operator's command is.
+    assert not any("paused your microphone" in json.dumps(m) for m in run.sent)
+    assert any("resumed your microphone from a /talk command" in json.dumps(m) for m in run.sent)
+
+    out = capsys.readouterr().out
+    assert "Enter to pause" not in out
+    assert "talk: microphone paused\n" in out, "no key hint where there is no key"
+    assert "talk: microphone listening again" in out
+
+
+def test_cli_entry_grants_the_keyboard_only_to_the_standalone_command(monkeypatch):
+    """``hermes talk`` arrives through argparse and owns its tty; the bare
+    ``cli_entry()`` the in-session ``/talk`` makes does not — that terminal
+    belongs to the Hermes prompt for the whole call."""
+
+    seen: list[dict] = []
+
+    async def fake_session(**kwargs):
+        seen.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(talk_cli, "run_talk_session", fake_session)
+
+    assert talk_cli.cli_entry(argparse.Namespace(talk_command="session")) == 0
+    assert talk_cli.cli_entry() == 0
+    assert talk_cli.cli_entry(keyboard_control=False) == 0
+    standalone = argparse.Namespace(talk_command="session")
+    assert talk_cli.cli_entry(standalone, keyboard_control=False) == 0
+    assert [k["keyboard_control"] for k in seen] == [True, False, False, False]
 
 
 def test_the_cli_lane_watches_the_real_stdin_only_when_it_is_a_terminal(monkeypatch):
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    assert talk_cli.keyboard_pause_control_available() is False
     assert talk_cli.start_keyboard_pause_control() is None

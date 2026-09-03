@@ -238,8 +238,8 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False):
     """
 
     # The browser owns this lane's microphone, so the pause tool is not
-    # offered here (talk_tools.PAUSABLE_LANES).
-    tools = talk_tools.default_talk_tools(lane="dashboard")
+    # offered here (default_talk_tools' pausable stays False).
+    tools = talk_tools.default_talk_tools()
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),

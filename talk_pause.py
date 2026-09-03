@@ -13,6 +13,15 @@ remembered. A flag armed against a session that has not started yet would
 silently mute the next one, and the dashboard tab (whose microphone lives in
 the browser) must hear "there is nothing here to pause", not "paused".
 
+A pause is also refused when the attached session registered NO operator
+control that can undo it (:func:`attach_session`'s ``resume_control``). A
+paused microphone cannot hear the word "resume", so without a key or a
+command the only way back would be Ctrl+C — the one exit this feature
+exists to avoid. The session decides that control before it advertises the
+tool; this gate is the execution-side half of the same decision, so a tool
+call that arrives some other way (a relayed name, a stale schema) cannot
+arm a pause nobody can end.
+
 Thread model: the tool runs on the relay's daemon pool, the terminal key on
 its own reader thread, the Discord command on the gateway loop. Every entry
 point takes the lock; the attaching session's ``on_change`` callback fires
@@ -42,24 +51,41 @@ RESUMED = "resumed"
 ALREADY_PAUSED = "already_paused"
 ALREADY_LISTENING = "already_listening"
 NO_SESSION = "no_session"
+NO_RESUME_PATH = "no_resume_path"
 UNSUPPORTED = "unsupported"
+
+#: The operator's way back from a pause, in the words the receipts use. A
+#: session registers exactly one of these at attach time — or none, in which
+#: case pausing is refused (see the module docstring).
+RESUME_KEYBOARD = "Enter in the terminal"
+RESUME_COMMAND = "/talk resume in Discord"
 
 _LOCK = threading.Lock()
 _SURFACE: object | None = None
 _ON_CHANGE: Callable[[bool, str], None] | None = None
+_RESUME_CONTROL: str | None = None
 
 
-def attach_session(audio: object, on_change: Callable[[bool, str], None] | None = None) -> None:
+def attach_session(
+    audio: object,
+    on_change: Callable[[bool, str], None] | None = None,
+    *,
+    resume_control: str | None = None,
+) -> None:
     """Bind the live session's capture surface (and its receipt callback).
 
     ``on_change(paused, source)`` is called after every ACTUAL flip — never
-    for a no-op — from whichever thread made it.
+    for a no-op — from whichever thread made it. ``resume_control`` names
+    the operator's own way back (:data:`RESUME_KEYBOARD`,
+    :data:`RESUME_COMMAND`); ``None`` means there is none, and every pause
+    is then refused with :data:`NO_RESUME_PATH`.
     """
 
-    global _SURFACE, _ON_CHANGE
+    global _SURFACE, _ON_CHANGE, _RESUME_CONTROL
     with _LOCK:
         _SURFACE = audio
         _ON_CHANGE = on_change
+        _RESUME_CONTROL = resume_control
 
 
 def detach_session(audio: object | None = None) -> None:
@@ -69,12 +95,20 @@ def detach_session(audio: object | None = None) -> None:
     teardown must not undo the attach of the session that replaced it.
     """
 
-    global _SURFACE, _ON_CHANGE
+    global _SURFACE, _ON_CHANGE, _RESUME_CONTROL
     with _LOCK:
         if audio is not None and _SURFACE is not audio:
             return
         _SURFACE = None
         _ON_CHANGE = None
+        _RESUME_CONTROL = None
+
+
+def resume_control() -> str | None:
+    """The attached session's operator resume control; ``None`` when there is none."""
+
+    with _LOCK:
+        return _RESUME_CONTROL if _SURFACE is not None else None
 
 
 def is_paused() -> bool | None:
@@ -101,7 +135,7 @@ def set_paused(paused: bool, *, source: str) -> str:
     if source not in SOURCES:
         raise ValueError(f"unknown pause source: {source!r}")
     with _LOCK:
-        surface, on_change = _SURFACE, _ON_CHANGE
+        surface, on_change, way_back = _SURFACE, _ON_CHANGE, _RESUME_CONTROL
         if surface is None:
             return NO_SESSION
         pause = getattr(surface, "pause_input", None)
@@ -113,6 +147,10 @@ def set_paused(paused: bool, *, source: str) -> str:
             return ALREADY_PAUSED
         if not paused and not current:
             return ALREADY_LISTENING
+        if paused and way_back is None:
+            # Resuming is always allowed — it can only widen listening back
+            # to normal. Pausing needs a way back first.
+            return NO_RESUME_PATH
         (pause if paused else resume)()
     if on_change is not None:
         try:
@@ -129,9 +167,12 @@ def reset_for_tests() -> None:
 __all__ = [
     "ALREADY_LISTENING",
     "ALREADY_PAUSED",
+    "NO_RESUME_PATH",
     "NO_SESSION",
     "PAUSED",
     "RESUMED",
+    "RESUME_COMMAND",
+    "RESUME_KEYBOARD",
     "SOURCES",
     "SOURCE_COMMAND",
     "SOURCE_KEYBOARD",
@@ -141,5 +182,6 @@ __all__ = [
     "detach_session",
     "is_paused",
     "reset_for_tests",
+    "resume_control",
     "set_paused",
 ]

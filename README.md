@@ -394,9 +394,24 @@ a verbatim line cannot, and nothing is on screen to check it against.
 the mic") and the model calls `pause_voice_input`: the call stays connected,
 playback keeps playing, background work keeps running and its results are
 still announced — only your speech stops reaching the provider. A paused
-microphone cannot hear the word "resume", so the way back is your own control:
-**Enter** in the terminal (it toggles; `p` and `r` are explicit), `/talk resume`
-in Discord. Both directions get a spoken receipt, and Ctrl+C still hangs up.
+microphone cannot hear the word "resume", so the way back is your own control,
+and **the pause is offered only where that control is guaranteed to exist**:
+
+- **`hermes talk` in a real terminal** — **Enter** toggles (`p` and `r` are
+  explicit; on Windows they are single keys, elsewhere type the word and
+  Enter). The connected line says `Enter to pause or resume the microphone`
+  when the key is live. With a piped or non-tty stdin (Git Bash's mintty
+  reports no tty to Python; launcher wrappers) there is no key, so no pause is
+  offered and a pause call is refused with a receipt that says why.
+- **`/talk` typed at the Hermes prompt** — the prompt owns that terminal for
+  the whole call, so the session never watches it for a key, and offers no
+  pause either. Use `hermes talk` on its own when you want the control.
+- **Discord** — `/talk pause` and `/talk resume`, typed. The model-side tool
+  is offered on the legacy provider-owned lane; on the `provider-host-tools`
+  lane the host supplies the tool list and the typed commands are the path.
+
+Both directions get a spoken receipt, the receipt names the control for the
+room you are in, and Ctrl+C still hangs up.
 
 **In Discord**, `/talk join` runs the call in the voice channel Hermes is
 already in — same conversation, same tools, same steering, in a room other

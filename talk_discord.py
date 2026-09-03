@@ -1410,6 +1410,10 @@ _PAUSE_COMMAND_RECEIPTS = {
     talk_pause.NO_SESSION: (
         "The voice session isn't listening yet — give it a moment, then try again."
     ),
+    talk_pause.NO_RESUME_PATH: (
+        "I didn't pause — this session registered no way to resume, and a pause "
+        "nobody can undo would be a hang-up. Say `talk leave` to stop instead."
+    ),
     talk_pause.UNSUPPORTED: "This voice session can't pause its input.",
 }
 

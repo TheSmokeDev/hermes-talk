@@ -497,9 +497,14 @@ def test_slash_command_subcommands_are_gateway_only(plugin):
 def test_slash_command_runs_the_session_outside_a_loop(plugin, monkeypatch):
     ctx = StubCtx()
     plugin.register(ctx)
-    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda *a, **k: 0)
+    calls: list[dict] = []
+    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda *a, **k: calls.append(k) or 0)
 
     assert ctx.commands["talk"]["handler"]("") == "Voice session ended."
+    # The Hermes prompt owns this terminal for the whole call (prompt_toolkit,
+    # raw mode, its own stdin reader): the session must never watch stdin for
+    # the pause key here (hermes-talk#100).
+    assert calls == [{"keyboard_control": False}]
 
 
 def test_slash_command_reaches_the_rooms_pause_and_resume(plugin, monkeypatch):
@@ -523,10 +528,10 @@ def test_slash_command_reaches_the_rooms_pause_and_resume(plugin, monkeypatch):
 
     assert asyncio.run(call_from_a_loop()) == ["p", "p", "r", "r"]
     assert calls == ["pause", "pause", "resume", "resume"]
-    # In a terminal the words name the room that isn't there — and the
-    # terminal's own control, which is a key, not a command.
+    # In a terminal the words name the room that isn't there — and the key
+    # exists only on the standalone command, whose session owns its tty.
     reply = handler("pause")
-    assert "terminal" in reply.lower() and "Enter pauses" in reply
+    assert "terminal" in reply.lower() and "`hermes talk` command adds Enter" in reply
 
 
 def test_core_absent_process_keeps_legacy_imports_and_reports_optional():

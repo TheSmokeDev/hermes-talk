@@ -198,12 +198,17 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
         if sub in {"join", "core join", "pause", "resume", "leave", "status"}:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
-                "terminal, plain `/talk` starts the call (Enter pauses and "
-                "resumes the microphone during it)."
+                "terminal, plain `/talk` starts the call; the standalone "
+                "`hermes talk` command adds Enter to pause and resume the "
+                "microphone."
             )
+        # This prompt owns the terminal for the whole call (prompt_toolkit,
+        # raw mode, its own stdin reader), so the session must not watch
+        # stdin for the pause key — and without that key it offers no pause
+        # (hermes-talk#100). `hermes talk` on its own is the lane that does.
         return (
             "Voice session ended."
-            if talk_cli.cli_entry() == 0
+            if talk_cli.cli_entry(keyboard_control=False) == 0
             else ("Voice session ended with errors — see stderr.")
         )
 
