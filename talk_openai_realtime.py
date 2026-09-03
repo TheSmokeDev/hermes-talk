@@ -49,6 +49,7 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
         instructions=setup.instructions,
         tools=[_tool_wire(tool) for tool in setup.tools] or None,
         automatic_response=setup.automatic_response,
+        turn_detection=setup.turn_detection,
         text_output=setup.text_output,
     )
     return {
@@ -348,6 +349,7 @@ class _OpenAIWireSession:
             instructions=configuration["instructions"],
             tools=configuration.get("tools"),
             automatic_response=configuration["automatic_response"],
+            turn_detection=configuration["turn_detection"],
             text_output=configuration.get("text_output", False),
         )
 
@@ -359,6 +361,7 @@ class _OpenAIWireSession:
         instructions: str,
         tools: list[dict] | None,
         automatic_response: bool,
+        turn_detection: rt.RealtimeTurnDetection,
         session_update: dict[str, Any],
         text_output: bool = False,
     ) -> None:
@@ -374,6 +377,7 @@ class _OpenAIWireSession:
                     instructions=instructions,
                     tools=tools,
                     automatic_response=automatic_response,
+                    turn_detection=turn_detection,
                     text_output=text_output,
                 )
             finally:
@@ -549,6 +553,7 @@ class OpenAIRealtimeSession:
                 instructions=setup.instructions,
                 tools=tools,
                 automatic_response=setup.automatic_response,
+                turn_detection=setup.turn_detection,
                 session_update=build_session_update(setup),
                 text_output=setup.text_output,
             )
