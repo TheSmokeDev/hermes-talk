@@ -11,7 +11,17 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## [Unreleased]
+## [0.17.0] — 2026-09-03
+
+Prove it, then pause it. `hermes talk check` runs the whole path — doctor,
+one live provider turn, one bounded Hermes run that has to echo a token —
+so a green report means the lane works right now, not that the config
+parses. `hermes talk diagnostics --bundle` turns a bug report into one
+redacted file. The model can pause the microphone without hanging up, two
+delegated jobs that touch the same thing can no longer race each other, and
+an announcement waits for the speaker to finish instead of talking over the
+answer you are still hearing. First release with the Hermes core realtime
+contract adapter, a security policy, and a contributing guide.
 
 ### Added
 - `pause_voice_input` — the model can pause listening without ending the
@@ -307,10 +317,13 @@ named rather than smoothed.
 
 ## [0.16.0] — 2026-09-01
 
-Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add
-xai-oauth` once, `TALK_PROVIDER=grok`, no API key — the last provider that
-still forced a metered key now rides the host login the way the OpenAI
-lane rides the Codex CLI's.
+Grok voice on an X subscription. `hermes auth add xai-oauth` once,
+`TALK_PROVIDER=grok`, no API key — the last provider that still forced a
+metered key now rides the host login the way the OpenAI lane rides the
+Codex CLI's. Verified live on **X Premium** (the $8 tier) on 2026-09-03:
+`POST /v1/realtime/client_secrets` → 200, the realtime socket → 101,
+`session.created`. A tier without realtime access still gets the honest
+403 line instead of a traceback.
 
 ### Added
 - **`xai-oauth` auth lane for Grok** (`talk_grok_auth.py`). Resolved
