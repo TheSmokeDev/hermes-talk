@@ -91,6 +91,16 @@ named rather than smoothed.
   transcript and the agent's brief in the runs panel are readable rather
   than grey mush (#79). `docs/render-dashboard-gif.py` regenerates it from
   the published release asset.
+- The plugin scans `safe` again. A literal U+FEFF typed into
+  `tests/test_grok_auth.py` — the BOM fixture for the BOM-prefixed auth-store
+  test, added with the Grok subscription lane in `01518ae` — tripped the
+  upstream `plugin_guard` scanner's `invisible_unicode` check as a HIGH
+  finding, taking the whole repo to a BLOCKED verdict. That scanner gates
+  `hermes plugins install`, so the block reached users, not just CI. The BOM
+  is now written as the escape `"\ufeff"`: identical bytes on disk, pinned by
+  the same `startswith(b"ï»¿")` assertion the test already made, and
+  no invisible character left in the source for a reader or a scanner to have
+  to distinguish from an accidental one.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.

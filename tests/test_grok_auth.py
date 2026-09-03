@@ -329,7 +329,11 @@ def test_file_fallback_reads_a_bom_prefixed_store(tmp_path):
     token = _jwt(time.time() + 7200)
     tokens = {"access_token": token, "refresh_token": REFRESH}
     body = json.dumps({"providers": {"xai-oauth": {"tokens": tokens}}})
-    path = _write_xai_store(tmp_path, access="ignored", raw="﻿" + body)
+    # The BOM as an escape, not as an invisible character in the source.
+    # The bytes written are identical -- the assertion below pins them --
+    # but a U+FEFF typed literally is indistinguishable from one pasted in
+    # by accident, which is why the plugin-guard scanner flags it high.
+    path = _write_xai_store(tmp_path, access="ignored", raw="\ufeff" + body)
     assert path.read_bytes().startswith(b"\xef\xbb\xbf")
     assert talk_grok_auth.resolve_grok_auth(env={}, hermes_home=tmp_path).token == token
 
