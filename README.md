@@ -390,6 +390,14 @@ agent-loop-only tools (`memory`, `session_search`, `honcho_search`,
 says which of the two it answered from — a recollection can be stale in a way
 a verbatim line cannot, and nothing is on screen to check it against.
 
+**Pause the microphone without hanging up.** Say "stop listening" (or "mute
+the mic") and the model calls `pause_voice_input`: the call stays connected,
+playback keeps playing, background work keeps running and its results are
+still announced — only your speech stops reaching the provider. A paused
+microphone cannot hear the word "resume", so the way back is your own control:
+**Enter** in the terminal (it toggles; `p` and `r` are explicit), `/talk resume`
+in Discord. Both directions get a spoken receipt, and Ctrl+C still hangs up.
+
 **In Discord**, `/talk join` runs the call in the voice channel Hermes is
 already in — same conversation, same tools, same steering, in a room other
 people can hear. Talk now reports speaker transitions to the model using the
@@ -397,7 +405,9 @@ member's immutable Discord user ID; display names are quoted as untrusted data,
 and an unknown SSRC stays unresolved and unauthorized. Configure immutable IDs
 with `TALK_DISCORD_OPERATOR_USER_IDS=<id>[,<id>...]`. Only those speakers may
 run `delegate_task`, `steer_agent`, `redirect_agent`, or `stop_work`; everyone
-may still converse and use read-only tools. Unset, blank, or any malformed list
+may still converse and use read-only tools — including `pause_voice_input`,
+which can only narrow what the session does; `/talk resume` (text) brings
+listening back. Unset, blank, or any malformed list
 authorizes nobody. Talk binds permission to the exact Discord PCM, VAD input
 item, and opaque Realtime response metadata — never a display name, SSRC,
 model argument, or whichever person spoke most recently. Mixed, missing, or

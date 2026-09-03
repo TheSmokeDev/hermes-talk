@@ -69,6 +69,7 @@ _BASE_TOOLS = [
     "resolve_approval",
     "talk_status",
     "talk_capabilities",
+    "pause_voice_input",
 ]
 
 

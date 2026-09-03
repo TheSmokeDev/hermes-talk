@@ -14,6 +14,28 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- `pause_voice_input` — the model can pause listening without ending the
+  call (#100). "Stop listening" or "mute the mic" is a tool call: the session
+  stays connected, playback keeps playing, background work keeps running and
+  its results are still announced; only the operator's speech stops reaching
+  the provider. The flag lives on the capture surface — `DuplexAudio` and
+  `DiscordAudio` grew `pause_input` / `resume_input` / `input_paused`, the
+  same one-interface pattern as `playback_pending` in #87 — so both rooms
+  honour it identically: blocks captured while paused are dropped (never
+  queued stale), the already-queued ones are discarded, and the Discord bridge
+  keeps the host's buffers drained and its inactivity timer armed so the bot
+  is not evicted from the channel. A paused microphone cannot hear the word
+  "resume", so the way back is the operator's own control: Enter in the
+  terminal (toggle; `p`/`r` explicit — a polling watcher, never a blocking
+  stdin read that could swallow the next Hermes prompt line), `/talk pause` /
+  `/talk resume` in Discord (`/talk status` says when it is paused). Both
+  directions get a spoken receipt: the model's tool result for its own flips,
+  a contained announcement for the operator's. The tool classifies read-only
+  (it can only narrow what a session does, and a pause is never a path to
+  authority), is advertised only on lanes whose microphone this process pumps
+  (the dashboard tab's lives in the browser), and refuses — never arms —
+  when no session is attached. Ported idea from bielcarpi/hermes-live-voice
+  (MIT), idea only.
 - Run admission control on `delegate_task` (#101). The model may declare
   `execution_mode` (`exclusive`, the default, or `parallel_read_only`) and up
   to eight normalized `resource_keys` naming what a task touches — a repo

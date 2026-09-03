@@ -340,7 +340,9 @@ SSRC alone, model arguments, and "last speaker" state are never authority.
 Configured IDs may run the four state-changing tools: `delegate_task`,
 `steer_agent`, `redirect_agent`, and `stop_work`. Other speakers retain normal
 conversation and the read-only tools (`search_memory`, `search_vault`,
-`check_work`, `list_agents`, `talk_status`, and `talk_capabilities`). Missing
+`check_work`, `list_agents`, `talk_status`, `talk_capabilities`, and
+`pause_voice_input` — a pause changes nothing outside the session and can only
+narrow what it does; `/talk resume`, typed, brings listening back). Missing
 response correlation,
 an unresolved speaker, two speakers in one VAD turn, or a speaker outside the
 allowlist returns a non-sensitive spoken denial without running the handler.

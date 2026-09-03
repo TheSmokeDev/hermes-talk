@@ -37,6 +37,7 @@ try:
         talk_doctor,
         talk_host,
         talk_identity,
+        talk_pause,
         talk_runs,
         talk_steer,
         talk_vault,
@@ -51,6 +52,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_doctor
     import talk_host
     import talk_identity
+    import talk_pause
     import talk_runs
     import talk_steer
     import talk_vault
@@ -387,6 +389,32 @@ _TOOL_TALK_CAPABILITIES: dict = {
 }
 
 
+_TOOL_PAUSE_VOICE_INPUT: dict = {
+    "type": "function",
+    "name": "pause_voice_input",
+    "description": (
+        "Pause listening — mute your microphone WITHOUT ending the call. Use "
+        "when the operator says to stop listening, mute the mic, or hold on "
+        "while they talk to someone else. Playback, background work and its "
+        "announcements all continue; only their speech stops reaching you. "
+        "Once paused you cannot hear a spoken resume: the operator resumes "
+        "from their own control (Enter in the terminal, /talk resume in "
+        "Discord), so say how to resume as you confirm the pause. Pass "
+        "paused=false to resume when a non-spoken path asks you to."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "paused": {
+                "type": "boolean",
+                "description": "true (default) pauses the microphone; false resumes it.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+
 class TalkToolError(Exception):
     """Unknown tool name or otherwise malformed tool call."""
 
@@ -410,13 +438,22 @@ def plugin_version() -> str:
     return "unknown"
 
 
-def default_talk_tools() -> list[dict]:
+#: Lanes whose microphone this process owns, and can therefore pause. The
+#: dashboard tab's microphone lives in the browser: advertising a pause
+#: there would offer a tool that can only answer "nothing here to pause".
+PAUSABLE_LANES = frozenset({"cli", "discord"})
+
+
+def default_talk_tools(*, lane: str = "cli") -> list[dict]:
     """The tool set advertised to a new Talk session (fresh copies per call).
 
     The base set is unconditional. ``search_vault`` is CONDITIONAL: it is
     advertised only when a memory provider is actually loadable in this
     process, because advertising a lookup that cannot be served is the same
     defect as the provider block this plugin stopped passing through.
+    ``pause_voice_input`` is conditional the same way, on the LANE: only a
+    room whose capture surface this process pumps (:data:`PAUSABLE_LANES`)
+    can honour it.
     """
 
     tools = [
@@ -431,6 +468,8 @@ def default_talk_tools() -> list[dict]:
         _TOOL_TALK_STATUS,
         _TOOL_TALK_CAPABILITIES,
     ]
+    if lane in PAUSABLE_LANES:
+        tools.append(_TOOL_PAUSE_VOICE_INPUT)
     try:
         if talk_vault.available():
             tools.insert(1, _TOOL_SEARCH_VAULT)
@@ -625,6 +664,39 @@ def _handle_resolve_approval(arguments: dict) -> str:
     return talk_approvals.resolve(run_id, arguments.get("choice"))
 
 
+#: What the model reads back after a pause flip. Spoken, so each one says
+#: what is TRUE now and, for a pause, how the operator gets back — a paused
+#: microphone cannot carry the word "resume".
+PAUSE_RECEIPTS: dict[str, str] = {
+    talk_pause.PAUSED: (
+        "Microphone paused — you are no longer hearing the operator. Playback, "
+        "background work and its announcements continue. Tell them how to "
+        "resume: Enter in the terminal, or /talk resume in Discord."
+    ),
+    talk_pause.ALREADY_PAUSED: "The microphone was already paused.",
+    talk_pause.RESUMED: "Microphone resumed — you are hearing the operator again.",
+    talk_pause.ALREADY_LISTENING: "The microphone was not paused; you are already listening.",
+    talk_pause.NO_SESSION: (
+        "There is no live voice session attached to this process, so there is "
+        "no microphone here to pause — in the dashboard tab the browser owns "
+        "the microphone, so use its own mute control."
+    ),
+    talk_pause.UNSUPPORTED: "This session's audio device cannot pause its input.",
+}
+
+_FALSE_WORDS = frozenset({"false", "no", "0", "off", "resume"})
+
+
+def _handle_pause_voice_input(arguments: dict) -> str:
+    raw = arguments.get("paused")
+    if isinstance(raw, str):
+        paused = raw.strip().lower() not in _FALSE_WORDS
+    else:
+        paused = True if raw is None else bool(raw)
+    outcome = talk_pause.set_paused(paused, source=talk_pause.SOURCE_TOOL)
+    return PAUSE_RECEIPTS[outcome]
+
+
 def _identity_summary() -> dict[str, int]:
     """Resolved identity sections as ``{NAME: char_count}``. Never content.
 
@@ -798,12 +870,15 @@ _HANDLERS = {
     "resolve_approval": _handle_resolve_approval,
     "talk_status": _handle_talk_status,
     "talk_capabilities": _handle_talk_capabilities,
+    "pause_voice_input": _handle_pause_voice_input,
 }
 
 
 __all__ = [
     "MAX_CATALOG_ENTRIES",
     "MAX_OUTPUT_CHARS",
+    "PAUSABLE_LANES",
+    "PAUSE_RECEIPTS",
     "REGISTRATION_FAILURES",
     "REGISTRATION_RECEIPTS",
     "REGISTRATION_REQUIREMENTS",

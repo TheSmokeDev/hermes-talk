@@ -165,9 +165,9 @@ def _register_talk_command(ctx) -> None:
         "description": (
             "Start provider-owned voice with canonical Hermes tools (join), or the "
             "canonical core voice lane (core join); "
-            "gateway also supports leave and status"
+            "gateway also supports pause, resume, leave and status"
         ),
-        "args_hint": "[join|core join|leave|status]",
+        "args_hint": "[join|core join|pause|resume|leave|status]",
     }
     if contextual:
         kwargs["invocation_context"] = True
@@ -195,10 +195,11 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        if sub in {"join", "core join", "leave", "status"}:
+        if sub in {"join", "core join", "pause", "resume", "leave", "status"}:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
-                "terminal, plain `/talk` starts the call."
+                "terminal, plain `/talk` starts the call (Enter pauses and "
+                "resumes the microphone during it)."
             )
         return (
             "Voice session ended."
@@ -210,6 +211,12 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
         return talk_discord.stop_session()
     if sub == "status":
         return talk_discord.session_status()
+    # The room's microphone control (hermes-talk#100): text, because a paused
+    # session hears nobody and the way back cannot be spoken.
+    if sub in {"pause", "mute"}:
+        return talk_discord.pause_session()
+    if sub in {"resume", "unmute"}:
+        return talk_discord.resume_session()
     if sub == "core join":
         if not talk_core_realtime.core_provider_available():
             return "Canonical core voice is unsupported by this Hermes host."

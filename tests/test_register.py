@@ -502,6 +502,33 @@ def test_slash_command_runs_the_session_outside_a_loop(plugin, monkeypatch):
     assert ctx.commands["talk"]["handler"]("") == "Voice session ended."
 
 
+def test_slash_command_reaches_the_rooms_pause_and_resume(plugin, monkeypatch):
+    """`/talk pause` / `/talk resume` (hermes-talk#100) are text on purpose:
+    a paused session hears nobody, so the way back cannot be spoken."""
+
+    ctx = StubCtx()
+    plugin.register(ctx)
+    handler = ctx.commands["talk"]["handler"]
+    assert "pause" in ctx.commands["talk"]["args_hint"]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        plugin.talk_discord, "pause_session", lambda: calls.append("pause") or "p", raising=False
+    )
+    monkeypatch.setattr(
+        plugin.talk_discord, "resume_session", lambda: calls.append("resume") or "r", raising=False
+    )
+
+    async def call_from_a_loop():
+        return [handler(word) for word in ("pause", "mute", "resume", "unmute")]
+
+    assert asyncio.run(call_from_a_loop()) == ["p", "p", "r", "r"]
+    assert calls == ["pause", "pause", "resume", "resume"]
+    # In a terminal the words name the room that isn't there — and the
+    # terminal's own control, which is a key, not a command.
+    reply = handler("pause")
+    assert "terminal" in reply.lower() and "Enter pauses" in reply
+
+
 def test_core_absent_process_keeps_legacy_imports_and_reports_optional():
     script = textwrap.dedent(
         f"""

@@ -269,6 +269,7 @@ class DuplexAudio:
         self._dropped_playback_bytes = 0
         self._played_frames = 0
         self._output_level = 0.0
+        self._input_paused = False
         self._in_stream = None
         self._out_stream = None
         self._pulse_webrtc = _PulseWebRtcAudio()
@@ -352,6 +353,13 @@ class DuplexAudio:
         input_level = _pcm16_rms(pcm)
         with self._lock:
             output_level = self._output_level
+            paused = self._input_paused
+        if paused:
+            # Paused capture is DROPPED here, not queued and skipped later: a
+            # block that sits in the queue through a pause would be the first
+            # thing sent on resume, seconds stale. (One block can still race
+            # the flag; resume_input drains it.)
+            return
         if self._echo_gate_enabled and not self._pulse_webrtc.active:
             output_active = output_level > self._output_active_level
             echo_threshold = max(
@@ -415,10 +423,55 @@ class DuplexAudio:
     def read_input_chunk(self) -> bytes | None:
         """One captured block, or ``None`` when the microphone has nothing yet."""
 
+        if self.input_paused:
+            return None
         try:
             return self._input.get_nowait()
         except queue.Empty:
             return None
+
+    def _discard_queued_input(self) -> None:
+        while True:
+            try:
+                self._input.get_nowait()
+            except queue.Empty:
+                break
+
+    def pause_input(self) -> None:
+        """Stop feeding captured audio to the session; playback is untouched.
+
+        From the moment this returns nothing the microphone heard reaches
+        the wire: blocks captured from here on are dropped in the callback,
+        the ones already queued (captured before the flag, not yet drained
+        by the sender) are discarded, and the reader answers empty while the
+        flag is up. Playback, ``playback_pending`` and the barge-in boundary
+        are unaffected — a paused session still speaks, and still knows what
+        it has said.
+        """
+
+        with self._lock:
+            self._input_paused = True
+        self._discard_queued_input()
+
+    def resume_input(self) -> None:
+        """Feed captured audio to the session again, from the next block on.
+
+        Drains first: the callback's flag check and its queue write are not
+        one atomic step, so one block admitted just before the pause can
+        land after the pause's drain. It is the stalest audio there is, and
+        without this it would be the first thing sent on resume.
+        """
+
+        self._discard_queued_input()
+        with self._lock:
+            self._input_paused = False
+
+    @property
+    def input_paused(self) -> bool:
+        """Whether capture is paused (hermes-talk#100)."""
+
+        with self._lock:
+            return self._input_paused
 
     def queue_playback(self, pcm: bytes, item_id: str | None = None) -> None:
         """Queue model audio for the speaker. Drops on overflow, never blocks."""
