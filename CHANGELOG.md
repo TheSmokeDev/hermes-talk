@@ -15,50 +15,107 @@ named rather than smoothed.
 
 ### Added
 - `pause_voice_input` — the model can pause listening without ending the
-  call (#100). "Stop listening" or "mute the mic" is a tool call: the session
-  stays connected, playback keeps playing, background work keeps running and
-  its results are still announced; only the operator's speech stops reaching
-  the provider. The flag lives on the capture surface — `DuplexAudio` and
-  `DiscordAudio` grew `pause_input` / `resume_input` / `input_paused`, the
-  same one-interface pattern as `playback_pending` in #87 — so both rooms
-  honour it identically: blocks captured while paused are dropped (never
-  queued stale), the already-queued ones are discarded, and the Discord bridge
-  keeps the host's buffers drained and its inactivity timer armed so the bot
-  is not evicted from the channel. A paused microphone cannot hear the word
-  "resume", so the way back is the operator's own control — Enter in the
-  standalone `hermes talk` terminal (toggle; `p`/`r` explicit — a polling
-  watcher, never a blocking stdin read), `/talk pause` / `/talk resume` in
-  Discord (`/talk status` says when it is paused) — and the tool is offered
-  ONLY where that control is guaranteed: the pause decision is made once,
-  before the tool list is built, from the same predicate that starts the
-  keyboard watcher, and the registered control is what the receipt names.
-  No control, no pause: a piped or non-tty stdin gets no key and no tool;
-  `/talk` at the Hermes prompt shares its tty with prompt_toolkit, so that
-  lane never watches stdin and offers no pause; and a pause call that
-  arrives anyway is refused (`no_resume_path`) rather than armed, because a
-  pause nobody can undo would be a hang-up. On Windows an extended key
-  (arrows, Insert, F-keys) is consumed whole — before, Down-Arrow's scan
-  code read as `p` and paused the microphone. Both directions get a spoken
-  receipt: the model's tool result for its own flips, a contained
-  announcement for the operator's. The tool classifies read-only (it can
-  only narrow what a session does, and a pause is never a path to authority)
-  and refuses — never arms — when no session is attached. Ported idea from
-  bielcarpi/hermes-live-voice (MIT), idea only.
-- Run admission control on `delegate_task` (#101). The model may declare
-  `execution_mode` (`exclusive`, the default, or `parallel_read_only`) and up
-  to eight normalized `resource_keys` naming what a task touches — a repo
-  checkout, a deployment target. Two live runs that share a key never overlap
-  unless both are read-only; the check runs before a run id is minted or an
-  acceptance record is written, so a refused job burns nothing and can never
-  surface as `lost`. The refusal is a spoken tool result naming the run in
-  the way and the shared key, never a hang or a silent queue, and
-  `check_work` reads out what each running job holds. New knob
-  `TALK_TRUST_DECLARED_READ_ONLY`, default off: until the operator sets it,
-  `parallel_read_only` is downgraded to `exclusive` and recorded that way,
-  because the declaration is the delegating model's own claim, not a
-  sandbox. A task that names no keys is exactly the task Talk always ran.
-- The contributor experience, written down. `CONTRIBUTING.md` now ranks
-  what we take first (bug fixes on live lanes, then provider and host
+  call (#100). "Stop listening" or "mute the mic" is a tool call: the
+  session stays connected, playback keeps playing, background work keeps
+  running and its results are still announced; only the operator's speech
+  stops reaching the provider. The flag lives on the capture surface —
+  `DuplexAudio` and `DiscordAudio` grew `pause_input` / `resume_input` /
+  `input_paused`, the same one-interface pattern as `playback_pending` in
+  #87 — so both rooms honour it identically: blocks captured while paused
+  are dropped (never queued stale), the already-queued ones are discarded,
+  and the Discord bridge keeps the host's buffers drained and its inactivity
+  timer armed so the bot is not evicted from the channel. A paused
+  microphone cannot hear the word "resume", so the way back is the
+  operator's own control — Enter in the standalone `hermes talk` terminal
+  (toggle; `p`/`r` explicit — a polling watcher, never a blocking stdin
+  read), `/talk pause` / `/talk resume` in Discord (`/talk status` says when
+  it is paused) — and the tool is offered ONLY where that control is
+  guaranteed: the pause decision is made once, before the tool list is
+  built, from the same predicate that starts the keyboard watcher, and the
+  registered control is what the receipt names. No control, no pause: a
+  piped or non-tty stdin gets no key and no tool; `/talk` at the Hermes
+  prompt shares its tty with prompt_toolkit, so that lane never watches
+  stdin and offers no pause; and a pause call that arrives anyway is refused
+  (`no_resume_path`) rather than armed, because a pause nobody can undo
+  would be a hang-up. On Windows an extended key (arrows, Insert, F-keys) is
+  consumed whole — before, Down-Arrow's scan code read as `p` and paused the
+  microphone. Both directions get a spoken receipt: the model's tool result
+  for its own flips, a contained announcement for the operator's. The tool
+  classifies read-only (it can only narrow what a session does, and a pause
+  is never a path to authority) and refuses — never arms — when no session
+  is attached. Ported idea from bielcarpi/hermes-live-voice (MIT), idea
+  only.
+- Run admission control on `delegate_task` (#101). The model may
+  declare `execution_mode` (`exclusive`, the default, or
+  `parallel_read_only`) and up to eight normalized `resource_keys` naming
+  what a task touches — a repo checkout, a deployment target. Two live runs
+  that share a key never overlap unless both are read-only; the check runs
+  before a run id is minted or an acceptance record is written, so a refused
+  job burns nothing and can never surface as `lost`. The refusal is a spoken
+  tool result naming the run in the way and the shared key, never a hang or
+  a silent queue, and `check_work` reads out what each running job holds.
+  New knob `TALK_TRUST_DECLARED_READ_ONLY`, default off: until the operator
+  sets it, `parallel_read_only` is downgraded to `exclusive` and recorded
+  that way, because the declaration is the delegating model's own claim, not
+  a sandbox. A task that names no keys is exactly the task Talk always ran.
+- `hermes talk check` proves the whole voice path end to end, right now
+  (#97). Doctor is read-only by design, so a green doctor could
+  still hide a dead mint, a refused socket, or a delegation lane that never
+  starts. The check runs the doctor checks, then a REAL session on the
+  configured provider through the same adapter and credential resolution the
+  voice uses (connect, `SessionReady`, one text turn, `ResponseFinished`),
+  then ONE bounded Hermes run through the same delegation path the voice
+  uses whose output must contain `HERMES_TALK_CHECK_OK`. `--json` reports
+  every step as pass/fail/skip with its duration and the exit code is 0 only
+  when every non-skipped step passed; `--no-run` skips the agent step;
+  `--timeout` budgets it (a run that outlives its budget is stopped, not
+  abandoned). The report never carries tokens or paths. A mock cannot go
+  green: `--provider` accepts only live lanes, the report's provider is
+  validated against the same fail-closed list `TALK_PROVIDER` uses, and the
+  live steps refuse under the test harness unless a test opts in by name.
+  Ported idea from bielcarpi/hermes-live-voice's `launch-check` (MIT) — idea
+  only, no code. Session credential/model/voice resolution moved into one
+  `talk_cli.resolve_provider_lane()` so the check proves the session's real
+  path rather than a copy of it.
+- `hermes talk diagnostics` writes a redacted support bundle for issue
+  reports (#98). Most "it doesn't work" reports could not be
+  reproduced from what the reporter pasted. The bundle carries versions
+  (Python, hermes-talk, the Hermes host, the OS), the NAMES of the `TALK_*` /
+  `HERMES_*` variables that are set plus a fixed list of shared ones
+  (presence only — values are never read), audio device counts and default
+  device names, host capability facts, and every doctor check's outcome with
+  an allowlisted subset of its details. No logs, prompts, transcripts, task
+  results, audio, secret values, or paths. The serializer is default-deny:
+  `BUNDLE_ALLOWLIST` names every key and the shape its value must have,
+  identifier-shaped leaves are dropped outright if secret redaction would
+  change them, free-text leaves pass redaction plus a path scrub and a
+  length cap, and anything not on the list is dropped — a key doctor grows
+  later cannot leak by inheritance (a test plants secret-shaped values at
+  every level and proves none reach the file). `--bundle [PATH]` writes it
+  owner-only (POSIX `0600`; the setup wizard's protected owner-only DACL on
+  Windows, applied to the empty temp before any bytes land) and verifies the
+  permissions after the move, deleting the file if they cannot be proven;
+  `--json` prints it instead. The bug-report issue template now asks for the
+  bundle first. Ported idea from bielcarpi/hermes-live-voice's `diagnostics`
+  (MIT) — idea only, no code.
+- hermes-talk's three realtime lanes now register on the Hermes core
+  `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
+  NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
+  `hermes-talk/grok`, and `hermes-talk/gemini`, so `hermes realtime --provider
+  <name>` drives them through core's own orchestrator. Registration is
+  feature-detected on both sides: a host without the hook, or with a different
+  contract version, loads hermes-talk exactly as before — one debug line, no
+  warning, every other surface intact. Capabilities are declared per lane
+  rather than assumed, so core degrades explicitly instead of calling an
+  operation the wire cannot perform. Availability stays offline and read-only
+  on all three lanes: no socket, no token refresh, no auth-store write.
+- The neutral session contract gained `ToolCallsCancelled`, and the Gemini Live
+  adapter emits it for `toolCallCancellation`. The server can discard a
+  pending tool call mid-turn; until now that was recorded silently and only
+  visible as a dropped result on the send path, which told policy nothing until
+  it had already produced work nobody wanted.
+- The contributor experience, written down. `CONTRIBUTING.md` now
+  ranks what we take first (bug fixes on live lanes, then provider and host
   compatibility, security hardening, cross-platform, new providers behind
   the contract, new surfaces, docs), maps the common paths — a new realtime
   provider, a new surface, a new talk tool, a fix, a docs change — to the
@@ -86,173 +143,79 @@ named rather than smoothed.
   showed up: @kvnloo, @TheAngryPit, @webdevtodayjason. Ported idea from
   bielcarpi/hermes-live-voice's provider-compatibility receipt (MIT) — idea
   only, no text.
-- `SECURITY.md`: supported versions (the latest PyPI release and `main`),
-  private reporting through GitHub security advisories (private vulnerability
-  reporting is enabled on the repository), a 72-hour acknowledgement target,
-  and what counts — credential leakage, auth-store writes outside the
-  documented refresh, tool-authority bypass, redaction failures, supply chain.
-- `.github/dependabot.yml`: weekly `pip` and `github-actions` updates, minor
-  and patch bumps grouped into one PR per ecosystem, majors on their own.
-- `hermes talk check` proves the whole voice path end to end, right now
-  (#97). Doctor is read-only by design, so a green doctor could still hide a
-  dead mint, a refused socket, or a delegation lane that never starts. The
-  check runs the doctor checks, then a REAL session on the configured
-  provider through the same adapter and credential resolution the voice
-  uses (connect, `SessionReady`, one text turn, `ResponseFinished`), then
-  ONE bounded Hermes run through the same delegation path the voice uses
-  whose output must contain `HERMES_TALK_CHECK_OK`. `--json` reports every
-  step as pass/fail/skip with its duration and the exit code is 0 only when
-  every non-skipped step passed; `--no-run` skips the agent step; `--timeout`
-  budgets it (a run that outlives its budget is stopped, not abandoned).
-  The report never carries tokens or paths. A mock cannot go green:
-  `--provider` accepts only live lanes, the report's provider is validated
-  against the same fail-closed list `TALK_PROVIDER` uses, and the live steps
-  refuse under the test harness unless a test opts in by name. Ported idea
-  from bielcarpi/hermes-live-voice's `launch-check` (MIT) — idea only, no
-  code. Session credential/model/voice resolution moved into one
-  `talk_cli.resolve_provider_lane()` so the check proves the session's real
-  path rather than a copy of it.
-- `hermes talk diagnostics` writes a redacted support bundle for issue
-  reports (#98). Most "it doesn't work" reports could not be reproduced from
-  what the reporter pasted. The bundle carries versions (Python, hermes-talk,
-  the Hermes host, the OS), the NAMES of the `TALK_*` / `HERMES_*` variables
-  that are set plus a fixed list of shared ones (presence only — values are
-  never read), audio device counts and default device names, host capability
-  facts, and every doctor check's outcome with an allowlisted subset of its
-  details. No logs, prompts, transcripts, task results, audio, secret values,
-  or paths. The serializer is default-deny: `BUNDLE_ALLOWLIST` names every
-  key and the shape its value must have, identifier-shaped leaves are dropped
-  outright if secret redaction would change them, free-text leaves pass
-  redaction plus a path scrub and a length cap, and anything not on the list
-  is dropped — a key doctor grows later cannot leak by inheritance (a test
-  plants secret-shaped values at every level and proves none reach the file).
-  `--bundle [PATH]` writes it owner-only (POSIX `0600`; the setup wizard's
-  protected owner-only DACL on Windows, applied to the empty temp before any
-  bytes land) and verifies the permissions after the move, deleting the file
-  if they cannot be proven; `--json` prints it instead. The bug-report issue
-  template now asks for the bundle first. Ported idea from
-  bielcarpi/hermes-live-voice's `diagnostics` (MIT) — idea only, no code.
-- hermes-talk's three realtime lanes now register on the Hermes core
-  `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
-  NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
-  `hermes-talk/grok`, and `hermes-talk/gemini`, so `hermes realtime --provider
-  <name>` drives them through core's own orchestrator. Registration is
-  feature-detected on both sides: a host without the hook, or with a different
-  contract version, loads hermes-talk exactly as before — one debug line, no
-  warning, every other surface intact. Capabilities are declared per lane
-  rather than assumed, so core degrades explicitly instead of calling an
-  operation the wire cannot perform. Availability stays offline and read-only
-  on all three lanes: no socket, no token refresh, no auth-store write.
-- The neutral session contract gained `ToolCallsCancelled`, and the Gemini Live
-  adapter emits it for `toolCallCancellation`. The server can discard a pending
-  tool call mid-turn; until now that was recorded silently and only visible as a
-  dropped result on the send path, which told policy nothing until it had
-  already produced work nobody wanted.
-- A visible trust surface on the repository (#95). Three new workflows:
-  CodeQL over the Python and over the workflow files themselves (PR, push,
-  weekly), OpenSSF Scorecard (push, weekly, results published so the badge
-  and the public viewer render), and dependency review on every PR (fails
-  on a moderate-or-worse advisory or a license outside the permissive
-  allowlist). Releases now carry provenance twice: `publish.yml` attests the
-  built dist with `actions/attest-build-provenance` before uploading, and the
-  PyPI upload passes `attestations: true` (PEP 740). Every third-party action
-  in every workflow is pinned to a full commit SHA with its version alongside
-  — the standard `plugin-guard.yml` already set for the upstream scanner —
-  which also moves `checkout` and `setup-python` from their floating `v4`/`v5`
-  majors to current releases. The README header gained CodeQL, Scorecard, and
-  PyPI badges.
 
 ### Changed
-- README leads with what works today (#96). The first screen is now: what it
-  is, the three surfaces and three providers as facts, a one-line install,
-  the demo GIF with the with-sound cut on its own line, a full badge row (CI,
-  CodeQL, Scorecard, PyPI version and downloads, license), and an "Is it
-  working?" block that puts `hermes talk doctor` before any narrative. New
-  Surfaces and Providers tables, a "Current boundaries" section that states
-  the no-self-hosted-lane limit and the other honest gaps ourselves, and a
-  "Where this sits upstream" section for RFC #77111, core PR #101808, and
-  docs PR #97325. The stale "650+ offline tests" receipt is now 1,400+ across
-  46 files, and the Status block no longer hardcodes a stale version — the
-  PyPI badge carries it.
+- README leads with what works today (#96). The first screen is now:
+  what it is, the three surfaces and three providers as facts, a one-line
+  install, the demo GIF with the with-sound cut on its own line, a full badge
+  row (CI, CodeQL, Scorecard, PyPI version and downloads, license), and an
+  "Is it working?" block that puts `hermes talk doctor` before any narrative.
+  New Surfaces and Providers tables, a "Current boundaries" section that
+  states the no-self-hosted-lane limit and the other honest gaps ourselves,
+  and a "Where this sits upstream" section for RFC #77111, core PR #101808,
+  and docs PR #97325. The stale "650+ offline tests" receipt is now 1,400+
+  across 46 files, and the Status block no longer hardcodes a stale version —
+  the PyPI badge carries it.
   Every existing section survives — reorganized, none deleted. CONTRIBUTING
   gains the `uv sync --extra dev` path, the `ruff==0.16.5` pin's reason, the
   #93 twelve-test baseline on a box where Hermes is importable, and the
   module table now lists every shipped module.
+- The software echo gate (mic blocks below the playback echo floor are
+  dropped while model audio plays) now runs on every platform whenever
+  PulseAudio AEC is not active — that is always on Windows and macOS.
+  On headphones there is no echo to suppress, so it is tunable:
+  `TALK_ECHO_GATE=off` disables it; `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL`,
+  `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL`, and `TALK_ECHO_GATE_RATIO` retune it.
+  Read when the audio stream is constructed. All four are now in
+  `docs/OPERATING.md`'s Audio table.
 
 ### Fixed
-- The dashboard `/status` route no longer echoes a configuration error's
-  text into its response (CodeQL `py/stack-trace-exposure`). An unusable
-  `TALK_VOICE` or `TALK_VOICE_MODE` still keeps the tile answerable, but the
-  response now names only WHICH setting refused plus a short reference; the
-  exception text — which quotes the offending value — goes to the dashboard's
-  own log under the same reference. The mint keeps repeating the exact
-  remediation on its own refusal path, where the caller is the operator
-  pressing Start.
-- The `ci`, `plugin-guard`, and `CodeQL` workflows run on a least-privilege
-  `GITHUB_TOKEN`: `contents: read` at the workflow level (they inherited the
-  repository default, which can be read/write), with the one write CodeQL
-  needs — `security-events: write` to upload its SARIF — granted on the
-  analyze job alone. Closes CodeQL alerts #20/#21 and Scorecard's
-  Token-Permissions findings.
-- CI lints against a pinned ruff. The dev extra asked for `ruff>=0.4` and CI
-  installed whatever was current, so ruff 0.16 arrived on its own and failed
-  the build on `RUF100`: it stopped reporting `BLE001` where the handler logs
-  the exception through a name it treats as a logger, which retired three
-  `noqa: BLE001` directives in `talk_core_provider.py` — the only module that
-  both names its logger `logger` (the other fourteen use `_log`, which ruff
-  does not recognise) and carries those directives. The trap was that the two
-  versions wanted opposite source: deleting the directives fixed CI and broke
-  every dev box still on 0.15.x. `ruff==0.16.5` is now pinned in the dev extra
-  (which is what CI installs), the three retired directives are gone with
-  their reasons kept as plain comments, and the `[tool.ruff]` comment no
-  longer claims CI runs whatever ruff is current.
-- A Discord `talk join` that refuses before going live now says WHAT
-  refused instead of "session exited unsuccessfully". The session already
-  knew — it printed the reason to the gateway's stderr and returned a bare
-  exit code — so the operator, the one person who could act on it, was the
-  only one who never saw it. Configuration and provider-connect refusals
-  also point at `/talk core join`, which resolves its provider through the
-  host and so routes around exactly those two. An audio refusal does not:
-  core voice opens the same channel and would fail the same way.
-- A tool-setup failure on the legacy Discord lane raised
-  `AttributeError` out of the session instead of refusing. That lane has no
-  host execution attachment, and the handler closed one unconditionally, so
-  the crash — not the tool problem — was what reached the operator.
+- Linux terminal calls now route default audio through PulseAudio's WebRTC
+  echo canceller and noise suppressor. Echo-cancelled input bypasses the
+  fallback amplitude/VAD gate so barge-in does not clip quiet words.
+  ([#81](https://github.com/TheSmokeDev/hermes-talk/pull/81), thanks
+  [@kvnloo](https://github.com/kvnloo) — the first outside contribution to a
+  live lane.)
 - Proactive announcements now wait for the SPEAKER to drain, not just for the
-  server's `response.done`. The model streams far faster than realtime, so the
-  terminal event can arrive with a second of the previous answer still queued
-  locally — and the announcement started on top of it, overlapping two
-  responses at the only surface the operator actually has. `DuplexAudio` and
-  the Discord bridge gained a non-destructive `playback_pending`; the
-  announcement gate now consults it both in the pump's poll and in the
-  re-check inside the send lock, so the wire and the room are decided
-  together. A deferred announcement is delayed, never dropped.
+  server's `response.done`. The model streams far faster than
+  realtime, so the terminal event can arrive with a second of the previous
+  answer still queued locally — and the announcement started on top of it,
+  overlapping two responses at the only surface the operator actually has.
+  `DuplexAudio` and the Discord bridge gained a non-destructive
+  `playback_pending`; the announcement gate now consults it both in the
+  pump's poll and in the re-check inside the send lock, so the wire and the
+  room are decided together. A deferred announcement is delayed, never
+  dropped.
 - An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
-  (30s, 0 disables) now tells the operator once. Deferring is correct, but a
-  gate that never opens was previously a silent slow poll with nothing to see.
-- A voice session whose transport declares remote speakers
-  (`discord_speaker_authorization`) but carries no authorization ledger is now
-  REFUSED at session setup, before a secret is minted or a socket is opened.
-  That equivalence held by construction and was asserted only in a comment
-  several hundred lines from where it is relied on — and the branch relying on
-  it silently selects the allow-all `local_operator_authorizer`, so a
-  construction bug would have handed every speaker in a voice channel full
-  operator authority with nothing anywhere refusing. It refuses through the
-  same bounded-reason sink every other startup refusal uses, so a Discord
-  `talk join` says what happened instead of "session exited unsuccessfully" —
-  and that sentence does not offer `/talk core join`, which would take the
-  same channel with the same speakers and refuse identically.
-- An unnamed tool call is now identified the same way on every path. The two
-  authorizer call sites disagreed (`"tool"` when revoking a permit, `""` when
-  authorizing one), so the identity a nameless event was revoked under was not
-  the identity it would have been authorized under. One helper answers for
-  both, and it returns `""` — which cannot collide with a registered tool, a
-  classification set, or a permit's recorded action.
-- The README demo GIF is re-rendered from the original 1280x582 screen
-  recording instead of the 640x291 downscale it shipped as, so the
-  transcript and the agent's brief in the runs panel are readable rather
-  than grey mush (#79). `docs/render-dashboard-gif.py` regenerates it from
-  the published release asset.
+  (30s, 0 disables) now tells the operator once. Deferring is
+  correct, but a gate that never opens was previously a silent slow poll
+  with nothing to see.
+- A Discord `talk join` that refuses before going live now says WHAT
+  refused instead of "session exited unsuccessfully". The session
+  already knew — it printed the reason to the gateway's stderr and returned
+  a bare exit code — so the operator, the one person who could act on it,
+  was the only one who never saw it. Configuration and provider-connect
+  refusals also point at `/talk core join`, which resolves its provider
+  through the host and so routes around exactly those two. An audio refusal
+  does not: core voice opens the same channel and would fail the same way.
+- A tool-setup failure on the legacy Discord lane raised
+  `AttributeError` out of the session instead of refusing. That lane
+  has no host execution attachment, and the handler closed one
+  unconditionally, so the crash — not the tool problem — was what reached
+  the operator.
+- CI lints against a pinned ruff. The dev extra asked for
+  `ruff>=0.4` and CI installed whatever was current, so ruff 0.16 arrived on
+  its own and failed the build on `RUF100`: it stopped reporting `BLE001`
+  where the handler logs the exception through a name it treats as a logger,
+  which retired three `noqa: BLE001` directives in `talk_core_provider.py` —
+  the only module that both names its logger `logger` (the other fourteen
+  use `_log`, which ruff does not recognise) and carries those directives.
+  The trap was that the two versions wanted opposite source: deleting the
+  directives fixed CI and broke every dev box still on 0.15.x. `ruff==0.16.5`
+  is now pinned in the dev extra (which is what CI installs), the three
+  retired directives are gone with their reasons kept as plain comments, and
+  the `[tool.ruff]` comment no longer claims CI runs whatever ruff is
+  current.
 - The plugin scans `safe` again. A literal U+FEFF typed into
   `tests/test_grok_auth.py` — the BOM fixture for the BOM-prefixed auth-store
   test, added with the Grok subscription lane in `01518ae` — tripped the
@@ -263,18 +226,68 @@ named rather than smoothed.
   the same `startswith(b"ï»¿")` assertion the test already made, and
   no invisible character left in the source for a reader or a scanner to have
   to distinguish from an accidental one.
-- Linux terminal calls now route default audio through PulseAudio's WebRTC
-  echo canceller and noise suppressor. Echo-cancelled input bypasses the
-  fallback amplitude/VAD gate so barge-in does not clip quiet words.
+- The README demo GIF is re-rendered from the original 1280x582 screen
+  recording instead of the 640x291 downscale it shipped as, so the
+  transcript and the agent's brief in the runs panel are readable rather
+  than grey mush (#79). `docs/render-dashboard-gif.py` regenerates it
+  from the published release asset.
 
-### Changed
-- The software echo gate (mic blocks below the playback echo floor are
-  dropped while model audio plays) now runs on every platform whenever
-  PulseAudio AEC is not active — that is always on Windows and macOS. On
-  headphones there is no echo to suppress, so it is tunable:
-  `TALK_ECHO_GATE=off` disables it; `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL`,
-  `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL`, and `TALK_ECHO_GATE_RATIO` retune it.
-  Read when the audio stream is constructed.
+### Security
+- A visible trust surface on the repository (#95). Three new
+  workflows: CodeQL over the Python and over the workflow files themselves
+  (PR, push, weekly), OpenSSF Scorecard (push, weekly, results published so
+  the badge and the public viewer render), and dependency review on every PR
+  (fails on a moderate-or-worse advisory or a license outside the permissive
+  allowlist). Releases now carry provenance twice: `publish.yml` attests the
+  built dist with `actions/attest-build-provenance` before uploading, and the
+  PyPI upload passes `attestations: true` (PEP 740). Every third-party action
+  in every workflow is pinned to a full commit SHA with its version alongside
+  — the standard `plugin-guard.yml` already set for the upstream scanner —
+  which also moves `checkout` and `setup-python` from their floating `v4`/`v5`
+  majors to current releases. The README header gained CodeQL, Scorecard, and
+  PyPI badges.
+- `SECURITY.md`: supported versions (the latest PyPI release and
+  `main`), private reporting through GitHub security advisories (private
+  vulnerability reporting is enabled on the repository), a 72-hour
+  acknowledgement target, and what counts — credential leakage, auth-store
+  writes outside the documented refresh, tool-authority bypass, redaction
+  failures, supply chain.
+- `.github/dependabot.yml`: weekly `pip` and `github-actions`
+  updates, minor and patch bumps grouped into one PR per ecosystem, majors on
+  their own.
+- The `ci`, `plugin-guard`, and `CodeQL` workflows run on a least-privilege
+  `GITHUB_TOKEN`: `contents: read` at the workflow level (they
+  inherited the repository default, which can be read/write), with the one
+  write CodeQL needs — `security-events: write` to upload its SARIF —
+  granted on the analyze job alone. Closes CodeQL alerts #20/#21 and
+  Scorecard's Token-Permissions findings.
+- The dashboard `/status` route no longer echoes a configuration error's
+  text into its response (CodeQL `py/stack-trace-exposure`). An
+  unusable `TALK_VOICE` or `TALK_VOICE_MODE` still keeps the tile
+  answerable, but the response now names only WHICH setting refused plus a
+  short reference; the exception text — which quotes the offending value —
+  goes to the dashboard's own log under the same reference. The mint keeps
+  repeating the exact remediation on its own refusal path, where the caller
+  is the operator pressing Start.
+- A voice session whose transport declares remote speakers
+  (`discord_speaker_authorization`) but carries no authorization ledger is now
+  REFUSED at session setup, before a secret is minted or a socket is
+  opened. That equivalence held by construction and was asserted only in a
+  comment several hundred lines from where it is relied on — and the branch
+  relying on it silently selects the allow-all `local_operator_authorizer`,
+  so a construction bug would have handed every speaker in a voice channel
+  full operator authority with nothing anywhere refusing. It refuses through
+  the same bounded-reason sink every other startup refusal uses, so a Discord
+  `talk join` says what happened instead of "session exited unsuccessfully" —
+  and that sentence does not offer `/talk core join`, which would take the
+  same channel with the same speakers and refuse identically.
+- An unnamed tool call is now identified the same way on every path.
+  The two authorizer call sites disagreed (`"tool"` when revoking a permit,
+  `""` when authorizing one), so the identity a nameless event was revoked
+  under was not the identity it would have been authorized under. One helper
+  answers for both, and it returns `""` — which cannot collide with a
+  registered tool, a classification set, or a permit's recorded action.
+
 ## [0.16.0] — 2026-09-01
 
 Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add
@@ -312,6 +325,7 @@ lane rides the Codex CLI's.
 - Reading Grok Build CLI's `~/.grok/auth.json`; a device-code login inside
   the plugin; any write to any auth store. The dashboard tab stays
   OpenAI-only.
+
 ## [0.15.1] — 2026-09-01
 
 Voice hears you again on end-to-end-encrypted Discord calls. 0.15.0's

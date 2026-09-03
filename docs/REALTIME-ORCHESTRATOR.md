@@ -1,9 +1,9 @@
 # Realtime Orchestrator — architecture map (on-demand context)
 
-Written 2026-08-15 after wiring the full tool-calling lane live. Load this
-instead of re-crawling the repos. Sources: hermes-talk @ `0e3b477` (main,
-PRs #29/#30), hermes-agent fork branch `feat/realtime-execution-attachment-20260813`
-merged into the live install checkout.
+Written 2026-08-15 after wiring the full tool-calling lane live, and kept
+current since. Load this instead of re-crawling the repos. Sources:
+hermes-talk @ `0e3b477` (main, PRs #29/#30) plus the hermes-agent side of
+the realtime execution attachment.
 
 ## The one-sentence version
 
@@ -18,34 +18,56 @@ handler table.
 
 - `__init__.py` — `register(ctx)`; captures the host's realtime execution
   attachment via `capture_realtime_execution_attachment` on the session
-  invocation (~line 185).
+  invocation (in `_talk_command`, ~line 237).
 - `talk_core_realtime.py` / `talk_core_session.py` — provider-neutral
   realtime session core; batches provider function calls into ONE canonical
   Hermes execution, returns ordered durable tool results, requests one
   continuation. Response-local cancellation + barge-in boundaries preserved.
-- `talk_openai_realtime.py` — OpenAI Realtime provider (`gpt-realtime-2.1`,
-  voice `cedar` on this machine).
-- `talk_tools.py` — the curated Talk verbs that remain: `search_memory`,
-  `search_vault`, `delegate_task`, `check_work`, `list_agents`,
-  `steer_agent`, `redirect_agent`, `stop_work`, `talk_status`,
-  `talk_capabilities`.
+- `talk_openai_realtime.py` — OpenAI Realtime provider (defaults
+  `gpt-realtime-2.1`, voice `cedar`; both are `TALK_MODEL` / `TALK_VOICE`).
+- `talk_tools.py` — the curated Talk verbs that remain. `default_talk_tools()`
+  advertises ten unconditionally: `search_memory`, `delegate_task`,
+  `check_work`, `list_agents`, `steer_agent`, `redirect_agent`, `stop_work`,
+  `resolve_approval`, `talk_status`, `talk_capabilities`. Two are
+  CONDITIONAL, because advertising a verb that cannot be served is the same
+  defect as passing through a provider block: `search_vault` only when a
+  memory provider is loadable in this process, and `pause_voice_input` only
+  when this process pumps the microphone AND the operator has a guaranteed
+  way back (`pausable=True`).
   (`talk_identity.py` renders the exact schema names into the session prompt
   so the persona knows its real surface.)
+- `talk_core_provider.py` — the OTHER direction. The modules above make the
+  provider drive Hermes; this one publishes all three lanes on Hermes core's
+  own provider-neutral contract (`agent/realtime_voice_provider.py`, API v2)
+  as `hermes-talk/openai`, `hermes-talk/grok`, `hermes-talk/gemini`, so
+  core's orchestrator can drive them. Registration is feature-detected on
+  both sides (`core_contract_available()` → `build_providers()` →
+  `ctx.register_realtime_voice_provider`); a host without the hook loads
+  hermes-talk exactly as before, with one debug line. Capabilities are
+  DECLARED per lane (`OPENAI_CAPABILITIES` / `GROK_CAPABILITIES` /
+  `GEMINI_CAPABILITIES`) rather than assumed, so core degrades explicitly
+  instead of calling an operation the wire cannot perform. This lane is
+  deliberately input-only — it never executes provider tools; the duplex
+  lane described above still owns those, and `talk_status` labels it
+  `legacy-provider-executor` to keep the two apart.
 - `talk_discord.py` — Discord `/talk join` runs the SAME `run_talk_session`
   with `DiscordAudio` swapped in; identical tools/instructions. Mutating
   tools are gated by an immutable-ID operator allowlist.
 - `talk_runs.py` — async run registry: slow work returns a spoken receipt
   (`WORK_STARTED #<id>`) and the watcher speaks the result when it lands.
 - `talk_auth.py` — fail-closed auth order: `TALK_OPENAI_API_KEY` →
-  `OPENAI_API_KEY` → Codex CLI OAuth (winning lane on this machine:
-  `codex-oauth`).
+  `OPENAI_API_KEY` → Codex CLI OAuth (`codex-oauth`). `hermes talk doctor`
+  names whichever lane wins on your box.
 
 ### Host side (`hermes-agent`)
 
 - `gateway/realtime_execution_attachment.py` — the canonical execution
-  attachment the plugin captures. Added by fork branch
-  `feat/realtime-execution-attachment-20260813`; **not yet upstream**
-  (NousResearch PR pending — track the fork branch until it merges).
+  attachment the plugin captures. Its upstream status is a hermes-agent
+  question, not one this repo can answer: nothing here proves whether it has
+  landed. Check `hermes-agent` itself, and treat the plugin side as the
+  contract — the capture is feature-detected (`getattr(invocation,
+  "capture_realtime_execution_attachment", None)`), so a host without it
+  simply takes the other lane.
 - `agent/external_tool_batch.py` + `gateway/external_tool_batch.py` — the
   batched canonical execution path for provider function calls.
 - Plugin capability surface (upstream, current): `ctx.dispatch_tool`
@@ -58,36 +80,59 @@ handler table.
 - Core has NO duplex realtime voice by design — plugin-owned Realtime
   session is the sanctioned shape (upstream docs steer voice to plugins).
 
-### Live install layout (this machine)
+### Install layout and restart rules
 
-- `HERMES_HOME=C:\Users\Degen\AppData\Local\hermes` (NOT `~/.hermes` — the
-  `~/.hermes/plugins/hermes-talk` copy is a stale v0.6.1 leftover).
-- Hermes venv: `%LOCALAPPDATA%\hermes\hermes-agent\venv`, installing from
-  `C:\Users\Degen\isolated-dev\hermes-agent-prp005-desktop-realtime-20260809`
-  (branch `feat/discord-core-session-runtime`, attachment branch merged
-  2026-08-15, pre-merge HEAD `d03d60fe3` if rollback is needed).
-- Dev clone of the plugin: `C:\Users\Degen\hermes-talk` (tracks origin/main).
-- Gateway runs as `pythonw -m hermes_cli.main gateway run` (supervisor tree);
-  after ANY plugin or host update it must be restarted — kill the specific
-  PID only, never kill-all.
+- **`HERMES_HOME` is the installed layout, and `~/.hermes` is only a
+  fallback.** `talk_config.get_hermes_home()` asks the HOST's own resolver
+  first (`hermes_constants.get_hermes_home`), which resolves context override
+  → process `HERMES_HOME` → platform default (`%LOCALAPPDATA%\hermes` on
+  Windows). Only when hermes-agent is not importable at all does the plugin
+  fall back to `$HERMES_HOME`, then to `~/.hermes`. The state dir
+  (`HERMES_HOME/state/`, home of `talk-runs.jsonl`) hangs off whichever won,
+  so read the winner out of `hermes talk doctor` instead of assuming.
+- **A directory on disk is not proof of what is loaded.** Because the two
+  resolutions above can differ, a box can hold a `~/.hermes/plugins/hermes-talk`
+  copy that nothing loads from — a stale version sitting where it is easy to
+  read and easy to believe. `hermes plugins list` reports the version the host
+  actually registered; trust that over any directory, and over a dev clone's
+  git log.
+- **The gateway keeps running the code it loaded at startup.** It runs under a
+  supervisor tree, so after ANY plugin or host update it must be restarted
+  before the new code is live — files changing on disk does nothing to a
+  process already holding the old ones. Restart it, then re-check
+  `talk_status`'s `version` field.
+- **Kill only the specific PID.** Never kill-all-by-name: a supervised tree
+  and any other Python on the box look identical to a name match.
 
 ## Verify (no talking required)
 
 ```bash
-hermes plugins list          # hermes-talk · enabled · 0.8.0
-hermes talk doctor --json    # 8/8 pass, incl. "host exposes every Talk capability"
+hermes plugins list          # hermes-talk · enabled · <the version you installed>
+hermes talk doctor --json    # 10/10 pass, incl. "host exposes every Talk capability"
+hermes talk check --json     # the live proof: doctor + one provider turn + one bounded run
 hermes talk &                # wire canary: established TLS :443 = session mints+connects
 ```
 
-Test gate: in `C:\Users\Degen\hermes-talk` — `.venv/Scripts/python -m pytest -q`
-(834 passed / 7 skipped at wiring time) + `ruff check`.
+Doctor's check set is fixed by `talk_doctor.CHECK_ORDER` and asserted against
+the report it builds, so the denominator is ten: plugin, provider, auth,
+model, voice, cascade, audio, identity, discord, host.
+
+Test gate: `uv run --extra dev pytest -q` + `uv run --extra dev ruff check .`
+in a clone. (This page was written at 834 passed / 7 skipped; the suite has
+grown well past that — see CONTRIBUTING for the current baseline and the #93
+known failures.)
 
 ## Known limits
 
 - Subagent completion announcements need
-  `PluginContext.active_parent_session_id` (upstream PR #79716, pending).
-  Below that, announcements are suppressed, not guessed.
-- `redirect_agent`'s clean-abort path wants host ≥ 0.20 (install is 0.20.0).
+  `PluginContext.active_parent_session_id` (upstream
+  [PR #79716](https://github.com/NousResearch/hermes-agent/pull/79716)).
+  Below that, announcements are suppressed, not guessed. Whether that PR has
+  landed is a hermes-agent fact this page cannot verify — `docs/OPERATING.md`
+  and the README carry the same compatibility boundary, and `hermes talk
+  doctor` reports what your host actually exposes.
+- `redirect_agent`'s clean-abort path wants host ≥ 0.20; below that it
+  degrades to the steer queue and says so.
 - Live voice proof (speak a real tool request; Discord `/talk join`) needs a
   human at the mic — the canary proves everything short of speech.
 
