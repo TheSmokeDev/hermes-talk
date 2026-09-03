@@ -2,6 +2,7 @@
 
 **Realtime voice as an orchestrator for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
 
+<!-- Regenerate this GIF (needs ffmpeg): python docs/render-dashboard-gif.py -->
 ![The Talk tab in the Hermes dashboard — a live voice session, a background agent delegated mid-conversation, its result landing in the runs panel (8× speed)](docs/dashboard.gif)
 
 *Real session, 8× speed. 🔊 [Watch it with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — 2:27: delegate, keep talking, hear the result land. This is a voice demo; the sound is the point. Recorded at v0.3.0 — the flow is unchanged.*
