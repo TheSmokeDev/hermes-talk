@@ -121,6 +121,199 @@ class RoutingUnavailable(RuntimeError):
     """
 
 
+# -- admission control (hermes-talk#101) --------------------------------------
+#
+# A delegating model may declare each run ``exclusive`` or
+# ``parallel_read_only`` and name up to MAX_RESOURCE_KEYS stable resources it
+# touches (an absolute repo path, a deployment target). Two LIVE runs in this
+# process that share a key never overlap unless both are read-only AND the
+# operator has opted into believing that declaration
+# (``TALK_TRUST_DECLARED_READ_ONLY``). No keys means no fence, in either
+# direction — a run that names nothing is exactly today's run.
+#
+# The fence is per PROCESS. The registry is; a run in the dashboard lane's
+# process is invisible here in every other respect too (see the module
+# docstring), and a history-only "running" record is a dead process's, not
+# a live holder.
+
+EXECUTION_EXCLUSIVE = "exclusive"
+EXECUTION_PARALLEL_READ_ONLY = "parallel_read_only"
+EXECUTION_MODES = (EXECUTION_EXCLUSIVE, EXECUTION_PARALLEL_READ_ONLY)
+MAX_RESOURCE_KEYS = 8
+MAX_RESOURCE_KEY_CHARS = 200
+
+#: Keys reserved between the admission check and the registry insert. The
+#: acceptance write in between takes the file lock, which must never nest
+#: inside ``_RUN_LOCK``, so the check cannot simply hold the lock across it —
+#: and two tool-pool workers admitted in that gap would both start. Guarded
+#: by ``_RUN_LOCK``.
+_RESERVATIONS: dict[int, dict] = {}
+_RESERVATION_SEQ = 0
+
+
+class AdmissionRefused(RuntimeError):
+    """A live run already holds a resource this one names (hermes-talk#101).
+
+    Raised BEFORE acceptance: no run id is burned, no history row is written,
+    no thread starts. The message names the run in the way so the model can
+    offer to wait for it, stop it, or re-delegate without that key — a
+    refusal the operator can act on, never a silent queue.
+    """
+
+    def __init__(self, *, run_id: int | None, label: str, keys: tuple[str, ...]) -> None:
+        self.run_id = run_id
+        self.label = label
+        self.keys = keys
+        quoted = ", ".join(f"'{key}'" for key in keys)
+        noun = "resource" if len(keys) == 1 else "resources"
+        # A None run id is a reservation: a sibling accepted a breath ago and
+        # has no number yet. It is as live as any run — say so, without one.
+        holder = (
+            f"run {run_id} ({label})" if run_id is not None else f"a run just accepted ({label})"
+        )
+        super().__init__(
+            f"{holder} is still running and touches the same "
+            f"{noun} ({quoted}); wait for it, stop it, or re-delegate without that key"
+        )
+
+
+def normalize_resource_keys(keys: Any) -> tuple[str, ...]:
+    """The canonical form of a declared key list; raises ``ValueError`` when unusable.
+
+    Whitespace is stripped and collapsed, case is folded, blanks dropped,
+    duplicates removed with order kept. Folding case is the SAFE direction:
+    two spellings of one path become one key, so the fence errs toward a
+    refusal, never toward an overlap. More than :data:`MAX_RESOURCE_KEYS`
+    after normalization is refused rather than truncated — a key dropped on
+    the floor would be a silent hole in the fence. A bare string is one key.
+    """
+
+    if keys is None:
+        return ()
+    if isinstance(keys, str):
+        keys = [keys]
+    if not isinstance(keys, (list, tuple)):
+        raise ValueError("resource_keys must be a list of short strings")
+    seen: list[str] = []
+    for raw in keys:
+        if not isinstance(raw, str):
+            raise ValueError("resource_keys must be a list of short strings")
+        key = " ".join(raw.split()).casefold()
+        if not key:
+            continue
+        if len(key) > MAX_RESOURCE_KEY_CHARS:
+            raise ValueError(
+                f"a resource key must be at most {MAX_RESOURCE_KEY_CHARS} characters"
+            )
+        if key not in seen:
+            seen.append(key)
+    if len(seen) > MAX_RESOURCE_KEYS:
+        raise ValueError(f"at most {MAX_RESOURCE_KEYS} resource_keys are allowed")
+    return tuple(seen)
+
+
+def resolve_execution_mode(mode: str | None) -> str:
+    """The mode a run is ADMITTED under, after the trust knob has its say.
+
+    ``None`` is ``exclusive``. ``parallel_read_only`` survives only when the
+    operator set ``TALK_TRUST_DECLARED_READ_ONLY`` (read at call time, Rule
+    1); otherwise it is downgraded to ``exclusive`` — the model's claim is
+    kept as policy input, never as a sandbox. Anything else is a caller bug.
+    """
+
+    if mode is None:
+        return EXECUTION_EXCLUSIVE
+    if mode not in EXECUTION_MODES:
+        raise ValueError(f"unknown execution_mode: {mode!r}")
+    if mode == EXECUTION_PARALLEL_READ_ONLY and not talk_config.trust_declared_read_only():
+        return EXECUTION_EXCLUSIVE
+    return mode
+
+
+def _effective_mode(admission: dict | None) -> str:
+    """A holder's mode under the knob as it is NOW, not as it was at admission."""
+
+    if not admission or admission.get("mode") != EXECUTION_PARALLEL_READ_ONLY:
+        return EXECUTION_EXCLUSIVE
+    return (
+        EXECUTION_PARALLEL_READ_ONLY
+        if talk_config.trust_declared_read_only()
+        else EXECUTION_EXCLUSIVE
+    )
+
+
+def _admission_conflict_locked(mode: str, keys: tuple[str, ...]) -> dict | None:
+    """The first live holder this run may not overlap, or ``None``. Caller holds the lock.
+
+    Live means a non-terminal registry entry or a reservation mid-acceptance.
+    Two runs may share a key only when BOTH are read-only under the knob as
+    it stands now — a holder admitted as read-only under an earlier
+    configuration is judged again, so turning the knob off closes every
+    overlap it had allowed.
+    """
+
+    if not keys:
+        return None
+    holders = [
+        (run_id, run) for run_id, run in _RUNS.items() if run["status"] not in TERMINAL_STATUSES
+    ]
+    holders.extend((None, reservation) for reservation in _RESERVATIONS.values())
+    for run_id, holder in holders:
+        admission = holder.get("admission") or {}
+        held = admission.get("keys") or ()
+        shared = tuple(key for key in keys if key in held)
+        if not shared:
+            continue
+        if (
+            mode == EXECUTION_PARALLEL_READ_ONLY
+            and _effective_mode(admission) == EXECUTION_PARALLEL_READ_ONLY
+        ):
+            continue
+        return {"runId": run_id, "label": holder.get("label") or "", "keys": shared}
+    return None
+
+
+def check_admission(execution_mode: str | None, resource_keys: Any) -> None:
+    """Raise :class:`AdmissionRefused` if this declaration could not start now.
+
+    A dry check — nothing is reserved. For the lane that runs a child inside
+    the host's own delegation registry (which this fence cannot hold), it is
+    still the half that CAN be enforced: never start on top of a registry
+    run that holds the key. ``ValueError`` for an unusable declaration.
+    """
+
+    mode = resolve_execution_mode(execution_mode)
+    keys = normalize_resource_keys(resource_keys)
+    with _RUN_LOCK:
+        conflict = _admission_conflict_locked(mode, keys)
+    if conflict is not None:
+        raise AdmissionRefused(
+            run_id=conflict["runId"], label=conflict["label"], keys=conflict["keys"]
+        )
+
+
+def _reserve_admission_locked(label: str, mode: str, keys: tuple[str, ...]) -> int:
+    """Hold ``keys`` until the entry lands in the registry. Caller holds the lock."""
+
+    global _RESERVATION_SEQ
+    _RESERVATION_SEQ += 1
+    _RESERVATIONS[_RESERVATION_SEQ] = {
+        "label": label,
+        "admission": {"mode": mode, "keys": list(keys)},
+    }
+    return _RESERVATION_SEQ
+
+
+def _copy_admission(admission: dict) -> dict:
+    """A snapshot's own copy of an admission — the key list included.
+
+    Snapshots are handed to callers who may mutate them; a shared list would
+    let a reader widen or narrow a LIVE holder's fence.
+    """
+
+    return {**admission, "keys": list(admission.get("keys") or ())}
+
+
 # The ambient ticket for the currently attached Talk connection. Same shape and
 # contract as talk_lifecycle's attach/detach: one connection at a time, last
 # attach wins, fail closed while unbound. Module-level state is per PROCESS, so
@@ -456,6 +649,8 @@ def start_run(
     worker: Callable[[int], str],
     *,
     meta: dict | None = None,
+    execution_mode: str | None = None,
+    resource_keys: Any = None,
 ) -> int:
     """Register a run and spawn its daemon worker thread.
 
@@ -468,10 +663,18 @@ def start_run(
     ``ALLOW_EPHEMERAL_ENV`` opt-in. All three mean the same thing: there is
     no exact place to send the result, so accepting the job would be a
     promise this process cannot keep.
+
+    ``execution_mode`` and ``resource_keys`` are the admission declaration
+    (hermes-talk#101). Raises :class:`AdmissionRefused` — also before any
+    work, before even a run id — when a live run holds a named key this one
+    may not share. Both absent is exactly the run this function always
+    accepted: no fence, no extra record field.
     """
 
     if kind not in RUN_KINDS:
         raise ValueError(f"unknown run kind: {kind!r}")
+    mode = resolve_execution_mode(execution_mode)
+    keys = normalize_resource_keys(resource_keys)
 
     owner = current_owner()
     if owner is None:
@@ -494,12 +697,38 @@ def start_run(
         "ts": now,
         "updated": now,
     }
+    declared = execution_mode is not None or bool(keys)
+    if declared:
+        entry["admission"] = {"mode": mode, "keys": list(keys)}
+    # Admission BEFORE acceptance: a refused run must burn no id and leave no
+    # history row — a "running" record for work that never started would
+    # surface as `lost` on the next reconnect. The keys are reserved under
+    # the same lock the check ran under, because the acceptance write below
+    # cannot happen inside it (lock ordering) and two workers admitted in
+    # that gap would both start.
+    with _RUN_LOCK:
+        conflict = _admission_conflict_locked(mode, keys)
+        if conflict is not None:
+            raise AdmissionRefused(
+                run_id=conflict["runId"], label=conflict["label"], keys=conflict["keys"]
+            )
+        reservation = _reserve_admission_locked(label, mode, keys) if keys else None
     # Durability FIRST, then the registry, then the worker. The old order wrote
     # history last and fail-open, so a failed write still returned a run id and
     # the caller still spoke WORK_STARTED — a receipt for a run nothing could
     # ever route.
-    run_id = _accept_run(entry)
+    try:
+        run_id = _accept_run(entry)
+    except BaseException:
+        if reservation is not None:
+            with _RUN_LOCK:
+                _RESERVATIONS.pop(reservation, None)
+        raise
     with _RUN_LOCK:
+        if reservation is not None:
+            # Same critical section as the insert: the keys pass from the
+            # reservation to the entry with no instant in which nobody holds them.
+            _RESERVATIONS.pop(reservation, None)
         _RUNS[run_id] = entry
         # Evict AFTER inserting so the cap holds for the registry as it now
         # stands; the entry just added is running, so it is never a candidate.
@@ -873,6 +1102,8 @@ def list_undelivered_for_session(
         for run_id, run in _RUNS.items():
             snapshot = dict(run)
             snapshot["meta"] = dict(run["meta"])
+            if "admission" in run:
+                snapshot["admission"] = _copy_admission(run["admission"])
             snapshot["runId"] = run_id
             live[run_id] = snapshot
     # Deliberately NOT list_runs(limit=100, ...): that limit is a UI display
@@ -978,6 +1209,8 @@ def get_run(run_id: int) -> dict | None:
             return None
         snapshot = dict(run)
         snapshot["meta"] = dict(run["meta"])
+        if "admission" in run:
+            snapshot["admission"] = _copy_admission(run["admission"])
         snapshot["runId"] = run_id
         return snapshot
 
@@ -998,6 +1231,8 @@ def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
         for run_id, run in _RUNS.items():
             snapshot = dict(run)
             snapshot["meta"] = dict(run["meta"])
+            if "admission" in run:
+                snapshot["admission"] = _copy_admission(run["admission"])
             snapshot["runId"] = run_id
             live[run_id] = snapshot
 
@@ -1121,10 +1356,12 @@ def reset_for_tests() -> None:
     fail-closed behaviour hermes-talk#35 added.
     """
 
-    global _RUN_SEQ
+    global _RUN_SEQ, _RESERVATION_SEQ
     with _RUN_LOCK:
         _RUNS.clear()
+        _RESERVATIONS.clear()
         _RUN_SEQ = 0
+        _RESERVATION_SEQ = 0
     with _PROCESS_LOCK:
         _PROCESSES.clear()
     detach_owner()
@@ -1135,12 +1372,19 @@ __all__ = [
     "DELIVERED",
     "DELIVERY_CLAIMED",
     "DELIVERY_PENDING",
+    "EXECUTION_EXCLUSIVE",
+    "EXECUTION_MODES",
+    "EXECUTION_PARALLEL_READ_ONLY",
     "HISTORY_OUTPUT_CAP",
+    "MAX_RESOURCE_KEYS",
+    "MAX_RESOURCE_KEY_CHARS",
     "RUN_KINDS",
     "TERMINAL_STATUSES",
+    "AdmissionRefused",
     "RoutingUnavailable",
     "annotate_run",
     "attach_owner",
+    "check_admission",
     "claim_delivery",
     "current_owner",
     "detach_owner",
@@ -1150,9 +1394,11 @@ __all__ = [
     "list_runs",
     "list_undelivered_for_session",
     "mark_delivered",
+    "normalize_resource_keys",
     "register_process",
     "release_process",
     "reset_for_tests",
+    "resolve_execution_mode",
     "start_run",
     "started_sentinel",
     "terminate_process",

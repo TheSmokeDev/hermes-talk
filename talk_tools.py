@@ -140,7 +140,11 @@ _TOOL_DELEGATE_TASK: dict = {
         "Hand a real task to a background Hermes agent and keep talking. The "
         "agent starts fresh and never sees this call, so write the whole task "
         "out: what to do, where it lives, and what done looks like. Returns a "
-        "WORK_STARTED receipt — say it is running and move on."
+        "WORK_STARTED receipt — say it is running and move on. If the task "
+        "touches something other work might also touch — a repository "
+        "checkout, a deployment target — name it in resource_keys so two jobs "
+        "never collide; a refusal names the run in the way, so offer to wait "
+        "for it, stop it, or retry without that key."
     ),
     "parameters": {
         "type": "object",
@@ -154,6 +158,30 @@ _TOOL_DELEGATE_TASK: dict = {
             "background": {
                 "type": "boolean",
                 "description": "Run without blocking the call (default true).",
+            },
+            "execution_mode": {
+                "type": "string",
+                "enum": ["exclusive", "parallel_read_only"],
+                "description": (
+                    "How this task may share its resource_keys with other running "
+                    "work. 'exclusive' (the default): nothing else touching the "
+                    "same key runs at the same time. 'parallel_read_only': the "
+                    "task only reads, so it may overlap other read-only work on "
+                    "the same key — honored only when the operator has chosen to "
+                    "trust that declaration. Use exclusive unless the task is "
+                    "certainly read-only."
+                ),
+            },
+            "resource_keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 8,
+                "description": (
+                    "Stable names for what the task touches: an absolute "
+                    "repository path, a deployment target, a service name. Two "
+                    "tasks that share a key never run together unless both are "
+                    "parallel_read_only. Omit when the task touches nothing shared."
+                ),
             },
         },
         "required": ["task"],
@@ -462,7 +490,21 @@ def _handle_delegate_task(arguments: dict) -> str:
     if not task:
         return "delegate_task needs a task to hand off."
     background = arguments.get("background")
-    return talk_host.host().run_agent(task, background is not False)
+    # The admission declaration (hermes-talk#101) is validated HERE, before
+    # any backend is consulted: a malformed declaration must not fall through
+    # to a lane that would then run the task unfenced.
+    mode = arguments.get("execution_mode")
+    if mode is not None:
+        mode = str(mode).strip().lower() or None
+        if mode is not None and mode not in talk_runs.EXECUTION_MODES:
+            return "delegate_task's execution_mode must be 'exclusive' or 'parallel_read_only'."
+    try:
+        keys = talk_runs.normalize_resource_keys(arguments.get("resource_keys"))
+    except ValueError as exc:
+        return f"delegate_task could not use those resource_keys: {exc}."
+    return talk_host.host().run_agent(
+        task, background is not False, execution_mode=mode, resource_keys=keys
+    )
 
 
 def _describe_age(run: dict) -> str:
@@ -483,6 +525,12 @@ def _describe_run(run: dict) -> str:
     line = f"run {run.get('runId')} ({run.get('kind')}) {run.get('status')}"
     if run.get("status") == "running":
         line += _describe_age(run)
+        # What a live run holds (hermes-talk#101), so "why was that refused?"
+        # has an answer the model can read out.
+        admission = run.get("admission") if isinstance(run.get("admission"), dict) else {}
+        held = [key for key in admission.get("keys") or () if isinstance(key, str)]
+        if held:
+            line += " holding " + ", ".join(f"'{key}'" for key in held)
     if run.get("status") == "lost":
         line += " (started before this session — I can't see how it ended)"
     # A stop verb's detached confirmation lands in meta (hermes-talk#2) —

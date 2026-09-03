@@ -870,6 +870,21 @@ def approval_prompt_timeout_s() -> float:
     )
 
 
+def trust_declared_read_only() -> bool:
+    """Whether a model's ``parallel_read_only`` declaration is believed.
+
+    Default **off** (hermes-talk#101): the declaration is the delegating
+    model's own claim about work it has not done yet — policy input, not a
+    sandbox — so by default every delegated run is treated as ``exclusive``
+    and two runs sharing a resource key never overlap. Only an explicit
+    ``TALK_TRUST_DECLARED_READ_ONLY=true`` lets read-only runs on a shared
+    key run together; anything else, junk included, keeps the fence.
+    """
+
+    raw = (os.environ.get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
@@ -936,5 +951,6 @@ __all__ = [
     "talk_model",
     "talk_provider",
     "talk_voice",
+    "trust_declared_read_only",
     "voice_mode",
 ]

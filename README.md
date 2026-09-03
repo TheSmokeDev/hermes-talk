@@ -516,6 +516,42 @@ silently does less than you asked:
    lane that always exists as long as `hermes` is on the PATH.
 4. None available — a refusal naming all three missing lanes.
 
+### Two jobs, one checkout — admission control
+
+Delegate two tasks that both touch the same repository and, left alone, they
+race: two agents editing one checkout, two deploys to one target. Since #101
+the model can say what a task touches, and the run registry refuses the second
+job instead of letting it collide:
+
+- `delegate_task` takes two optional arguments. `resource_keys` names up to
+  eight stable things the task touches — an absolute repo path, a deployment
+  target, a service name (whitespace-collapsed and case-folded, so two
+  spellings of one path are one key). `execution_mode` is `exclusive` (the
+  default) or `parallel_read_only`.
+- Two live runs that share any key never overlap unless **both** are
+  `parallel_read_only`. The check happens before a run id is minted, before
+  the acceptance record is written, before the worker starts — a refused job
+  burns nothing and leaves no `lost` record behind.
+- A refusal is a spoken tool result naming the run in the way: "run 4 (audit
+  the repo) is still running and touches the same resource ('/srv/app'); wait
+  for it, stop it, or re-delegate without that key." Never a hang, never a
+  silent queue. `check_work` reads out what each running job is holding.
+- **`parallel_read_only` is believed only when you say so.** The declaration
+  is the delegating model's own claim about work it has not done yet — policy
+  input, not a sandbox — so by default it is downgraded to `exclusive` and
+  recorded that way. `TALK_TRUST_DECLARED_READ_ONLY=true` lets read-only jobs
+  on a shared key run together; the knob is read at admission time, so turning
+  it back off closes every overlap it had allowed. It is the only thing that
+  can widen behavior.
+- No keys means no fence, in either direction: a task that names nothing is
+  exactly the task Talk always ran, record and all.
+
+The fence is per process and covers the api-server and detached lanes, whose
+runs this registry owns. Inside `/talk`, the host's own delegation registry
+runs the child: the job is still checked against the keys this registry
+holds — never started on top of one — but it holds none itself afterwards,
+and its `WORK_STARTED` receipt says so.
+
 ### Redirecting work that's already running
 
 Say "tell that audit to focus on the token refresh instead" and `steer_agent`
@@ -666,6 +702,7 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Where the api-server lane looks |
 | `TALK_API_SERVER_KEY` | `API_SERVER_KEY` | Key for the api-server lane (blank = send none) |
 | `TALK_AGENT_TIMEOUT_S` | `1800` | Budget for one background run, and its watcher |
+| `TALK_TRUST_DECLARED_READ_ONLY` | `false` | Believe a delegated task's `parallel_read_only` declaration, letting read-only runs share a `resource_key`; off downgrades every run to `exclusive` |
 | `TALK_IDENTITY_INCLUDE` | all | Which identity sections ride the prompt |
 | `TALK_MEMORY_SEARCH_TIMEOUT_S` | `10.0` | Wait bound for the in-process remembered-context (Honcho) lookup |
 | `TALK_SESSION_KEY` | unset | Stable operator scope sent as `X-Hermes-Session-Key` on api-server runs, so host-side memory survives `/clear` (blank = send none). **Not a session boundary: every voice-channel participant shares this scope** — memory reads are not gated by the operator ledger, so do not set it in multi-user channels until per-speaker scoping lands |
