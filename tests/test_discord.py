@@ -619,6 +619,38 @@ def test_every_startup_refusal_reason_has_exactly_one_speakable_line():
     assert talk_discord._startup_refusal_failure("not-a-reason") is None
 
 
+def test_only_the_reasons_core_join_can_route_around_offer_core_join():
+    """Which sentences point at `/talk core join` is a judgement, so pin it.
+
+    Core voice resolves its provider through the HOST, so it routes around a
+    plugin-side configuration or connect refusal. It opens the SAME channel
+    with the SAME speakers, so it cannot route around an audio failure or an
+    authorization one — offering it there just costs the operator a retry.
+    """
+
+    routable = {
+        talk_cli.STARTUP_REFUSAL_CONFIGURATION,
+        talk_cli.STARTUP_REFUSAL_PROVIDER,
+    }
+    for reason, line in talk_discord._STARTUP_REFUSAL_FAILURES.items():
+        offers_core_join = "core join" in line.lower()
+        assert offers_core_join is (reason in routable), reason
+
+
+def test_the_authorization_refusal_names_the_host_not_a_retry():
+    """A wiring contradiction is not something the operator can retry away."""
+
+    line = talk_discord._startup_refusal_failure(
+        talk_cli.STARTUP_REFUSAL_AUTHORIZATION
+    )
+
+    assert line is not None
+    assert "core join" not in line.lower()
+    assert "host" in line.lower()
+    # It must not leak WHY the ledger is missing; the receipt is a chat message.
+    assert "ledger" not in line.lower()
+
+
 def test_both_session_call_sites_pass_the_discord_lane(monkeypatch):
     """The lane line is only true if every path names its own room (#64)."""
 

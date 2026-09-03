@@ -1266,6 +1266,13 @@ _STARTUP_REFUSAL_FAILURES = {
     ),
     "audio": "the voice channel would not open",
     "tools": "the session's tools could not be prepared",
+    # No `/talk core join` pointer: this refusal is a wiring contradiction in
+    # this process, not a setting the operator got wrong, and core join takes
+    # the same channel with the same speakers — it would refuse identically.
+    "authorization": (
+        "I can't tell this channel's speakers apart, so I won't take voice "
+        "authority from them — this needs a fix on the host, not a retry"
+    ),
 }
 
 

@@ -218,6 +218,120 @@ def test_a_session_with_no_refusal_hook_still_exits_one(monkeypatch):
     assert asyncio.run(talk_cli.run_talk_session()) == 1
 
 
+class _RemoteSpeakerAudio:
+    """A transport that declares it hears speakers other than the operator."""
+
+    played_ms = 0
+    discord_speaker_authorization = True
+
+    def __init__(self):
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+    def read_input_chunk(self):  # pragma: no cover - the session never runs
+        return None
+
+    def queue_playback(self, _pcm):  # pragma: no cover - the session never runs
+        pass
+
+    def drain_playback(self):
+        pass
+
+    def reset_played_ms(self):
+        pass
+
+
+def test_a_multi_speaker_transport_without_a_ledger_is_refused(monkeypatch, capsys):
+    """hermes-talk#47 item 1: enforce the wiring invariant, do not document it.
+
+    `authorization_ledger is None` has to mean "no remote speakers", because
+    a None ledger silently selects the allow-all `local_operator_authorizer`
+    hundreds of lines below. It holds by construction today; a construction
+    bug that broke it would hand every Discord speaker operator authority
+    with nothing anywhere refusing.
+    """
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    monkeypatch.setattr(
+        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda: None
+    )
+
+    def never():  # pragma: no cover - must not be reached
+        raise AssertionError("dialled the provider for an unauthorized transport")
+
+    monkeypatch.setattr(talk_cli, "_import_aiohttp", never)
+    audio = _RemoteSpeakerAudio()
+    seen: list[str] = []
+
+    assert asyncio.run(talk_cli.run_talk_session(audio=audio, on_refusal=seen.append)) == 1
+    assert not audio.started, "opened the channel before refusing"
+    err = capsys.readouterr().err
+    assert "authorization ledger" in err
+    assert "operator authority" in err
+    # It refuses through the SAME bounded-reason sink every other startup
+    # refusal uses (#58), so the Discord lane can speak it instead of
+    # collapsing it into "session exited unsuccessfully".
+    assert seen == [talk_cli.STARTUP_REFUSAL_AUTHORIZATION]
+    assert talk_cli.STARTUP_REFUSAL_AUTHORIZATION in talk_cli.STARTUP_REFUSAL_REASONS
+
+
+def test_a_multi_speaker_transport_with_its_ledger_is_not_refused(monkeypatch):
+    """The refusal must be the contradiction, not the transport."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    audio = _RemoteSpeakerAudio()
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("stop here, past the ledger check")
+
+        async def close(self):
+            pass
+
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: _RefusingSession()
+        )
+    )
+
+    assert code == 1  # refused at the provider, not at the ledger gate
+    assert audio.started, "the ledger gate rejected a correctly wired transport"
+
+
+def test_a_single_speaker_transport_still_needs_no_ledger(monkeypatch):
+    """The named allow-all stays reachable for the operator's own microphone."""
+
+    class _LocalAudio(_RemoteSpeakerAudio):
+        discord_speaker_authorization = False
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    audio = _LocalAudio()
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("stop here, past the ledger check")
+
+        async def close(self):
+            pass
+
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: _RefusingSession()
+        )
+    )
+
+    assert code == 1
+    assert audio.started
+
+
 def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
     """Receive and cancel keep moving while the serialized tool worker is busy."""
 
