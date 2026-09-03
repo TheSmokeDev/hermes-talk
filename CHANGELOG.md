@@ -14,6 +14,13 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- `SECURITY.md`: supported versions (the latest PyPI release and `main`),
+  private reporting through GitHub security advisories (private vulnerability
+  reporting is enabled on the repository), a 72-hour acknowledgement target,
+  and what counts — credential leakage, auth-store writes outside the
+  documented refresh, tool-authority bypass, redaction failures, supply chain.
+- `.github/dependabot.yml`: weekly `pip` and `github-actions` updates, minor
+  and patch bumps grouped into one PR per ecosystem, majors on their own.
 - `hermes talk check` proves the whole voice path end to end, right now
   (#97). Doctor is read-only by design, so a green doctor could still hide a
   dead mint, a refused socket, or a delegation lane that never starts. The
@@ -101,6 +108,20 @@ named rather than smoothed.
   module table now lists every shipped module.
 
 ### Fixed
+- The dashboard `/status` route no longer echoes a configuration error's
+  text into its response (CodeQL `py/stack-trace-exposure`). An unusable
+  `TALK_VOICE` or `TALK_VOICE_MODE` still keeps the tile answerable, but the
+  response now names only WHICH setting refused plus a short reference; the
+  exception text — which quotes the offending value — goes to the dashboard's
+  own log under the same reference. The mint keeps repeating the exact
+  remediation on its own refusal path, where the caller is the operator
+  pressing Start.
+- The `ci`, `plugin-guard`, and `CodeQL` workflows run on a least-privilege
+  `GITHUB_TOKEN`: `contents: read` at the workflow level (they inherited the
+  repository default, which can be read/write), with the one write CodeQL
+  needs — `security-events: write` to upload its SARIF — granted on the
+  analyze job alone. Closes CodeQL alerts #20/#21 and Scorecard's
+  Token-Permissions findings.
 - CI lints against a pinned ruff. The dev extra asked for `ruff>=0.4` and CI
   installed whatever was current, so ruff 0.16 arrived on its own and failed
   the build on `RUF100`: it stopped reporting `BLE001` where the handler logs

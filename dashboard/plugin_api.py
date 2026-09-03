@@ -202,6 +202,22 @@ async def _json_body(request) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _status_problem(setting: str, exc: Exception) -> str:
+    """Record a config refusal server-side; hand the tile a fixed line and a reference.
+
+    The exception text is the operator's remediation, but this route answers
+    any peer the gate admits, so it never rides the response: it goes to the
+    dashboard's own log under a short reference the tile repeats, and the
+    tile says only WHICH setting refused. The mint repeats the exact
+    remediation on its own refusal path, where the caller is the operator
+    pressing Start.
+    """
+
+    reference = os.urandom(4).hex()
+    _log.warning("dashboard status: %s unusable [ref %s]: %s", setting, reference, exc)
+    return f" ({setting} unusable; see the dashboard log, ref {reference})"
+
+
 def _warm_agent_lane() -> str:
     """Resolve the agent lane, paying for a cold probe. Worker thread only."""
 
@@ -284,7 +300,7 @@ async def talk_status(request: Request) -> dict:
         voice = talk_config.talk_voice()
     except talk_config.TalkConfigError as exc:
         voice = ""
-        detail_suffix = f" (TALK_VOICE unusable: {exc})"
+        detail_suffix = _status_problem("TALK_VOICE", exc)
     else:
         detail_suffix = ""
     try:
@@ -293,7 +309,7 @@ async def talk_status(request: Request) -> dict:
         # Stay answerable: the tile reads as native and the mint refuses with
         # the exact remediation when Start is pressed.
         voice_mode = ""
-        detail_suffix += f" (TALK_VOICE_MODE unusable: {exc})"
+        detail_suffix += _status_problem("TALK_VOICE_MODE", exc)
     status = talk_auth.auth_status()
     return {
         "ok": True,

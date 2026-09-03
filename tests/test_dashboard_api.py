@@ -428,6 +428,42 @@ def test_status_stays_answerable_when_the_voice_is_unusable(monkeypatch):
     assert "TALK_VOICE unusable" in body["detail"]
 
 
+def test_status_logs_the_config_refusal_and_answers_with_a_reference(monkeypatch, caplog):
+    """The exception text is remediation for the operator's log, never response body.
+
+    The status route answers any peer the gate admits, so a config error's
+    text (which quotes the offending value) must not ride it. The tile gets
+    WHICH setting refused plus a reference; the log gets the text under the
+    same reference. Both settings, both sinks.
+    """
+
+    monkeypatch.setenv("TALK_VOICE", "gilbert-the-unlisted")
+    monkeypatch.setenv("TALK_VOICE_MODE", "telepathy")
+
+    with caplog.at_level("WARNING", logger=api._log.name):
+        body = call(api.talk_status, FakeRequest())
+
+    detail = body["detail"]
+    assert "gilbert-the-unlisted" not in detail
+    assert "telepathy" not in detail
+    references = re.findall(
+        r"\((TALK_VOICE(?:_MODE)?) unusable; see the dashboard log, ref ([0-9a-f]{8})\)",
+        detail,
+    )
+    assert [setting for setting, _ in references] == ["TALK_VOICE", "TALK_VOICE_MODE"]
+    logged = {
+        record.getMessage()
+        for record in caplog.records
+        if "dashboard status" in record.getMessage()
+    }
+    assert len(logged) == 2
+    for setting, reference in references:
+        matching = [line for line in logged if f"{setting} unusable [ref {reference}]" in line]
+        assert len(matching) == 1, (setting, reference, logged)
+    assert any("gilbert-the-unlisted" in line for line in logged)
+    assert any("telepathy" in line for line in logged)
+
+
 # -- the gate -----------------------------------------------------------------
 
 
