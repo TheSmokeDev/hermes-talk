@@ -1,0 +1,36 @@
+name: OpenSSF Scorecard
+
+# Supply-chain hygiene score (pinned deps, branch protection, token perms,
+# dangerous workflow patterns…). publish_results makes the badge render and
+# feeds the public API at https://scorecard.dev/viewer/?uri=github.com/TheSmokeDev/hermes-talk.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "37 5 * * 2"  # Tuesdays 05:37 UTC
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  scorecard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write         # required by publish_results
+      security-events: write  # upload the SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: results.sarif

@@ -2,17 +2,25 @@ name: publish
 
 # Publishes to PyPI via trusted publishing (OIDC) — no API token stored
 # anywhere. Trigger: push a version tag (git tag v0.8.0 && git push --tags).
+# The release ships with provenance twice over: a PEP 740 attestation on
+# PyPI (Trusted Publishing signs it) and a GitHub build-provenance
+# attestation on the same dist files, visible on the repo's Attestations tab.
 on:
   push:
     tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -36,7 +44,7 @@ jobs:
           print(f"all {len(expected)} declared modules present in {wheel}")
           EOF
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
@@ -46,11 +54,22 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write  # required for PyPI trusted publishing
+      id-token: write      # PyPI trusted publishing + signing both attestations
+      attestations: write  # write the GitHub build-provenance attestation
+      contents: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attest build provenance (GitHub)
+        # Runs BEFORE the upload so a failed attestation stops the release
+        # rather than leaving an unattested version on PyPI.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: true  # PEP 740 — stated explicitly so it can't drift

@@ -30,6 +30,19 @@ named rather than smoothed.
   tool call mid-turn; until now that was recorded silently and only visible as a
   dropped result on the send path, which told policy nothing until it had
   already produced work nobody wanted.
+- A visible trust surface on the repository (#95). Three new workflows:
+  CodeQL over the Python and over the workflow files themselves (PR, push,
+  weekly), OpenSSF Scorecard (push, weekly, results published so the badge
+  and the public viewer render), and dependency review on every PR (fails
+  on a moderate-or-worse advisory or a license outside the permissive
+  allowlist). Releases now carry provenance twice: `publish.yml` attests the
+  built dist with `actions/attest-build-provenance` before uploading, and the
+  PyPI upload passes `attestations: true` (PEP 740). Every third-party action
+  in every workflow is pinned to a full commit SHA with its version alongside
+  — the standard `plugin-guard.yml` already set for the upstream scanner —
+  which also moves `checkout` and `setup-python` from their floating `v4`/`v5`
+  majors to current releases. The README header gained CodeQL, Scorecard, and
+  PyPI badges.
 
 ### Fixed
 - CI lints against a pinned ruff. The dev extra asked for `ruff>=0.4` and CI
