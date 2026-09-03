@@ -229,12 +229,18 @@ STARTUP_REFUSAL_CONFIGURATION = "configuration"
 STARTUP_REFUSAL_TOOLS = "tools"
 STARTUP_REFUSAL_AUDIO = "audio"
 STARTUP_REFUSAL_PROVIDER = "provider"
+#: The transport hears speakers the session cannot authorize. Unlike the four
+#: above this is not a knob the operator forgot to set — it is a wiring
+#: contradiction inside this process, so its sentence points at the host, not
+#: at a setting.
+STARTUP_REFUSAL_AUTHORIZATION = "authorization"
 STARTUP_REFUSAL_REASONS = frozenset(
     {
         STARTUP_REFUSAL_CONFIGURATION,
         STARTUP_REFUSAL_TOOLS,
         STARTUP_REFUSAL_AUDIO,
         STARTUP_REFUSAL_PROVIDER,
+        STARTUP_REFUSAL_AUTHORIZATION,
     }
 )
 TOOL_SESSION_QUEUE_SIZE = 1
@@ -515,6 +521,25 @@ class ToolResponseCoordinator:
                     self.queue.task_done()
 
 
+def _event_tool_name(event: dict) -> str:
+    """The provider's tool name for this event, or "" when it gave none.
+
+    Empty, never a stand-in like ``"tool"``. Every downstream comparison is
+    exact-match — ``READ_ONLY_TALK_TOOLS`` / ``MUTATING_TALK_TOOLS``
+    membership, ``classify_host_tool``, and the ledger's ``permit.action !=
+    name`` rename tripwire — so an unnamed call has to be matched as the
+    unknown it is. A synthetic name could one day BE a registered tool and
+    would then be classified as one.
+
+    Both authorizer call sites read the name through here: they disagreed
+    (``"tool"`` in :meth:`HostExecutionRelay._consume_tool_attempt`, ``""``
+    in the batch path), which meant the same nameless event was revoked under
+    a different identity than it would have been authorized under.
+    """
+
+    return str(event.get("name") or "")
+
+
 def local_operator_authorizer(tool_name: str, event: dict) -> None:
     """Grant speaker authority for a session with no remote speakers.
 
@@ -588,7 +613,7 @@ class HostExecutionRelay:
     def _consume_tool_attempt(self, event: dict) -> None:
         """Consume a bound call permit on any terminal non-execution path."""
 
-        self.tool_authorizer(str(event.get("name") or "tool"), event)
+        self.tool_authorizer(_event_tool_name(event), event)
 
     def discard_tool_event(self, event: dict) -> None:
         """Revoke a queued tool event that session teardown will never execute."""
@@ -623,7 +648,7 @@ class HostExecutionRelay:
             # event["arguments"] string read below — nothing rewrites the
             # dict in between, so the authorized and executed arguments
             # cannot diverge.
-            name = str(event.get("name") or "")
+            name = _event_tool_name(event)
             denial = self.tool_authorizer(name, event)
             if denial is None:
                 # WHO may act is settled; WHAT may run on this thread is a
@@ -1314,6 +1339,23 @@ async def run_talk_session(
         if discord_authorization
         else None
     )
+    # ENFORCED, not documented: `authorization_ledger is None` has to mean
+    # "this transport declared no remote speakers". It holds by construction
+    # three lines up, but the place that RELIES on it is the tool-authorizer
+    # wiring far below, where a None ledger silently selects the allow-all
+    # `local_operator_authorizer`. A transport that hears a whole voice
+    # channel must never reach that branch, so the contradiction is refused
+    # here — before a secret is minted or a socket is opened — instead of
+    # being trusted across a few hundred lines (hermes-talk#47).
+    if discord_authorization and authorization_ledger is None:
+        print(
+            "talk: refusing a multi-speaker session with no authorization "
+            "ledger — every speaker would inherit operator authority",
+            file=sys.stderr,
+        )
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+        return refuse(STARTUP_REFUSAL_AUTHORIZATION)
     try:
         audio.start()
     except talk_audio.TalkAudioError as exc:
@@ -1584,9 +1626,11 @@ async def run_talk_session(
                         authorization_ledger.authorize_tool
                         if authorization_ledger is not None
                         # No ledger means the transport declared no remote
-                        # speakers (audio.discord_speaker_authorization is
-                        # False): the local operator is the only voice, so
-                        # the allow-all is named, not accidental.
+                        # speakers: session setup above REFUSES the session
+                        # outright when discord_speaker_authorization is true
+                        # and the ledger is absent, so reaching this branch
+                        # proves the local operator is the only voice and the
+                        # allow-all is named, not accidental.
                         else local_operator_authorizer
                     ),
                 )
@@ -2003,6 +2047,7 @@ __all__ = [
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
     "STARTUP_REFUSAL_AUDIO",
+    "STARTUP_REFUSAL_AUTHORIZATION",
     "STARTUP_REFUSAL_CONFIGURATION",
     "STARTUP_REFUSAL_PROVIDER",
     "STARTUP_REFUSAL_REASONS",

@@ -38,6 +38,24 @@ named rather than smoothed.
 - An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
   (30s, 0 disables) now tells the operator once. Deferring is correct, but a
   gate that never opens was previously a silent slow poll with nothing to see.
+- A voice session whose transport declares remote speakers
+  (`discord_speaker_authorization`) but carries no authorization ledger is now
+  REFUSED at session setup, before a secret is minted or a socket is opened.
+  That equivalence held by construction and was asserted only in a comment
+  several hundred lines from where it is relied on — and the branch relying on
+  it silently selects the allow-all `local_operator_authorizer`, so a
+  construction bug would have handed every speaker in a voice channel full
+  operator authority with nothing anywhere refusing. It refuses through the
+  same bounded-reason sink every other startup refusal uses, so a Discord
+  `talk join` says what happened instead of "session exited unsuccessfully" —
+  and that sentence does not offer `/talk core join`, which would take the
+  same channel with the same speakers and refuse identically.
+- An unnamed tool call is now identified the same way on every path. The two
+  authorizer call sites disagreed (`"tool"` when revoking a permit, `""` when
+  authorizing one), so the identity a nameless event was revoked under was not
+  the identity it would have been authorized under. One helper answers for
+  both, and it returns `""` — which cannot collide with a registered tool, a
+  classification set, or a permit's recorded action.
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
   echo canceller and noise suppressor. Echo-cancelled input bypasses the
   fallback amplitude/VAD gate so barge-in does not clip quiet words.
