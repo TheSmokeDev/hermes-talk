@@ -1,0 +1,35 @@
+# Dependabot keeps the two dependency surfaces current on the same weekly
+# cadence CodeQL and Scorecard already sweep on. Minor and patch bumps arrive
+# grouped — one PR per ecosystem per week, not one per package — so review
+# cost stays flat; a major bump still gets its own PR because it deserves its
+# own read. Every action in the workflows is pinned to a commit SHA, and
+# Dependabot updates the SHA together with the version comment beside it.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(ci)"
