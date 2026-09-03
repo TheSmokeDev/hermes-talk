@@ -478,3 +478,242 @@ def test_status_defaults_to_native(monkeypatch):
 
     body = _run(api.talk_status(JsonRequest()))
     assert body["voiceMode"] == "native"
+
+
+# -- the ASGI branch the relay actually runs on -------------------------------
+#
+# These drive the response object directly rather than through Starlette's
+# TestClient. That is deliberate and load-bearing: TestClient omits
+# `spec_version` from the scope entirely, so it takes the SAME broken branch
+# (`scope.get("asgi", {}).get("spec_version", "2.0")` -> below 2.4) and a test
+# written through it would HANG rather than fail. Every assertion here is
+# pinned to the scope VALUE, never to a version string, so a future uvicorn
+# that advertises 2.4 leaves these tests meaningful instead of vacuous.
+
+
+class _RecordingChannel:
+    """An ASGI ``send``/``receive`` pair that records who called what.
+
+    ``receive`` never returns: it is the disconnect listener's first await,
+    and a relay that touches it has taken the body message the relay's own
+    ``request.stream()`` was waiting for.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.receive_calls = 0
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+
+    async def receive(self) -> dict:
+        self.receive_calls += 1
+        await asyncio.Event().wait()  # the deadlock, made explicit
+        raise AssertionError("unreachable")
+
+    def body(self) -> bytes:
+        return b"".join(
+            m.get("body", b"") for m in self.sent if m["type"] == "http.response.body"
+        )
+
+
+def _http_scope(spec_version: str) -> dict:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": spec_version},
+        "method": "POST",
+        "path": "/cascade-tts",
+        "headers": [],
+    }
+
+
+async def _one_chunk():
+    yield b"pcm-bytes"
+
+
+def test_relay_streams_on_a_server_advertising_asgi_below_2_4():
+    """The branch uvicorn actually selects: spec_version 2.3 over HTTP.
+
+    Starlette's own StreamingResponse races a disconnect listener against
+    the body generator here, and the listener calls receive() FIRST —
+    swallowing the browser's http.request messages, so the relay waits
+    forever for text that already arrived. RelayResponse owns the body
+    channel and must never touch receive().
+    """
+
+    channel = _RecordingChannel()
+    response = api.RelayResponse(_one_chunk(), media_type=api.CASCADE_PCM_MEDIA_TYPE)
+
+    _run(
+        asyncio.wait_for(
+            response(_http_scope("2.3"), channel.receive, channel.send), timeout=2.0
+        )
+    )
+
+    assert channel.receive_calls == 0, "the relay must own the request body channel"
+    assert channel.body() == b"pcm-bytes"
+    assert channel.sent[0]["type"] == "http.response.start"
+    assert channel.sent[0]["status"] == 200
+    assert channel.sent[-1] == {
+        "type": "http.response.body",
+        "body": b"",
+        "more_body": False,
+    }
+
+
+class _AsgiChannel:
+    """A real single-consumer ASGI channel: each message is delivered ONCE.
+
+    This is the whole bug in one object. The browser's upload arrives as
+    ``http.request`` messages on the same channel the disconnect listener
+    reads, and whichever coroutine calls ``receive()`` first takes them. A
+    fake that hands the body to everyone who asks cannot reproduce this.
+    """
+
+    def __init__(self, *bodies: bytes) -> None:
+        self.messages = [
+            {"type": "http.request", "body": body, "more_body": True}
+            for body in bodies
+        ]
+        self.messages.append({"type": "http.request", "body": b"", "more_body": False})
+        self.messages.append({"type": "http.disconnect"})
+        self.sent: list[dict] = []
+        self.receive_calls = 0
+
+    async def receive(self) -> dict:
+        self.receive_calls += 1
+        if self.messages:
+            return self.messages.pop(0)
+        await asyncio.Event().wait()  # drained: whoever waits here is stuck
+        raise AssertionError("unreachable")
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+
+    def body(self) -> bytes:
+        return b"".join(
+            m.get("body", b"") for m in self.sent if m["type"] == "http.response.body"
+        )
+
+
+async def _drive_relay(response_cls, tts, pcm: bytes) -> bytes:
+    """Run the real relay body through ``response_cls`` over a real channel."""
+
+    starlette_requests = pytest.importorskip("starlette.requests")
+
+    upload = b"".join(
+        ndjson({"delta": "Hello there. "}, {"done": "Hello there."})
+    )
+    channel = _AsgiChannel(upload)
+    scope = _http_scope("2.3")
+    request = starlette_requests.Request(scope, channel.receive)
+
+    config = api._resolve_cascade_relay_config()
+    response = response_cls(
+        api._cascade_pcm_stream(request, config),
+        media_type=api.CASCADE_PCM_MEDIA_TYPE,
+    )
+
+    async def script_upstream():
+        await _wait_for(lambda: len(tts.sockets) == 1, timeout=1.0)
+        ws = tts.sockets[0]
+        await _wait_for(lambda: len(ws.sent) >= 3, timeout=1.0)
+        ws.feed_audio(pcm)
+        ws.feed_final()
+
+    upstream = asyncio.create_task(script_upstream())
+    try:
+        await asyncio.wait_for(response(scope, channel.receive, channel.send), 3.0)
+    finally:
+        upstream.cancel()
+        await asyncio.gather(upstream, return_exceptions=True)
+    return channel.body()
+
+
+def test_the_stock_streaming_response_loses_the_upload_on_the_same_scope(tts):
+    """Fail-without-the-fix, pinned to the scope VALUE, not a version string.
+
+    Starlette's disconnect listener calls receive() first and takes the
+    browser's `http.request` messages, so the relay's own request.stream()
+    only ever sees `http.disconnect` and the answer's text never reaches the
+    cascade. The reported symptom exactly: HTTP 200, zero bytes of PCM, and
+    a ClientDisconnect once the browser gives up.
+
+    If a future starlette stops racing here, THIS test fails and the
+    subclass can be reconsidered — the fixed one beside it stays green
+    either way, which is why the assertion is on the scope value rather
+    than on a starlette or uvicorn version.
+    """
+
+    starlette_responses = pytest.importorskip("starlette.responses")
+
+    body = _run(
+        _drive_relay(starlette_responses.StreamingResponse, tts, b"\x07\x08" * 480)
+    )
+
+    assert body == b"", "the stock response is expected to lose the upload"
+    assert not tts.sockets, "no text reached the cascade, so it never dialed"
+
+
+def test_the_relay_response_delivers_the_pcm_on_the_same_scope(tts):
+    """The same channel, the same scope, the same relay — with the fix."""
+
+    pcm = b"\x07\x08" * 480
+
+    body = _run(_drive_relay(api.RelayResponse, tts, pcm))
+
+    assert body == pcm
+    assert len(tts.sockets) == 1
+    assert [m.get("text") for m in tts.sockets[0].sent] == [" ", "Hello there.", ""]
+
+
+def test_relay_streams_identically_when_the_server_advertises_2_4():
+    """A server that advertises 2.4 gets byte-identical behavior."""
+
+    channel = _RecordingChannel()
+    response = api.RelayResponse(_one_chunk(), media_type=api.CASCADE_PCM_MEDIA_TYPE)
+
+    _run(
+        asyncio.wait_for(
+            response(_http_scope("2.4"), channel.receive, channel.send), timeout=2.0
+        )
+    )
+
+    assert channel.receive_calls == 0
+    assert channel.body() == b"pcm-bytes"
+
+
+def test_the_route_returns_a_relay_response_not_a_bare_streaming_response():
+    """The whole fix is which class the route hands back."""
+
+    response = _run(api.cascade_tts(StreamRequest([])))
+    assert isinstance(response, api.RelayResponse)
+    assert response.media_type == api.CASCADE_PCM_MEDIA_TYPE
+
+
+def test_a_client_that_vanishes_mid_upload_is_an_abort_not_an_error(tts, caplog):
+    """ClientDisconnect is handled like a stream that ends without `done`.
+
+    A browser that goes away mid-answer (barge-in, tab closed) must cancel
+    the TTS rather than raise out of the feeder — the operator hears silence,
+    the log stays clean, and no half-answer keeps speaking into a closed tab.
+    """
+
+    class _DisconnectingRequest(StreamRequest):
+        async def stream(self):
+            for chunk in self._chunks:
+                yield chunk
+            raise api.ClientDisconnect()
+
+    request = _DisconnectingRequest(ndjson({"delta": "Hello there. "}))
+
+    async def scenario():
+        response = await api.cascade_tts(request)
+        return await _collect(response)
+
+    with caplog.at_level("WARNING"):
+        out = _run(scenario())
+
+    assert out == b""  # aborted before any PCM was completed
+    assert "malformed" not in caplog.text
+    assert "unrecognized" not in caplog.text

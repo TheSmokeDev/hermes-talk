@@ -10,7 +10,13 @@ dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
-dev = ["pytest>=8", "ruff==0.16.5"]
+# starlette is a TEST dependency, never a runtime one: the dashboard relay's
+# streaming response is a starlette response, and its ASGI behavior differs by
+# what the SERVER advertises (uvicorn says spec_version 2.3 for HTTP). Without
+# the real class in CI that branch is untestable, which is exactly how the
+# relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
+# stub when starlette is absent, so the plugin installs without it.
+dev = ["pytest>=8", "ruff==0.16.5", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
