@@ -10,6 +10,12 @@ Mirrors ``talk_auth`` for the xAI realtime surface. Two lanes:
 hermes-talk never implements OAuth and never writes an auth store. When the
 host is importable its resolver owns refresh and quarantine under its own
 lock; otherwise the store is parsed read-only.
+
+The host keeps an ``xai-oauth`` login in either of two shapes, and the
+read-only parse has to know both: a ``providers`` block with the tokens nested
+under ``tokens``, and — what current hosts write for a device-code login — a
+``credential_pool`` list whose rows carry the tokens FLAT. See
+:func:`_inspect_store`.
 """
 
 from __future__ import annotations
@@ -36,6 +42,12 @@ TalkAuthError = talk_auth.TalkAuthError
 SOURCE_CONFIGURED = talk_auth.SOURCE_CONFIGURED
 SOURCE_ENV = talk_auth.SOURCE_ENV
 SOURCE_XAI_OAUTH = "xai-oauth"
+
+#: Where in the host store a login was found. The host reads two shapes for
+#: ``xai-oauth`` and Talk reports which one answered, so an operator debugging
+#: a "no login" verdict can tell an empty store from an unread one.
+STORE_PROVIDERS = "providers"
+STORE_CREDENTIAL_POOL = "credential_pool"
 
 PREFERENCE_ENV = "TALK_PREFER_XAI_OAUTH"
 RELOGIN_COMMAND = "hermes auth add xai-oauth"
@@ -106,48 +118,112 @@ def _store_path(hermes_home: Path | None) -> Path:
     return home / "auth.json"
 
 
-def _inspect_store(hermes_home: Path | None) -> tuple[str, str | None, int | None]:
-    """Read-only look at the host store's ``xai-oauth`` entry.
+def _usable_access_token(tokens: object) -> str | None:
+    """The access token from a mapping the host would accept, else ``None``.
 
-    Returns ``(state, access_token, expires_s)`` with ``state`` one of
+    The host requires BOTH tokens on every candidate it considers, in either
+    store shape (``hermes_cli/auth.py:5291-5295`` for ``providers``,
+    ``:5307-5311`` for the pool). That pair check is also what rejects a
+    quarantined login: the host quarantines by POPPING both tokens off the
+    state it persists (``hermes_cli/auth.py:7891-7896``), so a quarantined
+    entry arrives here with nothing to read rather than with a status flag.
+    """
+
+    if not isinstance(tokens, Mapping):
+        return None
+    access = tokens.get("access_token")
+    refresh = tokens.get("refresh_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    return access.strip()
+
+
+def _classify_token(access: str) -> tuple[str, str, int | None]:
+    expires_s = talk_auth._decode_jwt_expiry_s(access)
+    if expires_s is not None and expires_s <= int(time.time()) + _EXPIRY_MARGIN_S:
+        return "expired", access, expires_s
+    return "valid", access, expires_s
+
+
+def _pool_rows(data: Mapping) -> list:
+    """``credential_pool["xai-oauth"]`` rows, in the order the host reads them.
+
+    A LIST is the only shape the host accepts here — both its pool reader
+    (``hermes_cli/auth.py:2277-2282``) and its xAI resolver
+    (``:5303``) type-check for one and ignore anything else — so a non-list
+    slice yields no candidates rather than a token the host would never use.
+    """
+
+    pool = data.get("credential_pool")
+    if not isinstance(pool, Mapping):
+        return []
+    rows = pool.get(SOURCE_XAI_OAUTH)
+    return list(rows) if isinstance(rows, list) else []
+
+
+def _inspect_store(hermes_home: Path | None) -> tuple[str, str | None, int | None, str | None]:
+    """Read-only look at the host store's ``xai-oauth`` login.
+
+    Returns ``(state, access_token, expires_s, store)`` with ``state`` one of
     ``missing`` (no entry), ``invalid`` (unreadable, or an entry the host
-    itself would refuse — both tokens are required), ``expired``, ``valid``.
+    itself would refuse — both tokens are required), ``expired``, ``valid``,
+    and ``store`` naming which shape answered (:data:`STORE_PROVIDERS` or
+    :data:`STORE_CREDENTIAL_POOL`), or ``None`` when nothing was usable.
+
+    Mirrors ``hermes_cli.auth._xai_oauth_state_from_store``
+    (``hermes_cli/auth.py:5287-5321``) — the function behind
+    ``resolve_xai_oauth_runtime_credentials``, which is the resolver
+    :func:`_resolve_via_host` calls, so predicting it is what makes this
+    diagnostic agree with the live lane. Its order is ``providers`` FIRST,
+    then the pool; current hosts write device-code logins into the pool with
+    the tokens FLAT on the row rather than nested under ``tokens``.
     """
 
     path = _store_path(hermes_home)
     try:
         raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
-        return "missing", None, None
+        return "missing", None, None, None
     except OSError as exc:
         _log.debug("xai-oauth store unreadable: %s", type(exc).__name__)
-        return "invalid", None, None
+        return "invalid", None, None, None
     try:
         data = json.loads(raw)
     except ValueError:
-        return "invalid", None, None
+        return "invalid", None, None, None
     if not isinstance(data, dict):
-        return "invalid", None, None
+        return "invalid", None, None, None
+
+    # An ``xai-oauth`` login exists in some shape but none of it was usable.
+    # Separates the host's ``xai_auth_missing`` (fall through to other lanes)
+    # from its shape/token complaints (refuse and ask for a re-login).
+    present = False
+
+    # Leg 1 — ``providers["xai-oauth"]["tokens"]`` (hermes_cli/auth.py:5289-5295).
     providers = data.get("providers")
-    if not isinstance(providers, dict):
-        return "invalid", None, None
-    entry = providers.get(SOURCE_XAI_OAUTH)
-    if entry is None:
-        return "missing", None, None
-    tokens = entry.get("tokens") if isinstance(entry, dict) else None
-    if not isinstance(tokens, dict):
-        return "invalid", None, None
-    access = tokens.get("access_token")
-    refresh = tokens.get("refresh_token")
-    if not isinstance(access, str) or not access.strip():
-        return "invalid", None, None
-    if not isinstance(refresh, str) or not refresh.strip():
-        return "invalid", None, None
-    access = access.strip()
-    expires_s = talk_auth._decode_jwt_expiry_s(access)
-    if expires_s is not None and expires_s <= int(time.time()) + _EXPIRY_MARGIN_S:
-        return "expired", access, expires_s
-    return "valid", access, expires_s
+    entry = providers.get(SOURCE_XAI_OAUTH) if isinstance(providers, Mapping) else None
+    if entry is not None:
+        present = True
+        tokens = entry.get("tokens") if isinstance(entry, Mapping) else None
+        access = _usable_access_token(tokens)
+        if access is not None:
+            return (*_classify_token(access), STORE_PROVIDERS)
+
+    # Leg 2 — ``credential_pool["xai-oauth"]`` (hermes_cli/auth.py:5297-5320).
+    # The host walks the list in stored order and takes the first row carrying
+    # both tokens; it does not sort by ``priority`` or read ``last_status``
+    # here, so neither does this.
+    for row in _pool_rows(data):
+        if not isinstance(row, Mapping):
+            continue
+        present = True
+        access = _usable_access_token(row)
+        if access is not None:
+            return (*_classify_token(access), STORE_CREDENTIAL_POOL)
+
+    return ("invalid" if present else "missing"), None, None, None
 
 
 def _host_refresh_available() -> bool:
@@ -218,7 +294,7 @@ def _resolve_xai_oauth(hermes_home: Path | None) -> TalkAuth | None:
     if _host_refresh_available():
         # Host importable and it said "no login"; do not second-guess it.
         return None
-    state, token, _expires_s = _inspect_store(hermes_home)
+    state, token, _expires_s, _store = _inspect_store(hermes_home)
     if state == "missing":
         return None
     if state == "invalid":
@@ -312,7 +388,7 @@ def grok_auth_diagnostic(
     scoped_state = _key_state(env, "TALK_XAI_API_KEY")
     shared_state = _key_state(env, "XAI_API_KEY")
     metered_key_present = "present" in (scoped_state, shared_state)
-    oauth_state, _token, expires_s = _inspect_store(hermes_home)
+    oauth_state, _token, expires_s, oauth_store = _inspect_store(hermes_home)
     if oauth_state == "valid" and expires_s is not None and expires_s <= now + _EXPIRY_MARGIN_S:
         oauth_state = "expired"
     host_refresh = _host_refresh_available()
@@ -347,6 +423,7 @@ def grok_auth_diagnostic(
         "winning_lane": winning_lane,
         "preference": preference,
         "xai_oauth": oauth_state,
+        "xai_oauth_source": oauth_store,
         "host_refresh_available": host_refresh,
         "metered_key_present": metered_key_present,
         "metered_key_wins_over_oauth": (
@@ -403,6 +480,8 @@ __all__ = [
     "SOURCE_CONFIGURED",
     "SOURCE_ENV",
     "SOURCE_XAI_OAUTH",
+    "STORE_CREDENTIAL_POOL",
+    "STORE_PROVIDERS",
     "TalkAuth",
     "TalkAuthError",
     "grok_auth_diagnostic",

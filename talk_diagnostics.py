@@ -99,6 +99,7 @@ _AUTH_DETAILS = {
     "preference": "token",
     "codex_oauth": "token",
     "xai_oauth": "token",
+    "xai_oauth_source": "token",
     "host_refresh_available": "bool",
     "metered_key_present": "bool",
     "metered_key_wins_over_codex": "bool",
