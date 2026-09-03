@@ -390,6 +390,29 @@ agent-loop-only tools (`memory`, `session_search`, `honcho_search`,
 says which of the two it answered from — a recollection can be stale in a way
 a verbatim line cannot, and nothing is on screen to check it against.
 
+**Pause the microphone without hanging up.** Say "stop listening" (or "mute
+the mic") and the model calls `pause_voice_input`: the call stays connected,
+playback keeps playing, background work keeps running and its results are
+still announced — only your speech stops reaching the provider. A paused
+microphone cannot hear the word "resume", so the way back is your own control,
+and **the pause is offered only where that control is guaranteed to exist**:
+
+- **`hermes talk` in a real terminal** — **Enter** toggles (`p` and `r` are
+  explicit; on Windows they are single keys, elsewhere type the word and
+  Enter). The connected line says `Enter to pause or resume the microphone`
+  when the key is live. With a piped or non-tty stdin (Git Bash's mintty
+  reports no tty to Python; launcher wrappers) there is no key, so no pause is
+  offered and a pause call is refused with a receipt that says why.
+- **`/talk` typed at the Hermes prompt** — the prompt owns that terminal for
+  the whole call, so the session never watches it for a key, and offers no
+  pause either. Use `hermes talk` on its own when you want the control.
+- **Discord** — `/talk pause` and `/talk resume`, typed. The model-side tool
+  is offered on the legacy provider-owned lane; on the `provider-host-tools`
+  lane the host supplies the tool list and the typed commands are the path.
+
+Both directions get a spoken receipt, the receipt names the control for the
+room you are in, and Ctrl+C still hangs up.
+
 **In Discord**, `/talk join` runs the call in the voice channel Hermes is
 already in — same conversation, same tools, same steering, in a room other
 people can hear. Talk now reports speaker transitions to the model using the
@@ -397,7 +420,9 @@ member's immutable Discord user ID; display names are quoted as untrusted data,
 and an unknown SSRC stays unresolved and unauthorized. Configure immutable IDs
 with `TALK_DISCORD_OPERATOR_USER_IDS=<id>[,<id>...]`. Only those speakers may
 run `delegate_task`, `steer_agent`, `redirect_agent`, or `stop_work`; everyone
-may still converse and use read-only tools. Unset, blank, or any malformed list
+may still converse and use read-only tools — including `pause_voice_input`,
+which can only narrow what the session does; `/talk resume` (text) brings
+listening back. Unset, blank, or any malformed list
 authorizes nobody. Talk binds permission to the exact Discord PCM, VAD input
 item, and opaque Realtime response metadata — never a display name, SSRC,
 model argument, or whichever person spoke most recently. Mixed, missing, or

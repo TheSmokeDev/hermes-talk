@@ -1,11 +1,12 @@
-"""Discord voice as an audio device — the same eight methods, a different room.
+"""Discord voice as an audio device — the same eleven methods, a different room.
 
 :class:`DiscordAudio` implements exactly the surface
 :class:`talk_audio.DuplexAudio` exposes (``start`` / ``stop`` /
-``read_input_chunk`` / ``queue_playback`` / ``drain_playback`` /
-``playback_pending`` / ``played_ms`` / ``reset_played_ms``), so the Realtime
-session, its tool calls, the steering ledger, and the announcement pump all
-run unchanged.
+``read_input_chunk`` / ``pause_input`` / ``resume_input`` / ``input_paused``
+/ ``queue_playback`` / ``drain_playback`` / ``playback_pending`` /
+``played_ms`` / ``reset_played_ms``), so the Realtime session, its tool
+calls, the steering ledger, the announcement pump, and the microphone pause
+all run unchanged.
 Only the room changes: instead of a microphone and a speaker, the frames
 come from and go to a Discord voice channel.
 
@@ -44,9 +45,10 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from . import talk_audio
+    from . import talk_audio, talk_pause
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
+    import talk_pause
 
 _log = logging.getLogger(__name__)
 
@@ -406,6 +408,7 @@ class DiscordAudio:
         self._speaker_notifier = None
         self._speaker_notifier_generation = 0
         self._last_speaker_key: Any = _UNSET
+        self._input_paused = False
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -816,7 +819,19 @@ class DiscordAudio:
                 chunks = self._take_receiver_chunks(receiver)
             if chunks:
                 self._touch_host_timer()
+            with self._lock:
+                paused = self._input_paused
             for ssrc, raw_user_id, chunk in chunks:
+                if paused:
+                    # Paused (hermes-talk#100): the host's buffers were still
+                    # taken — they must not grow — and its inactivity timer
+                    # still re-armed, but nothing reaches the session. The
+                    # per-speaker carry goes too, so a half-sample from
+                    # before the pause cannot prefix the first frame after.
+                    # (One chunk can still race the flag; resume_input
+                    # drains it.)
+                    self._capture_remainder.pop(ssrc, None)
+                    continue
                 # Per speaker: one speaker's partial sample group prepended
                 # to another's audio would shift it and transpose L/R for
                 # that chunk.
@@ -1076,6 +1091,16 @@ class DiscordAudio:
 
         self._fail_if_bridge_lost()
         now = time.monotonic()
+        with self._lock:
+            if self._input_paused:
+                # Nothing flows while paused — not real audio, and not the
+                # synthesized silence either: a server that hears nothing
+                # detects no turn. The pacing clock keeps up with the wall
+                # clock so a resume starts at "now" instead of replaying the
+                # whole pause as a burst of catch-up silence frames.
+                if self._audio_clock > 0.0:
+                    self._audio_clock = max(self._audio_clock, now)
+                return None
         try:
             packet = self._inbound.get_nowait()
         except queue.Empty:
@@ -1107,6 +1132,49 @@ class DiscordAudio:
 
         packet = self.read_input_packet()
         return packet.pcm if packet is not None else None
+
+    def _discard_queued_input(self) -> None:
+        while True:
+            try:
+                self._inbound.get_nowait()
+            except queue.Empty:
+                break
+
+    def pause_input(self) -> None:
+        """Stop feeding the channel's audio to the session (hermes-talk#100).
+
+        The room keeps hearing the bot: playback, ``playback_pending`` and
+        the heard boundary are untouched. What stops is capture — the
+        host's buffers are still drained (and its inactivity timer still
+        re-armed, so it does not leave the channel), but nothing reaches the
+        session: frames decoded from here on are dropped, the ones already
+        queued are discarded, and the reader answers empty while the flag
+        is up.
+        """
+
+        with self._lock:
+            self._input_paused = True
+        self._discard_queued_input()
+
+    def resume_input(self) -> None:
+        """Feed the channel's audio to the session again, from the next frame on.
+
+        Drains first, for the same reason the terminal does: the drain
+        thread's flag check and its queue write are not one atomic step, so
+        one chunk admitted just before the pause can land after the pause's
+        drain — and it must not be the first thing sent on resume.
+        """
+
+        self._discard_queued_input()
+        with self._lock:
+            self._input_paused = False
+
+    @property
+    def input_paused(self) -> bool:
+        """Whether capture is paused (hermes-talk#100)."""
+
+        with self._lock:
+            return self._input_paused
 
     # -- playback -------------------------------------------------------------
 
@@ -1195,8 +1263,10 @@ __all__ = [
     "InputAudioPacket",
     "TalkDiscordError",
     "discord_to_session",
+    "pause_session",
     "reset_for_tests",
     "resolve_voice_bridge",
+    "resume_session",
     "session_status",
     "session_to_discord",
     "start_core_session",
@@ -1284,7 +1354,10 @@ def _startup_refusal_failure(reason: str | None) -> str | None:
     return _STARTUP_REFUSAL_FAILURES.get(reason)
 
 
-JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
+JOIN_USAGE = (
+    "Say `talk join` once I'm in a voice channel, `talk pause` / `talk resume` to "
+    "mute or unmute my listening, or `talk leave` to hand it back."
+)
 
 
 def session_status() -> str:
@@ -1307,15 +1380,68 @@ def session_status() -> str:
                 "say `talk leave` to stop."
             )
         return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
+    # The microphone pause (hermes-talk#100) is the one live fact that changes
+    # what "live" means: a paused session plays and announces but hears nobody.
+    paused = " The microphone is paused — say `talk resume` to be heard again." if (
+        talk_pause.is_paused()
+    ) else ""
     if mode == "provider-host-tools":
         return (
             f"Provider-owned Realtime voice with canonical Hermes tools is live on server "
-            f"{guild_id}. Say `talk leave` to stop."
+            f"{guild_id}. Say `talk leave` to stop.{paused}"
         )
     return (
         f"Limited legacy provider-owned voice is live on server {guild_id}. "
         "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
+        f"{paused}"
     )
+
+
+#: The Discord room's own microphone control (hermes-talk#100). Text, on
+#: purpose: a paused session hears nobody, so the way back cannot be spoken.
+_PAUSE_COMMAND_RECEIPTS = {
+    talk_pause.PAUSED: (
+        "Microphone paused — I'll keep talking and announcing, but I'm not "
+        "listening. Say `talk resume` when you want me to hear you again."
+    ),
+    talk_pause.ALREADY_PAUSED: "The microphone is already paused — `talk resume` unpauses it.",
+    talk_pause.RESUMED: "Microphone resumed — I'm listening again.",
+    talk_pause.ALREADY_LISTENING: "I'm already listening — the microphone wasn't paused.",
+    talk_pause.NO_SESSION: (
+        "The voice session isn't listening yet — give it a moment, then try again."
+    ),
+    talk_pause.NO_RESUME_PATH: (
+        "I didn't pause — this session registered no way to resume, and a pause "
+        "nobody can undo would be a hang-up. Say `talk leave` to stop instead."
+    ),
+    talk_pause.UNSUPPORTED: "This voice session can't pause its input.",
+}
+
+
+def _set_session_paused(paused: bool) -> str:
+    with _SESSION_LOCK:
+        task = _SESSION.get("task")
+        mode = _SESSION.get("mode", "legacy")
+    if task is None or task.done():
+        return "I'm not in a voice session right now."
+    if mode == "core":
+        # The canonical core lane is input-only and host-owned: the host's
+        # orchestrator decides what it hears and says, not this plugin.
+        return "The canonical core lane doesn't pause — say `talk leave` to stop it."
+    outcome = talk_pause.set_paused(paused, source=talk_pause.SOURCE_COMMAND)
+    return _PAUSE_COMMAND_RECEIPTS[outcome]
+
+
+def pause_session() -> str:
+    """Mute the live session's listening without leaving the channel."""
+
+    return _set_session_paused(True)
+
+
+def resume_session() -> str:
+    """Unmute a paused session's listening."""
+
+    return _set_session_paused(False)
 
 
 async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) -> bool:

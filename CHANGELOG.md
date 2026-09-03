@@ -14,6 +14,36 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- `pause_voice_input` — the model can pause listening without ending the
+  call (#100). "Stop listening" or "mute the mic" is a tool call: the session
+  stays connected, playback keeps playing, background work keeps running and
+  its results are still announced; only the operator's speech stops reaching
+  the provider. The flag lives on the capture surface — `DuplexAudio` and
+  `DiscordAudio` grew `pause_input` / `resume_input` / `input_paused`, the
+  same one-interface pattern as `playback_pending` in #87 — so both rooms
+  honour it identically: blocks captured while paused are dropped (never
+  queued stale), the already-queued ones are discarded, and the Discord bridge
+  keeps the host's buffers drained and its inactivity timer armed so the bot
+  is not evicted from the channel. A paused microphone cannot hear the word
+  "resume", so the way back is the operator's own control — Enter in the
+  standalone `hermes talk` terminal (toggle; `p`/`r` explicit — a polling
+  watcher, never a blocking stdin read), `/talk pause` / `/talk resume` in
+  Discord (`/talk status` says when it is paused) — and the tool is offered
+  ONLY where that control is guaranteed: the pause decision is made once,
+  before the tool list is built, from the same predicate that starts the
+  keyboard watcher, and the registered control is what the receipt names.
+  No control, no pause: a piped or non-tty stdin gets no key and no tool;
+  `/talk` at the Hermes prompt shares its tty with prompt_toolkit, so that
+  lane never watches stdin and offers no pause; and a pause call that
+  arrives anyway is refused (`no_resume_path`) rather than armed, because a
+  pause nobody can undo would be a hang-up. On Windows an extended key
+  (arrows, Insert, F-keys) is consumed whole — before, Down-Arrow's scan
+  code read as `p` and paused the microphone. Both directions get a spoken
+  receipt: the model's tool result for its own flips, a contained
+  announcement for the operator's. The tool classifies read-only (it can
+  only narrow what a session does, and a pause is never a path to authority)
+  and refuses — never arms — when no session is attached. Ported idea from
+  bielcarpi/hermes-live-voice (MIT), idea only.
 - Run admission control on `delegate_task` (#101). The model may declare
   `execution_mode` (`exclusive`, the default, or `parallel_read_only`) and up
   to eight normalized `resource_keys` naming what a task touches — a repo

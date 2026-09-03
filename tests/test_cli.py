@@ -2161,7 +2161,7 @@ def test_session_always_detaches_the_lifecycle_target(monkeypatch, capsys):
 
 
 def test_keyboard_interrupt_hangs_up_cleanly(monkeypatch, capsys):
-    async def interrupted():
+    async def interrupted(**_kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(talk_cli, "run_talk_session", interrupted)
@@ -2178,7 +2178,7 @@ def test_setup_cli_adds_no_required_arguments():
 
 
 def test_cli_entry_raises_systemexit_on_failure(monkeypatch):
-    async def failing():
+    async def failing(**_kwargs):
         return 1
 
     monkeypatch.setattr(talk_cli, "run_talk_session", failing)

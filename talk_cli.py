@@ -27,11 +27,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -55,6 +58,7 @@ try:
         talk_lifecycle,
         talk_openai_realtime,
         talk_operator_auth,
+        talk_pause,
         talk_progress,
         talk_realtime,
         talk_runs,
@@ -84,6 +88,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_lifecycle
     import talk_openai_realtime
     import talk_operator_auth
+    import talk_pause
     import talk_progress
     import talk_realtime
     import talk_runs
@@ -93,6 +98,8 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_transcript
     import talk_wire
     from talk_relay import RealtimeRelay
+
+_log = logging.getLogger(__name__)
 
 #: How long the sender waits when the microphone queue is empty. One tenth of
 #: a block: short enough that capture never falls behind, long enough that an
@@ -1036,6 +1043,174 @@ def approval_outcome_commands(event: dict) -> list[talk_realtime.RealtimeCommand
     return _announcement_commands(headline, "")
 
 
+#: Which operator control flipped the microphone, in words the model can
+#: repeat. The model's OWN flips (the pause_voice_input tool) are absent on
+#: purpose: it speaks those as its tool result, and an announcement on top
+#: would be the same receipt twice.
+_PAUSE_CONTROLS = {
+    talk_pause.SOURCE_KEYBOARD: "the keyboard",
+    talk_pause.SOURCE_COMMAND: "a /talk command",
+}
+
+
+def input_pause_commands(paused: bool, source: str) -> list[talk_realtime.RealtimeCommand]:
+    """Contained speech for an OPERATOR-made microphone flip (hermes-talk#100).
+
+    A control the operator pressed has no voice of its own, so the receipt
+    rides the same self-deleting, tools-off announcement shape as every
+    other out-of-band injection. Nothing untrusted is quoted: the headline
+    is plugin-owned words and a control name from a fixed table.
+    """
+
+    control = _PAUSE_CONTROLS.get(source)
+    if control is None:
+        return []
+    if paused:
+        headline = (
+            f"The operator just paused your microphone from {control}. You will "
+            "not hear them until they resume it; playback and background work "
+            "continue."
+        )
+    else:
+        headline = (
+            f"The operator just resumed your microphone from {control} — you can "
+            "hear them again."
+        )
+    return _announcement_commands(headline, "")
+
+
+#: How often the terminal control checks for a keypress. The reader never
+#: blocks on stdin: a thread parked in ``readline()`` would outlive the
+#: session and swallow the operator's NEXT line — the one meant for the
+#: Hermes prompt `/talk` returns to.
+KEYBOARD_POLL_S = 0.1
+_KEY_ACTIONS = {
+    "": "toggle",
+    "p": "pause",
+    "pause": "pause",
+    "mute": "pause",
+    "r": "resume",
+    "resume": "resume",
+    "unmute": "resume",
+    "listen": "resume",
+}
+#: ``msvcrt.getwch()`` returns one of these for an extended key, then the
+#: key's scan code on the next call (`Python docs: msvcrt.getch`).
+_WIN32_EXTENDED_KEY_PREFIXES = ("\x00", "\xe0")
+
+
+def _read_control_key(stdin, stop: threading.Event) -> str | None:
+    """One bounded poll of the terminal: an action name, or None for nothing.
+
+    Windows consoles have no ``select`` on stdin, so a waiting keypress is
+    read through ``msvcrt`` one character at a time — Enter toggles, ``p``
+    and ``r`` pause and resume. An extended key (an arrow, Insert, an F-key)
+    arrives as a ``'\\x00'`` or ``'\\xe0'`` prefix and THEN its scan code on
+    the next read; the scan code is consumed here with the prefix, because
+    read on its own it is a letter — Down-Arrow's is ``'P'``, Insert's is
+    ``'R'`` — and would pause or resume the microphone. Elsewhere ``select``
+    waits for a whole line in the terminal's own cooked mode (no tty state
+    is ever changed, so a crash cannot leave the shell raw): a bare Enter
+    toggles, and the words in ``_KEY_ACTIONS`` are explicit. EOF stops the
+    watcher for good.
+    """
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        if not msvcrt.kbhit():
+            time.sleep(KEYBOARD_POLL_S)
+            return None
+        char = msvcrt.getwch()
+        if char in _WIN32_EXTENDED_KEY_PREFIXES:
+            msvcrt.getwch()  # the scan code; documented to follow without blocking
+            return None
+        if char in ("\r", "\n"):
+            return "toggle"
+        if char.isascii() and char.isalpha():
+            return _KEY_ACTIONS.get(char.lower())
+        return None
+    import select
+
+    try:
+        ready, _, _ = select.select([stdin], [], [], KEYBOARD_POLL_S)
+    except (OSError, ValueError):
+        stop.set()
+        return None
+    if not ready:
+        return None
+    line = stdin.readline()
+    if line == "":
+        stop.set()
+        return None
+    return _KEY_ACTIONS.get(line.strip().lower())
+
+
+def keyboard_pause_control_available(stdin=None) -> bool:
+    """Whether :func:`start_keyboard_pause_control` would start on ``stdin``.
+
+    The ONE predicate both the advertisement and the watcher use: a pause
+    tool is offered on the terminal lane exactly when this returns True, so
+    the model can never be handed a pause the operator has no key to undo.
+    False for a piped or missing stdin, a closed file, or anything that is
+    not a tty (Git Bash's mintty reports ``isatty() == False`` to Python).
+    """
+
+    stdin = sys.stdin if stdin is None else stdin
+    try:
+        return stdin is not None and bool(stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def start_keyboard_pause_control(
+    stdin=None, *, read_key=None
+) -> Callable[[], None] | None:
+    """Watch the terminal for the operator's pause control (hermes-talk#100).
+
+    Returns a stop callable, or ``None`` when there is no terminal to watch
+    — a piped stdin, a test, a gateway. The watcher is a daemon thread that
+    polls rather than blocks, so ``stop()`` is honoured within one poll and
+    nothing typed after the session ends is ever consumed here. Each key
+    goes through :func:`talk_pause.set_paused` exactly like the tool does;
+    the attached session's receipt callback owns what is said and printed.
+
+    Callers decide WHETHER this terminal may be watched at all: the
+    standalone ``hermes talk`` command owns its tty, but ``/talk`` typed at
+    the Hermes prompt runs while prompt_toolkit holds that same tty in raw
+    mode with its own stdin reader, and a second reader would race it for
+    every byte (and, on POSIX, park in ``readline()`` waiting for a newline
+    raw mode never delivers). That lane passes ``keyboard_control=False``
+    to :func:`run_talk_session` and never reaches here.
+    """
+
+    stdin = sys.stdin if stdin is None else stdin
+    if not keyboard_pause_control_available(stdin):
+        return None
+    stop = threading.Event()
+    read = read_key or _read_control_key
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                action = read(stdin, stop)
+            except Exception as exc:  # noqa: BLE001 — a dead console ends the watcher, not the call
+                _log.debug("keyboard pause control stopped: %s: %s", type(exc).__name__, exc)
+                return
+            if action not in _KEY_ACTIONS.values() or stop.is_set():
+                continue
+            # A toggle with nothing attached reads as "pause": the flip is
+            # refused downstream (NO_SESSION) rather than guessed here.
+            paused = not bool(talk_pause.is_paused()) if action == "toggle" else action == "pause"
+            try:
+                talk_pause.set_paused(paused, source=talk_pause.SOURCE_KEYBOARD)
+            except Exception as exc:  # noqa: BLE001 — one bad key must not end the watcher
+                _log.debug("keyboard pause flip failed: %s: %s", type(exc).__name__, exc)
+
+    threading.Thread(target=watch, name="talk-keyboard-pause", daemon=True).start()
+    return stop.set
+
+
 def _active_parent_session_id() -> str | None:
     """Snapshot the bound Hermes session id, or fail closed on older hosts."""
 
@@ -1270,6 +1445,7 @@ async def run_talk_session(
     host_execution_attachment=None,
     lane: str = "cli",
     on_refusal=None,
+    keyboard_control: bool = False,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -1289,6 +1465,16 @@ async def run_talk_session(
     (the terminal) ignores it, and a lane that owes the operator a spoken
     receipt (Discord) uses it to say what actually refused instead of
     collapsing every startup failure into "exited unsuccessfully".
+
+    ``keyboard_control`` says this session OWNS the terminal's stdin and may
+    watch it for the microphone pause key (hermes-talk#100). Only the
+    standalone ``hermes talk`` command passes True; ``/talk`` at the Hermes
+    prompt shares its tty with prompt_toolkit and must not. It is one input
+    to the pause decision — the key still has to exist (a tty) — and that
+    decision is made ONCE, before the tools are built: ``pause_voice_input``
+    is advertised exactly when an operator resume control is guaranteed
+    (that key, or ``/talk resume`` in Discord), and the same control is
+    registered with :mod:`talk_pause`, which refuses to pause without one.
     """
 
     def refuse(reason: str) -> int:
@@ -1328,11 +1514,23 @@ async def run_talk_session(
             host_execution_attachment.close()
         return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
+    # The operator's way back from a pause (hermes-talk#100), decided HERE so
+    # the tool list below and the registry attach further down agree: the
+    # Discord room has `/talk resume`; the terminal has Enter only when this
+    # session owns a real tty. Anything else has no way back, so no pause is
+    # offered — Ctrl+C is the exit this feature exists to avoid.
+    if lane == "discord":
+        resume_control: str | None = talk_pause.RESUME_COMMAND
+    elif lane == "cli" and keyboard_control and keyboard_pause_control_available():
+        resume_control = talk_pause.RESUME_KEYBOARD
+    else:
+        resume_control = None
+
     try:
         tools = (
             host_execution_attachment.tool_definitions()
             if host_execution_attachment is not None
-            else talk_tools.default_talk_tools()
+            else talk_tools.default_talk_tools(pausable=resume_control is not None)
         )
     except Exception as exc:  # noqa: BLE001 - host attachment startup boundary
         print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
@@ -1416,6 +1614,7 @@ async def run_talk_session(
     watchers: list[asyncio.Task] = []
     watched: set[int] = set()
     spoken_item: str | None = None
+    keyboard_stop: Callable[[], None] | None = None
 
     def on_barge_in() -> None:
         played = audio.played_ms
@@ -1580,12 +1779,23 @@ async def run_talk_session(
             start_watchers(commands)
             return True
 
+        # The operator's own microphone control (hermes-talk#100), terminal
+        # lane only: a gateway has no keyboard, and its room gets `/talk
+        # pause` instead. Started only when the pause decision above chose
+        # the keyboard (same predicate, so it starts iff the tool was
+        # advertised), and before the connected line so that line can say
+        # the key exists.
+        if resume_control == talk_pause.RESUME_KEYBOARD:
+            keyboard_stop = start_keyboard_pause_control()
+        controls = "Ctrl+C to hang up" + (
+            ", Enter to pause or resume the microphone." if keyboard_stop else "."
+        )
         print(
             f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
-            "Ctrl+C to hang up.\n"
+            f"{controls}\n"
             if cascade_config is None
             else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
-            f"via elevenlabs, auth {auth.source}). Ctrl+C to hang up.\n"
+            f"via elevenlabs, auth {auth.source}). {controls}\n"
         )
 
         async def send_microphone() -> None:
@@ -1835,6 +2045,25 @@ async def run_talk_session(
             if commands:
                 announce_queue.put_nowait(commands)
 
+        def on_pause_change(paused: bool, source: str) -> None:
+            """Receipt for a microphone flip (hermes-talk#100), from any thread.
+
+            Printed for every flip. SPOKEN only for an operator control: the
+            model's own tool call already speaks its result, and an
+            announcement on top would say the same thing twice.
+            """
+
+            def deliver() -> None:
+                state = "paused" if paused else "listening again"
+                hint = " (Enter to resume)" if paused and keyboard_stop else ""
+                print(f"\ntalk: microphone {state}{hint}", flush=True)
+                commands = input_pause_commands(paused, source)
+                if commands:
+                    announce_queue.put_nowait(commands)
+
+            with suppress(RuntimeError):  # loop closed while the flip was in flight
+                loop.call_soon_threadsafe(deliver)
+
         loop = asyncio.get_running_loop()
         # Snapshot ownership once for this session. Older Hermes builds do not
         # expose the property; None suppresses announcements instead of guessing.
@@ -1864,6 +2093,12 @@ async def run_talk_session(
             operator=auth.source,
             profile=talk_profile,
         )
+        # The microphone pause (hermes-talk#100) binds the SAME way, before
+        # any tool can run: the model's pause_voice_input and the operator's
+        # key or command all flip this one surface. The registered resume
+        # control is the one the tool list was built from; with none, the
+        # registry refuses every pause.
+        talk_pause.attach_session(audio, on_pause_change, resume_control=resume_control)
         # Results this session is OWED — accepted under a durable Hermes
         # session that is still ours, by this SAME operator/profile binding
         # (a ticket bound to a different binding is never adopted), finished
@@ -1956,6 +2191,7 @@ async def run_talk_session(
             # Unbound again: with no live connection there is no destination,
             # so further dispatch is refused rather than accepted into a void.
             talk_runs.detach_owner()
+            talk_pause.detach_session(audio)
             sender.cancel()
             pump.cancel()
             receiver.cancel()
@@ -1999,6 +2235,9 @@ async def run_talk_session(
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
         talk_approvals.detach_session()
+        talk_pause.detach_session(audio)
+        if keyboard_stop is not None:
+            keyboard_stop()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         if cascade is not None:
@@ -2108,7 +2347,9 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     subparser.set_defaults(talk_command="session")
 
 
-def cli_entry(args: argparse.Namespace | None = None) -> int:
+def cli_entry(
+    args: argparse.Namespace | None = None, *, keyboard_control: bool | None = None
+) -> int:
     """Synchronous entry point for ``hermes talk``.
 
     A failed session raises ``SystemExit`` rather than returning: Hermes's
@@ -2116,6 +2357,13 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
     (``args.func(args)`` with no exit propagation), so a plain ``return 1``
     would exit the process 0 on failure — scripts and CI would read a dead
     session as success.
+
+    ``keyboard_control`` (hermes-talk#100): whether the session may watch
+    stdin for the pause key. Unset, it follows how we were called — the
+    standalone ``hermes talk`` subcommand arrives with argparse ``args`` and
+    owns the terminal; a bare call is the in-session ``/talk``, whose tty
+    belongs to the Hermes prompt (prompt_toolkit, raw mode) for the whole
+    call. ``/talk`` passes False explicitly as well.
     """
 
     command = getattr(args, "talk_command", "session") if args is not None else "session"
@@ -2155,8 +2403,10 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
             raise SystemExit(code)
         return 0
 
+    if keyboard_control is None:
+        keyboard_control = args is not None
     try:
-        code = asyncio.run(run_talk_session())
+        code = asyncio.run(run_talk_session(keyboard_control=keyboard_control))
     except KeyboardInterrupt:
         print("\ntalk: hung up.")
         return 0
@@ -2169,6 +2419,7 @@ __all__ = [
     "ANNOUNCE_STARVATION_WARN_S",
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
+    "KEYBOARD_POLL_S",
     "STARTUP_REFUSAL_AUDIO",
     "STARTUP_REFUSAL_AUTHORIZATION",
     "STARTUP_REFUSAL_CONFIGURATION",
@@ -2183,6 +2434,8 @@ __all__ = [
     "SpeakerPacketLane",
     "build_session_update",
     "cli_entry",
+    "input_pause_commands",
+    "keyboard_pause_control_available",
     "landed_note_messages",
     "pump_announcements",
     "resolve_provider_lane",
@@ -2190,6 +2443,7 @@ __all__ = [
     "run_phase_messages",
     "run_talk_session",
     "setup_cli",
+    "start_keyboard_pause_control",
     "started_run_ids",
     "subagent_phase_messages",
     "subagent_stop_messages",

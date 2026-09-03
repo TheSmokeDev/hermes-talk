@@ -46,14 +46,19 @@ def _tone(samples: int, *, rate: int, freq: float = 440.0, stereo: bool = False)
 
 
 def test_bridge_wears_the_audio_device_surface():
-    # The session calls exactly these eight. If DuplexAudio grows a ninth,
+    # The session calls exactly these eleven. If DuplexAudio grows a twelfth,
     # this test is what tells us the Discord room needs it too.
     # playback_pending joined in hermes-talk#50: the announcement gate needs
-    # to ask whether the room is still speaking WITHOUT draining it.
+    # to ask whether the room is still speaking WITHOUT draining it. The
+    # pause trio joined in hermes-talk#100: the model's tool and the
+    # operator's controls mute listening without leaving the room.
     surface = (
         "start",
         "stop",
         "read_input_chunk",
+        "pause_input",
+        "resume_input",
+        "input_paused",
         "queue_playback",
         "drain_playback",
         "playback_pending",

@@ -42,6 +42,12 @@ TRUSTED_CONTINUATION_EVENT_KEY = "_talk_continuation"
 #: (cleared from inbound events first), read only for the denial log line.
 _PERMIT_REFUSAL_EVENT_KEY = "_talk_permit_refusal"
 
+#: ``pause_voice_input`` is read-only on purpose (hermes-talk#100): it changes
+#: nothing outside this session and can only NARROW what the session does —
+#: a paused microphone runs no tool at all, mutating or otherwise. Resume by
+#: voice is unreachable once paused (nobody is heard), so a speaker who is
+#: not the operator can at worst mute listening until the operator's own
+#: control brings it back; the pause is never a path to authority.
 READ_ONLY_TALK_TOOLS = frozenset(
     {
         "search_memory",
@@ -50,6 +56,7 @@ READ_ONLY_TALK_TOOLS = frozenset(
         "list_agents",
         "talk_status",
         "talk_capabilities",
+        "pause_voice_input",
     }
 )
 MUTATING_TALK_TOOLS = frozenset(

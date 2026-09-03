@@ -78,6 +78,18 @@ def test_default_tools_are_fresh_copies():
     assert [tool["name"] for tool in talk_tools.default_talk_tools()] == _BASE_TOOLS
 
 
+def test_the_pause_tool_is_advertised_only_when_the_session_asks_for_it():
+    """pause_voice_input (hermes-talk#100) rides on ``pausable``, which the
+    session sets only when the operator has a guaranteed way to resume; the
+    default is the safe direction — no pause a key or command cannot undo."""
+
+    assert [tool["name"] for tool in talk_tools.default_talk_tools(pausable=True)] == [
+        *_BASE_TOOLS,
+        "pause_voice_input",
+    ]
+    assert [tool["name"] for tool in talk_tools.default_talk_tools(pausable=False)] == _BASE_TOOLS
+
+
 def test_the_vault_tool_is_advertised_only_when_it_can_be_served(monkeypatch):
     """Advertising a lookup that cannot run is the same defect as the
     provider block this plugin stopped passing through — the model calls it,
@@ -108,10 +120,11 @@ def test_every_advertised_tool_has_a_handler(monkeypatch):
     middle of a live call."""
 
     monkeypatch.setattr(talk_vault, "available", lambda: True)
-    names = {tool["name"] for tool in talk_tools.default_talk_tools()}
+    names = {tool["name"] for tool in talk_tools.default_talk_tools(pausable=True)}
     assert "search_vault" in names
+    assert "pause_voice_input" in names
 
-    for tool in talk_tools.default_talk_tools():
+    for tool in talk_tools.default_talk_tools(pausable=True):
         assert tool["name"] in talk_tools._HANDLERS
         assert tool["type"] == "function"
         assert tool["parameters"]["type"] == "object"
@@ -123,6 +136,7 @@ def test_no_handler_is_orphaned():
 
     advertised = {tool["name"] for tool in talk_tools.default_talk_tools()}
     advertised.add("search_vault")  # conditional, absent when unservable
+    advertised.add("pause_voice_input")  # conditional, absent without a way to resume
 
     assert set(talk_tools._HANDLERS) == advertised
 
