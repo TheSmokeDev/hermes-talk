@@ -98,7 +98,7 @@ Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify
 | Provider | `TALK_PROVIDER` | Auth | Notes |
 |---|---|---|---|
 | OpenAI Realtime | `openai` (default) | your ChatGPT subscription through the Codex CLI login (`codex login`) — **no API key** — or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | every surface; the only lane the dashboard tab and the cascade voice speak today |
-| xAI Grok Voice | `grok` | SuperGrok / X Premium+ login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | terminal + Discord; five voices |
+| xAI Grok Voice | `grok` | an X Premium or SuperGrok login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | terminal + Discord; five voices |
 | Gemini Live | `gemini` | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | terminal + `hermes realtime`; no client-side cancel/truncate on the wire, so barge-in drops playback locally; Discord refuses it for now |
 
 The knob is fail-closed and never inferred from which keys exist. Full
@@ -234,8 +234,10 @@ knob is fail-closed and never inferred from which keys exist — an operator
 holding several gets the provider they named or an error, not a silent
 switch.
 
-The Grok lane runs on a **SuperGrok / X Premium+ subscription** — no key:
-`hermes auth add xai-oauth` once, then `TALK_PROVIDER=grok`. Talk consumes
+The Grok lane runs on an **X subscription** — no key: `hermes auth add
+xai-oauth` once, then `TALK_PROVIDER=grok`. Verified live on X Premium (the
+$8 tier); a tier without realtime access is told so in one line rather than
+a traceback. Talk consumes
 the host's `xai-oauth` login the way the OpenAI lane consumes the Codex
 CLI's (the host refreshes and stores; Talk never writes an auth store).
 Bring an xAI key instead if you'd rather (`TALK_XAI_API_KEY`, falling back

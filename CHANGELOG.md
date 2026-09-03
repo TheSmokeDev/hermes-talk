@@ -317,10 +317,13 @@ contract adapter, a security policy, and a contributing guide.
 
 ## [0.16.0] — 2026-09-01
 
-Grok voice on a SuperGrok / X Premium+ subscription. `hermes auth add
-xai-oauth` once, `TALK_PROVIDER=grok`, no API key — the last provider that
-still forced a metered key now rides the host login the way the OpenAI
-lane rides the Codex CLI's.
+Grok voice on an X subscription. `hermes auth add xai-oauth` once,
+`TALK_PROVIDER=grok`, no API key — the last provider that still forced a
+metered key now rides the host login the way the OpenAI lane rides the
+Codex CLI's. Verified live on **X Premium** (the $8 tier) on 2026-09-03:
+`POST /v1/realtime/client_secrets` → 200, the realtime socket → 101,
+`session.created`. A tier without realtime access still gets the honest
+403 line instead of a traceback.
 
 ### Added
 - **`xai-oauth` auth lane for Grok** (`talk_grok_auth.py`). Resolved
