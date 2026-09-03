@@ -21,6 +21,7 @@ try:
     from . import (
         talk_cli,
         talk_config,
+        talk_core_provider,
         talk_core_realtime,
         talk_discord,
         talk_host,
@@ -33,6 +34,7 @@ try:
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
     import talk_config
+    import talk_core_provider
     import talk_core_realtime
     import talk_discord
     import talk_host
@@ -105,6 +107,42 @@ def _attempt_boolean_registration(ctx, method_name: str, surface: str, receipt: 
         _record(surface, receipt, exc)
         return
     REGISTRATION_RECEIPTS[receipt] = "registered" if accepted is True else "rejected"
+
+
+def _register_core_realtime_providers(ctx) -> None:
+    """Publish hermes-talk's three lanes on the Hermes core realtime contract.
+
+    Feature-detected on BOTH sides. Every released Hermes has no such hook,
+    and a host may ship a different contract version than the one
+    ``talk_core_provider`` targets; either way hermes-talk must load exactly
+    as it does today. That path is deliberately silent apart from one debug
+    line — an operator running a supported host should never see a warning
+    about a surface their Hermes was never expected to have.
+    """
+
+    receipt = "core_realtime_providers"
+    method = getattr(ctx, "register_realtime_voice_provider", None)
+    if not callable(method) or not talk_core_provider.core_contract_available():
+        REGISTRATION_RECEIPTS[receipt] = "unsupported-optional"
+        logger.debug(
+            "hermes-talk: host does not expose the Hermes core realtime voice "
+            "contract; core provider registration skipped"
+        )
+        return
+
+    outcome = "registered"
+    for provider in talk_core_provider.build_providers():
+        try:
+            accepted = method(provider)
+        except Exception as exc:  # noqa: BLE001 - isolate this registration surface
+            _record("core realtime voice provider", receipt, exc)
+            return
+        # The host hook returns a registration handle (or None when it
+        # refuses); older speculative hosts returned a bare bool. Anything
+        # falsy is a refusal, and one refusal makes the whole surface partial.
+        if not accepted:
+            outcome = "rejected"
+    REGISTRATION_RECEIPTS[receipt] = outcome
 
 
 def _register_talk_command(ctx) -> None:
@@ -222,6 +260,8 @@ def register(ctx) -> None:
         )
     else:
         _unsupported("realtime voice provider", "realtime_voice_provider")
+
+    _register_core_realtime_providers(ctx)
 
     _attempt_registration(
         ctx,

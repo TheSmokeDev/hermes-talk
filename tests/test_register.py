@@ -31,7 +31,17 @@ def load_plugin():
         sys.modules[parent] = namespace
 
     module_name = f"{parent}.hermes_talk"
-    sys.modules.pop(module_name, None)
+    # Drop the cached SUBMODULES too, not just the package. Popping only the
+    # package leaves `from . import talk_tools` bound to whatever loaded first
+    # -- and on a box with hermes-talk installed under ~/.hermes or AppData,
+    # that is the INSTALLED copy, so these tests quietly assert against a
+    # stale plugin instead of this checkout.
+    for cached in [
+        name
+        for name in sys.modules
+        if name == module_name or name.startswith(f"{module_name}.")
+    ]:
+        sys.modules.pop(cached, None)
     spec = importlib.util.spec_from_file_location(
         module_name,
         REPO_ROOT / "__init__.py",
@@ -132,15 +142,20 @@ def test_register_wires_every_surface(plugin, monkeypatch):
     ]
     assert len(ctx.tts_providers) == 1
     assert len(ctx.stt_providers) == 1
+    # Two independent core surfaces: the legacy input-only adapter and the
+    # full-contract one. Each registers only on a host exposing ITS contract,
+    # so a given box normally lights up one, the other, or neither.
+    expected_names = []
     if plugin.talk_core_realtime.core_provider_available():
-        assert len(ctx.realtime_providers) == 1
-        assert ctx.realtime_providers[0].name == "talk_openai_realtime"
-    else:
-        assert ctx.realtime_providers == []
+        expected_names.append("talk_openai_realtime")
+    if plugin.talk_core_provider.core_contract_available():
+        expected_names.extend(plugin.talk_core_provider.PROVIDER_NAMES)
+    assert [provider.name for provider in ctx.realtime_providers] == expected_names
     assert plugin.REGISTRATION_FAILURES == []
     expected_receipts = (
         {"registered"}
         if plugin.talk_core_realtime.core_provider_available()
+        and plugin.talk_core_provider.core_contract_available()
         else {"registered", "unsupported-optional"}
     )
     assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == expected_receipts
@@ -235,15 +250,16 @@ def test_every_surface_failing_is_recorded_separately(plugin, monkeypatch):
 
     plugin.register(ctx)
 
-    # Core-absent standalone Talk records realtime as unsupported-optional;
-    # a core-present host attempts it and records the tenth failure.
-    expected_failures = 10 if plugin.talk_core_realtime.core_provider_available() else 9
+    # Core-absent standalone Talk records each realtime surface as
+    # unsupported-optional; a host exposing that surface's contract attempts
+    # the registration instead and records one more failure.
+    legacy_core = plugin.talk_core_realtime.core_provider_available()
+    full_core = plugin.talk_core_provider.core_contract_available()
+    expected_failures = 9 + int(legacy_core) + int(full_core)
     assert len(plugin.REGISTRATION_FAILURES) == expected_failures
     assert plugin.talk_host.get_ctx() is ctx
     expected_receipts = (
-        {"failed"}
-        if plugin.talk_core_realtime.core_provider_available()
-        else {"failed", "unsupported-optional"}
+        {"failed"} if legacy_core and full_core else {"failed", "unsupported-optional"}
     )
     assert set(plugin.talk_tools.REGISTRATION_RECEIPTS.values()) == expected_receipts
 
@@ -316,7 +332,7 @@ def test_absent_optional_methods_warn_without_registration_failure(plugin, monke
     check = plugin.talk_cli.talk_doctor._plugin_check()
     assert check["status"] == "warn"
     assert check["details"]["required_issue_count"] == 0
-    assert check["details"]["optional_issue_count"] == 8
+    assert check["details"]["optional_issue_count"] == 9
 
 
 def test_absent_required_method_is_a_required_failure_not_an_exception(plugin, monkeypatch):

@@ -13,6 +13,24 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- hermes-talk's three realtime lanes now register on the Hermes core
+  `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
+  NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
+  `hermes-talk/grok`, and `hermes-talk/gemini`, so `hermes realtime --provider
+  <name>` drives them through core's own orchestrator. Registration is
+  feature-detected on both sides: a host without the hook, or with a different
+  contract version, loads hermes-talk exactly as before — one debug line, no
+  warning, every other surface intact. Capabilities are declared per lane
+  rather than assumed, so core degrades explicitly instead of calling an
+  operation the wire cannot perform. Availability stays offline and read-only
+  on all three lanes: no socket, no token refresh, no auth-store write.
+- The neutral session contract gained `ToolCallsCancelled`, and the Gemini Live
+  adapter emits it for `toolCallCancellation`. The server can discard a pending
+  tool call mid-turn; until now that was recorded silently and only visible as a
+  dropped result on the send path, which told policy nothing until it had
+  already produced work nobody wanted.
+
 ### Fixed
 - A Discord `talk join` that refuses before going live now says WHAT
   refused instead of "session exited unsuccessfully". The session already
@@ -38,6 +56,24 @@ named rather than smoothed.
 - An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
   (30s, 0 disables) now tells the operator once. Deferring is correct, but a
   gate that never opens was previously a silent slow poll with nothing to see.
+- A voice session whose transport declares remote speakers
+  (`discord_speaker_authorization`) but carries no authorization ledger is now
+  REFUSED at session setup, before a secret is minted or a socket is opened.
+  That equivalence held by construction and was asserted only in a comment
+  several hundred lines from where it is relied on — and the branch relying on
+  it silently selects the allow-all `local_operator_authorizer`, so a
+  construction bug would have handed every speaker in a voice channel full
+  operator authority with nothing anywhere refusing. It refuses through the
+  same bounded-reason sink every other startup refusal uses, so a Discord
+  `talk join` says what happened instead of "session exited unsuccessfully" —
+  and that sentence does not offer `/talk core join`, which would take the
+  same channel with the same speakers and refuse identically.
+- An unnamed tool call is now identified the same way on every path. The two
+  authorizer call sites disagreed (`"tool"` when revoking a permit, `""` when
+  authorizing one), so the identity a nameless event was revoked under was not
+  the identity it would have been authorized under. One helper answers for
+  both, and it returns `""` — which cannot collide with a registered tool, a
+  classification set, or a permit's recorded action.
 - The README demo GIF is re-rendered from the original 1280x582 screen
   recording instead of the 640x291 downscale it shipped as, so the
   transcript and the agent's brief in the runs panel are readable rather
