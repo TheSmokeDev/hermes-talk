@@ -143,6 +143,23 @@ def test_mint_returns_the_ephemeral_secret_and_the_session_shape(minted):
     assert minted["auth_token"] == RAW_KEY
 
 
+def test_desktop_relay_mint_is_renderer_only(minted):
+    body = call(api.create_session, FakeRequest(body={"mode": "desktop-relay"}))
+
+    assert body["mode"] == "desktop-relay"
+    session = minted["session"]
+    assert session["audio"]["input"]["turn_detection"]["create_response"] is False
+    assert "tools" not in session
+    assert "tool_choice" not in session
+
+
+def test_unknown_session_mode_is_rejected(minted):
+    with pytest.raises(api.HTTPException) as excinfo:
+        call(api.create_session, FakeRequest(body={"mode": "other"}))
+
+    assert excinfo.value.status_code == 400
+
+
 def test_mint_response_contains_no_raw_credential(minted):
     body = call(api.create_session, FakeRequest(body={}))
     blob = serialized(body)
