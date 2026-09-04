@@ -119,7 +119,7 @@ class _PendingApproval:
     request_text: str
     choices: tuple[str, ...]
     #: The host's approval request id (always present on real SSE events).
-    #: Sent back as ``approvalId`` so a host that supports exact routing
+    #: Sent back as ``request_id`` so a host that supports exact routing
     #: resolves THIS request instead of FIFO-popping the oldest; ``None``
     #: for reconciled prompts, where the id was lost with the stream.
     request_id: str | None = None

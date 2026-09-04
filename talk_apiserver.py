@@ -621,7 +621,7 @@ def respond_to_approval(
     :class:`TalkApiServerError` with speakable text on any other failure.
 
     ``approval_id`` is the request's own id from the ``approval.request``
-    event: a host that supports exact routing (the field is ``approvalId``
+    event: a host that supports exact routing (the field is ``request_id``
     on the wire) resolves THAT request instead of FIFO-popping the oldest;
     hosts that predate the field ignore it.
 
@@ -632,7 +632,7 @@ def respond_to_approval(
 
     body: dict = {"choice": choice}
     if approval_id:
-        body["approvalId"] = approval_id
+        body["request_id"] = approval_id
     try:
         response = httpx.post(
             f"{talk_config.api_server_url()}{RUNS_PATH}/{run_id}/approval",
