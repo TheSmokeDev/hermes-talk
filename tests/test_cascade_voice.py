@@ -260,7 +260,7 @@ async def _stream_lifecycle_bos_chunks_eos_isfinal():
         await _wait_for(lambda: len(ws.sent) == 3)
         # EOS ends the response's text AND carries the turn's one generation
         # trigger — the documented end-of-turn flush.
-        assert ws.sent[2] == {"text": "", "flush": True}
+        assert ws.sent[2] == {"text": ""}
 
         ws.feed_audio(b"pcm-one")
         ws.feed_audio(b"pcm-two")
@@ -466,7 +466,7 @@ async def _unflushed_tail_speaks_at_response_finished():
         ws = harness.connect.sockets[0]
         await _wait_for(lambda: len(ws.sent) == 3)
         assert ws.sent[1]["text"] == "a tail without punctuation"
-        assert ws.sent[2] == {"text": "", "flush": True}
+        assert ws.sent[2] == {"text": ""}
     finally:
         await voice.aclose()
 
@@ -521,13 +521,15 @@ async def _no_chunk_ever_forces_its_own_generation():
         ws = harness.connect.sockets[0]
         voice.handle_event(_delta("And a fourth sentence. "))
         voice.handle_event(_final(response_id="resp_1"))
-        await _wait_for(lambda: ws.sent and ws.sent[-1].get("flush") is True)
+        await _wait_for(lambda: ws.sent and ws.sent[-1] == {"text": ""})
 
         assert not any("try_trigger_generation" in frame for frame in ws.sent)
-        # Exactly one flush, and it is the LAST frame — the end of the turn.
-        flushed = [i for i, frame in enumerate(ws.sent) if frame.get("flush")]
-        assert flushed == [len(ws.sent) - 1]
-        assert ws.sent[-1] == {"text": "", "flush": True}
+        # No frame carries a `flush` key at all: the close IS the flush.
+        assert not any("flush" in frame for frame in ws.sent)
+        # The EOS is the LAST frame and appears exactly once.
+        assert [i for i, f in enumerate(ws.sent) if f == {"text": ""}] == [
+            len(ws.sent) - 1
+        ]
         # Everything between BOS and EOS is a bare text frame.
         assert all(set(frame) == {"text"} for frame in ws.sent[1:-1])
     finally:

@@ -547,12 +547,16 @@ class CascadeVoice:
         while True:
             item = await self._queue.get()
             if item is _FLUSH:
-                # The turn's final frame carries the ONE generation trigger:
-                # "we advise using `flush: true` along with the text at the
-                # end of conversation turn to ensure timely audio
-                # generation". Latency is unchanged where it is audible —
-                # this frame already ended the turn.
-                await ws.send_json({"text": "", "flush": True})
+                # The documented CloseConnection frame, which also flushes:
+                # ElevenLabs generates whatever is still buffered when the
+                # context closes. That is the whole end-of-turn trigger — no
+                # `flush` key rides along, because their `flush: true` is
+                # documented only ON a frame carrying real text, and an
+                # empty-text frame with `flush` appears nowhere in their
+                # schema (SendText requires `text`). Mixing the two variants
+                # would work by accident today and break on their next
+                # deploy.
+                await ws.send_json({"text": ""})
                 return
             await ws.send_json({"text": item})
 
