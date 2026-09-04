@@ -627,6 +627,22 @@ def test_speed_resolves_at_call_time_not_import_time(monkeypatch):
     assert "speed" not in talk_config.elevenlabs_voice_settings()
 
 
+def test_the_two_default_voice_settings_cannot_drift_apart():
+    """Two declarations of the same defaults, and nothing else keeps them equal.
+
+    ``talk_cascade_voice`` deliberately does NOT import ``talk_config`` — it
+    is a TTS transport, and config resolution belongs to the config module —
+    so its fallback defaults are declared locally and the config module
+    declares them again for the builder. That boundary is worth keeping, but
+    it means a value changed in one place would silently disagree with the
+    other: the CLI and dashboard would speak with the resolved settings
+    while a caller that omitted them got the stale ones. This is the only
+    thing enforcing that they agree.
+    """
+
+    assert cascade._VOICE_SETTINGS == talk_config.DEFAULT_ELEVENLABS_VOICE_SETTINGS
+
+
 def test_voice_settings_builder_hands_back_a_fresh_dict(monkeypatch):
     """A caller mutating its copy must not poison the next session."""
 
