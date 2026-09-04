@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Changed
+- `starlette` is now a **dev/test** dependency. It is where
+  `StreamingResponse` and `ClientDisconnect` actually live (fastapi
+  re-exports them), and the relay deadlock fixed below is starlette
+  behavior — untestable in CI without the real class, which is exactly how the
+  deadlock shipped. `dashboard/plugin_api.py` still falls back to its own
+  stub when starlette is absent, so the plugin installs with no web
+  dependency of its own.
+
 ### Fixed
 - The dashboard cascade relay no longer deadlocks on the servers Hermes
   actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
@@ -45,14 +54,38 @@ named rather than smoothed.
   channel and asserts on the scope VALUE rather than on a version string,
   so a future uvicorn that advertises 2.4 leaves it meaningful.
 
-### Changed
-- `starlette` is now a **dev/test** dependency. It is where
-  `StreamingResponse` and `ClientDisconnect` actually live (fastapi
-  re-exports them), and the relay's behavior above is starlette behavior —
-  untestable in CI without the real class, which is exactly how the
-  deadlock shipped. `dashboard/plugin_api.py` still falls back to its own
-  stub when starlette is absent, so the plugin installs with no web
-  dependency of its own.
+- The dashboard's cloned voice no longer ticks at every chunk seam. The
+  page opened its AudioContext at the browser default (48kHz on Windows)
+  and then handed it 24kHz buffers, and Web Audio resamples each
+  `AudioBuffer` independently — two chunks resampled in isolation do not
+  line up where they meet, so every chunk boundary was a discontinuity
+  while the PCM leaving the server was provably clean. Measured on a 440 Hz
+  tone split into 40 uneven chunks: the per-chunk path jumped 0.105 between
+  adjacent output samples where a smooth signal steps 0.035, and a 3x step
+  at a seam is the tick you hear. The context is now requested at the PCM's
+  own 24kHz so nothing is resampled at all; browsers that refuse the rate
+  get a resampler that carries the previous chunk's last sample and its
+  fractional read position across chunks, which measures identical to
+  resampling the whole tone at once. Barge-in clears that carry-over along
+  with the generation bump, so an interrupted sentence cannot splice itself
+  onto the next answer.
+- The dashboard cascade no longer goes silently mute on HTTP/1.1. The relay
+  posted its request body as a `ReadableStream` with `duplex: "half"`, and
+  Chrome only sends a streaming request body over HTTP/2 or HTTP/3 — on a
+  plain HTTP/1.1 origin, which a local dashboard almost always is, the
+  fetch rejects outright. The `.catch(() => {})` swallowed it by design, so
+  the model's text captioned normally, no audio ever played, no error
+  appeared anywhere, and zero requests reached `/cascade-tts`. The page now
+  checks the protocol it actually negotiated
+  (`performance.getEntriesByType("navigation")[0].nextHopProtocol`) and
+  posts the whole answer once its text is done when it cannot stream. That
+  costs sentence pipelining — the first sentence no longer plays while the
+  model writes the second — but it produces audio instead of silence.
+- A cascade relay that fails for a real reason now says so once, through
+  the tab's own error surface and the console, instead of vanishing into
+  the same `.catch()`. "Silently" was half of the bug above: a mute voice
+  and a working one were indistinguishable. A deliberate abort (barge-in,
+  hang-up) stays quiet, because that is not a failure.
 
 ## [0.17.0] — 2026-09-03
 
