@@ -1690,6 +1690,7 @@ async def run_talk_session(
             model=cascade_config[2],
             on_audio=audio.queue_playback,
             on_error=on_error,
+            voice_settings=talk_config.elevenlabs_voice_settings(),
         )
     session = None
     result = 0

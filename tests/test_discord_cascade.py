@@ -215,7 +215,7 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
         ws = tts.sockets[0]
         await _wait_for(lambda: len(ws.sent) == 3)
         # BOS, the one sentence chunk, EOS — and the key rode only the header.
-        assert ws.sent[1] == {"text": "Hello Discord.", "try_trigger_generation": True}
+        assert ws.sent[1] == {"text": "Hello Discord."}
         assert ws.sent[2] == {"text": ""}
         assert tts.dials[0]["headers"] == {"xi-api-key": FAKE_KEY}
         assert FAKE_KEY not in tts.dials[0]["url"]

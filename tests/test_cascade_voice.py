@@ -36,6 +36,7 @@ def _scrub_elevenlabs_env(monkeypatch):
     monkeypatch.delenv("TALK_VOICE_MODE", raising=False)
     monkeypatch.delenv("TALK_CASCADE_TTS", raising=False)
     monkeypatch.delenv("TALK_ELEVENLABS_MODEL", raising=False)
+    monkeypatch.delenv("TALK_CASCADE_SPEED", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +184,7 @@ class _FakeConnect:
 
 
 class _Harness:
-    def __init__(self) -> None:
+    def __init__(self, **overrides) -> None:
         self.audio: list[bytes] = []
         self.errors: list[str] = []
         self.connect = _FakeConnect()
@@ -195,6 +196,7 @@ class _Harness:
             on_error=self.errors.append,
             aiohttp_module=aiohttp,
             ws_connect=self.connect,
+            **overrides,
         )
         self.voice.start()
 
@@ -242,10 +244,12 @@ async def _stream_lifecycle_bos_chunks_eos_isfinal():
         await _wait_for(lambda: len(harness.connect.sockets) == 1)
         ws = harness.connect.sockets[0]
         await _wait_for(lambda: len(ws.sent) == 2)
-        # BOS opens the stream with voice settings; the chunk asks for generation.
+        # BOS opens the stream with voice settings; the chunk is text ONLY —
+        # no per-chunk generation trigger, so the buffer keeps its prosodic
+        # context across the sentence boundary.
         assert ws.sent[0]["text"] == " "
         assert "voice_settings" in ws.sent[0]
-        assert ws.sent[1] == {"text": "Hello there.", "try_trigger_generation": True}
+        assert ws.sent[1] == {"text": "Hello there."}
         # The key rides the header; identifiers ride the URL; never the reverse.
         assert harness.connect.calls[0]["headers"] == {"xi-api-key": FAKE_KEY}
         assert FAKE_VOICE_ID in harness.connect.calls[0]["url"]
@@ -254,7 +258,9 @@ async def _stream_lifecycle_bos_chunks_eos_isfinal():
 
         voice.handle_event(_final(response_id="resp_1"))
         await _wait_for(lambda: len(ws.sent) == 3)
-        assert ws.sent[2] == {"text": ""}  # EOS ends the response's text
+        # The documented CloseConnection frame, and nothing else: closing is
+        # what generates the buffered text, so no `flush` key rides along.
+        assert ws.sent[2] == {"text": ""}
 
         ws.feed_audio(b"pcm-one")
         ws.feed_audio(b"pcm-two")
@@ -471,6 +477,231 @@ def test_stream_input_url_carries_identifiers_only():
     assert "voice%20abc" in url
     assert "model_id=model%2F1" in url
     assert "output_format=pcm_24000" in url
+
+
+def test_stream_input_url_states_ssml_parsing_explicitly():
+    """The one query parameter ElevenLabs documents no default for.
+
+    Left off, a ``<break time="0.4s" />`` is dropped rather than spoken, and
+    nothing in the response says so — which is why the flag is sent either
+    way instead of relying on an unstated default.
+    """
+
+    assert "enable_ssml_parsing=true" in cascade.stream_input_url("v", "m")
+    assert "enable_ssml_parsing=false" in cascade.stream_input_url(
+        "v", "m", enable_ssml=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prosody: one generation per TURN, never one per chunk
+# ---------------------------------------------------------------------------
+
+
+def test_no_chunk_ever_forces_its_own_generation():
+    asyncio.run(_no_chunk_ever_forces_its_own_generation())
+
+
+async def _no_chunk_ever_forces_its_own_generation():
+    """Every text frame is text ONLY; the turn ends on the documented close.
+
+    ``try_trigger_generation`` per chunk is what flattened prosody: it
+    defeats the buffer whose entire purpose is giving the model enough
+    context to carry intonation across a sentence boundary. An ellipsis-
+    heavy line is the worst case — the chunker ends a chunk on each pause
+    marker, so the old path produced a forced generation per marker.
+
+    Nothing replaces it: no frame carries a ``flush`` key, because closing
+    is documented to generate whatever is buffered and this lane closes its
+    socket once per response. The assertions below pin BOTH halves — no
+    per-chunk trigger, and no undocumented empty-text-plus-flush frame.
+    """
+
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        voice.handle_event(_delta("First... second... third. "))
+        await _wait_for(lambda: len(harness.connect.sockets) == 1)
+        ws = harness.connect.sockets[0]
+        voice.handle_event(_delta("And a fourth sentence. "))
+        voice.handle_event(_final(response_id="resp_1"))
+        await _wait_for(lambda: ws.sent and ws.sent[-1] == {"text": ""})
+
+        assert not any("try_trigger_generation" in frame for frame in ws.sent)
+        # No frame carries a `flush` key at all: the close IS the flush.
+        assert not any("flush" in frame for frame in ws.sent)
+        # The EOS is the LAST frame and appears exactly once.
+        assert [i for i, f in enumerate(ws.sent) if f == {"text": ""}] == [
+            len(ws.sent) - 1
+        ]
+        # Everything between BOS and EOS is a bare text frame.
+        assert all(set(frame) == {"text"} for frame in ws.sent[1:-1])
+    finally:
+        await voice.aclose()
+
+
+def test_each_response_opens_and_closes_its_own_socket():
+    asyncio.run(_each_response_opens_and_closes_its_own_socket())
+
+
+async def _each_response_opens_and_closes_its_own_socket():
+    """The fact the end-of-turn design rests on: the socket is PER RESPONSE.
+
+    Dropping the per-chunk trigger is only safe without an explicit flush
+    because closing generates whatever is buffered, and this lane closes
+    once per turn — so every turn gets that flush for free. A future change
+    that held one socket across turns would silently lose the last partial
+    chunk of every answer until the NEXT answer pushed it out, and single-
+    context ``/stream-input`` has no schema-legal frame to force it (``text``
+    is required on ``SendText``). That change would need the sibling
+    ``multi-stream-input`` endpoint's ``FlushContextClient``. This test is
+    what fails first if anyone tries it.
+    """
+
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        for n in (1, 2):
+            rid = f"resp_{n}"
+            voice.handle_event(rt.ResponseStarted(response_id=rid))
+            voice.handle_event(_delta(f"Answer {n}. ", response_id=rid))
+            await _wait_for(lambda n=n: len(harness.connect.sockets) == n)
+            ws = harness.connect.sockets[n - 1]
+            voice.handle_event(_final(response_id=rid))
+            await _wait_for(lambda ws=ws: ws.sent and ws.sent[-1] == {"text": ""})
+            ws.feed_audio(b"pcm")
+            ws.feed_final()
+            await _wait_for(lambda ws=ws: ws.closed)
+
+        # Two responses, two sockets, each one closed — never one reused.
+        assert len(harness.connect.sockets) == 2
+        assert all(sock.closed for sock in harness.connect.sockets)
+        assert harness.connect.sockets[0] is not harness.connect.sockets[1]
+        # And each socket ended on the documented close frame.
+        for sock in harness.connect.sockets:
+            assert sock.sent[-1] == {"text": ""}
+    finally:
+        await voice.aclose()
+
+
+def test_voice_settings_are_a_caller_argument_with_unchanged_defaults():
+    asyncio.run(_voice_settings_are_a_caller_argument())
+
+
+async def _voice_settings_are_a_caller_argument():
+    """The caller owns delivery; omitting it reproduces the old BOS exactly."""
+
+    default = _Harness()
+    try:
+        default.voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        default.voice.handle_event(_delta("Hello. "))
+        await _wait_for(lambda: len(default.connect.sockets) == 1)
+        ws = default.connect.sockets[0]
+        await _wait_for(lambda: len(ws.sent) >= 1)
+        assert ws.sent[0]["voice_settings"] == {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        }
+    finally:
+        await default.voice.aclose()
+
+    custom = _Harness(voice_settings={"stability": 0.4, "speed": 1.1})
+    try:
+        custom.voice.handle_event(rt.ResponseStarted(response_id="resp_1"))
+        custom.voice.handle_event(_delta("Hello. "))
+        await _wait_for(lambda: len(custom.connect.sockets) == 1)
+        ws = custom.connect.sockets[0]
+        await _wait_for(lambda: len(ws.sent) >= 1)
+        assert ws.sent[0]["voice_settings"] == {"stability": 0.4, "speed": 1.1}
+    finally:
+        await custom.voice.aclose()
+
+
+# ---------------------------------------------------------------------------
+# TALK_CASCADE_SPEED
+# ---------------------------------------------------------------------------
+
+
+def test_speed_unset_sends_no_speed_field(monkeypatch):
+    """Unset must be byte-identical on the wire, not an explicit 1.0."""
+
+    _scrub_elevenlabs_env(monkeypatch)
+    assert talk_config.elevenlabs_speed() is None
+    assert talk_config.elevenlabs_voice_settings() == {
+        "stability": 0.5,
+        "similarity_boost": 0.75,
+    }
+    assert "speed" not in talk_config.elevenlabs_voice_settings()
+
+
+@pytest.mark.parametrize("raw,expected", [("0.7", 0.7), ("1", 1.0), ("1.2", 1.2)])
+def test_speed_in_range_is_threaded_into_voice_settings(monkeypatch, raw, expected):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_CASCADE_SPEED", raw)
+    assert talk_config.elevenlabs_speed() == pytest.approx(expected)
+    assert talk_config.elevenlabs_voice_settings()["speed"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["0.69", "1.21", "0", "-1", "4.0"])
+def test_speed_out_of_range_refuses_rather_than_clamping(monkeypatch, raw):
+    """A clamped pace would speak wrong on every word and never say why."""
+
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_CASCADE_SPEED", raw)
+    with pytest.raises(talk_config.TalkConfigError) as excinfo:
+        talk_config.elevenlabs_speed()
+    message = str(excinfo.value)
+    assert "TALK_CASCADE_SPEED" in message
+    assert "0.7" in message and "1.2" in message
+
+
+@pytest.mark.parametrize("raw", ["fast", "1.0x", ""])
+def test_speed_junk_refuses_except_blank_which_means_unset(monkeypatch, raw):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_CASCADE_SPEED", raw)
+    if not raw.strip():
+        assert talk_config.elevenlabs_speed() is None
+        return
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_CASCADE_SPEED"):
+        talk_config.elevenlabs_speed()
+
+
+def test_speed_resolves_at_call_time_not_import_time(monkeypatch):
+    """Rule 1: an operator's live edit takes effect on the next call."""
+
+    _scrub_elevenlabs_env(monkeypatch)
+    assert talk_config.elevenlabs_voice_settings().get("speed") is None
+    monkeypatch.setenv("TALK_CASCADE_SPEED", "0.9")
+    assert talk_config.elevenlabs_voice_settings()["speed"] == pytest.approx(0.9)
+    monkeypatch.delenv("TALK_CASCADE_SPEED")
+    assert "speed" not in talk_config.elevenlabs_voice_settings()
+
+
+def test_the_two_default_voice_settings_cannot_drift_apart():
+    """Two declarations of the same defaults, and nothing else keeps them equal.
+
+    ``talk_cascade_voice`` deliberately does NOT import ``talk_config`` — it
+    is a TTS transport, and config resolution belongs to the config module —
+    so its fallback defaults are declared locally and the config module
+    declares them again for the builder. That boundary is worth keeping, but
+    it means a value changed in one place would silently disagree with the
+    other: the CLI and dashboard would speak with the resolved settings
+    while a caller that omitted them got the stale ones. This is the only
+    thing enforcing that they agree.
+    """
+
+    assert cascade._VOICE_SETTINGS == talk_config.DEFAULT_ELEVENLABS_VOICE_SETTINGS
+
+
+def test_voice_settings_builder_hands_back_a_fresh_dict(monkeypatch):
+    """A caller mutating its copy must not poison the next session."""
+
+    _scrub_elevenlabs_env(monkeypatch)
+    first = talk_config.elevenlabs_voice_settings()
+    first["stability"] = 0.99
+    assert talk_config.elevenlabs_voice_settings()["stability"] == 0.5
+    assert talk_config.DEFAULT_ELEVENLABS_VOICE_SETTINGS["stability"] == 0.5
 
 
 # ---------------------------------------------------------------------------

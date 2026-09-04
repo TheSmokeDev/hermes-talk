@@ -13,6 +13,16 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- `TALK_CASCADE_SPEED` — delivery pace for the cascade voice, `0.7`–`1.2`
+  (`1.0` is normal), resolved at call time so an operator's edit lands on
+  the next session rather than the next process. Fail-closed like the rest
+  of the cascade knobs: junk and out-of-range values refuse with the range
+  rather than clamping, because a silently clamped pace is audible on every
+  word and never says why. Unset sends no `speed` field at all, so a cascade
+  that does not use the knob puts exactly the same bytes on the wire as
+  before it existed. `CascadeVoice` grew a `voice_settings` argument to
+  carry it; omitting it reproduces the previous BOS frame exactly.
 ### Changed
 - `starlette` is now a **dev/test** dependency. It is where
   `StreamingResponse` and `ClientDisconnect` actually live (fastapi
@@ -86,6 +96,40 @@ named rather than smoothed.
   the same `.catch()`. "Silently" was half of the bug above: a mute voice
   and a working one were indistinguishable. A deliberate abort (barge-in,
   hang-up) stays quiet, because that is not a failure.
+- The cascade voice no longer forces a generation per chunk, which is what
+  flattened its prosody. Every text frame carried
+  `try_trigger_generation: true`, defeating the buffer whose entire purpose
+  is giving ElevenLabs enough context to carry intonation across a sentence
+  boundary — their own reference calls forcing generation on small amounts
+  of text "lower quality audio" and recommends leaving the flag at `false`.
+  It compounded with the chunker: `SentenceChunker` ends a chunk on an
+  ellipsis run, so a line written with "..." pacing markers became a
+  separate forced generation per marker, and a multi-sentence answer read as
+  a series of unrelated fragments. Chunks now go out as bare text and
+  nothing replaces the trigger: the model buffers on its own
+  `chunk_length_schedule`, and the empty-text EOS frame the turn already
+  ended on closes the socket — which ElevenLabs documents as forcing
+  generation of whatever is still buffered. The cascade opens and closes one
+  socket per RESPONSE, so that close happens on every turn regardless.
+  Latency where it is audible is therefore unchanged. All three cascade
+  surfaces — terminal, Discord, dashboard relay — change together.
+
+  Deliberately NOT added: an explicit `flush: true` on the EOS frame. Their
+  flush example attaches the flag to a frame carrying real text, `text` is a
+  required field on `SendText`, and an empty-text frame is `CloseConnection`
+  — a different message in the same schema. A combined
+  `{"text": "", "flush": true}` appears nowhere in their documentation, and
+  on this endpoint there is no schema-legal way to force generation without
+  either real text or the close. Their sibling `multi-stream-input` endpoint
+  does define a purpose-built `FlushContextClient` frame with optional
+  `text`, which is what a persistent-socket design would need; this lane
+  does not, because its socket is per-turn.
+- The cascade socket now states `enable_ssml_parsing` instead of relying on
+  a default ElevenLabs does not document. Every neighbouring query parameter
+  declares a default in their schema and this one declares none, so a
+  `<break time="0.4s" />` was as likely to be dropped as spoken, with
+  nothing in the response saying which. Break tags are supported on this
+  lane's model and cap at 3 seconds.
 
 ## [0.17.0] — 2026-09-03
 

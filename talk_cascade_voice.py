@@ -93,17 +93,25 @@ def _import_aiohttp():
     return aiohttp
 
 
-def stream_input_url(voice_id: str, model: str) -> str:
+def stream_input_url(voice_id: str, model: str, *, enable_ssml: bool = True) -> str:
     """The ElevenLabs stream-input endpoint for one voice and model.
 
     Voice id and model are identifiers, not secrets — they ride the URL
     query/path. The KEY never does: it is an ``xi-api-key`` header.
+
+    ``enable_ssml_parsing`` is sent EXPLICITLY because its default is the one
+    thing ElevenLabs does not state: every neighbouring query parameter
+    declares a default in their schema and this one declares none. Unparsed,
+    a ``<break time="0.4s" />`` is not a pause — it is dropped, silently, and
+    the sentence runs on. Break tags are supported on this lane's model
+    (Flash v2.5) and cap at 3 seconds.
     """
 
     return (
         "wss://api.elevenlabs.io/v1/text-to-speech/"
         f"{quote(voice_id, safe='')}/stream-input"
         f"?model_id={quote(model, safe='')}&output_format=pcm_24000"
+        f"&enable_ssml_parsing={'true' if enable_ssml else 'false'}"
     )
 
 
@@ -260,9 +268,17 @@ class CascadeVoice:
         aiohttp_module: Any = None,
         ws_connect: Callable[..., Any] | None = None,
         chunk_budget: int = CLAUSE_BUDGET_CHARS,
+        voice_settings: dict | None = None,
+        enable_ssml: bool = True,
     ) -> None:
         self._api_key = api_key
-        self._url = stream_input_url(voice_id, model)
+        self._url = stream_input_url(voice_id, model, enable_ssml=enable_ssml)
+        #: Resolved by the CALLER and copied here, never read from a module
+        #: default at send time, so an operator's live edit to the pace knob
+        #: takes effect on the next session rather than the next process.
+        self._voice_settings = (
+            dict(voice_settings) if voice_settings else dict(_VOICE_SETTINGS)
+        )
         self._on_audio = on_audio
         self._on_error = on_error
         self._on_stream_end = on_stream_end
@@ -485,9 +501,17 @@ class CascadeVoice:
         ws = await self._connect()
         try:
             await ws.send_json(
-                {"text": _BOS_TEXT, "voice_settings": dict(_VOICE_SETTINGS)}
+                {"text": _BOS_TEXT, "voice_settings": dict(self._voice_settings)}
             )
-            await ws.send_json({"text": first_chunk, "try_trigger_generation": True})
+            # Deliberately NO generation trigger: forcing one per chunk
+            # defeats the buffer that gives the model its prosodic context,
+            # which ElevenLabs calls lower quality audio and recommends
+            # against. Nothing replaces it — the model now buffers on its own
+            # chunk_length_schedule, and the EOS frame _send_rest ends on
+            # closes the socket, which is documented to generate whatever is
+            # still buffered. One socket per response makes that the whole
+            # end-of-turn story.
+            await ws.send_json({"text": first_chunk})
             sender = asyncio.create_task(self._send_rest(ws))
             try:
                 await self._read_audio(ws, generation)
@@ -526,9 +550,18 @@ class CascadeVoice:
         while True:
             item = await self._queue.get()
             if item is _FLUSH:
+                # The documented CloseConnection frame, which also flushes:
+                # ElevenLabs generates whatever is still buffered when the
+                # context closes. That is the whole end-of-turn trigger — no
+                # `flush` key rides along, because their `flush: true` is
+                # documented only ON a frame carrying real text, and an
+                # empty-text frame with `flush` appears nowhere in their
+                # schema (SendText requires `text`). Mixing the two variants
+                # would work by accident today and break on their next
+                # deploy.
                 await ws.send_json({"text": ""})
                 return
-            await ws.send_json({"text": item, "try_trigger_generation": True})
+            await ws.send_json({"text": item})
 
     async def _read_audio(self, ws: Any, generation: int) -> None:
         """Emit stream-input audio frames until the terminal isFinal frame."""

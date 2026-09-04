@@ -63,6 +63,18 @@ DEFAULT_CASCADE_TTS = "elevenlabs"
 #: ElevenLabs TTS model for the cascade lane, probed against the live
 #: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+#: Delivery pace for the cascade voice. The bounds are the stream-input
+#: ``RealtimeVoiceSettings`` schema's own, not a house rule — that schema
+#: documents "Values range from 0.7 to 1.2, with 1.0 being the default
+#: speed", and the REST endpoint's wider 0.25-4.0 range belongs to a
+#: DIFFERENT schema that this lane never speaks.
+ELEVENLABS_SPEED_MIN = 0.7
+ELEVENLABS_SPEED_MAX = 1.2
+DEFAULT_ELEVENLABS_SPEED = 1.0
+#: Delivery defaults for the cascade voice, probed against the live
+#: stream-input endpoint (2026-08-28). ``style`` stays unsent: ElevenLabs
+#: recommends keeping it at 0, and an unsent field is the documented 0.
+DEFAULT_ELEVENLABS_VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75}
 
 #: Where Hermes's api_server gateway platform listens by default
 #: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
@@ -657,6 +669,55 @@ def elevenlabs_model() -> str:
     )
 
 
+def elevenlabs_speed() -> float | None:
+    """Cascade delivery pace (``TALK_CASCADE_SPEED``), or ``None`` when unset.
+
+    ``None`` means "send no ``speed`` field", which is not the same as
+    sending ``1.0``: an omitted field leaves the wire frame byte-identical
+    to the pre-knob cascade, so turning the knob on is the only thing that
+    changes what ElevenLabs receives.
+
+    Fail-closed like every other cascade knob. Junk and out-of-range values
+    REFUSE rather than clamping: a silently clamped 2.0 would speak at a
+    pace the operator did not ask for and never say why, and pace is
+    audible on every single word.
+    """
+
+    raw = (os.environ.get("TALK_CASCADE_SPEED") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        raise TalkConfigError(
+            f"TALK_CASCADE_SPEED '{raw}' is not a number — set it between "
+            f"{ELEVENLABS_SPEED_MIN} and {ELEVENLABS_SPEED_MAX} "
+            f"({DEFAULT_ELEVENLABS_SPEED} is normal pace), or unset it"
+        ) from None
+    if not ELEVENLABS_SPEED_MIN <= parsed <= ELEVENLABS_SPEED_MAX:
+        raise TalkConfigError(
+            f"TALK_CASCADE_SPEED {parsed:g} is outside the range ElevenLabs "
+            f"accepts on this lane ({ELEVENLABS_SPEED_MIN}-"
+            f"{ELEVENLABS_SPEED_MAX}, {DEFAULT_ELEVENLABS_SPEED} is normal pace)"
+        )
+    return parsed
+
+
+def elevenlabs_voice_settings() -> dict:
+    """The cascade's BOS ``voice_settings``, resolved at CALL time.
+
+    Rule 1: this is rebuilt per session start, never bound to a default
+    argument, so an operator's live edit to ``TALK_CASCADE_SPEED`` takes
+    effect on the next call instead of the next process.
+    """
+
+    settings = dict(DEFAULT_ELEVENLABS_VOICE_SETTINGS)
+    speed = elevenlabs_speed()
+    if speed is not None:
+        settings["speed"] = speed
+    return settings
+
+
 def cascade_voice_config(provider: str) -> tuple[str, str, str]:
     """The resolved cascade TTS triple — (key, voice id, model). Fail-closed.
 
@@ -897,6 +958,8 @@ __all__ = [
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_CATALOG_STARTUP_WAIT_S",
     "DEFAULT_ELEVENLABS_MODEL",
+    "DEFAULT_ELEVENLABS_SPEED",
+    "DEFAULT_ELEVENLABS_VOICE_SETTINGS",
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
@@ -907,6 +970,8 @@ __all__ = [
     "DEFAULT_TALK_VOICE",
     "DEFAULT_VOICE_MODE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
+    "ELEVENLABS_SPEED_MAX",
+    "ELEVENLABS_SPEED_MIN",
     "GEMINI_LIVE_VOICES",
     "GROK_REALTIME_VOICES",
     "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
@@ -933,7 +998,9 @@ __all__ = [
     "detect_agent_profile",
     "discord_operator_user_ids",
     "elevenlabs_model",
+    "elevenlabs_speed",
     "elevenlabs_voice_id",
+    "elevenlabs_voice_settings",
     "get_hermes_home",
     "identity_include",
     "memory_search_timeout_s",

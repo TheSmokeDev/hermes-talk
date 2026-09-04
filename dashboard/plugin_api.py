@@ -535,8 +535,13 @@ _PCM_END = object()
 _FEED_DONE = object()
 
 
-def _resolve_cascade_relay_config() -> tuple[str, str, str]:
-    """The cascade triple for one relay call — fail-closed, HTTP-shaped.
+def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
+    """The cascade config for one relay call — fail-closed, HTTP-shaped.
+
+    Delivery settings resolve HERE, beside the key and the voice, so a bad
+    ``TALK_CASCADE_SPEED`` refuses as a 400 with remediation before the
+    stream opens. Resolved inside the streaming body it would surface as a
+    torn response instead — HTTP 200, then nothing.
 
     The browser only calls this route for a session minted with
     ``voiceMode: "cascade"``, so a server no longer in cascade mode means the
@@ -553,7 +558,10 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str]:
             ),
         )
     try:
-        return talk_config.cascade_voice_config(talk_config.talk_provider())
+        api_key, voice_id, model = talk_config.cascade_voice_config(
+            talk_config.talk_provider()
+        )
+        return (api_key, voice_id, model, talk_config.elevenlabs_voice_settings())
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -608,7 +616,9 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
     )
 
 
-async def _cascade_pcm_stream(request, config: tuple[str, str, str]) -> AsyncIterator[bytes]:
+async def _cascade_pcm_stream(
+    request, config: tuple[str, str, str, dict]
+) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
     A fresh CascadeVoice per request: one POST == one response's speech. The
@@ -622,7 +632,7 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str]) -> AsyncIte
     """
 
     audio_queue: asyncio.Queue = asyncio.Queue()
-    api_key, voice_id, model = config
+    api_key, voice_id, model, voice_settings = config
     voice = talk_cascade_voice.CascadeVoice(
         api_key=api_key,
         voice_id=voice_id,
@@ -630,6 +640,7 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str]) -> AsyncIte
         on_audio=audio_queue.put_nowait,
         on_error=lambda text: _log.warning("dashboard cascade relay: %s", text),
         on_stream_end=lambda: audio_queue.put_nowait(_PCM_END),
+        voice_settings=voice_settings,
     )
     voice.start()
     state = {"completed": False, "speakable": False}
