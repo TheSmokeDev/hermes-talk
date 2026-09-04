@@ -91,6 +91,73 @@
     return relayEncoder.encode(JSON.stringify(line) + "\n");
   }
 
+  /** The cascade's PCM is 24kHz mono s16le; the context should agree. */
+  const PCM_RATE = 24000;
+
+  /**
+   * An AudioContext at the PCM's OWN rate, so no resampling happens at all.
+   *
+   * Web Audio resamples every AudioBuffer independently. At the browser
+   * default (48kHz on Windows) two chunks resampled in isolation do not line
+   * up where they meet, so every chunk seam is a discontinuity — an audible
+   * tick every couple of seconds while the PCM leaving the server is clean.
+   * Chrome and Edge honour the requested rate; the ones that refuse fall back
+   * to a resampler that carries state across chunks (see resampleToContext).
+   */
+  /** One mono AudioBuffer at `rate`, filled from `values` scaled by `scale`. */
+  function pcmBuffer(ctx, values, rate, scale) {
+    const buffer = ctx.createBuffer(1, values.length, rate);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < values.length; i++) channel[i] = values[i] / scale;
+    return buffer;
+  }
+
+  function makePcmContext() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try {
+      return new Ctx({ sampleRate: PCM_RATE });
+    } catch (e) {
+      return new Ctx();
+    }
+  }
+
+  /**
+   * Whether this page may send a STREAMING request body.
+   *
+   * Chrome only streams an upload over HTTP/2 or HTTP/3. On a plain HTTP/1.1
+   * origin — which a local dashboard almost always is — `fetch` with
+   * `duplex: "half"` rejects outright, and the cascade's own `.catch()` used
+   * to swallow it: the model's text captioned fine, no audio ever played, and
+   * zero requests reached the relay. Gate on the protocol the page actually
+   * negotiated and buffer the answer when we cannot stream.
+   *
+   * Memoised, and computed on FIRST USE rather than at load: the navigation
+   * timing entry is not necessarily populated while this IIFE is still
+   * evaluating.
+   */
+  let canStreamUploadCache = null;
+  function canStreamUpload() {
+    if (canStreamUploadCache !== null) return canStreamUploadCache;
+    canStreamUploadCache = false;
+    try {
+      const nav = (typeof performance !== "undefined" && performance.getEntriesByType)
+        ? (performance.getEntriesByType("navigation")[0] || null)
+        : null;
+      const hop = String((nav && nav.nextHopProtocol) || "").toLowerCase();
+      if (!/^h[23]/.test(hop)) return canStreamUploadCache;
+      if (typeof Request === "undefined" || typeof ReadableStream === "undefined") {
+        return canStreamUploadCache;
+      }
+      // The browser must also ACCEPT a stream body — older engines throw here.
+      new Request("/", { method: "POST", body: new ReadableStream(), duplex: "half" });
+      canStreamUploadCache = true;
+    } catch (e) {
+      canStreamUploadCache = false;
+    }
+    return canStreamUploadCache;
+  }
+
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
   function isAuthError(err) {
     return /^(401|403)\b/.test(String((err && err.message) || ""));
@@ -149,6 +216,14 @@
       this.pcmNextTime = 0;
       this.pcmSources = [];
       this.pcmGeneration = 0;
+      // Resampler carry-over: the previous chunk's last sample and the
+      // fractional read position. Only used when the browser refused a
+      // 24kHz context; stale values would click on the next answer, so
+      // stopPcmPlayback() clears them alongside the generation bump.
+      this.pcmPrev = null;
+      this.pcmPos = 0;
+      // One receipt per session for a relay that failed for a real reason.
+      this.cascadeFailureLogged = false;
     }
 
     async start() {
@@ -337,50 +412,110 @@
      * writing the second, same as the terminal lane's sentence pipelining.
      */
     startCascadeStream() {
-      const req = { controller: new AbortController(), sink: null };
+      const req = { controller: new AbortController(), sink: null, buffered: null };
       this.cascadeReq = req;
       this.cascadeReqs.add(req);
+      if (!canStreamUpload()) {
+        // HTTP/1.1: this browser cannot send a streaming body at all. Collect
+        // the answer's lines and post them in one piece when its text is
+        // done (see finishCascadeStream). That costs sentence pipelining —
+        // the first sentence no longer plays while the model writes the
+        // second — but it produces audio instead of silence.
+        req.buffered = [];
+        return;
+      }
       const body = new ReadableStream({
         start: (controller) => {
           req.sink = controller;
         },
       });
+      this.sendCascadeRequest(req, body, true);
+    }
+
+    /** POST one relay request; `stream` picks the duplex upload path. */
+    sendCascadeRequest(req, body, stream) {
       const headers = { "content-type": "application/x-ndjson" };
       const token = readToken();
       if (token) headers["x-talk-token"] = token;
-      // Raw fetch, not apiCall: this is a bidirectional byte stream, not JSON.
-      fetch(API + "/cascade-tts", {
+      const init = {
         method: "POST",
         headers: headers,
         body: body,
-        duplex: "half",
         signal: req.controller.signal,
-      })
+      };
+      if (stream) init.duplex = "half";
+      // Raw fetch, not apiCall: this is a byte stream, not JSON.
+      fetch(API + "/cascade-tts", init)
         .then((res) => {
-          if (!res.ok || !res.body) return undefined;
+          if (!res.ok || !res.body) {
+            this.noteCascadeFailure("relay refused the answer (" +
+              ((res && res.status) || "no response") + ")");
+            return undefined;
+          }
           return this.playCascadePcm(req, res.body.getReader());
         })
-        .catch(() => {
-          // Aborts (barge-in, stop) and refusals alike land here: the answer
-          // degrades to text-only on screen, which is already true.
+        .catch((error) => {
+          // A barge-in or hang-up aborts on purpose and is not a failure.
+          // Anything else used to vanish here — which is how a browser that
+          // silently refused to stream the upload looked exactly like a
+          // working session with a mute voice.
+          if (!req.controller.signal.aborted) {
+            this.noteCascadeFailure(errorText(error));
+          }
         });
+    }
+
+    /** Say once, per session, that the custom voice is not being heard. */
+    noteCascadeFailure(detail) {
+      if (this.cascadeFailureLogged) return;
+      this.cascadeFailureLogged = true;
+      const message = "Custom voice unavailable — answers stay text-only. " + detail;
+      if (typeof console !== "undefined" && console.warn) console.warn(message);
+      if (this.cb && this.cb.onError) {
+        try { this.cb.onError(message); } catch (e) { /* UI must not kill audio */ }
+      }
     }
 
     cascadeSend(line) {
       // The previous response's relay may still be draining PCM — that is no
       // reason to drop THIS response's text; it opens its own stream.
-      if (!this.cascadeReq || !this.cascadeReq.sink) this.startCascadeStream();
-      const sink = this.cascadeReq && this.cascadeReq.sink;
+      const open = this.cascadeReq && (this.cascadeReq.sink || this.cascadeReq.buffered);
+      if (!open) this.startCascadeStream();
+      const req = this.cascadeReq;
+      if (!req) return;
       // An upload stream carries BYTES — a string chunk is a fetch-type error.
-      if (sink) sink.enqueue(encodeRelayLine(line));
+      if (req.sink) req.sink.enqueue(encodeRelayLine(line));
+      else if (req.buffered) req.buffered.push(encodeRelayLine(line));
     }
 
     /** The response's text is complete; the PCM answer keeps streaming. */
     finishCascadeStream() {
       const req = this.cascadeReq;
-      if (req && req.sink) {
+      if (!req) return;
+      if (req.sink) {
         try { req.sink.close(); } catch (e) { /* an errored stream is already closed */ }
         req.sink = null;
+        return;
+      }
+      if (req.buffered) {
+        // The whole answer at once — this is the point the buffered path was
+        // waiting for. A response with no text never posts at all.
+        const lines = req.buffered;
+        req.buffered = null;
+        if (!lines.length) {
+          this.cascadeReqs.delete(req);
+          if (this.cascadeReq === req) this.cascadeReq = null;
+          return;
+        }
+        let total = 0;
+        for (let i = 0; i < lines.length; i++) total += lines[i].length;
+        const body = new Uint8Array(total);
+        let offset = 0;
+        for (let i = 0; i < lines.length; i++) {
+          body.set(lines[i], offset);
+          offset += lines[i].length;
+        }
+        this.sendCascadeRequest(req, body, false);
       }
     }
 
@@ -393,6 +528,9 @@
         if (req.sink) {
           try { req.sink.close(); } catch (e) { /* already closed */ }
         }
+        // A buffered answer that never posted is dropped, not sent: the
+        // operator interrupted it, so there is nothing left to speak.
+        req.buffered = null;
         req.controller.abort();
       });
       this.stopPcmPlayback();
@@ -409,6 +547,11 @@
       this.pcmSources = [];
       this.pcmNextTime = 0;
       this.pcmGeneration += 1;
+      // Interpolation state belongs to the answer that was speaking. Left
+      // behind, it would splice the end of an interrupted sentence onto the
+      // start of the next one — the same seam click, one barge-in later.
+      this.pcmPrev = null;
+      this.pcmPos = 0;
     }
 
     /** PCM24k mono s16le off the wire onto the playback timeline. */
@@ -434,20 +577,52 @@
       if (this.cascadeReq === req) this.cascadeReq = null;
     }
 
+    /**
+     * PCM24k -> the context's rate, continuous ACROSS chunks.
+     *
+     * Carrying the previous chunk's last sample and the fractional read
+     * position is what makes the stream one unbroken signal. Interpolating
+     * each chunk in isolation is the original bug in a different costume.
+     */
+    resampleToContext(samples, rate) {
+      const ratio = PCM_RATE / rate;
+      const prev = this.pcmPrev === null ? samples[0] : this.pcmPrev;
+      const n = samples.length;
+      const at = (i) => (i === 0 ? prev : samples[i - 1]) / 32768;  // 0 = carried
+      const out = [];
+      let p = this.pcmPos;
+      while (p < n) {
+        const i = Math.floor(p);
+        const frac = p - i;
+        out.push(at(i) * (1 - frac) + at(i + 1) * frac);
+        p += ratio;
+      }
+      this.pcmPrev = samples[n - 1];
+      this.pcmPos = Math.max(0, p - n);
+      return out;
+    }
+
     /** Schedule one chunk after the last — gapless, in arrival order. */
     schedulePcm(bytes, generation) {
       if (generation !== this.pcmGeneration) return;  // decoded before a barge-in
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;  // no playback surface — the transcript still reads
       if (!this.pcmContext) {
-        this.pcmContext = new Ctx();
+        this.pcmContext = makePcmContext();
+        if (!this.pcmContext) return;  // no playback surface — transcript still reads
         this.pcmNextTime = 0;
       }
       const ctx = this.pcmContext;
       const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2);
-      const buffer = ctx.createBuffer(1, samples.length, 24000);
-      const channel = buffer.getChannelData(0);
-      for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+      if (!samples.length) return;
+      let buffer;
+      if (ctx.sampleRate === PCM_RATE) {
+        // The common path: the context took the PCM's own rate, so the
+        // browser resamples nothing and no seam can drift.
+        buffer = pcmBuffer(ctx, samples, PCM_RATE, 32768);
+      } else {
+        const resampled = this.resampleToContext(samples, ctx.sampleRate);
+        if (!resampled.length) return;
+        buffer = pcmBuffer(ctx, resampled, ctx.sampleRate, 1);
+      }
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
