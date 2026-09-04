@@ -11,6 +11,49 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Fixed
+- The dashboard cascade relay no longer deadlocks on the servers Hermes
+  actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
+  HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
+  the log once the browser gave up — so the dashboard's cloned voice
+  silently degraded to text-only with no error anywhere.
+
+  Starlette's `StreamingResponse` only trusts `send()` for disconnect
+  signalling when the server advertises ASGI `spec_version` 2.4 or above.
+  Below that it races the body generator against a disconnect listener, and
+  that listener calls `receive()` first — taking the browser's
+  `http.request` messages off the channel. The relay's own
+  `request.stream()` then only ever saw `http.disconnect`, so it waited
+  forever for text that had already arrived. **Uvicorn advertises 2.3 for
+  HTTP**, hardcoded in both `h11_impl.py` and `httptools_impl.py`, so this
+  was the branch every dashboard took; only its websocket protocols say
+  2.4, which is why the websocket lanes never showed it.
+
+  The relay now returns a `RelayResponse` that owns the request body
+  channel and takes Starlette's own `>= 2.4` path verbatim. A browser that
+  vanishes mid-upload raises `ClientDisconnect` into the feeder, which is
+  now handled as an abort — the same path as a stream that ends without its
+  `done` line — rather than escaping as an error.
+
+  The existing tests could not have caught this: they drive the route with
+  a fake request and never touch an ASGI server, and Starlette's own
+  `TestClient` omits `spec_version` from the scope, so a test written
+  through it takes the same broken branch and HANGS instead of failing. The
+  new coverage drives the real relay body over a real single-consumer ASGI
+  channel and asserts on the scope VALUE rather than on a version string,
+  so a future uvicorn that advertises 2.4 leaves it meaningful.
+
+### Changed
+- `starlette` is now a **dev/test** dependency. It is where
+  `StreamingResponse` and `ClientDisconnect` actually live (fastapi
+  re-exports them), and the relay's behavior above is starlette behavior —
+  untestable in CI without the real class, which is exactly how the
+  deadlock shipped. `dashboard/plugin_api.py` still falls back to its own
+  stub when starlette is absent, so the plugin installs with no web
+  dependency of its own.
+
 ## [0.17.0] — 2026-09-03
 
 Prove it, then pause it. `hermes talk check` runs the whole path — doctor,

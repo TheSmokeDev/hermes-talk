@@ -66,9 +66,36 @@ import talk_runs  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
 
+# Two tiers, because the streaming half of this module and the routing half
+# come from different packages. ``StreamingResponse`` and ``ClientDisconnect``
+# are STARLETTE's — fastapi only re-exports them — and the relay's ASGI
+# behavior below is starlette behavior. Importing them from their real home
+# lets the dev extra install starlette ALONE, so that behavior is covered in
+# CI without pulling a whole web framework into a plugin that has no web
+# dependency of its own.
+try:
+    from starlette.requests import ClientDisconnect
+    from starlette.responses import StreamingResponse
+except ImportError:  # pragma: no cover - no dashboard deps at all
+
+    class ClientDisconnect(Exception):  # type: ignore[no-redef]
+        """Raised by ``request.stream()`` when the browser goes away.
+
+        Defined here too so the relay's ``except`` clause is importable on a
+        box without the dashboard deps — offline it is simply never raised.
+        """
+
+    class StreamingResponse:  # type: ignore[no-redef]
+        """The three attributes the route and offline tests touch."""
+
+        def __init__(self, content, media_type=None) -> None:
+            self.body_iterator = content
+            self.media_type = media_type
+            self.status_code = 200
+
+
 try:
     from fastapi import APIRouter, HTTPException, Request
-    from fastapi.responses import StreamingResponse
 except ImportError:  # pragma: no cover - offline tests run without the dashboard deps
 
     class APIRouter:  # type: ignore[no-redef]
@@ -91,13 +118,42 @@ except ImportError:  # pragma: no cover - offline tests run without the dashboar
     class Request:  # type: ignore[no-redef]
         """Annotation target only — never instantiated on this path."""
 
-    class StreamingResponse:  # type: ignore[no-redef]
-        """The two attributes the route and offline tests touch, in fastapi's shape."""
 
-        def __init__(self, content, media_type=None) -> None:
-            self.body_iterator = content
-            self.media_type = media_type
-            self.status_code = 200
+class RelayResponse(StreamingResponse):
+    """A streaming response that leaves the request body to the relay.
+
+    Starlette pairs the body stream with a disconnect listener that calls
+    ``receive()`` on the same channel. Below ASGI ``spec_version`` 2.4 it
+    races that listener against the body generator, and the listener wins
+    the first ``receive()`` — swallowing the browser's ``http.request``
+    messages. The relay's own ``request.stream()`` then only ever sees
+    ``http.disconnect``, so it waits forever for text that already arrived:
+    HTTP 200, zero bytes, then a ClientDisconnect in the log when the
+    browser gives up.
+
+    **Uvicorn advertises 2.3 for HTTP** — hardcoded in both
+    ``protocols/http/h11_impl.py`` and ``httptools_impl.py`` — so this is
+    the branch every Hermes dashboard actually takes, not an edge case.
+    Only uvicorn's websocket protocols say 2.4, which is why the websocket
+    lanes never showed this.
+
+    The relay reads the upload itself and ends on its own when the client
+    goes away, so the listener buys nothing here. This takes Starlette's OWN
+    ``>= 2.4`` path verbatim — including the ``OSError`` mapping and the
+    background callback — rather than a reduced version of it, so a server
+    that does advertise 2.4 and this class behave identically.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":  # websocket denial keeps base behavior
+            await super().__call__(scope, receive, send)
+            return
+        try:
+            await self.stream_response(send)
+        except OSError as exc:
+            raise ClientDisconnect() from exc
+        if self.background is not None:
+            await self.background()
 
 
 _log = logging.getLogger(__name__)
@@ -603,6 +659,12 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str]) -> AsyncIte
                     "dashboard cascade relay: unrecognized stream line — answer cancelled"
                 )
                 return
+        except ClientDisconnect:
+            # The browser vanished mid-upload (barge-in, tab closed, socket
+            # torn). That is an abort, not an error: same handling as a
+            # stream that ends without its `done` line — `completed` stays
+            # false, so the drain loop stops and aclose() silences the TTS.
+            return
         finally:
             audio_queue.put_nowait(_FEED_DONE)
 
@@ -642,7 +704,7 @@ async def cascade_tts(request: Request):
 
     require_dashboard_auth(request)
     config = _resolve_cascade_relay_config()
-    return StreamingResponse(
+    return RelayResponse(
         _cascade_pcm_stream(request, config),
         media_type=CASCADE_PCM_MEDIA_TYPE,
     )
