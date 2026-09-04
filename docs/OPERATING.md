@@ -269,15 +269,25 @@ streams back. One NDJSON `{"delta": ...}` line per text delta, one terminal
 `{"done": ...}` line per response; an aborted stream (barge-in, tab closed)
 cancels the answer's TTS rather than flushing it.
 
-Generation is triggered once per TURN, not once per sentence: chunks go out as
-bare text and the turn's final frame carries the flush. That is what lets
-ElevenLabs buffer enough context to carry intonation across a sentence
-boundary — forcing a generation per chunk is documented as producing lower
-quality audio, and it is why a multi-sentence answer used to read as a series
-of unrelated fragments. Latency where it is audible is unchanged: the final
-frame already ended the turn. SSML parsing is enabled explicitly on the
-socket, so `<break time="0.4s" />` in an answer is a real pause (up to 3s)
-instead of being silently dropped.
+Generation happens once per TURN, not once per sentence: chunks go out as bare
+text with no generation trigger, so ElevenLabs buffers on its own
+`chunk_length_schedule` and gets enough context to carry intonation across a
+sentence boundary. Forcing a generation per chunk is documented as producing
+lower quality audio, and it is why a multi-sentence answer used to read as a
+series of unrelated fragments.
+
+Nothing replaces that trigger, and nothing needs to. The cascade opens and
+closes one socket per RESPONSE, and closing is documented to generate whatever
+is still buffered — so the empty-text EOS frame that already ended every turn
+is the end-of-turn flush. Latency where it is audible is unchanged. (There is
+deliberately no explicit `flush: true` frame: on this endpoint `text` is
+required on `SendText` and an empty-text frame means `CloseConnection`, so a
+combined frame is not a documented shape. A lane that held ONE socket across
+turns would need the sibling `multi-stream-input` endpoint and its
+`FlushContextClient` message instead.)
+
+SSML parsing is enabled explicitly on the socket, so `<break time="0.4s" />`
+in an answer is a real pause (up to 3s) instead of being silently dropped.
 
 One trap that is not fixable here: `eleven_flash_v2_5` ships with number
 normalization DISABLED for latency, and re-enabling it

@@ -105,13 +105,25 @@ named rather than smoothed.
   It compounded with the chunker: `SentenceChunker` ends a chunk on an
   ellipsis run, so a line written with "..." pacing markers became a
   separate forced generation per marker, and a multi-sentence answer read as
-  a series of unrelated fragments. Chunks now go out as bare text and the
-  turn's FINAL frame carries `flush: true`, the documented end-of-turn
-  trigger ("we advise using `flush: true` along with the text at the end of
-  conversation turn to ensure timely audio generation"). Latency is
-  unchanged where it is audible: that frame already ended the turn, and the
-  close it rides on flushed the buffer regardless. All three cascade
+  a series of unrelated fragments. Chunks now go out as bare text and
+  nothing replaces the trigger: the model buffers on its own
+  `chunk_length_schedule`, and the empty-text EOS frame the turn already
+  ended on closes the socket — which ElevenLabs documents as forcing
+  generation of whatever is still buffered. The cascade opens and closes one
+  socket per RESPONSE, so that close happens on every turn regardless.
+  Latency where it is audible is therefore unchanged. All three cascade
   surfaces — terminal, Discord, dashboard relay — change together.
+
+  Deliberately NOT added: an explicit `flush: true` on the EOS frame. Their
+  flush example attaches the flag to a frame carrying real text, `text` is a
+  required field on `SendText`, and an empty-text frame is `CloseConnection`
+  — a different message in the same schema. A combined
+  `{"text": "", "flush": true}` appears nowhere in their documentation, and
+  on this endpoint there is no schema-legal way to force generation without
+  either real text or the close. Their sibling `multi-stream-input` endpoint
+  does define a purpose-built `FlushContextClient` frame with optional
+  `text`, which is what a persistent-socket design would need; this lane
+  does not, because its socket is per-turn.
 - The cascade socket now states `enable_ssml_parsing` instead of relying on
   a default ElevenLabs does not document. Every neighbouring query parameter
   declares a default in their schema and this one declares none, so a

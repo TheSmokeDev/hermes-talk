@@ -258,8 +258,8 @@ async def _stream_lifecycle_bos_chunks_eos_isfinal():
 
         voice.handle_event(_final(response_id="resp_1"))
         await _wait_for(lambda: len(ws.sent) == 3)
-        # EOS ends the response's text AND carries the turn's one generation
-        # trigger — the documented end-of-turn flush.
+        # The documented CloseConnection frame, and nothing else: closing is
+        # what generates the buffered text, so no `flush` key rides along.
         assert ws.sent[2] == {"text": ""}
 
         ws.feed_audio(b"pcm-one")
@@ -503,13 +503,18 @@ def test_no_chunk_ever_forces_its_own_generation():
 
 
 async def _no_chunk_ever_forces_its_own_generation():
-    """Every text frame is text ONLY; the turn ends with exactly one flush.
+    """Every text frame is text ONLY; the turn ends on the documented close.
 
     ``try_trigger_generation`` per chunk is what flattened prosody: it
     defeats the buffer whose entire purpose is giving the model enough
     context to carry intonation across a sentence boundary. An ellipsis-
     heavy line is the worst case — the chunker ends a chunk on each pause
     marker, so the old path produced a forced generation per marker.
+
+    Nothing replaces it: no frame carries a ``flush`` key, because closing
+    is documented to generate whatever is buffered and this lane closes its
+    socket once per response. The assertions below pin BOTH halves — no
+    per-chunk trigger, and no undocumented empty-text-plus-flush frame.
     """
 
     harness = _Harness()
@@ -532,6 +537,50 @@ async def _no_chunk_ever_forces_its_own_generation():
         ]
         # Everything between BOS and EOS is a bare text frame.
         assert all(set(frame) == {"text"} for frame in ws.sent[1:-1])
+    finally:
+        await voice.aclose()
+
+
+def test_each_response_opens_and_closes_its_own_socket():
+    asyncio.run(_each_response_opens_and_closes_its_own_socket())
+
+
+async def _each_response_opens_and_closes_its_own_socket():
+    """The fact the end-of-turn design rests on: the socket is PER RESPONSE.
+
+    Dropping the per-chunk trigger is only safe without an explicit flush
+    because closing generates whatever is buffered, and this lane closes
+    once per turn — so every turn gets that flush for free. A future change
+    that held one socket across turns would silently lose the last partial
+    chunk of every answer until the NEXT answer pushed it out, and single-
+    context ``/stream-input`` has no schema-legal frame to force it (``text``
+    is required on ``SendText``). That change would need the sibling
+    ``multi-stream-input`` endpoint's ``FlushContextClient``. This test is
+    what fails first if anyone tries it.
+    """
+
+    harness = _Harness()
+    voice = harness.voice
+    try:
+        for n in (1, 2):
+            rid = f"resp_{n}"
+            voice.handle_event(rt.ResponseStarted(response_id=rid))
+            voice.handle_event(_delta(f"Answer {n}. ", response_id=rid))
+            await _wait_for(lambda n=n: len(harness.connect.sockets) == n)
+            ws = harness.connect.sockets[n - 1]
+            voice.handle_event(_final(response_id=rid))
+            await _wait_for(lambda ws=ws: ws.sent and ws.sent[-1] == {"text": ""})
+            ws.feed_audio(b"pcm")
+            ws.feed_final()
+            await _wait_for(lambda ws=ws: ws.closed)
+
+        # Two responses, two sockets, each one closed — never one reused.
+        assert len(harness.connect.sockets) == 2
+        assert all(sock.closed for sock in harness.connect.sockets)
+        assert harness.connect.sockets[0] is not harness.connect.sockets[1]
+        # And each socket ended on the documented close frame.
+        for sock in harness.connect.sockets:
+            assert sock.sent[-1] == {"text": ""}
     finally:
         await voice.aclose()
 

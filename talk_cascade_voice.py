@@ -506,8 +506,11 @@ class CascadeVoice:
             # Deliberately NO generation trigger: forcing one per chunk
             # defeats the buffer that gives the model its prosodic context,
             # which ElevenLabs calls lower quality audio and recommends
-            # against. End-of-turn generation is triggered once, by the
-            # final frame in _send_rest.
+            # against. Nothing replaces it — the model now buffers on its own
+            # chunk_length_schedule, and the EOS frame _send_rest ends on
+            # closes the socket, which is documented to generate whatever is
+            # still buffered. One socket per response makes that the whole
+            # end-of-turn story.
             await ws.send_json({"text": first_chunk})
             sender = asyncio.create_task(self._send_rest(ws))
             try:
