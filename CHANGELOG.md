@@ -13,6 +13,17 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.17.1] — 2026-09-07
+
+Seven fixes and one knob. Spoken approvals in a Discord room now reach the
+host under the field name it actually reads, so they stop failing with HTTP
+400 (the first outside fix to a live production lane, by @danclaw93). The
+cascade voice stops forcing a generation per chunk and lets ElevenLabs buffer
+the turn, the dashboard relay no longer deadlocks on the servers Hermes
+actually runs, cloned-voice playback is gapless, and a browser that cannot
+stream says so instead of going mute. `TALK_CASCADE_SPEED` sets the delivery
+pace.
+
 ### Added
 - `TALK_CASCADE_SPEED` — delivery pace for the cascade voice, `0.7`–`1.2`
   (`1.0` is normal), resolved at call time so an operator's edit lands on
@@ -36,7 +47,9 @@ named rather than smoothed.
 - Room-scoped spoken approvals now return the approval event's exact
   `request_id` under the field name required by the Hermes run API. They no
   longer fail with HTTP 400 `approval_request_required` while a pending action
-  waits for an answer.
+  waits for an answer. Fixed by
+  [@danclaw93](https://github.com/danclaw93), the first outside fix to a
+  live production lane.
 - The dashboard cascade relay no longer deadlocks on the servers Hermes
   actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
   HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
