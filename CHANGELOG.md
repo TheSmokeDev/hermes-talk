@@ -13,6 +13,14 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Gemini `doctor`, `check`, and `setup` now follow Gemini's own credential,
+  model, and voice settings. A Gemini-only install no longer fails an
+  unrelated OpenAI auth check or gets told to run `codex login`. Human
+  reports and redacted support bundles carry the Gemini receipt without
+  requiring Codex/xAI fields. Static diagnostics remain offline: configured
+  keys and models are not a claim that Google accepted a live connection.
+
 ## [0.17.1] — 2026-09-07
 
 Seven fixes and one knob. Spoken approvals in a Discord room now reach the
