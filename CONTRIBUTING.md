@@ -85,8 +85,8 @@ uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 ```
 
-Either way you get the pinned `ruff==0.16.5` from the dev extra — the pin is
-load-bearing, see below.
+Either way you get the ruff version pinned in the dev extra (see
+`pyproject.toml`). The pin is load-bearing, see below.
 
 **Why `--extra dev` on every `uv run`:** pytest and the pinned ruff live in
 the `dev` extra, not in the dependencies. `uv run` only guarantees the base

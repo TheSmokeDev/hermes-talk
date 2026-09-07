@@ -894,7 +894,11 @@ it does not claim that hot lifecycle support already exists here.
 
 ### Contributors
 
-[@kvnloo](https://github.com/kvnloo) — PulseAudio WebRTC echo cancellation
+[@danclaw93](https://github.com/danclaw93): room-scoped spoken approvals send
+the `request_id` the Hermes run API reads, so they stop failing with HTTP 400
+(0.17.1).
+
+[@kvnloo](https://github.com/kvnloo): PulseAudio WebRTC echo cancellation
 on Linux, and the fix that stopped quiet words being clipped during
 playback ([#81](https://github.com/TheSmokeDev/hermes-talk/pull/81));
 semantic turn-detection controls across the three lanes
