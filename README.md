@@ -158,9 +158,9 @@ pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip i
 hermes talk
 ```
 
-Zero core edits — pure `register(ctx)` plugin surface, proven on a stock
-v0.17.0 install. 1,400+ offline tests across 46 files in [`tests/`](tests/),
-CI on ubuntu + windows × py3.11–3.13.
+Zero core edits: a pure `register(ctx)` plugin surface, proven on a stock
+Hermes install. 1,600+ offline tests across 50+ files in [`tests/`](tests/),
+CI on ubuntu and windows, Python 3.11 to 3.13.
 
 ## Quickstart — your first call on each surface
 
