@@ -33,6 +33,10 @@ named rather than smoothed.
   dependency of its own.
 
 ### Fixed
+- Room-scoped spoken approvals now return the approval event's exact
+  `request_id` under the field name required by the Hermes run API. They no
+  longer fail with HTTP 400 `approval_request_required` while a pending action
+  waits for an answer.
 - The dashboard cascade relay no longer deadlocks on the servers Hermes
   actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
   HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
@@ -574,8 +578,9 @@ regression tests:
   single-shot upstream (a reconnect 404s); when a run's watcher dies, the
   poll loop reconciles one conservative prompt (`once`/`deny`) instead of
   letting the approval sit silent until the host's 300s auto-deny. Resolves
-  also carry the request's own id (`approvalId`) for exact routing on hosts
-  that support it.
+  also carry the request's own id for exact routing; this release sent it as
+  `approvalId`, while current Hermes requires `request_id` (corrected under
+  [Unreleased](#unreleased)).
 - **Stale sidecars are quarantined by attach generation.** A delegated run
   outliving its session can no longer speak its approval into — or be
   resolved from — the next session.
