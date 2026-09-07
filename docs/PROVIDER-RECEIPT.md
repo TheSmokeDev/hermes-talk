@@ -69,7 +69,7 @@ a gap is fixable, a leaked key is not.
 | Model | the doctor's `model` check | `grok-voice-latest` |
 | Credential lane | the doctor's `auth` check — the lane, never the credential | `xAI OAuth` |
 | Surface | where you ran the call | `Discord voice channel` |
-| hermes-talk version | `hermes plugins list` | `0.16.0` |
+| hermes-talk version | `hermes plugins list` | `0.17.2` |
 | Hermes host version | `hermes --version` | `0.21.0` |
 | Python / OS | `python --version`, your OS | `3.12.6 / Windows 11` |
 | Events observed | the checklist above | `SessionReady, SpeechStarted, ResponseFinished` — no `FunctionCall` |
