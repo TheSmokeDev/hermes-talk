@@ -97,7 +97,74 @@ const waitFor = async (predicate, timeoutMs = 1000) => {
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_dashboard_cascade_relays_text_and_plays_pcm_until_barge_in():
+def test_dashboard_stop_is_idempotent_when_teardown_throws():
+    """stop() must fully tear down even if a sub-step throws.
+
+    A throw in abortCascade() (or any other teardown step) used to skip the
+    rest of stop(), leaving the channel/peer open so the server kept
+    listening even though the UI reset to idle. Every step is now guarded so
+    a single failure can never strand the session.
+    """
+
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const window = {
+  __HERMES_TALK_TEST_HOOK__: true,
+  __HERMES_PLUGINS__: { register() {} },
+  __HERMES_PLUGIN_SDK__: {
+    React: { createElement() {} },
+    hooks: { useState() {}, useEffect() {}, useRef() {}, useCallback() {} },
+    components: {},
+  },
+  sessionStorage: { getItem() { return ""; } },
+  setTimeout,
+  clearTimeout,
+};
+const context = { window, setTimeout, clearTimeout, AbortController, console };
+vm.runInNewContext(source, context, { filename: "index.js" });
+const Transport = window.__HERMES_TALK_TEST__.TalkTransport;
+const transport = new Transport({}, { onStatus() {}, onError() {} });
+
+// Every teardown target is present and live.
+const channel = { readyState: "open", close() { this.closed = true; } };
+const peer = { connectionState: "connected", close() { this.closed = true; } };
+const track = { stop() { this.stopped = true; } };
+const media = { getTracks() { return [track]; } };
+const audio = { remove() { this.removed = true; } };
+transport.channel = channel;
+transport.peer = peer;
+transport.media = media;
+transport.audio = audio;
+
+// The failure that used to strand the session: abortCascade() throws.
+transport.abortCascade = () => { throw new Error("boom"); };
+
+// stop() must still close everything and null every reference.
+transport.stop();
+if (transport.channel !== null) throw new Error("channel not nulled");
+if (transport.peer !== null) throw new Error("peer not nulled");
+if (transport.media !== null) throw new Error("media not nulled");
+if (transport.audio !== null) throw new Error("audio not nulled");
+if (!channel.closed) throw new Error("channel not closed");
+if (!peer.closed) throw new Error("peer not closed");
+if (!track.stopped) throw new Error("mic track not stopped");
+if (!audio.removed) throw new Error("audio element not removed");
+
+// And a second call must be a no-op, not a throw.
+transport.stop();
+process.exit(0);
+""".lstrip()
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     """The cascade transport: NDJSON out, PCM onto the AudioContext, abort kills both."""
 
     script = r"""

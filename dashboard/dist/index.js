@@ -296,22 +296,42 @@
 
     stop() {
       this.closed = true;
-      if (this.offerAbort) this.offerAbort.abort();
-      this.offerAbort = null;
-      this.abortCascade();
+      // Teardown is idempotent and each step is guarded so a throw in one can
+      // never skip the rest. (A throw in abortCascade() used to leave the
+      // channel/peer open, so the server kept listening even though the UI
+      // reset to idle.)
+      if (this.offerAbort) {
+        try { this.offerAbort.abort(); } catch (e) { /* already aborted */ }
+        this.offerAbort = null;
+      }
+      try { this.abortCascade(); } catch (e) { /* already torn down */ }
       if (this.pcmContext) {
         const ctx = this.pcmContext;
         this.pcmContext = null;
         if (ctx.close) Promise.resolve(ctx.close()).catch(() => {});
       }
-      if (this.channel) this.channel.close();
-      this.channel = null;
-      if (this.peer) this.peer.close();
-      this.peer = null;
-      if (this.media) this.media.getTracks().forEach((track) => track.stop());
-      this.media = null;
-      if (this.audio) this.audio.remove();
-      this.audio = null;
+      if (this.channel) {
+        try {
+          if (this.channel.readyState === "open" || this.channel.readyState === "connecting") {
+            this.channel.close();
+          }
+        } catch (e) { /* already closed */ }
+        this.channel = null;
+      }
+      if (this.peer) {
+        try {
+          if (this.peer.connectionState !== "closed") this.peer.close();
+        } catch (e) { /* already closed */ }
+        this.peer = null;
+      }
+      if (this.media) {
+        try { this.media.getTracks().forEach((track) => track.stop()); } catch (e) { /* already stopped */ }
+        this.media = null;
+      }
+      if (this.audio) {
+        try { this.audio.remove(); } catch (e) { /* already removed */ }
+        this.audio = null;
+      }
     }
 
     send(payload) {
