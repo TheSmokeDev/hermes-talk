@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.17.2] — 2026-09-07
+
+One fix, for the Gemini lane. A Gemini-only install used to fail an OpenAI
+auth check it never needed and get told to run `codex login`; doctor, check,
+and setup now follow Gemini's own credential, model, and voice settings, and
+the live check reaches Google instead of stopping at a false failure.
+Reported as #122 by @eabase, fixed by Codex, reviewed and live-verified
+before merge.
+
 ### Fixed
 - Gemini `doctor`, `check`, and `setup` now follow Gemini's own credential,
   model, and voice settings. A Gemini-only install no longer fails an
@@ -20,6 +29,7 @@ named rather than smoothed.
   reports and redacted support bundles carry the Gemini receipt without
   requiring Codex/xAI fields. Static diagnostics remain offline: configured
   keys and models are not a claim that Google accepted a live connection.
+  (#122)
 
 ## [0.17.1] — 2026-09-07
 
