@@ -94,6 +94,10 @@ _MAX_TEXT_CHARS = 300
 # A dict is a nested allowlist. Anything absent is dropped.
 
 _AUTH_DETAILS = {
+    "provider": "token",
+    "source": "token",
+    "keys": "token_map",
+    "validation_scope": "token",
     "configured": "bool",
     "winning_lane": "token",
     "preference": "token",
@@ -136,13 +140,14 @@ CHECK_DETAILS_ALLOWLIST: dict[str, dict[str, Any]] = {
     },
     "auth": _AUTH_DETAILS,
     "model": {
+        "provider": "token",
         "model": "token",
         "source": "token",
         "compatibility": "token",
         "policy_version": "token",
         "validation_scope": "token",
     },
-    "voice": {"voice": "token", "source": "token", "valid": "bool"},
+    "voice": {"provider": "token", "voice": "token", "source": "token", "valid": "bool"},
     "cascade": {
         "voice_mode": "token",
         "source": "token",

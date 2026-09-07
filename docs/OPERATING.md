@@ -249,6 +249,23 @@ all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
 | `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first (free-tier keys work). Set-but-blank is a hard refusal, same rule as the OpenAI keys. The key rides the WebSocket URL query on this lane, so the URL is treated as a secret: assembled at connect, never logged, scrubbed out of transport errors. The Live protocol has no client cancel/truncate command — barge-in degrades to local playback handling with a logged receipt. |
 
+### Gemini diagnostics and setup
+
+With `TALK_PROVIDER=gemini`, `hermes talk doctor` checks Gemini's key,
+`TALK_GEMINI_MODEL`, and `TALK_GEMINI_VOICE`. It does not require OpenAI
+credentials or a Codex login. Key precedence matches the session:
+`TALK_GEMINI_API_KEY` before `GEMINI_API_KEY`, with an explicitly blank
+override refusing rather than falling through. `hermes talk setup` repairs
+the Gemini settings and asks for confirmation before each write.
+
+Doctor and support bundles report configuration only; they do not connect
+to Google or verify that a key/model is accepted. Custom Gemini models
+produce a warning about unverified availability. Use
+`hermes talk check --provider gemini --no-run` for a bounded live provider
+turn without a delegated Hermes run. That command uses the real provider
+and may consume API quota. OpenAI/Grok auth behavior and Gemini's existing
+surface restrictions are unchanged.
+
 ### Custom voice (cascade lane)
 
 | Variable | Default | Effect / failure mode |

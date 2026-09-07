@@ -400,11 +400,58 @@ def _grok_auth_check() -> dict[str, Any]:
     return _check("auth", "pass", summary, details)
 
 
-def _auth_check() -> dict[str, Any]:
+def _selected_provider() -> str | None:
     try:
-        provider = talk_config.talk_provider()
+        return talk_config.talk_provider()
     except talk_config.TalkConfigError:
-        provider = None
+        return None  # The provider check already reports this configuration error.
+
+
+def _gemini_auth_check() -> dict[str, Any]:
+    """Use session-time key precedence without network access or foreign auth stores."""
+
+    scoped = os.environ.get("TALK_GEMINI_API_KEY")
+    shared = os.environ.get("GEMINI_API_KEY")
+    source = (
+        "TALK_GEMINI_API_KEY" if scoped is not None
+        else "GEMINI_API_KEY" if shared is not None else None
+    )
+    details = {
+        "provider": "gemini",
+        "source": source,
+        "configured": False,
+        "winning_lane": None,
+        "keys": {"scoped": _key_presence(scoped), "shared": _key_presence(shared)},
+        "blocked_by": None,
+        "validation_scope": "presence-only",
+    }
+    try:
+        # Discard the value: only the resolver's success belongs in this receipt.
+        talk_config.resolve_gemini_key()
+    except talk_config.TalkConfigError:
+        if source is None:
+            details["blocked_by"] = "missing-key"
+            summary = "no Gemini API key is configured"
+        else:
+            details["blocked_by"] = "blank-talk-key" if scoped is not None else "blank-gemini-key"
+            summary = f"{source} is set but blank and blocks Gemini authentication"
+        return _check(
+            "auth", "fail", summary, details,
+            ("Set TALK_GEMINI_API_KEY or GEMINI_API_KEY; replace or unset a blank override.",),
+        )
+    details["configured"] = True
+    details["winning_lane"] = (
+        talk_auth.SOURCE_CONFIGURED if scoped is not None else talk_auth.SOURCE_ENV
+    )
+    return _check(
+        "auth", "pass", "Gemini API key is configured; live authentication was not checked", details
+    )
+
+
+def _auth_check() -> dict[str, Any]:
+    provider = _selected_provider()
+    if provider == "gemini":
+        return _gemini_auth_check()
     if provider == "grok":
         return _grok_auth_check()
     receipt = talk_auth.auth_diagnostic()
@@ -476,6 +523,24 @@ def _auth_check() -> dict[str, Any]:
 
 
 def _model_check() -> dict[str, Any]:
+    if _selected_provider() == "gemini":
+        model = talk_config.talk_gemini_model()
+        known_default = model == talk_config.DEFAULT_GEMINI_MODEL
+        return _check(
+            "model",
+            "pass" if known_default else "warn",
+            f"Gemini model {model} is configured; live availability was not checked",
+            {
+                "provider": "gemini",
+                "model": model,
+                "source": (
+                    "TALK_GEMINI_MODEL"
+                    if (os.environ.get("TALK_GEMINI_MODEL") or "").strip() else "default"
+                ),
+                "compatibility": "known-default" if known_default else "unknown",
+                "validation_scope": "configuration-only",
+            },
+        )
     model = talk_config.talk_model()
     source = "TALK_MODEL" if (os.environ.get("TALK_MODEL") or "").strip() else "default"
     compatibility = talk_config.realtime_model_compatibility(model)
@@ -515,6 +580,29 @@ def _model_check() -> dict[str, Any]:
 
 
 def _voice_check() -> dict[str, Any]:
+    if _selected_provider() == "gemini":
+        source = (
+            "TALK_GEMINI_VOICE"
+            if (os.environ.get("TALK_GEMINI_VOICE") or "").strip() else "default"
+        )
+        try:
+            voice = talk_config.talk_gemini_voice()
+        except talk_config.TalkConfigError:
+            return _check(
+                "voice", "fail", "configured Gemini voice is not a built-in Gemini Live voice",
+                {
+                    "provider": "gemini",
+                    "voice": (os.environ.get("TALK_GEMINI_VOICE") or "").strip() or None,
+                    "source": source,
+                    "valid": False,
+                },
+                (f"Choose TALK_GEMINI_VOICE from {', '.join(talk_config.GEMINI_LIVE_VOICES)} "
+                 "(case-sensitive).",),
+            )
+        return _check(
+            "voice", "pass", f"Gemini voice {voice} is valid",
+            {"provider": "gemini", "voice": voice, "source": source, "valid": True},
+        )
     source = "TALK_VOICE" if (os.environ.get("TALK_VOICE") or "").strip() else "default"
     try:
         voice = talk_config.talk_voice()
@@ -863,7 +951,13 @@ def render_human(report: dict[str, Any]) -> str:
     for check in report["checks"]:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
         details = check["details"]
-        if check["id"] == "auth":
+        if check["id"] == "auth" and details.get("provider") == "gemini":
+            lines.append(
+                "  receipt: provider=gemini, "
+                f"winner={details.get('winning_lane') or 'none'}, "
+                f"source={details.get('source') or 'none'}, validation=presence-only"
+            )
+        elif check["id"] == "auth":
             if "xai_oauth" in details:
                 oauth = f"xai-oauth={details['xai_oauth']}"
                 # Name the store shape that answered, so a "missing" verdict

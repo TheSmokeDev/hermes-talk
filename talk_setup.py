@@ -1120,6 +1120,26 @@ def _grok_auth_changes(
     return []
 
 
+def _gemini_auth_changes(
+    check: dict, *, input_fn: InputFn, secret_input_fn: InputFn,
+) -> list[EnvChange]:
+    """Repair only the Gemini key selected by the offline diagnostic."""
+
+    if check.get("status") != "fail":
+        return []
+    blocked_by = check.get("details", {}).get("blocked_by")
+    key = "GEMINI_API_KEY" if blocked_by == "blank-gemini-key" else "TALK_GEMINI_API_KEY"
+    if blocked_by in {"blank-talk-key", "blank-gemini-key"}:
+        action = _ask_choice(
+            f"{key} is blank. Replace it or remove its dotenv entry?",
+            ("replace", "remove"), input_fn,
+        )
+        if action == "remove":
+            return [(key, None, True)]
+    secret = _ask_nonempty_secret(f"Enter {key} (input hidden): ", secret_input_fn)
+    return [(key, secret, True)]
+
+
 def _auth_changes(
     check: dict,
     *,
@@ -1128,6 +1148,8 @@ def _auth_changes(
     output_fn: OutputFn,
 ) -> list[tuple[str, str | None, bool]]:
     details = check.get("details", {})
+    if details.get("provider") == "gemini":
+        return _gemini_auth_changes(check, input_fn=input_fn, secret_input_fn=secret_input_fn)
     if "xai_oauth" in details:
         return _grok_auth_changes(
             check, input_fn=input_fn, secret_input_fn=secret_input_fn, output_fn=output_fn
@@ -1212,6 +1234,14 @@ def _model_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None
     if check.get("status") == "pass":
         return []
     details = check.get("details", {})
+    if details.get("provider") == "gemini":
+        choice = _ask_choice(
+            "This Gemini model has not been checked live. Keep it or use the default?",
+            ("keep", "default"), input_fn,
+        )
+        return [] if choice == "keep" else [
+            ("TALK_GEMINI_MODEL", talk_config.DEFAULT_GEMINI_MODEL, False)
+        ]
     if check.get("status") == "warn" and details.get("compatibility") == "unknown":
         choice = _ask_choice(
             "The configured model has unknown duplex/tool compatibility. "
@@ -1232,6 +1262,13 @@ def _model_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None
 def _voice_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None, bool]]:
     if check.get("status") != "fail":
         return []
+    if check.get("details", {}).get("provider") == "gemini":
+        while True:
+            voice = input_fn(
+                f"Choose a Gemini voice [{talk_config.DEFAULT_GEMINI_VOICE}] (case-sensitive): "
+            ).strip() or talk_config.DEFAULT_GEMINI_VOICE
+            if voice in talk_config.GEMINI_LIVE_VOICES:
+                return [("TALK_GEMINI_VOICE", voice, False)]
     allowed = tuple(talk_config.OPENAI_REALTIME_VOICES)
     while True:
         voice = input_fn(
