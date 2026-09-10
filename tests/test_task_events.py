@@ -181,7 +181,8 @@ def test_api_poll_is_snapshot_only_and_never_opens_single_consumer_stream(tmp_pa
         token, "poll-seven", mode="api_poll", source_session="worker", run_id=7
     )
     store.source_unavailable(token, lease)
-    assert store.page(token)["sources"][0]["gap"] == "unavailable"
+    assert store.page(token)["sources"][0]["availability"] == "unavailable"
+    assert store.page(token)["sources"][0]["gap"] == "snapshot_only"
     store.observe_poll(token, lease, 7, poll(4, output="not copied"))
     store.observe_poll(token, lease, 7, poll(4, output="not copied"))
     assert store.observe_poll(token, lease, 7, poll(2, status="running")) is None
@@ -567,3 +568,124 @@ def test_reconnect_resolves_durable_result_beyond_ui_listing_cap(tmp_path, monke
     assert store.result_view(token, 7)["status"] == "lost"
     with pytest.raises(TaskEventError, match="unavailable"):
         store.result_view(token, 7, resolve_run=lambda _: None)
+
+
+@pytest.mark.parametrize("integrity_gap", ["truncated", "epoch_reset"])
+def test_replay_gap_survives_outage_and_ordinary_recovery(tmp_path, integrity_gap):
+    store, _, token = scope(tmp_path)
+    lease = rpc(store, token)
+    if integrity_gap == "truncated":
+        store.observe_rpc(token, lease, replay(frame(10), truncated=True))
+        recovery = replay(frame(11))
+    else:
+        store.observe_rpc(token, lease, replay(frame(1)))
+        lease = store.open_source(
+            token, "rpc", mode="rpc", source_session="parent", epoch="epoch-b", previous=lease
+        )
+        store.observe_rpc(token, lease, replay(frame(1), epoch="epoch-b"))
+        recovery = replay(frame(2), epoch="epoch-b")
+    store.source_unavailable(token, lease)
+    assert store.page(token)["sources"][0]["gap"] == integrity_gap
+    store.observe_rpc(token, lease, recovery)
+    page = store.page(token)
+    assert page["sources"][0]["gap"] == integrity_gap
+    assert page["sources"][0]["availability"] == "available"
+    assert page["snapshot_refetch_required"] is True
+
+
+def test_global_capacity_reclaims_32_abandoned_expired_owners(tmp_path):
+    now = [1000.0]
+    for index in range(32):
+        store, _, token = scope(
+            tmp_path, parent=f"old-{index}", tab=f"old-tab-{index}", clock=lambda: now[0], ttl=10
+        )
+        rpc(store, token, session=f"old-{index}")
+    now[0] = 1011.0
+    fresh, _, token = scope(tmp_path, parent="fresh", clock=lambda: now[0], ttl=10)
+    assert fresh.diagnostics(token)["sources"] == 0
+    with sqlite3.connect(tmp_path / "state" / "talk-history-outbox.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM task_event_owners").fetchone()[0] == 1
+
+
+def test_global_reclamation_preserves_unexpired_foreign_state(tmp_path):
+    now = [1000.0]
+    for index in range(31):
+        scope(tmp_path, parent=f"old-{index}", tab=f"old-tab-{index}", clock=lambda: now[0], ttl=10)
+    now[0] = 1005.0
+    live, _, live_token = scope(
+        tmp_path, parent="live", tab="live-tab", clock=lambda: now[0], ttl=100
+    )
+    lease = rpc(live, live_token, session="live")
+    live.observe_rpc(live_token, lease, replay(frame(1, session="live")))
+    live.bind_run(
+        live_token, run_record(parent="live"), operator="operator", worker_session_id="worker"
+    )
+    before = live.page(live_token)
+    now[0] = 1011.0
+    scope(tmp_path, parent="fresh", clock=lambda: now[0], ttl=10)
+    assert live.page(live_token) == before
+    assert (
+        live.result_view(live_token, 7, resolve_run=lambda _: run_record(parent="live"))["status"]
+        == "done"
+    )
+
+
+def test_run_binding_retention_is_independent_of_active_owner(tmp_path):
+    now = [1000.0]
+    store, _, token = scope(tmp_path, clock=lambda: now[0], ttl=10)
+    for index in range(1, 129):
+        store.bind_run(
+            token,
+            {**run_record(request=f"request-{index}"), "runId": index},
+            operator="operator",
+            worker_session_id=f"worker-{index}",
+        )
+    heartbeat = rpc(store, token)
+    now[0] = 1009.0
+    store.observe_rpc(token, heartbeat, replay(frame(1)))
+    now[0] = 1011.0
+    store.bind_run(
+        token,
+        {**run_record(request="new-request"), "runId": 999},
+        operator="operator",
+        worker_session_id="new-worker",
+    )
+    assert store.page(token)["events"][0]["source_seq"] == 1
+    with sqlite3.connect(tmp_path / "state" / "talk-history-outbox.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM task_event_runs").fetchone()[0] == 1
+
+
+def test_source_retention_is_independent_of_active_owner(tmp_path):
+    now = [1000.0]
+    store, _, token = scope(tmp_path, clock=lambda: now[0], ttl=10)
+    for index in range(63):
+        rpc(store, token, source=f"old-source-{index}")
+    now[0] = 1009.0
+    active = rpc(store, token, source="active-source")
+    store.observe_rpc(token, active, replay(frame(1)))
+    now[0] = 1011.0
+    rpc(store, token, source="new-source")
+    assert {row["source_id"] for row in store.page(token)["sources"]} == {
+        "active-source",
+        "new-source",
+    }
+
+
+def test_active_source_renews_only_its_associated_run(tmp_path):
+    now = [1000.0]
+    store, _, token = scope(tmp_path, clock=lambda: now[0], ttl=10)
+    bind(store, token)
+    store.bind_run(
+        token,
+        {**run_record(request="request-eight"), "runId": 8},
+        operator="operator",
+        worker_session_id="worker-eight",
+    )
+    now[0] = 1009.0
+    lease = store.open_source(
+        token, "active-poll", mode="api_poll", source_session="worker", run_id=7
+    )
+    now[0] = 1011.0
+    store.observe_poll(token, lease, 7, poll(status="running"))
+    with sqlite3.connect(tmp_path / "state" / "talk-history-outbox.sqlite3") as db:
+        assert [row[0] for row in db.execute("SELECT run_id FROM task_event_runs")] == [7]

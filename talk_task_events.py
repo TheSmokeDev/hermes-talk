@@ -100,10 +100,12 @@ class TaskEvents:
                 epoch TEXT, revision INTEGER NOT NULL, run_id INTEGER,
                 cursor INTEGER NOT NULL DEFAULT 0,
                 latest INTEGER NOT NULL DEFAULT 0, gap TEXT NOT NULL, occurred REAL,
+                availability TEXT NOT NULL, expires REAL NOT NULL,
                 PRIMARY KEY(owner,source_id))""")
             db.execute("""CREATE TABLE IF NOT EXISTS task_event_runs (
                 owner TEXT NOT NULL REFERENCES task_event_owners(owner) ON DELETE CASCADE,
                 run_id INTEGER NOT NULL, binding TEXT NOT NULL, operator_hash TEXT NOT NULL,
+                expires REAL NOT NULL,
                 PRIMARY KEY(owner,run_id))""")
             db.execute("""CREATE TABLE IF NOT EXISTS task_events (
                 idx INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,17 +148,45 @@ class TaskEvents:
     def _prune(self, db):
         now = self._clock()
         for owner, floor in db.execute(
-            "SELECT owner,max(idx) FROM task_events WHERE owner=? AND expires<=? GROUP BY owner",
-            (self._owner.key, now),
+            "SELECT owner,max(idx) FROM task_events WHERE expires<=? GROUP BY owner",
+            (now,),
         ).fetchall():
             db.execute(
                 "UPDATE task_event_owners SET floor_idx=max(floor_idx,?) WHERE owner=?",
                 (floor, owner),
             )
-        db.execute("DELETE FROM task_events WHERE owner=? AND expires<=?", (self._owner.key, now))
+        # Profile-wide admission counts require profile-wide expiry reclamation.
+        # Only expired records qualify; capacity pressure never evicts live foreign state.
+        db.execute("DELETE FROM task_events WHERE expires<=?", (now,))
+        db.execute("DELETE FROM task_event_sources WHERE expires<=?", (now,))
+        db.execute("DELETE FROM task_event_runs WHERE expires<=?", (now,))
         db.execute(
-            "DELETE FROM task_event_owners WHERE owner=? AND expires<=?", (self._owner.key, now)
+            """DELETE FROM task_event_owners WHERE expires<=?
+            AND NOT EXISTS (SELECT 1 FROM task_events WHERE owner=task_event_owners.owner)
+            AND NOT EXISTS (SELECT 1 FROM task_event_sources WHERE owner=task_event_owners.owner)
+            AND NOT EXISTS (SELECT 1 FROM task_event_runs WHERE owner=task_event_owners.owner)""",
+            (now,),
         )
+
+    def _touch_owner(self, db):
+        db.execute(
+            "UPDATE task_event_owners SET expires=max(expires,?) WHERE owner=?",
+            (self._clock() + self._ttl, self._owner.key),
+        )
+
+    def _touch_source(self, db, lease):
+        expires = self._clock() + self._ttl
+        db.execute(
+            "UPDATE task_event_sources SET availability='available',expires=? "
+            "WHERE owner=? AND source_id=?",
+            (expires, self._owner.key, lease.source_id),
+        )
+        if lease.run_id is not None:
+            db.execute(
+                "UPDATE task_event_runs SET expires=? WHERE owner=? AND run_id=?",
+                (expires, self._owner.key, lease.run_id),
+            )
+        self._touch_owner(db)
 
     @contextmanager
     def _db(self, token):
@@ -197,9 +227,21 @@ class TaskEvents:
                 if db.execute("SELECT count(*) FROM task_event_runs").fetchone()[0] >= 128:
                     raise TaskEventError("capacity")
                 db.execute(
-                    "INSERT INTO task_event_runs VALUES (?,?,?,?)",
-                    (self._owner.key, binding.local_run_id, data, digest(operator)),
+                    "INSERT INTO task_event_runs VALUES (?,?,?,?,?)",
+                    (
+                        self._owner.key,
+                        binding.local_run_id,
+                        data,
+                        digest(operator),
+                        self._clock() + self._ttl,
+                    ),
                 )
+            else:
+                db.execute(
+                    "UPDATE task_event_runs SET expires=? WHERE owner=? AND run_id=?",
+                    (self._clock() + self._ttl, self._owner.key, binding.local_run_id),
+                )
+            self._touch_owner(db)
         return binding
 
     def _binding(self, db, run_id):
@@ -269,7 +311,7 @@ class TaskEvents:
                 gap = "snapshot_only" if mode == "api_poll" else "unsequenced"
             db.execute(
                 """INSERT OR REPLACE INTO task_event_sources
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     self._owner.key,
                     source_id,
@@ -282,11 +324,15 @@ class TaskEvents:
                     prior["latest"] if same_epoch else 0,
                     gap,
                     prior["occurred"] if same_epoch else None,
+                    "available",
+                    self._clock() + self._ttl,
                 ),
             )
-            return SourceLease(
+            lease = SourceLease(
                 self._owner.key, source_id, mode, source_session, epoch, revision, run_id
             )
+            self._touch_source(db, lease)
+            return lease
 
     def _source(self, db, lease):
         if lease.owner_key != self._owner.key:
@@ -364,10 +410,7 @@ class TaskEvents:
                 self._clock() + self._ttl,
             ),
         ).fetchone()[0]
-        db.execute(
-            "UPDATE task_event_owners SET expires=? WHERE owner=?",
-            (self._clock() + self._ttl, self._owner.key),
-        )
+        self._touch_owner(db)
         while True:
             count = db.execute(
                 "SELECT count(*) FROM task_events WHERE owner=?", (self._owner.key,)
@@ -424,8 +467,6 @@ class TaskEvents:
             while cursor + 1 in seen:
                 cursor += 1
             gap = source["gap"]
-            if gap == "unavailable":
-                gap = "none"
             if payload["truncated"]:
                 cursor, gap = latest, "truncated"
             elif cursor < latest and gap in {"none", "missing_sequence"}:
@@ -437,6 +478,7 @@ class TaskEvents:
                 "WHERE owner=? AND source_id=?",
                 (cursor, latest, gap, self._owner.key, lease.source_id),
             )
+            self._touch_source(db, lease)
             return tuple(ids)
 
     def observe_poll(self, token, lease, run_id, payload, *, live=False):
@@ -471,6 +513,7 @@ class TaskEvents:
                 "WHERE owner=? AND source_id=?",
                 (observation.occurred_at, self._owner.key, lease.source_id),
             )
+            self._touch_source(db, lease)
             return idx
 
     def observe_hook(self, token, lease, run_id, kind, payload, *, observation_id, live=False):
@@ -484,13 +527,16 @@ class TaskEvents:
             )
             if observation.session_id != lease.session_id:
                 raise TaskEventError("foreign_owner")
-            return self._append(db, token, lease, observation, live=live)
+            idx = self._append(db, token, lease, observation, live=live)
+            self._touch_source(db, lease)
+            return idx
 
     def source_unavailable(self, token, lease):
         with self._db(token) as db:
             self._source(db, lease)
             db.execute(
-                "UPDATE task_event_sources SET gap='unavailable' WHERE owner=? AND source_id=?",
+                "UPDATE task_event_sources SET availability='unavailable' "
+                "WHERE owner=? AND source_id=?",
                 (self._owner.key, lease.source_id),
             )
 
@@ -526,7 +572,9 @@ class TaskEvents:
                 origin_turn_id=receipt.origin_turn_id,
                 canonical_revision=receipt.revision,
             )
-            return self._append(db, token, lease, event, live=False)
+            idx = self._append(db, token, lease, event, live=False)
+            self._touch_source(db, lease)
+            return idx
 
     def page(self, token, *, after=0, limit=50):
         integer(after)
@@ -555,7 +603,7 @@ class TaskEvents:
             sources = [
                 dict(row)
                 for row in db.execute(
-                    "SELECT source_id,mode,epoch,cursor,latest,gap "
+                    "SELECT source_id,mode,epoch,cursor,latest,gap,availability "
                     "FROM task_event_sources WHERE owner=?",
                     (self._owner.key,),
                 )
@@ -567,7 +615,8 @@ class TaskEvents:
                 "snapshot_refetch_required": not sources
                 or after < floor
                 or any(
-                    source["gap"] in {"truncated", "epoch_reset", "missing_sequence", "unavailable"}
+                    source["gap"] in {"truncated", "epoch_reset", "missing_sequence"}
+                    or source["availability"] == "unavailable"
                     for source in sources
                 ),
                 "sources": sources,

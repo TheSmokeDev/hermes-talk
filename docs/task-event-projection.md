@@ -42,6 +42,8 @@ they never rewrite earlier messages or fabricate capture order. Truncation/reset
 requires snapshot refetch; refetching current state cannot prove missing history.
 API polling remains snapshot-only after stream loss: no extra SSE consumer and no
 `Last-Event-ID` claim. Call `source_unavailable` to expose a failed source explicitly.
+Source availability is separate from replay integrity. Restored connectivity does
+not clear an unrecovered truncation or epoch-reset gap.
 
 Replay always returns `speak: false`. Completed result references can call
 `result_view`, which uses the existing registry/history through `resolve_run_record`, rechecks the immutable
@@ -75,6 +77,11 @@ of complete history. Confirmed canonical target deletion cascades the authorized
 owner's event/source/run/delivery references through the P2a invalidation path.
 Receipt-specific retirement drops that canonical receipt's derived reference and
 retains unrelated task observations.
+Before global admission checks, expired derived records are reclaimed across the
+profile; unexpired foreign state remains intact. Source and run-binding inactivity
+TTLs are independent of owner activity. Only observations or revalidation for that
+specific source/run refresh its retention, so an active owner cannot pin abandoned
+source/run records indefinitely.
 
 Dashboard/terminal/Discord wiring and dispatch-origin/linked-child integration remain
 separate. No remote/Codex or provider capability is inferred from these local modules.
