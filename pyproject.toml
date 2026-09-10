@@ -45,6 +45,9 @@ py-modules = [
   "talk_diagnostics",
   "talk_wire",
   "talk_identity",
+  "talk_passive",
+  "talk_outbox",
+  "talk_attachment",
   "talk_host",
   "talk_tools",
   "talk_runs",
@@ -97,6 +100,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 [tool.ruff.lint.isort]
 known-first-party = [
   "talk_apiserver",
+  "talk_attachment",
   "talk_approvals",
   "talk_audio",
   "talk_auth",
@@ -113,6 +117,8 @@ known-first-party = [
   "talk_grok_realtime",
   "talk_host",
   "talk_identity",
+  "talk_outbox",
+  "talk_passive",
   "talk_lifecycle",
   "talk_operator_auth",
   "talk_openai_realtime",
