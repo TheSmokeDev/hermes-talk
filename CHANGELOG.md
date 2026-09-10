@@ -68,6 +68,14 @@ pace.
   waits for an answer. Fixed by
   [@danclaw93](https://github.com/danclaw93), the first outside fix to a
   live production lane.
+- The dashboard transport's `stop()` is now idempotent and every teardown
+  step is guarded, so a throw in one can never skip the rest. Previously a
+  throw in `abortCascade()` (or any other step) left the channel and peer
+  open — the server kept listening even though the UI reset to idle, and a
+  second `stop()` could throw again. Each step now nulls its reference and
+  swallows its own failure, so teardown always completes and a repeated
+  call is a no-op. Regression test drives the real bundle through `node`
+  with a throwing `abortCascade()` and asserts every wire is closed.
 - The dashboard cascade relay no longer deadlocks on the servers Hermes
   actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
   HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
