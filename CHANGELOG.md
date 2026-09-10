@@ -13,6 +13,26 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.17.3] — 2026-09-09
+
+One fix, for the dashboard tab. Ending a session could strand it: if any
+teardown step threw, the rest of `stop()` was skipped, the UI reset to
+idle, and the server kept listening, so the next session started with the
+previous one still live. Every teardown step now owns its own failure and a
+repeated `stop()` is a no-op. Found and fixed by
+[@JakeStevenson](https://github.com/JakeStevenson) while building a mobile
+surface on the dashboard transport, the second outside fix to a live lane.
+
+### Fixed
+- The dashboard transport's `stop()` is now idempotent and every teardown
+  step is guarded, so a throw in one can never skip the rest. Previously a
+  throw in `abortCascade()` (or any other step) left the channel and peer
+  open — the server kept listening even though the UI reset to idle, and a
+  second `stop()` could throw again. Each step now nulls its reference and
+  swallows its own failure, so teardown always completes and a repeated
+  call is a no-op. Regression test drives the real bundle through `node`
+  with a throwing `abortCascade()` and asserts every wire is closed. (#130)
+
 ## [0.17.2] — 2026-09-07
 
 One fix, for the Gemini lane. A Gemini-only install used to fail an OpenAI
@@ -68,14 +88,6 @@ pace.
   waits for an answer. Fixed by
   [@danclaw93](https://github.com/danclaw93), the first outside fix to a
   live production lane.
-- The dashboard transport's `stop()` is now idempotent and every teardown
-  step is guarded, so a throw in one can never skip the rest. Previously a
-  throw in `abortCascade()` (or any other step) left the channel and peer
-  open — the server kept listening even though the UI reset to idle, and a
-  second `stop()` could throw again. Each step now nulls its reference and
-  swallows its own failure, so teardown always completes and a repeated
-  call is a no-op. Regression test drives the real bundle through `node`
-  with a throwing `abortCascade()` and asserts every wire is closed.
 - The dashboard cascade relay no longer deadlocks on the servers Hermes
   actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
   HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
