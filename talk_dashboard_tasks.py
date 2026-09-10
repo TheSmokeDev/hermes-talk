@@ -137,6 +137,8 @@ class BoundDashboard:
     closed: bool = False
     last_seen: float = field(default_factory=time.time)
     poll_offset: int = 0
+    target_record: dict | None = None
+    return_depth: int = 0
 
     @property
     def token(self):
@@ -152,9 +154,12 @@ class DashboardTasks:
         self.transport_factory = transport_factory
         self._bindings: dict[str, BoundDashboard] = {}
         self._lock = threading.RLock()
+        self.target_resolver = None
+        self.selection_guard = None
 
-    def _store_proof(self, gateway, context):
-        gateway.require_local()
+    def _store_proof(self, gateway, context, target=None):
+        if not target or target["peer_id"] == "local":
+            gateway.require_local()
         caps = gateway.transport.request("capabilities")
         if caps.get("store_id") != context.store_id:
             raise DashboardTaskError("catalog_host_unverified", 503)
@@ -171,8 +176,15 @@ class DashboardTasks:
             or body["generation"] != bound.generation
         ):
             raise DashboardTaskError("connection_stale", 409)
-        context = self.resolve_context(request, bound.context.profile_name)
-        current_transport = self.transport_factory(context)
+        if bound.target_record is not None:
+            if self.target_resolver is None or self.selection_guard is None:
+                raise DashboardTaskError("context_denied", 403)
+            self.selection_guard(request, bound)
+            resolved = self.target_resolver(request, bound.target_record)
+            context, current_transport = resolved.context, resolved.transport
+        else:
+            context = self.resolve_context(request, bound.context.profile_name)
+            current_transport = self.transport_factory(context)
         if (
             context != bound.context
             or current_transport.owner(bound.attachment.owner.session_id) != bound.attachment.owner
@@ -180,11 +192,13 @@ class DashboardTasks:
             raise DashboardTaskError("context_denied", 403)
         bound.outbox.check(bound.token.owner, bound.token.connection_id, bound.token.generation)
         if write:
-            self._store_proof(bound.gateway, context)
+            self._store_proof(bound.gateway, context, bound.target_record)
+        if bound.target_record is not None:
+            self.selection_guard(request, bound)
         bound.last_seen = time.time()
         return bound
 
-    def join(self, request, task):
+    def join(self, request, task, *, resolved=None, activate=True):
         if not isinstance(task, dict) or set(task) - {
             "session_id",
             "profile",
@@ -193,12 +207,15 @@ class DashboardTasks:
         }:
             raise DashboardTaskError("invalid_event", 400)
         selected, tab = session_id(task.get("session_id")), identifier(task.get("tab_id"))
-        context = self.resolve_context(request, task.get("profile"))
+        context = (
+            resolved.context if resolved else self.resolve_context(request, task.get("profile"))
+        )
         if task.get("profile") != context.profile_name:
             raise DashboardTaskError("context_denied", 403)
-        transport = self.transport_factory(context)
+        transport = resolved.transport if resolved else self.transport_factory(context)
+        target = resolved.record if resolved else None
         gateway = TaskGateway(transport)
-        self._store_proof(gateway, context)
+        self._store_proof(gateway, context, target)
         capabilities = gateway.capabilities()
         gateway.require_child(capabilities)
         metadata = gateway.session(selected)
@@ -208,21 +225,25 @@ class DashboardTasks:
             transport,
             outbox,
             selected_session=selected,
-            connection_id=digest([context.principal_id, context.store_id, tab]),
+            connection_id=digest(
+                [context.principal_id, context.store_id, tab] + ([selected] if target else [])
+            ),
         )
         token = attachment.attach()
-        self._store_proof(gateway, context)
+        self._store_proof(gateway, context, target)
         events = TaskEvents(outbox, token)
         stages = DashboardStages(outbox, token)
         selected_context = {
             "task": {
                 "session_id": selected,
-                "title": str(metadata.get("title") or selected)[:200],
+                "title": str(metadata.get("title") or selected).replace(
+                    transport.credential, "[redacted]"
+                )[:200],
                 "source": "authorized_gateway_session",
             },
             "host": {
                 "state": "verified",
-                "label": "Configured local Hermes gateway",
+                "label": target["host_label"] if target else "Configured local Hermes gateway",
                 "principal_kind": context.principal_kind,
             },
             "workspace": {
@@ -243,30 +264,56 @@ class DashboardTasks:
             gateway,
             selected_context,
             capabilities,
+            target_record=target,
         )
         # Original-owner recovery is allowed before publishing this new connection generation.
         self._recover(bound)
         bound.generation = bound.token.generation
         bound.events = TaskEvents(outbox, bound.token)
         attachment.refresh_snapshot(bound.token)
+        if activate:
+            self.activate(bound)
+        return bound
+
+    def activate(self, bound, *, commit=None):
+        """Publish an already prepared descriptor; selection CAS runs under the registry lock."""
+        previous_bindings = []
         with self._lock:
+            retained = [
+                previous
+                for previous in self._bindings.values()
+                if not previous.closed
+                and time.time() - previous.last_seen <= 3600
+                and not (
+                    previous.context.principal_id == bound.context.principal_id
+                    and previous.browser_tab == bound.browser_tab
+                )
+            ]
+            if len(retained) >= 64:
+                raise DashboardTaskError("capacity", 409)
+            if commit is not None:
+                bound.return_depth = commit()
             for key, previous in list(self._bindings.items()):
                 if (
                     (
-                        previous.context.principal_id == context.principal_id
-                        and previous.browser_tab == tab
+                        previous.context.principal_id == bound.context.principal_id
+                        and previous.browser_tab == bound.browser_tab
                     )
                     or previous.closed
                     or time.time() - previous.last_seen > 3600
                 ):
                     previous.closed = True
                     del self._bindings[key]
-            if len(self._bindings) >= 64:
-                bound.closed = True
-                attachment.close(bound.token)
-                raise DashboardTaskError("capacity", 409)
+                    previous_bindings.append(previous)
             self._bindings[bound.connection_id] = bound
-        return bound
+        for previous in previous_bindings:
+            self.discard(previous)
+
+    @staticmethod
+    def discard(bound):
+        bound.closed = True
+        with suppress(HistoryError, DashboardTaskError):
+            bound.attachment.close(bound.token)
 
     @staticmethod
     def _page_reference(value):
@@ -305,6 +352,15 @@ class DashboardTasks:
             "tab_id": bound.browser_tab,
             "context": bound.selected_context,
             "history": self._history(bound),
+            **(
+                {
+                    "target_id": bound.target_record["target_id"],
+                    "peer_id": bound.target_record["peer_id"],
+                    "return_depth": bound.return_depth,
+                }
+                if bound.target_record
+                else {}
+            ),
         }
 
     @staticmethod
@@ -413,7 +469,7 @@ class DashboardTasks:
             return record
         if record.get("original_attempt_generation") == bound.token.generation and not recover:
             return record
-        self._store_proof(bound.gateway, bound.context)
+        self._store_proof(bound.gateway, bound.context, bound.target_record)
         bound.capabilities = bound.gateway.capabilities()
         bound.gateway.require_child(bound.capabilities)
         bound.outbox.add(
@@ -570,7 +626,7 @@ class DashboardTasks:
             return action
         if action["state"] not in {"prepared", "uncertain"}:
             raise DashboardTaskError("interaction_incomplete", 409)
-        self._store_proof(bound.gateway, bound.context)
+        self._store_proof(bound.gateway, bound.context, bound.target_record)
         bound.capabilities = bound.gateway.capabilities()
         bound.gateway.require_child(bound.capabilities)
         action = bound.stages.update_action(bound.token, action["run_id"], state="submitting")
@@ -598,7 +654,14 @@ class DashboardTasks:
         if name == "talk_capabilities":
             return json.dumps(
                 {
-                    "tools": sorted(BOUND_TOOLS),
+                    "tools": sorted(
+                        BOUND_TOOLS
+                        | (
+                            {"list_targets", "switch_target", "return_to_previous"}
+                            if bound.target_record
+                            else set()
+                        )
+                    ),
                     "task_mode": "canonical",
                     "linked_children": True,
                     "steering": "unsupported",
@@ -676,7 +739,7 @@ class DashboardTasks:
 
     def state(self, request, body):
         bound = self.binding(request, body)
-        self._store_proof(bound.gateway, bound.context)
+        self._store_proof(bound.gateway, bound.context, bound.target_record)
         bound.attachment.refresh_snapshot(bound.token)
         interactions, actions = bound.stages.records(bound.token)
         jobs = []
@@ -837,7 +900,7 @@ class DashboardTasks:
 
     def result(self, request, body):
         bound = self.binding(request, body)
-        self._store_proof(bound.gateway, bound.context)
+        self._store_proof(bound.gateway, bound.context, bound.target_record)
         action = bound.stages.action(bound.token, body.get("run_id"))
         if not action.get("api_run_id"):
             raise DashboardTaskError("result_unavailable", 404)

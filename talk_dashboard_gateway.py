@@ -35,6 +35,17 @@ class DashboardTaskError(Exception):
         "result_unavailable": "That job's result is not currently available.",
         "unsupported_tool": "This tool is unavailable in canonical task mode.",
         "busy": "The original task is busy; persistence remains pending.",
+        "target_missing": "That authorized target is missing or its catalog entry expired.",
+        "target_already_selected": "That target is already selected; use Rejoin to reconnect.",
+        "target_ambiguous": "More than one authorized target matches; choose an exact target.",
+        "target_route_changed": "That target's configured route or canonical store changed.",
+        "target_auth_unavailable": "The configured target has no usable scoped credential.",
+        "target_auth_denied": "The configured target refused authentication.",
+        "target_offline": "The configured target is offline; no local substitute was selected.",
+        "target_unsupported": "The configured target lacks the required continuity capability.",
+        "selection_store_unavailable": "The local selection state could not be read safely.",
+        "selection_busy": "A target change is already being prepared for this tab.",
+        "return_empty": "There is no previous authorized target to return to.",
     }
 
     def __init__(self, code: str, status: int = 409, *, retryable=False):
@@ -127,13 +138,33 @@ class TaskGateway:
             raise DashboardTaskError("child_dispatch_unsupported", 503)
 
     def session(self, selected_session):
-        value = self._request(
-            "GET", "/api/sessions/" + quote(session_id(selected_session), safe="")
-        )
+        try:
+            value = self._request(
+                "GET", "/api/sessions/" + quote(session_id(selected_session), safe="")
+            )
+        except DashboardTaskError as exc:
+            if exc.status == 404:
+                raise DashboardTaskError("target_missing", 404) from None
+            raise
         data = value.get("session")
         if not isinstance(data, dict) or data.get("id") != selected_session:
             raise DashboardTaskError("gateway_response_invalid", 502)
         return data
+
+    def sessions(self, *, bot=False):
+        query = "?title=Bot%20Chat&include_hidden=1&limit=2" if bot else "?limit=20"
+        response = self._request("GET", "/api/sessions" + query, max_bytes=256 * 1024)
+        rows = response.get("data")
+        if not isinstance(rows, list) or len(rows) > 200:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        if any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("id"), str)
+            or self.transport.credential in row["id"]
+            for row in rows
+        ):
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return rows
 
     def dispatch(self, body, *, idempotency_key):
         if set(body) != {"input", "session_id", "origin", "child"}:

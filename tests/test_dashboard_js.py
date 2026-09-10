@@ -343,10 +343,10 @@ process.exit(0);
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_dashboard_task_picker_rendering_and_page_generation_fences():
-    script = TASK_HARNESS + r"""
+PAGE_HARNESS = TASK_HARNESS + r"""
 const slots = [], listeners = {};
-let cursor = 0, effects = [], latestTransport, heldSession, sessionRelease;
+const transports = [];
+let cursor = 0, effects = [], latestTransport, heldSession, sessionRelease, startOverride;
 const sdk = window.__HERMES_PLUGIN_SDK__;
 sdk.React.createElement = (tag, props, ...children) => ({ tag, props: props || {}, children });
 sdk.components = { Button: "button", Input: "input" };
@@ -383,12 +383,16 @@ window.removeEventListener = (name) => { delete listeners[name]; };
 fetchOverride = (url, body) => {
   if (url.endsWith("/status")) return { configured: true, voices: ["marin"], voice: "marin",
     taskContinuity: { supported: true } };
-  if (url.startsWith("/api/sessions?")) return { sessions: [{ id: "chosen-task",
-    title: "Selected task" }] };
+  if (url.endsWith("/targets")) return { ok: true, targets: [{ target_id: "chosen-task",
+    label: "Selected task", kind: "task", peer_id: "local", host_label: "Local host",
+    profile: "default", session_id: "chosen-session" }], peers: [], unavailable: [],
+    selection: { current: null, return_depth: 0 } };
   if (url.endsWith("/session")) {
     const session = { task: Object.assign({}, body.task, {
       connection_id: "page-connection", generation: 8, context: {
         workspace: "explicitly unavailable" },
+      session_id: "chosen-session", profile: "default", peer_id: "local", kind: "task",
+      label: "Selected task", host_label: "Local host", return_depth: 0,
       history: { messages: [{ id: "canonical-1", role: "user",
         content: "<img src=x onerror=bad()>Saved history" }] },
     }) };
@@ -404,7 +408,9 @@ vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
 const Page = window.__HERMES_TALK_TEST__.TalkPage;
 window.__HERMES_TALK_TEST__.TalkTransport.prototype.start = async function () {
   latestTransport = this;
+  transports.push(this);
   this.channel = { readyState: "open", send(s) { sent.push(JSON.parse(s)); }, close() {} };
+  if (startOverride) await startOverride(this);
 };
 const render = () => { cursor = 0; effects = []; const tree = Page(); effects.forEach((f) => f());
   return tree; };
@@ -414,16 +420,270 @@ const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
   : Array.isArray(tree) ? tree.map(label).join(" ") : label(tree.children);
 const button = (tree, text) => nodes(tree).find((node) => node.tag === "button" && label(
   node) === text);
+"""
+
+
+TARGET_PAGE_HARNESS = PAGE_HARNESS + r"""
+const baseFetch = fetchOverride, connections = new Map();
+const targetRows = [
+  { target_id: "a", kind: "task", label: "Task A", peer_id: "local", host_label: "Local host",
+    profile: "default", session_id: "task-a" },
+  { target_id: "b", kind: "bot", label: "Bot Chat", peer_id: "local", host_label: "Local host",
+    profile: "default", session_id: "bot-b" },
+  { target_id: "remote-a", kind: "task", label: "Shared task", peer_id: "peer-a",
+    host_label: "Shared host", profile: "default", session_id: "same-session" },
+  { target_id: "remote-b", kind: "task", label: "Shared task", peer_id: "peer-b",
+    host_label: "Shared host", profile: "default", session_id: "same-session" },
+];
+let serverCurrent = null, generation = 0, switchHandler, peerOffline = false;
+const returnStack = [];
+const descriptor = (targetId, tab) => {
+  const target = targetRows.find((row) => row.target_id === targetId);
+  assert(target, "unknown target fixture");
+  const task = Object.assign({}, target, { tab_id: tab, connection_id: "connection-" + ++generation,
+    generation, return_depth: returnStack.length, context: { workspace: "unavailable" },
+    history: { messages: [{ id: targetId + "-message", role: "user",
+      content: targetId + " history" }] },
+  });
+  connections.set(task.connection_id, task);
+  serverCurrent = task;
+  return { task, selection: { state: "activated", target_id: targetId,
+    return_depth: returnStack.length, label: target.label, host_label: target.host_label } };
+};
+const activate = (body) => {
+  const tab = serverCurrent.tab_id;
+  let next = body.target_id;
+  if (body.back) { assert(returnStack.length); next = returnStack.pop(); }
+  else returnStack.push(serverCurrent.target_id);
+  return descriptor(next, tab);
+};
+fetchOverride = (url, body) => {
+  if (url.endsWith("/targets")) return { ok: true,
+    targets: peerOffline && body.peer_id !== "local" ? [] : targetRows.filter((row) =>
+      row.peer_id === body.peer_id).map((row) => Object.assign({}, row,
+        { profile: body.profile || row.profile })),
+    peers: [{ peer_id: "peer-a", label: "Shared peer" },
+      { peer_id: "peer-b", label: "Shared peer" }],
+    unavailable: peerOffline ? [{ peer_id: body.peer_id, profile: body.profile,
+      reason: "offline" }] : [],
+    selection: { current: serverCurrent, return_depth: returnStack.length },
+  };
+  if (url.endsWith("/session")) return descriptor(body.task.target_id, body.task.tab_id);
+  if (url.endsWith("/switch")) {
+    if (switchHandler) return switchHandler(body);
+    return activate(body);
+  }
+  if (url.endsWith("/state")) {
+    const task = connections.get(body.connection_id);
+    return { task, history: task.history, interactions: [], jobs: task.target_id === "a" ? [
+      { run_id: "a-job", action_id: "a-action", status: "running", goal: "Work owned by A",
+        result_available: true, approval: { state: "unsupported" } },
+    ] : [] };
+  }
+  if (url.includes("/result?")) return { ok: true, output: "A available result", truncated: false };
+  return baseFetch(url, body);
+};
+const field = (tree, name) => nodes(tree).find((node) => node.props["aria-label"] === name);
+const choose = (name, value) => {
+  const tree = render(); field(tree, name).props.onChange({ target: { value } }); return render();
+};
+const click = (text) => {
+  const tree = render(), control = button(tree, text);
+  assert(control && !control.props.disabled, "missing/disabled button: " + text);
+  control.props.onClick(); return render();
+};
+const readyPage = async () => { await drain(); render(); await drain(); return render(); };
+const bootA = async () => {
+  render(); await readyPage(); choose("Task or Bot target", "a"); click("Join / resume task");
+  await readyPage(); await latestTransport.task.refresh(); return render();
+};
+"""
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        r"""
+let tree = await bootA(); const first = latestTransport;
+assert(label(tree).includes("Work owned by A"));
+click("View available result"); tree = await readyPage();
+assert(label(tree).includes("A available result"));
+choose("Task or Bot target", "b"); click("Switch target"); await readyPage();
+assert(first.closed); assert.equal(latestTransport.session.task.target_id, "b");
+await latestTransport.task.refresh(); tree = render();
+assert(!label(tree).includes("Work owned by A") && !label(tree).includes("A available result"));
+assert(label(tree).includes("Bot Chat · bot · Local host (local) / default"));
+first.cb.onTaskState({ task: first.session.task, history: first.session.task.history,
+  jobs: [{ run_id: "late-job", goal: "Late A job must stay on A" }] });
+assert(!label(render()).includes("Late A job"));
+const second = latestTransport; click("Return to previous (1)"); await readyPage();
+assert(second.closed); assert.equal(latestTransport.session.task.target_id, "a");
+await latestTransport.task.refresh(); tree = render();
+assert(label(tree).includes("Work owned by A"));
+assert(!label(tree).includes("A available result"), "cached result migrated across connections");
+const switches = requests.filter((request) => request.url.endsWith("/switch"));
+assert.equal(switches[0].body.target_id, "b");
+assert.equal(switches[0].body.connection_id, first.task.context.connection_id);
+assert.equal(switches[1].body.back, true);
+assert.equal(switches[1].body.connection_id, second.task.context.connection_id);
+assert.equal(sent.length, 0, "switch/return replay caused speech");
+""",
+        r"""
+await bootA(); const original = latestTransport;
+choose("Target source", "peer-a"); let tree = await readyPage();
+assert(label(tree).includes("Shared task · task · Shared host (peer-a) / default"));
+const firstCatalogId = field(tree, "Task or Bot target").children.flat().find((node) =>
+  node && node.props && node.props.value === "remote-a").props.value;
+choose("Target source", "peer-b"); tree = await readyPage();
+assert(label(tree).includes("Shared task · task · Shared host (peer-b) / default"));
+assert.notEqual(firstCatalogId, "remote-b");
+choose("Remote profile", "research"); await readyPage();
+const catalog = requests.filter((request) => request.url.endsWith("/targets")).at(-1);
+assert.equal(catalog.body.peer_id, "peer-b"); assert.equal(catalog.body.profile, "research");
+assert(!requests.some((request) => /profiles|discover/.test(request.url)));
+switchHandler = () => ({ ok: false, state: "ambiguous", choices: targetRows.slice(2) });
+choose("Target reference", "Shared task");
+field(render(), "Target reference").props.onChange({ target: { value: "Shared task" } });
+const form = nodes(render()).find((node) => node.tag === "form" &&
+  label(node).includes("Find and switch"));
+form.props.onSubmit({ preventDefault() {} }); tree = await readyPage();
+assert.equal(latestTransport, original); assert(!original.closed);
+assert(button(tree, "Shared task · task · Shared host (peer-a) / default"));
+assert(button(tree, "Shared task · task · Shared host (peer-b) / default"));
+switchHandler = () => Promise.reject(new Error("403: target revoked"));
+click("Shared task · task · Shared host (peer-b) / default"); tree = await readyPage();
+assert.equal(latestTransport, original); assert(!original.closed);
+assert(label(tree).includes("target revoked"));
+assert.equal(requests.filter((request) => request.url.endsWith("/close")).length, 0);
+""",
+        r"""
+await bootA(); const original = latestTransport;
+let release;
+switchHandler = (body) => new Promise((resolve) => { release = () => resolve(activate(body)); });
+choose("Task or Bot target", "b"); click("Switch target"); await waitFor(() => release);
+assert.equal(latestTransport, original); assert(!original.closed);
+click("Cancel switch"); release(); let tree = await readyPage();
+assert.equal(latestTransport, original); assert(!original.closed);
+assert.equal(transports.length, 1, "late minted descriptor installed a provider transport");
+assert(label(tree).includes("reconcile or rejoin"));
+assert(requests.find((request) => request.url.endsWith("/switch")).signal.aborted);
+const close = requests.filter((request) => request.url.endsWith("/close")).at(-1);
+assert.notEqual(close.body.connection_id, original.task.context.connection_id);
+switchHandler = null;
+click("Refresh targets / selection"); tree = await readyPage();
+assert(original.closed, "reconciliation left superseded voice active");
+assert(label(tree).includes("Server selection changed"));
+click("Return to previous (1)"); await readyPage();
+assert.equal(latestTransport.session.task.target_id, "a");
+""",
+        r"""
+await bootA(); let release;
+switchHandler = (body) => new Promise((resolve) => { release = () => resolve(activate(body)); });
+choose("Task or Bot target", "b"); click("Switch target"); await waitFor(() => release);
+click("Cancel switch"); switchHandler = null;
+choose("Task or Bot target", "a"); click("Switch target"); await readyPage();
+const replacement = latestTransport; release(); await readyPage();
+assert.equal(latestTransport, replacement); assert(!replacement.closed);
+assert.equal(transports.length, 2, "late switch superseded the newer connection");
+""",
+        r"""
+await bootA(); let finishStart;
+startOverride = (transport) => transport.session.task.target_id === "b"
+  ? new Promise((resolve) => { finishStart = resolve; }) : undefined;
+choose("Task or Bot target", "b"); click("Switch target");
+await waitFor(() => finishStart); let tree = render();
+const candidate = latestTransport; click("Cancel switch"); finishStart(); tree = await readyPage();
+assert(candidate.closed, "cancelled provider setup stayed live");
+assert(button(tree, "Join / resume task"));
+assert(label(tree).includes("reconcile or rejoin"));
+""",
+        r"""
+await bootA(); const original = latestTransport;
+fetchOverride = ((base) => (url, body) => url.endsWith("/tool") ? {
+  ok: true, output: "Target switch requested; awaiting activation", selection: { target_id: "b" },
+} : base(url, body))(fetchOverride);
+await original.sendTyped("Switch to Bot Chat"); created(original, "selector-response");
+emit(original, { type: "response.function_call_arguments.done", response_id: "selector-response",
+  call_id: "selector-call", name: "switch_target", arguments: '{"reference":"Bot Chat"}' });
+await waitFor(() => requests.some((request) => request.url.endsWith("/tool")));
+await drain();
+assert(!requests.some((request) => request.url.endsWith("/switch")), "intent escaped done barrier");
+done(original, "selector-response", [{ id: "selector-item", type: "function_call",
+  call_id: "selector-call" }]);
+await waitFor(() => latestTransport !== original); await readyPage();
+assert(original.closed); assert.equal(latestTransport.session.task.target_id, "b");
+const staged = events("input.final"); assert.equal(staged.length, 1);
+assert.equal(staged[0].body.text, "Switch to Bot Chat");
+assert.equal(staged[0].body.connection_id, original.task.context.connection_id);
+const request = requests.find((item) => item.url.endsWith("/switch"));
+assert.equal(request.body.target_id, "b");
+assert.equal(request.body.connection_id, original.task.context.connection_id);
+assert.equal(creates().length, 1, "new target automatically spoke old selector result");
+""",
+        r"""
+await bootA(); const original = latestTransport;
+fetchOverride = ((base) => (url, body) => url.endsWith("/tool") ? {
+  ok: true, output: "Return requested", selection: { back: true },
+} : base(url, body))(fetchOverride);
+switchHandler = () => Promise.reject(new Error("403: previous target revoked"));
+await original.sendTyped("Return to my previous task"); created(original, "return-response");
+emit(original, { type: "response.function_call_arguments.done", response_id: "return-response",
+  call_id: "return-call", name: "return_to_previous", arguments: "{}" });
+done(original, "return-response", [{ id: "return-item", type: "function_call",
+  call_id: "return-call" }]);
+await waitFor(() => creates().length === 2);
+assert.equal(latestTransport, original); assert(!original.closed);
+const output = sent.find((message) => message.item && message.item.call_id === "return-call");
+assert(output.item.output.includes("not confirmed"));
+assert.equal(creates()[1].response.metadata.talk_previous_response_id, "return-response");
+assert.equal(events("input.final").length, 1);
+assert.equal(requests.find((item) => item.url.endsWith("/switch")).body.back, true);
+""",
+        r"""
+await bootA();
+choose("Target source", "peer-a"); await readyPage();
+choose("Task or Bot target", "remote-a"); click("Switch target"); await readyPage();
+assert.equal(latestTransport.session.task.peer_id, "peer-a");
+click("Stop"); peerOffline = true; click("Refresh targets / selection");
+let tree = await readyPage(); assert(label(tree).includes("offline"));
+click("Return to previous (1)"); await readyPage();
+assert.equal(latestTransport.session.task.target_id, "a");
+const request = requests.filter((item) => item.url.endsWith("/switch")).at(-1);
+assert.equal(request.body.back, true); assert(!Object.hasOwn(request.body, "peer_id"));
+assert.equal(sent.length, 0);
+""",
+    ],
+    ids=["local-switch-return", "peer-ambiguity-refusal", "cancel-late-switch",
+         "stale-switch", "cancel-provider-start", "model-selection-intent", "model-refused-return",
+         "offline-return"],
+)
+def test_dashboard_target_switching(scenario):
+    script = TARGET_PAGE_HARNESS + "\n(async () => {\n" + scenario + r"""
+listeners.pagehide();
+process.exit(0);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)], cwd=ROOT, capture_output=True,
+        text=True, timeout=NODE_TIMEOUT_S, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_dashboard_task_picker_rendering_and_page_generation_fences():
+    script = PAGE_HARNESS + r"""
 (async () => {
   render(); await drain(); let tree = render();
-  assert(requests.some((r) => r.url === "/api/sessions?profile=default&order=recent&limit=20"));
+  assert(requests.some((r) => r.url.endsWith("/targets") && r.body.peer_id === "local" &&
+    !Object.hasOwn(r.body, "profile") && r.body.tab_id.startsWith("tab_")));
   assert(label(tree).includes("Legacy unbound Talk (no task history)"));
   const picker = nodes(tree).find((node) => node.tag === "select" && label(node).includes(
     "Selected task"));
   picker.props.onChange({ target: { value: "chosen-task" } }); tree = render();
   button(tree, "Join / resume task").props.onClick(); await drain(); tree = render();
   const body = requests.find((r) => r.url.endsWith("/session")).body;
-  assert.equal(body.task.session_id, "chosen-task"); assert.equal(body.task.profile, "default");
+  assert.equal(body.task.target_id, "chosen-task");
+  assert(!Object.hasOwn(body.task, "session_id") && !Object.hasOwn(body.task, "profile"));
   assert(body.task.tab_id.startsWith("tab_"));
   assert.deepEqual(body.task.page_reference, { url: window.location.href,
     title: "Dashboard task page" });

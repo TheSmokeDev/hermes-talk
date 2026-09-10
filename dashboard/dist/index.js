@@ -355,6 +355,20 @@
       void response.row.tail.then(async () => {
         if (this.closed || response.row.incomplete) return;
         if (response.declared.length) {
+          const selections = response.declared.map((id) => response.calls.get(id).result.selection).filter(Boolean);
+          if (selections.length) {
+            // A tool supplies an intent. Only the page's authorized /switch
+            // receipt can replace this connection; original input stays here.
+            const same = selections.every((intent) => JSON.stringify(intent) === JSON.stringify(selections[0]));
+            const activate = this.transport.cb.onSelectionIntent;
+            if (same && activate && await activate(selections[0], this.transport)) return;
+            if (this.closed) return;
+            if (!same) this.report("Conflicting target selections require an explicit choice.");
+            for (const id of response.declared) {
+              const result = response.calls.get(id).result;
+              if (result.selection) result.message.item.output = "Target activation was not confirmed on this connection. Do not claim a target change; ask the operator to reconcile or retry.";
+            }
+          }
           for (const id of response.declared) {
             const result = response.calls.get(id).result;
             result.message.item.id = clientId("item_");
@@ -1024,19 +1038,21 @@
         /* a malformed arguments blob executes with {} */
       }
       this.cb.onStatus("Using " + name + "…");
-      let output;
+      let output, selection;
       try {
         const body = Object.assign({ name: name, arguments: args }, binding || {});
         const res = binding ? await this.task.request("/tool", body)
           : await apiPost("/tool", body, TOOL_TIMEOUT_MS);
         if (this.closed) return null;
         output = res && res.output ? String(res.output) : "(no output)";
+        if (binding && res && res.ok !== false && res.selection) selection = res.selection;
       } catch (err) {
         if (binding) { this.task.report(errorText(err)); return null; }
         output = name + " failed: " + errorText(err);
       }
       return {
         output: output,
+        selection: selection,
         message: {
           type: "conversation.item.create",
           item: { type: "function_call_output", call_id: callId, output: output },
@@ -1112,6 +1128,12 @@
 
   // -- page -----------------------------------------------------------------
 
+  function targetLabel(target) {
+    return (target.label || target.target_id || "Unavailable target") + " · " + (target.kind || "task") +
+      " · " + (target.host_label || "unavailable host") + " (" + (target.peer_id || "local") +
+      ") / " + (target.profile || "unavailable profile");
+  }
+
   function TalkPage() {
     const [status, setStatus] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -1123,7 +1145,11 @@
     const [error, setError] = useState("");
     const [needsToken, setNeedsToken] = useState(false);
     const [tokenDraft, setTokenDraft] = useState("");
-    const [profile, setProfile] = useState("default");
+    const [profile, setProfile] = useState("");
+    const [peerId, setPeerId] = useState("local");
+    const [peers, setPeers] = useState([]);
+    const [localProfiles, setLocalProfiles] = useState([]);
+    const [unavailable, setUnavailable] = useState([]);
     const [tasks, setTasks] = useState([]);
     const [selectedTask, setSelectedTask] = useState("");
     const [catalogError, setCatalogError] = useState("");
@@ -1132,10 +1158,19 @@
     const [results, setResults] = useState({});
     const [typed, setTyped] = useState("");
     const [sending, setSending] = useState(false);
+    const [switching, setSwitching] = useState(false);
+    const [choices, setChoices] = useState([]);
+    const [reference, setReference] = useState("");
+    const [selection, setSelection] = useState(null);
+    const [catalogReload, setCatalogReload] = useState(0);
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
     const sessionAbort = useRef(null);
+    const switchAbort = useRef(null);
+    const switchEpoch = useRef(0);
+    const switchInstallEpoch = useRef(null);
+    const lastTask = useRef(null);
     const tabId = useRef(null);
     if (!tabId.current) tabId.current = taskTabId();
     const rowId = useRef(1);
@@ -1180,6 +1215,9 @@
         connectionEpoch.current++;
         if (sessionAbort.current) sessionAbort.current.abort();
         sessionAbort.current = null;
+        switchEpoch.current++;
+        if (switchAbort.current) switchAbort.current.abort();
+        switchAbort.current = null;
         if (transportRef.current) transportRef.current.stop();
         transportRef.current = null;
       };
@@ -1194,14 +1232,42 @@
       const controller = new AbortController();
       setTasks([]);
       setCatalogError("");
-      if (profile.trim()) {
-        void SDK.fetchJSON("/api/sessions?profile=" + encodeURIComponent(profile.trim()) + "&order=recent&limit=20",
-          { signal: controller.signal }).then((res) => {
-          if (!controller.signal.aborted) setTasks(Array.isArray(res) ? res : (res.sessions || []));
-        }).catch((err) => { if (!controller.signal.aborted) setCatalogError(errorText(err)); });
-      }
+      setUnavailable([]);
+      const catalogEpoch = connectionEpoch.current;
+      const body = { peer_id: peerId, tab_id: tabId.current };
+      if (profile.trim()) body.profile = profile.trim();
+      void apiCall("/targets", { method: "POST", body: JSON.stringify(body), signal: controller.signal }).then((res) => {
+        if (controller.signal.aborted) return;
+        if (!res || !res.ok || !Array.isArray(res.targets)) throw new Error("Authorized target catalog is unavailable.");
+        setTasks(res.targets);
+        setPeers(res.peers || []);
+        setUnavailable(res.unavailable || []);
+        if (peerId === "local") setLocalProfiles((prev) => Array.from(new Set(prev.concat(res.targets.map((item) => item.profile)))).filter(Boolean));
+        if (catalogEpoch === connectionEpoch.current && res.selection) {
+          const current = res.selection.current;
+          const activeTask = transportRef.current && transportRef.current.task;
+          if (current && activeTask && (current.connection_id !== activeTask.context.connection_id ||
+              current.generation !== activeTask.context.generation)) {
+            connectionEpoch.current++;
+            transportRef.current.stop();
+            transportRef.current = null;
+            setPhase("idle");
+            setLive("");
+            setTaskState(null);
+            setTranscript([]);
+            setStages({});
+            setResults({});
+            setError("Server selection changed. Rejoin or Return to continue.");
+          }
+          if (!transportRef.current) {
+            lastTask.current = current || null;
+            setSelection(res.selection);
+            if (current) setSelectedTask(current.target_id);
+          }
+        }
+      }).catch((err) => { if (!controller.signal.aborted) setCatalogError(errorText(err)); });
       return () => controller.abort();
-    }, [profile]);
+    }, [peerId, profile, catalogReload]);
 
     useEffect(() => {
       let cancelled = false;
@@ -1237,6 +1303,37 @@
       });
     }, []);
 
+    async function installSession(session, epoch) {
+      const current = () => epoch === connectionEpoch.current;
+      const transport = new TalkTransport(session, {
+        onStatus: (message) => { if (current()) setLive(message); },
+        onTranscript: (role, text, final) => { if (current()) appendTranscript(role, text, final); },
+        onError: (message) => { if (current()) setError(message); },
+        onTaskState: (state) => { if (current()) setTaskState(state); },
+        onTaskStage: (row) => { if (current()) setStages((prev) => Object.assign({}, prev, { [row.input_id]: row })); },
+        onSelectionIntent: (intent, source) => current() && source === transportRef.current
+          ? switchTarget(intent, source) : Promise.resolve(false),
+      });
+      transportRef.current = transport;
+      lastTask.current = session.task || null;
+      setSelection(session.selection || (session.task ? { return_depth: session.task.return_depth || 0 } : null));
+      setTaskState(session.task ? { task: session.task, history: session.task.history, interactions: [], jobs: [] } : null);
+      setTranscript([]);
+      setStages({});
+      setResults({});
+      setRuns([]);
+      setTyped("");
+      setSending(false);
+      setChoices([]);
+      if (session.task && session.task.target_id) {
+        setSelectedTask(session.task.target_id);
+        if (session.task.peer_id) setPeerId(session.task.peer_id);
+        if (session.task.profile) setProfile(session.task.profile);
+      }
+      await transport.start();
+      if (current() && !transport.closed) setPhase("active");
+    }
+
     async function startTalk() {
       setError("");
       if (typeof RTCPeerConnection === "undefined" || !navigator.mediaDevices) {
@@ -1254,7 +1351,7 @@
       sessionAbort.current = controller;
       try {
         const body = voice ? { voice: voice } : {};
-        if (selectedTask) body.task = { session_id: selectedTask, profile: profile.trim(), tab_id: tabId.current,
+        if (selectedTask) body.task = { target_id: selectedTask, tab_id: tabId.current,
           page_reference: { url: window.location.href, title: document.title } };
         const session = await apiCall("/session", {
           method: "POST", body: JSON.stringify(body), signal: controller.signal,
@@ -1263,24 +1360,12 @@
           new TalkTransport(session, {}).stop();
           return;
         }
-        if (selectedTask && (!session.task || session.task.session_id !== selectedTask ||
-            session.task.profile !== profile.trim() || session.task.tab_id !== tabId.current)) {
+        if (selectedTask && (!session.task || session.task.target_id !== selectedTask ||
+            session.task.tab_id !== tabId.current)) {
           new TalkTransport(session, {}).stop();
           throw new Error("Bound task context did not match the selected task; join was refused.");
         }
-        const current = () => epoch === connectionEpoch.current;
-        const transport = new TalkTransport(session, {
-          onStatus: (message) => { if (current()) setLive(message); },
-          onTranscript: (role, text, final) => { if (current()) appendTranscript(role, text, final); },
-          onError: (message) => { if (current()) setError(message); },
-          onTaskState: (state) => { if (current()) setTaskState(state); },
-          onTaskStage: (row) => { if (current()) setStages((prev) => Object.assign({}, prev, { [row.input_id]: row })); },
-        });
-        transportRef.current = transport;
-        if (session.task) setTaskState({ task: session.task, history: session.task.history, interactions: [], jobs: [] });
-        await transport.start();
-        if (!current() || transport.closed) return;
-        setPhase("active");
+        await installSession(session, epoch);
       } catch (err) {
         if (epoch !== connectionEpoch.current) return;
         if (transportRef.current) transportRef.current.stop();
@@ -1295,6 +1380,7 @@
 
     function stopTalk() {
       connectionEpoch.current++;
+      cancelSwitch(false);
       if (sessionAbort.current) sessionAbort.current.abort();
       sessionAbort.current = null;
       if (transportRef.current) transportRef.current.stop();
@@ -1302,6 +1388,88 @@
       setPhase("idle");
       setLive("");
       setSending(false);
+    }
+
+    function cancelSwitch(showNotice = true) {
+      switchEpoch.current++;
+      if (switchAbort.current) switchAbort.current.abort();
+      switchAbort.current = null;
+      if (switchInstallEpoch.current !== null && switchInstallEpoch.current === connectionEpoch.current) {
+        connectionEpoch.current++;
+        if (transportRef.current) transportRef.current.stop();
+        transportRef.current = null;
+        setPhase("idle");
+        setLive("");
+      }
+      switchInstallEpoch.current = null;
+      setSwitching(false);
+      if (showNotice) setError("Switch cancelled locally. If the server already activated it, reconcile or rejoin the selected target.");
+    }
+
+    async function switchTarget(intent, source) {
+      const old = transportRef.current;
+      if (source && source !== old) return false;
+      const owner = old && old.task ? old.task.context : lastTask.current;
+      if (!owner || !owner.connection_id || switchAbort.current) return false;
+      const body = { connection_id: owner.connection_id, generation: owner.generation,
+        page_reference: { url: window.location.href, title: document.title } };
+      if (intent.back === true) body.back = true;
+      else if (typeof intent.target_id === "string" && intent.target_id) body.target_id = intent.target_id;
+      else if (typeof intent.reference === "string" && intent.reference.trim()) body.reference = intent.reference.trim();
+      else { setError("Target selection is missing an authorized target or exact reference."); return false; }
+      for (const key of ["peer_id", "profile"]) if (typeof intent[key] === "string" && intent[key]) body[key] = intent[key];
+      const operation = ++switchEpoch.current;
+      const controller = new AbortController();
+      switchAbort.current = controller;
+      setSwitching(true);
+      setChoices([]);
+      setError("");
+      let installedEpoch = null;
+      try {
+        const session = await apiCall("/switch", {
+          method: "POST", body: JSON.stringify(body), signal: controller.signal,
+        });
+        if (operation !== switchEpoch.current || controller.signal.aborted || transportRef.current !== old) {
+          if (session && session.task) new TalkTransport(session, {}).stop();
+          return false;
+        }
+        if (session && session.ok === false && session.state === "ambiguous") {
+          setChoices(session.choices || []);
+          setError("Choose the exact target; the current connection is unchanged.");
+          return false;
+        }
+        if (!session || !session.task || !session.selection || session.selection.state !== "activated" ||
+            session.selection.target_id !== session.task.target_id ||
+            session.task.tab_id !== tabId.current ||
+            (body.target_id && session.task.target_id !== body.target_id)) {
+          if (session && session.task) new TalkTransport(session, {}).stop();
+          throw new Error("Target switch was not authorized and activated.");
+        }
+        installedEpoch = ++connectionEpoch.current;
+        switchInstallEpoch.current = installedEpoch;
+        if (old) old.stop();
+        transportRef.current = null;
+        setPhase("starting");
+        setLive("Connecting to " + targetLabel(session.task) + "…");
+        await installSession(session, installedEpoch);
+        return operation === switchEpoch.current && installedEpoch === connectionEpoch.current;
+      } catch (err) {
+        if (operation !== switchEpoch.current || controller.signal.aborted) return false;
+        if (installedEpoch !== null && installedEpoch === connectionEpoch.current) {
+          if (transportRef.current) transportRef.current.stop();
+          transportRef.current = null;
+          setPhase("idle");
+          setLive("");
+          setError("Target activated, but voice connection failed. Rejoin or Return. " + errorText(err));
+        } else handleError(err);
+        return false;
+      } finally {
+        if (switchAbort.current === controller) {
+          switchAbort.current = null;
+          switchInstallEpoch.current = null;
+          setSwitching(false);
+        }
+      }
     }
 
     async function sendTyped() {
@@ -1335,6 +1503,8 @@
     const ready = Boolean(status && status.configured);
     const active = phase === "active";
     const starting = phase === "starting";
+    const bound = Boolean((transportRef.current && transportRef.current.task) || lastTask.current);
+    const returnDepth = Number((selection || {}).return_depth || 0);
 
     return h("div", { className: "ht-page" },
       h("div", { className: "ht-head" },
@@ -1355,23 +1525,53 @@
       ),
 
       h("div", { className: "ht-note" },
-        h("label", { className: "ht-field" }, "Task profile",
-          h(C.Input, { value: profile, disabled: active || starting,
-            onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); setTaskState(null); } })),
-        h("label", { className: "ht-field" }, "Task connection",
-          h("select", { className: "ht-select", value: selectedTask, disabled: active || starting,
-            onChange: (e) => { setSelectedTask(e.target.value); setTaskState(null); } },
-            h("option", { value: "" }, "Legacy unbound Talk (no task history)"),
+        h("label", { className: "ht-field" }, "Target source",
+          h("select", { className: "ht-select", value: peerId, disabled: starting || switching, "aria-label": "Target source",
+            onChange: (e) => { setPeerId(e.target.value); setProfile(e.target.value === "local" ? "" : "default"); setSelectedTask(""); } },
+            h("option", { value: "local" }, "Local host"),
+            peers.filter((peer) => peer.peer_id !== "local").map((peer) =>
+              h("option", { key: peer.peer_id, value: peer.peer_id }, peer.label + " · " + peer.peer_id)))),
+        h("label", { className: "ht-field" }, peerId === "local" ? "Local profile" : "Remote profile (explicit name)",
+          peerId === "local" ? h("select", { className: "ht-select", value: profile, disabled: starting || switching, "aria-label": "Local profile",
+            onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } },
+            h("option", { value: "" }, "All authorized local profiles"),
+            localProfiles.map((name) => h("option", { key: name, value: name }, name)))
+            : h(C.Input, { value: profile, disabled: starting || switching, placeholder: "default", "aria-label": "Remote profile",
+              onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } })),
+        h("label", { className: "ht-field" }, "Task or Bot target",
+          h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
+            onChange: (e) => setSelectedTask(e.target.value) },
+            h("option", { value: "", disabled: active }, "Legacy unbound Talk (no task history)"),
             tasks.map((task) => {
-              const id = task.session_id || task.id;
+              const id = task.target_id;
               return id && h("option", { key: id, value: id,
                 disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
-                (task.title || task.name || id) + " · " + id);
+                targetLabel(task));
             }))),
+        h("div", { className: "ht-token-row" },
+          bound && h(C.Button, { disabled: !selectedTask || starting || switching,
+            onClick: () => void switchTarget({ target_id: selectedTask }) }, "Switch target"),
+          bound && h(C.Button, { disabled: returnDepth < 1 || starting || switching,
+            onClick: () => void switchTarget({ back: true }) }, "Return to previous (" + returnDepth + ")"),
+          h(C.Button, { disabled: starting || switching,
+            onClick: () => setCatalogReload((value) => value + 1) }, "Refresh targets / selection"),
+          switching && h(C.Button, { onClick: () => cancelSwitch() }, "Cancel switch")),
+        bound && h("form", { className: "ht-token-row", onSubmit: (event) => {
+          event.preventDefault(); void switchTarget({ reference: reference, peer_id: peerId, profile: profile });
+        } }, h(C.Input, { value: reference, disabled: starting || switching, placeholder: "Exact target name",
+          "aria-label": "Target reference", onChange: (e) => setReference(e.target.value) }),
+          h(C.Button, { type: "submit", disabled: !reference.trim() || starting || switching }, "Find and switch")),
+        choices.length > 0 && h("div", { className: "ht-out" }, "Choose a target:",
+          choices.map((choice) => h(C.Button, { key: choice.target_id, disabled: starting || switching,
+            onClick: () => void switchTarget({ target_id: choice.target_id }) }, targetLabel(choice)))),
+        selection && selection.current && !taskState && h("div", { className: "ht-out" },
+          "Saved selection: " + targetLabel(selection.current)),
         selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
         status && status.taskContinuity && !status.taskContinuity.supported &&
           h("div", null, "Task continuity unavailable: " + status.taskContinuity.reason),
-        catalogError && h("div", { className: "ht-error" }, "Task list unavailable: " + catalogError)),
+        unavailable.map((item, index) => h("div", { key: index, className: "ht-out" },
+          item.peer_id + " / " + item.profile + ": " + item.reason)),
+        catalogError && h("div", { className: "ht-error" }, "Target list unavailable: " + catalogError)),
 
       needsToken && h("div", { className: "ht-note ht-note-warn" },
         h("div", { className: "ht-note-title" }, "This dashboard needs the hermes-talk token"),
@@ -1427,8 +1627,7 @@
       taskState && h("section", { className: "ht-card" },
         h("div", { className: "ht-card-head" }, "Bound task and server context"),
         h("div", { className: "ht-row ht-text" },
-          "Task: " + ((taskState.task || {}).session_id || "unavailable") +
-          " · profile: " + ((taskState.task || {}).profile || "unavailable") + "\n" +
+          targetLabel(taskState.task || {}) + " · session: " + ((taskState.task || {}).session_id || "unavailable") + "\n" +
           JSON.stringify((taskState.task || {}).context || { state: "unavailable" }, null, 2)),
         h("div", { className: "ht-card-head" }, "Canonical task history"),
         !((taskState.history || {}).messages || []).length && h("div", { className: "ht-empty" }, "No canonical messages available."),

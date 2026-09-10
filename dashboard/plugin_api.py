@@ -64,6 +64,7 @@ import talk_identity  # noqa: E402
 import talk_realtime  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
+import talk_target_selection  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
 from talk_dashboard_gateway import DashboardTaskError  # noqa: E402
@@ -165,6 +166,7 @@ _log = logging.getLogger(__name__)
 
 router = APIRouter()
 TASKS = talk_dashboard_tasks.DashboardTasks()
+TARGETS = talk_target_selection.TargetSelection(TASKS)
 
 DASHBOARD_TOKEN_ENV = "TALK_DASHBOARD_TOKEN"
 DASHBOARD_TOKEN_HEADER = "x-talk-token"
@@ -301,6 +303,8 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
     tools = talk_tools.default_talk_tools()
     if bound is not None:
         tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
+        if getattr(bound, "target_record", None) is not None:
+            tools += talk_target_selection.selection_tools()
         for tool in tools:
             if tool["name"] == "delegate_task":
                 tool["description"] = (
@@ -422,6 +426,8 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    if isinstance(body.get("task"), dict) and "target_id" in body["task"]:
+        return await _target_session(request, body, initial=True)
     bound = None
     if "task" in body and body["task"] is not None:
         bound = await _task_call(TASKS.join, request, body["task"])
@@ -516,6 +522,8 @@ async def run_tool(request: Request) -> dict:
     require_dashboard_auth(request)
     body = await _json_body(request)
     if "connection_id" in body:
+        if body.get("name") in talk_target_selection.SELECTION_TOOLS:
+            return await _task_call(TARGETS.tool, request, body)
         return await _task_call(TASKS.tool, request, body)
     name = str(body.get("name") or "").strip()
     arguments = body.get("arguments")
@@ -777,13 +785,94 @@ async def _task_call(function, request, body):
     except DashboardTaskError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
     except (HistoryError, TaskEventError) as exc:
+        code = getattr(exc, "code", "")
         mapped = DashboardTaskError(
-            "connection_stale"
-            if getattr(exc, "code", "") in {"stale_generation", "stale_attachment", "not_attached"}
-            else "gateway_refused",
+            {
+                "stale_generation": "connection_stale",
+                "stale_attachment": "connection_stale",
+                "not_attached": "connection_stale",
+                "unauthorized": "target_auth_denied",
+                "unavailable": "target_offline",
+                "unsupported": "target_unsupported",
+            }.get(code, "gateway_refused"),
             409,
         )
         raise HTTPException(status_code=409, detail=mapped.detail()) from exc
+
+
+async def _target_session(request, body, *, initial=False):
+    voice_mode = _resolve_voice_mode()
+    text_output = voice_mode == "cascade"
+    if text_output:
+        try:
+            talk_config.cascade_voice_config(talk_config.talk_provider())
+        except talk_config.TalkConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        voice = ""
+    else:
+        voice = _resolve_voice(body.get("voice"))
+    try:
+        auth = talk_auth.resolve_auth()
+    except talk_auth.TalkAuthError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    payload = body["task"] if initial else body
+    # A cancelled preparation is allowed to finish so its reserved candidate can be retired.
+    preparation = asyncio.create_task(
+        _task_call(lambda req, data: TARGETS.prepare(req, data, initial=initial), request, payload)
+    )
+    try:
+        prepared = await asyncio.shield(preparation)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            abandoned = await preparation
+            if not isinstance(abandoned, dict):
+                await asyncio.to_thread(TARGETS.cancel, abandoned)
+        raise
+    if isinstance(prepared, dict):
+        return prepared
+    activated = False
+    try:
+        descriptor = await asyncio.to_thread(
+            _mint, auth.token, voice, text_output=text_output, bound=prepared.bound
+        )
+        if hasattr(request, "is_disconnected") and await request.is_disconnected():
+            raise HTTPException(
+                status_code=409, detail=DashboardTaskError("connection_stale", 409).detail()
+            )
+        activation = asyncio.create_task(_task_call(TARGETS.activate, request, prepared))
+        try:
+            selection = await asyncio.shield(activation)
+        except asyncio.CancelledError:
+            # The durable CAS may already have accepted. Never cancel that state retroactively.
+            await activation
+            activated = True
+            raise
+        activated = True
+        return {
+            "ok": True,
+            **descriptor.to_wire(),
+            "authSource": auth.source,
+            "voiceMode": voice_mode,
+            "task": TASKS.descriptor(prepared.bound),
+            "selection": selection,
+        }
+    except talk_wire.TalkWireError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if not activated:
+            await asyncio.to_thread(TARGETS.cancel, prepared)
+
+
+@router.post("/targets")
+async def task_targets(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TARGETS.catalog.catalog, request, await _json_body(request))
+
+
+@router.post("/switch")
+async def task_switch(request: Request):
+    require_dashboard_auth(request)
+    return await _target_session(request, await _json_body(request))
 
 
 @router.post("/event")
@@ -831,6 +920,8 @@ ROUTE_HANDLERS = (
     task_state,
     task_result,
     task_close,
+    task_targets,
+    task_switch,
 )
 
 
