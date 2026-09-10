@@ -165,6 +165,9 @@ process.exit(0);
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_dashboard_cascade_relays_text_and_plays_pcm_until_barge_in():
     """The cascade transport: NDJSON out, PCM onto the AudioContext, abort kills both."""
 
     script = r"""
