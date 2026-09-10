@@ -84,6 +84,303 @@
     return apiCall(path, { method: "POST", body: JSON.stringify(body || {}) }, timeoutMs);
   }
 
+  function clientId(prefix) {
+    return prefix + window.crypto.randomUUID().replace(/-/g, "");
+  }
+
+  function taskTabId() {
+    const key = "hermes-talk-task-tab";
+    try {
+      let id = window.sessionStorage.getItem(key);
+      if (!id) { id = clientId("tab_"); window.sessionStorage.setItem(key, id); }
+      return id;
+    } catch (e) { return clientId("tab_"); }
+  }
+
+  /** A bound connection owns every request and every provider identity below. */
+  class TaskContinuity {
+    constructor(transport, task) {
+      this.transport = transport;
+      this.context = Object.freeze({ connection_id: task.connection_id, generation: task.generation });
+      this.closed = false;
+      this.controllers = new Set();
+      this.inputs = new Map();
+      this.committed = new Set();
+      this.requests = new Map();
+      this.responses = new Map();
+      this.completedGroups = [];
+      this.toolTail = Promise.resolve();
+      this.stateTail = null;
+    }
+
+    async request(path, body, method) {
+      if (this.closed) throw new Error("Task connection closed.");
+      const controller = new AbortController();
+      this.controllers.add(controller);
+      const timer = window.setTimeout(() => controller.abort(), OFFER_TIMEOUT_MS);
+      try {
+        const opts = { method: method || "POST", signal: controller.signal };
+        if (opts.method === "POST") opts.body = JSON.stringify(Object.assign({}, body, this.context));
+        const result = await apiCall(path, opts);
+        if (this.closed || controller.signal.aborted) throw new Error("Task connection closed or request cancelled.");
+        return result;
+      } finally {
+        window.clearTimeout(timer);
+        this.controllers.delete(controller);
+      }
+    }
+
+    report(message) {
+      if (!this.closed) this.transport.cb.onError(message);
+    }
+
+    refresh() {
+      if (this.closed) return Promise.resolve();
+      if (this.stateTail) return this.stateTail;
+      this.stateTail = this.request("/state", {}).then((state) => {
+        if (!this.closed && this.transport.cb.onTaskState) this.transport.cb.onTaskState(state);
+      }).catch((err) => this.report(errorText(err))).finally(() => { this.stateTail = null; });
+      return this.stateTail;
+    }
+
+    async result(runId) {
+      const query = "?connection_id=" + encodeURIComponent(this.context.connection_id) +
+        "&generation=" + encodeURIComponent(this.context.generation) + "&run_id=" + encodeURIComponent(runId);
+      // Results are inert UI data. Never inject them into the provider conversation.
+      return this.request("/result" + query, null, "GET");
+    }
+
+    notice(row, state) {
+      if (!this.closed && this.transport.cb.onTaskStage) {
+        this.transport.cb.onTaskStage({ input_id: row.input_id, text: row.text, state: state });
+      }
+    }
+
+    event(row, body) {
+      const next = row.tail.then(async () => {
+        const receipt = await row.ready;
+        if (!receipt || this.closed) return null;
+        return this.request("/event", Object.assign({}, body, { interaction_id: receipt.interaction_id }));
+      });
+      row.tail = next.catch((err) => {
+        row.incomplete = true;
+        this.notice(row, "incomplete");
+        this.report(errorText(err));
+      });
+      return next;
+    }
+
+    incomplete(row, reason) {
+      if (this.closed || row.incomplete) return;
+      row.incomplete = true;
+      this.notice(row, "incomplete: " + reason);
+      void this.event(row, { kind: "interaction.incomplete", reason: reason }).then(() => this.refresh()).catch(() => {});
+    }
+
+    stage(inputId, type, text) {
+      if (this.closed) return null;
+      if (!inputId || !text) {
+        this.report("Input is unlinked: a stable provider item ID and finalized text are required.");
+        return null;
+      }
+      if (this.inputs.has(inputId)) {
+        const existing = this.inputs.get(inputId);
+        if (existing.text !== text || existing.type !== type) this.incomplete(existing, "linkage_ambiguous");
+        return existing;
+      }
+      const row = { input_id: inputId, type: type, text: text, tail: Promise.resolve(),
+        requested: false, incomplete: false, items: [inputId] };
+      this.inputs.set(inputId, row);
+      this.notice(row, "staging");
+      row.ready = this.request("/event", {
+        kind: "input.final", input_id: inputId, input_type: type, text: text,
+      }).then((receipt) => {
+        if (!receipt || !receipt.interaction_id || receipt.input_id !== inputId) throw new Error("Invalid input stage receipt.");
+        row.receipt = receipt;
+        this.notice(row, receipt.state || "staged");
+        void this.refresh();
+        return receipt;
+      }).catch((err) => {
+        row.incomplete = true;
+        this.notice(row, "incomplete: input_stage_failed");
+        this.report(errorText(err));
+        return null;
+      });
+      return row;
+    }
+
+    async typed(text) {
+      const row = this.stage(clientId("item_"), "typed", text.trim());
+      if (!row) return false;
+      const receipt = await row.ready;
+      if (!receipt || this.closed || row.incomplete) return false;
+      this.transport.send({ type: "conversation.item.create", item: {
+        id: row.input_id, type: "message", role: "user", content: [{ type: "input_text", text: row.text }],
+      } });
+      this.requestResponse(row);
+      return true;
+    }
+
+    voice(event) {
+      const row = this.stage(event.item_id, "voice", event.transcript);
+      if (row) void this.respondToAudio(row);
+    }
+
+    async respondToAudio(row) {
+      const receipt = await row.ready;
+      if (receipt && !this.closed && !row.incomplete && this.committed.has(row.input_id) && !row.requested) {
+        this.requestResponse(row);
+      }
+    }
+
+    requestResponse(row, previous) {
+      if (this.closed || row.incomplete) return;
+      if (!previous && row.requested) return;
+      row.requested = true;
+      const token = clientId("req_");
+      const metadata = { talk_request_id: token, talk_interaction_id: row.receipt.interaction_id,
+        talk_input_id: row.input_id, talk_previous_response_id: previous || "" };
+      this.requests.set(token, { row: row, previous: previous || "", claimed: false });
+      // Explicit input references keep overlapping ASR completions from selecting
+      // whichever utterance happens to be last in the provider conversation.
+      const prior = this.completedGroups.filter((group) => !group.row.incomplete && group.row !== row)
+        .flatMap((group) => group.items);
+      this.transport.send({ type: "response.create", response: {
+        metadata: metadata, input: prior.concat(row.items).map((id) => ({ type: "item_reference", id: id })),
+      } });
+    }
+
+    rememberCompleted(row) {
+      if (this.closed || row.incomplete || row.remembered) return;
+      row.remembered = true;
+      this.completedGroups.push({ row: row, items: row.items.slice() });
+      // Drop whole interactions, including oversized groups, so a retained
+      // function output never loses its matching input/call context.
+      let count = this.completedGroups.reduce((total, group) => total + group.items.length, 0);
+      while (count > 64) count -= this.completedGroups.shift().items.length;
+    }
+
+    created(response) {
+      const meta = response.metadata || {};
+      const request = this.requests.get(meta.talk_request_id);
+      if (!response.id || !request || meta.talk_interaction_id !== request.row.receipt.interaction_id ||
+          meta.talk_input_id !== request.row.input_id || meta.talk_previous_response_id !== request.previous) {
+        this.report("Response is unlinked: provider response metadata did not identify a staged input.");
+        return;
+      }
+      if (this.responses.has(response.id)) return;
+      if (request.claimed) { this.incomplete(request.row, "linkage_ambiguous"); return; }
+      request.claimed = true;
+      const current = { id: response.id, row: request.row, previous: request.previous,
+        calls: new Map(), declared: null, done: false, finished: false };
+      this.responses.set(response.id, current);
+      const body = { kind: "response.started", response_id: response.id };
+      if (request.previous) body.previous_response_id = request.previous;
+      void this.event(current.row, body).catch(() => {});
+    }
+
+    final(event, text) {
+      const response = this.responses.get(event.response_id);
+      if (!response) { this.report("Final response is unlinked; it has not been saved."); return; }
+      if (!event.item_id) { this.incomplete(response.row, "linkage_ambiguous"); return; }
+      if (!response.row.items.includes(event.item_id)) response.row.items.push(event.item_id);
+      void this.event(response.row, { kind: "response.final", response_id: response.id,
+        output_item_id: event.item_id, text: text }).catch(() => {});
+    }
+
+    tool(event) {
+      const response = this.responses.get(event.response_id);
+      if (!response || !event.call_id || !event.name) {
+        this.report("Tool call refused: original input, response and call IDs must be linked.");
+        return;
+      }
+      if (response.done && !response.declared.includes(event.call_id)) {
+        this.incomplete(response.row, "missing_tool_calls");
+        return;
+      }
+      if (response.calls.has(event.call_id)) return;
+      const call = { done: false, result: null };
+      response.calls.set(event.call_id, call);
+      this.toolTail = this.toolTail.then(async () => {
+        await response.row.tail;
+        if (this.closed || response.row.incomplete) return;
+        const receipt = await response.row.ready;
+        if (!receipt || this.closed) return;
+        call.result = await this.transport.handleFunctionCall(event, {
+          interaction_id: receipt.interaction_id, response_id: response.id, call_id: event.call_id,
+        });
+        if (this.closed) return;
+        if (!call.result) { this.incomplete(response.row, "tool_failed"); return; }
+        call.done = true;
+        void this.refresh();
+        this.finish(response);
+      }).catch((err) => { this.report(errorText(err)); this.incomplete(response.row, "tool_failed"); });
+    }
+
+    done(value) {
+      const response = this.responses.get(value.id);
+      if (!response) { this.report("Completed response is unlinked; it has not been saved."); return; }
+      if (response.done) return;
+      const output = Array.isArray(value.output) ? value.output : [];
+      if (!Array.isArray(value.output)) { this.incomplete(response.row, "missing_tool_calls"); return; }
+      response.declared = output.filter((item) => item.type === "function_call").map((item) => item.call_id);
+      if (response.declared.some((id) => !id) || new Set(response.declared).size !== response.declared.length) {
+        this.incomplete(response.row, "missing_tool_calls"); return;
+      }
+      for (const item of output) {
+        if (item.id && !response.row.items.includes(item.id)) response.row.items.push(item.id);
+        if (item.type === "message") {
+          const text = (item.content || []).map((part) => part.text || part.transcript || "").join("");
+          if (text) this.final({ response_id: response.id, item_id: item.id }, text);
+        }
+      }
+      response.done = true;
+      response.doneReceipt = this.event(response.row, { kind: "response.done", response_id: response.id,
+        status: value.status === "completed" ? "completed" : value.status === "cancelled" ? "cancelled" : "failed",
+        tool_call_ids: response.declared });
+      void response.doneReceipt.then(() => this.finish(response)).catch(() => {});
+      if (value.status !== "completed") this.incomplete(response.row, "response_failed");
+      // Arguments may arrive after response.done. Only explicit call IDs can
+      // satisfy this barrier; the number of completed promises cannot.
+      this.finish(response);
+    }
+
+    finish(response) {
+      if (this.closed || response.finished || !response.done || response.row.incomplete) return;
+      if (Array.from(response.calls.keys()).some((id) => !response.declared.includes(id))) {
+        this.incomplete(response.row, "missing_tool_calls"); return;
+      }
+      if (response.declared.some((id) => !response.calls.has(id) || !response.calls.get(id).done)) return;
+      response.finished = true;
+      void response.row.tail.then(async () => {
+        if (this.closed || response.row.incomplete) return;
+        if (response.declared.length) {
+          for (const id of response.declared) {
+            const result = response.calls.get(id).result;
+            result.message.item.id = clientId("item_");
+            response.row.items.push(result.message.item.id);
+            this.transport.send(result.message);
+          }
+          this.requestResponse(response.row, response.id);
+        } else {
+          const receipt = await this.event(response.row, { kind: "interaction.settle", response_id: response.id });
+          if (receipt && receipt.ok) this.rememberCompleted(response.row);
+          void this.refresh();
+        }
+      }).catch((err) => this.report(errorText(err)));
+    }
+
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.controllers.forEach((controller) => controller.abort());
+      this.controllers.clear();
+      this.requests.clear();
+      // Revocation is best effort; all local continuations are already fenced.
+      void apiCall("/close", { method: "POST", body: JSON.stringify(this.context), keepalive: true }).catch(() => {});
+    }
+  }
+
   /** NDJSON encoder for the cascade relay, minted lazily (cascade mode only). */
   let relayEncoder = null;
   function encodeRelayLine(line) {
@@ -224,6 +521,7 @@
       this.pcmPos = 0;
       // One receipt per session for a relay that failed for a real reason.
       this.cascadeFailureLogged = false;
+      this.task = session && session.task ? new TaskContinuity(this, session.task) : null;
     }
 
     async start() {
@@ -253,7 +551,11 @@
 
       const channel = peer.createDataChannel("oai-events");
       this.channel = channel;
-      channel.addEventListener("open", () => this.cb.onStatus("Listening…"));
+      channel.addEventListener("open", () => {
+        if (this.closed) return;
+        this.cb.onStatus("Listening…");
+        if (this.task) void this.task.refresh();
+      });
       channel.addEventListener("message", (event) => this.handleEvent(event.data));
       peer.addEventListener("connectionstatechange", () => {
         if (this.closed) return;
@@ -296,6 +598,7 @@
 
     stop() {
       this.closed = true;
+      if (this.task) this.task.close();
       // Teardown is idempotent and each step is guarded so a throw in one can
       // never skip the rest. (A throw in abortCascade() used to leave the
       // channel/peer open, so the server kept listening even though the UI
@@ -335,10 +638,21 @@
     }
 
     send(payload) {
-      if (this.channel && this.channel.readyState === "open") {
+      if (!this.closed && this.channel && this.channel.readyState === "open") {
         if (payload && payload.type === "response.create") this.continuationPending = true;
         this.channel.send(JSON.stringify(payload));
       }
+    }
+
+    async sendTyped(text) {
+      if (this.closed || !text.trim() || !this.channel || this.channel.readyState !== "open") return false;
+      if (this.task) return this.task.typed(text);
+      this.send({ type: "conversation.item.create", item: {
+        id: clientId("item_"), type: "message", role: "user", content: [{ type: "input_text", text: text.trim() }],
+      } });
+      this.cb.onTranscript("user", text.trim(), true);
+      this.send({ type: "response.create" });
+      return true;
     }
 
     handleEvent(data) {
@@ -350,13 +664,22 @@
         return;
       }
       switch (event.type) {
+        case "input_audio_buffer.committed":
+          if (this.task && event.item_id) {
+            this.task.committed.add(event.item_id);
+            const row = this.task.inputs.get(event.item_id);
+            if (row) void this.task.respondToAudio(row);
+          }
+          return;
         case "conversation.item.input_audio_transcription.completed":
+          if (this.task) { this.task.voice(event); return; }
           if (event.transcript) this.cb.onTranscript("user", event.transcript, true);
           return;
         case "response.output_audio_transcript.delta":
           if (event.delta) this.cb.onTranscript("assistant", event.delta, false);
           return;
         case "response.output_audio_transcript.done":
+          if (this.task && event.transcript) this.task.final(event, event.transcript);
           if (event.transcript) this.cb.onTranscript("assistant", event.transcript, true);
           return;
         case "response.output_text.delta":
@@ -367,6 +690,7 @@
           return;
         case "response.output_text.done": {
           const text = typeof event.text === "string" ? event.text : "";
+          if (this.task && text) this.task.final(event, text);
           if (text) this.cb.onTranscript("assistant", text, true);
           if (this.cascade) {
             this.cascadeSend({ done: text });
@@ -375,6 +699,7 @@
           return;
         }
         case "response.created":
+          if (this.task) this.task.created(event.response || {});
           this.continuationPending = false;
           this.responseActive = true;
           this.cb.onStatus("Thinking…");
@@ -384,7 +709,8 @@
           // A response that ends with its text stream still open was
           // interrupted upstream; its half-spoken answer dies with it.
           if (this.cascade && this.cascadeReq && this.cascadeReq.sink) this.abortCascade();
-          this.finishToolResponse();
+          if (this.task) this.task.done(event.response || {});
+          else this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
         case "input_audio_buffer.speech_started":
@@ -400,7 +726,8 @@
           this.cb.onStatus("Processing…");
           return;
         case "response.function_call_arguments.done":
-          this.enqueueFunctionCall(event);
+          if (this.task) this.task.tool(event);
+          else this.enqueueFunctionCall(event);
           return;
         case "error":
           this.handleError(event.error);
@@ -685,7 +1012,7 @@
       this.toolBatch = null;
     }
 
-    async handleFunctionCall(event) {
+    async handleFunctionCall(event, binding) {
       const callId = typeof event.call_id === "string" ? event.call_id : "";
       const name = typeof event.name === "string" ? event.name : "";
       if (!callId || !name) return;
@@ -699,13 +1026,13 @@
       this.cb.onStatus("Using " + name + "…");
       let output;
       try {
-        const res = await apiPost(
-          "/tool",
-          { name: name, arguments: args },
-          TOOL_TIMEOUT_MS
-        );
+        const body = Object.assign({ name: name, arguments: args }, binding || {});
+        const res = binding ? await this.task.request("/tool", body)
+          : await apiPost("/tool", body, TOOL_TIMEOUT_MS);
+        if (this.closed) return null;
         output = res && res.output ? String(res.output) : "(no output)";
       } catch (err) {
+        if (binding) { this.task.report(errorText(err)); return null; }
         output = name + " failed: " + errorText(err);
       }
       return {
@@ -719,6 +1046,7 @@
 
     /** Start polling if this text announced background work. */
     watchForRun(text) {
+      if (this.task || this.closed) return;
       const started = WORK_STARTED_RE.exec(String(text || ""));
       if (started) this.pollRun(Number(started[1]), started[2]);
     }
@@ -729,6 +1057,7 @@
      * run can announce a follow-on run, so results are re-scanned.
      */
     pollRun(runId, kind) {
+      if (this.task || this.closed) return;
       const startedAt = Date.now();
       const cap = RUN_POLL_CAPS_MS[kind] || DEFAULT_RUN_CAP_MS;
       const tick = async () => {
@@ -744,9 +1073,11 @@
             }
           }
         } catch (e) {
+          if (this.closed) return;
           window.setTimeout(tick, RUN_POLL_MS);
           return;
         }
+        if (this.closed) return;
         if (!run || run.status === "running") {
           window.setTimeout(tick, RUN_POLL_MS);
           return;
@@ -792,8 +1123,21 @@
     const [error, setError] = useState("");
     const [needsToken, setNeedsToken] = useState(false);
     const [tokenDraft, setTokenDraft] = useState("");
+    const [profile, setProfile] = useState("default");
+    const [tasks, setTasks] = useState([]);
+    const [selectedTask, setSelectedTask] = useState("");
+    const [catalogError, setCatalogError] = useState("");
+    const [taskState, setTaskState] = useState(null);
+    const [stages, setStages] = useState({});
+    const [results, setResults] = useState({});
+    const [typed, setTyped] = useState("");
+    const [sending, setSending] = useState(false);
 
     const transportRef = useRef(null);
+    const connectionEpoch = useRef(0);
+    const sessionAbort = useRef(null);
+    const tabId = useRef(null);
+    if (!tabId.current) tabId.current = taskTabId();
     const rowId = useRef(1);
     const phaseRef = useRef("idle");
     phaseRef.current = phase;
@@ -820,9 +1164,11 @@
     }, [handleError]);
 
     const refreshRuns = useCallback(async () => {
+      const transport = transportRef.current;
+      if (transport && transport.task) { await transport.task.refresh(); return; }
       try {
         const res = await apiCall("/runs");
-        setRuns((res && res.runs) || []);
+        if (transportRef.current === transport) setRuns((res && res.runs) || []);
       } catch (e) {
         /* the runs panel is a status board — a failed poll is not a page error */
       }
@@ -830,11 +1176,32 @@
 
     useEffect(() => {
       void refresh();
-      return () => {
+      const cleanup = () => {
+        connectionEpoch.current++;
+        if (sessionAbort.current) sessionAbort.current.abort();
+        sessionAbort.current = null;
         if (transportRef.current) transportRef.current.stop();
         transportRef.current = null;
       };
+      window.addEventListener("pagehide", cleanup);
+      return () => {
+        cleanup();
+        window.removeEventListener("pagehide", cleanup);
+      };
     }, [refresh]);
+
+    useEffect(() => {
+      const controller = new AbortController();
+      setTasks([]);
+      setCatalogError("");
+      if (profile.trim()) {
+        void SDK.fetchJSON("/api/sessions?profile=" + encodeURIComponent(profile.trim()) + "&order=recent&limit=20",
+          { signal: controller.signal }).then((res) => {
+          if (!controller.signal.aborted) setTasks(Array.isArray(res) ? res : (res.sessions || []));
+        }).catch((err) => { if (!controller.signal.aborted) setCatalogError(errorText(err)); });
+      }
+      return () => controller.abort();
+    }, [profile]);
 
     useEffect(() => {
       let cancelled = false;
@@ -879,30 +1246,84 @@
       setPhase("starting");
       setLive("");
       setTranscript([]);
+      setStages({});
+      setResults({});
+      setTaskState(null);
+      const epoch = ++connectionEpoch.current;
+      const controller = new AbortController();
+      sessionAbort.current = controller;
       try {
-        const session = await apiPost("/session", voice ? { voice: voice } : {});
+        const body = voice ? { voice: voice } : {};
+        if (selectedTask) body.task = { session_id: selectedTask, profile: profile.trim(), tab_id: tabId.current,
+          page_reference: { url: window.location.href, title: document.title } };
+        const session = await apiCall("/session", {
+          method: "POST", body: JSON.stringify(body), signal: controller.signal,
+        });
+        if (epoch !== connectionEpoch.current || controller.signal.aborted) {
+          new TalkTransport(session, {}).stop();
+          return;
+        }
+        if (selectedTask && (!session.task || session.task.session_id !== selectedTask ||
+            session.task.profile !== profile.trim() || session.task.tab_id !== tabId.current)) {
+          new TalkTransport(session, {}).stop();
+          throw new Error("Bound task context did not match the selected task; join was refused.");
+        }
+        const current = () => epoch === connectionEpoch.current;
         const transport = new TalkTransport(session, {
-          onStatus: setLive,
-          onTranscript: appendTranscript,
-          onError: (message) => setError(message),
+          onStatus: (message) => { if (current()) setLive(message); },
+          onTranscript: (role, text, final) => { if (current()) appendTranscript(role, text, final); },
+          onError: (message) => { if (current()) setError(message); },
+          onTaskState: (state) => { if (current()) setTaskState(state); },
+          onTaskStage: (row) => { if (current()) setStages((prev) => Object.assign({}, prev, { [row.input_id]: row })); },
         });
         transportRef.current = transport;
+        if (session.task) setTaskState({ task: session.task, history: session.task.history, interactions: [], jobs: [] });
         await transport.start();
+        if (!current() || transport.closed) return;
         setPhase("active");
       } catch (err) {
+        if (epoch !== connectionEpoch.current) return;
         if (transportRef.current) transportRef.current.stop();
         transportRef.current = null;
         setPhase("idle");
         setLive("");
         handleError(err);
+      } finally {
+        if (sessionAbort.current === controller) sessionAbort.current = null;
       }
     }
 
     function stopTalk() {
+      connectionEpoch.current++;
+      if (sessionAbort.current) sessionAbort.current.abort();
+      sessionAbort.current = null;
       if (transportRef.current) transportRef.current.stop();
       transportRef.current = null;
       setPhase("idle");
       setLive("");
+      setSending(false);
+    }
+
+    async function sendTyped() {
+      const transport = transportRef.current;
+      if (!transport || !typed.trim() || sending) return;
+      const epoch = connectionEpoch.current;
+      setSending(true);
+      try {
+        const sent = await transport.sendTyped(typed);
+        if (epoch === connectionEpoch.current && sent) setTyped("");
+      } catch (err) { if (epoch === connectionEpoch.current) handleError(err); }
+      finally { if (epoch === connectionEpoch.current) setSending(false); }
+    }
+
+    async function showResult(runId) {
+      const transport = transportRef.current;
+      const epoch = connectionEpoch.current;
+      if (!transport || !transport.task) return;
+      try {
+        const result = await transport.task.result(runId);
+        if (epoch === connectionEpoch.current) setResults((prev) => Object.assign({}, prev, { [runId]: result }));
+      } catch (err) { if (epoch === connectionEpoch.current) handleError(err); }
     }
 
     function saveToken() {
@@ -927,12 +1348,30 @@
         ),
         h("div", { className: "ht-actions" },
           active || starting
-            ? h(C.Button, { onClick: stopTalk, disabled: starting },
-                starting ? "Connecting…" : "Stop")
+            ? h(C.Button, { onClick: stopTalk }, starting ? "Cancel connection" : "Stop")
             : h(C.Button, { onClick: () => void startTalk(), disabled: !ready || loading },
-                "Start")
+                selectedTask ? "Join / resume task" : "Start legacy Talk")
         )
       ),
+
+      h("div", { className: "ht-note" },
+        h("label", { className: "ht-field" }, "Task profile",
+          h(C.Input, { value: profile, disabled: active || starting,
+            onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); setTaskState(null); } })),
+        h("label", { className: "ht-field" }, "Task connection",
+          h("select", { className: "ht-select", value: selectedTask, disabled: active || starting,
+            onChange: (e) => { setSelectedTask(e.target.value); setTaskState(null); } },
+            h("option", { value: "" }, "Legacy unbound Talk (no task history)"),
+            tasks.map((task) => {
+              const id = task.session_id || task.id;
+              return id && h("option", { key: id, value: id,
+                disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
+                (task.title || task.name || id) + " · " + id);
+            }))),
+        selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
+        status && status.taskContinuity && !status.taskContinuity.supported &&
+          h("div", null, "Task continuity unavailable: " + status.taskContinuity.reason),
+        catalogError && h("div", { className: "ht-error" }, "Task list unavailable: " + catalogError)),
 
       needsToken && h("div", { className: "ht-note ht-note-warn" },
         h("div", { className: "ht-note-title" }, "This dashboard needs the hermes-talk token"),
@@ -985,9 +1424,74 @@
       live && h("div", { className: "ht-live" }, live),
       error && h("div", { className: "ht-error" }, error),
 
+      taskState && h("section", { className: "ht-card" },
+        h("div", { className: "ht-card-head" }, "Bound task and server context"),
+        h("div", { className: "ht-row ht-text" },
+          "Task: " + ((taskState.task || {}).session_id || "unavailable") +
+          " · profile: " + ((taskState.task || {}).profile || "unavailable") + "\n" +
+          JSON.stringify((taskState.task || {}).context || { state: "unavailable" }, null, 2)),
+        h("div", { className: "ht-card-head" }, "Canonical task history"),
+        !((taskState.history || {}).messages || []).length && h("div", { className: "ht-empty" }, "No canonical messages available."),
+        ((taskState.history || {}).messages || []).map((row) => h("div", { key: row.id, className: "ht-row" },
+          h("div", { className: "ht-role" }, row.role + " · " + row.id), h("div", { className: "ht-text" }, row.content))),
+        (taskState.history || {}).truncated && h("div", { className: "ht-out" }, "Earlier canonical history is truncated."),
+        h("div", { className: "ht-card-head" }, "Interactions and action receipts"),
+        Object.values(stages).filter((row) => !(taskState.interactions || []).some((item) => item.input_id === row.input_id))
+          .map((row) => h("div", { key: row.input_id, className: "ht-row" },
+            h("div", { className: "ht-role" }, row.state + " · pending canonical receipt"),
+            h("div", { className: "ht-text" }, row.text))),
+        (taskState.interactions || []).map((row) => h("div", { key: row.id, className: "ht-row",
+          id: "ht-interaction-" + encodeURIComponent(row.id) },
+          h("div", { className: "ht-role" }, row.state + " · canonical: " + row.canonical_state),
+          h("div", { className: "ht-text" }, row.text),
+          h("div", { className: "ht-out" }, JSON.stringify({ responses: row.responses, actions: row.actions,
+            canonical_message_ids: row.canonical_message_ids }, null, 2)))),
+        h("div", { className: "ht-card-head" }, "Observation / action log"),
+        (taskState.events || {}).retention_gap && h("div", { className: "ht-row ht-out" },
+          "Observation retention gap: earlier events are unavailable."),
+        (taskState.events || {}).snapshot_refetch_required && h("div", { className: "ht-row ht-out" },
+          "Snapshot refetch required: observations may be incomplete."),
+        !((taskState.events || {}).events || []).length &&
+          h("div", { className: "ht-empty" }, "No observations available."),
+        ((taskState.events || {}).events || []).slice()
+          .sort((left, right) => left.observed_index - right.observed_index).map((event) => {
+            const origin = (taskState.interactions || []).find((row) => row.origin_turn_id === event.origin_turn_id);
+            const job = (taskState.jobs || []).find((row) => row.action_id === event.action_id);
+            const action = (taskState.interactions || []).find((row) =>
+              (row.actions || []).some((item) => item.action_id === event.action_id));
+            const originLink = event.origin_turn_id && origin ? "#ht-interaction-" + encodeURIComponent(origin.id) : null;
+            const actionLink = event.action_id && job ? "#ht-job-" + encodeURIComponent(job.run_id)
+              : event.action_id && action ? "#ht-interaction-" + encodeURIComponent(action.id) : null;
+            const value = (entry) => entry == null ? "unavailable" : String(entry);
+            return h("div", { key: event.observed_index, className: "ht-row" },
+              h("div", { className: "ht-role" }, "Observed index: " + value(event.observed_index) +
+                " · " + value(event.kind) + " · " + value(event.state)),
+              event.label && h("div", { className: "ht-text" }, event.label),
+              h("div", { className: "ht-out" }, "Source sequence: " + value(event.source_seq) +
+                " · source epoch: " + value(event.source_epoch) +
+                " · canonical revision: " + value(event.canonical_revision)),
+              h("div", { className: "ht-out" }, "Origin: ",
+                h(originLink ? "a" : "span", originLink ? { href: originLink } : null, value(event.origin_turn_id)),
+                " · action: ", h(actionLink ? "a" : "span", actionLink ? { href: actionLink } : null, value(event.action_id))));
+          }),
+        h("div", { className: "ht-card-head" }, "Task jobs"),
+        (taskState.jobs || []).map((job) => h("div", { key: job.run_id, className: "ht-row",
+          id: "ht-job-" + encodeURIComponent(job.run_id) },
+          h("div", { className: "ht-role" }, job.status + " · run " + job.run_id + " · action " + job.action_id),
+          h("div", { className: "ht-text" }, job.goal),
+          h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
+          job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
+          results[job.run_id] && h("div", { className: "ht-text" }, results[job.run_id].output),
+          results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport.")))),
+
+      h("form", { className: "ht-token-row", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
+        h(C.Input, { value: typed, disabled: !active || sending, placeholder: "Type to this Talk connection",
+          "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
+        h(C.Button, { type: "submit", disabled: !active || sending || !typed.trim() }, sending ? "Staging…" : "Send")),
+
       h("div", { className: "ht-grid" },
         h("section", { className: "ht-card" },
-          h("div", { className: "ht-card-head" }, "Transcript"),
+          h("div", { className: "ht-card-head" }, taskState ? "Live captions (not canonical history)" : "Transcript"),
           transcript.length === 0
             ? h("div", { className: "ht-empty" }, "No transcript yet. Start a session and speak.")
             : transcript.map((row) =>
@@ -996,7 +1500,7 @@
                     (row.role === "user" ? "You" : "Hermes") + (row.final ? "" : " …")),
                   h("div", { className: "ht-text" }, row.text)))
         ),
-        h("section", { className: "ht-card" },
+        !taskState && h("section", { className: "ht-card" },
           h("div", { className: "ht-card-head" }, "Background runs"),
           runs.length === 0
             ? h("div", { className: "ht-empty" }, "Nothing running.")
@@ -1019,7 +1523,7 @@
   }
 
   if (window.__HERMES_TALK_TEST_HOOK__) {
-    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport };
+    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, TalkPage: TalkPage };
   }
   window.__HERMES_PLUGINS__.register("hermes-talk", TalkPage);
 })();

@@ -58,6 +58,7 @@ import talk_auth  # noqa: E402
 import talk_capabilities  # noqa: E402
 import talk_cascade_voice  # noqa: E402
 import talk_config  # noqa: E402
+import talk_dashboard_tasks  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
 import talk_realtime  # noqa: E402
@@ -65,6 +66,9 @@ import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
+from talk_dashboard_gateway import DashboardTaskError  # noqa: E402
+from talk_passive import HistoryError  # noqa: E402
+from talk_task_sources import TaskEventError  # noqa: E402
 
 # Two tiers, because the streaming half of this module and the routing half
 # come from different packages. ``StreamingResponse`` and ``ClientDisconnect``
@@ -160,6 +164,7 @@ _log = logging.getLogger(__name__)
 
 
 router = APIRouter()
+TASKS = talk_dashboard_tasks.DashboardTasks()
 
 DASHBOARD_TOKEN_ENV = "TALK_DASHBOARD_TOKEN"
 DASHBOARD_TOKEN_HEADER = "x-talk-token"
@@ -233,9 +238,7 @@ def require_dashboard_auth(request) -> None:
         presented = _presented_token(request)
         # compare_digest over bytes: unequal lengths return False rather than
         # raising, and the comparison does not short-circuit on first mismatch.
-        if presented and hmac.compare_digest(
-            presented.encode("utf-8"), configured.encode("utf-8")
-        ):
+        if presented and hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8")):
             return
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
     if _is_loopback(request):
@@ -285,7 +288,7 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False):
+def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
     """Assemble instructions and mint. Blocking — called on a worker thread.
 
     ``text_output`` is the cascade lane: the minted session asks the provider
@@ -296,19 +299,37 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False):
     # The browser owns this lane's microphone, so the pause tool is not
     # offered here (default_talk_tools' pausable stays False).
     tools = talk_tools.default_talk_tools()
+    if bound is not None:
+        tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
+        for tool in tools:
+            if tool["name"] == "delegate_task":
+                tool["description"] = (
+                    "Run a derived goal in a linked child of this task and keep talking."
+                )
+                tool["parameters"]["properties"].pop("resource_keys", None)
+                tool["parameters"]["properties"].pop("execution_mode", None)
+            elif tool["name"] == "resolve_approval":
+                tool["parameters"]["properties"]["approval_id"] = {"type": "string"}
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),
         voice=voice,
         instructions=talk_identity.build_instructions(
-            talk_host.host().identity_sections(),
+            None if bound is not None else talk_host.host().identity_sections(),
             tools=tools,
             lane="dashboard",
+            canonical_task=bound is not None,
             # The session route already paid for the catalog warm, so the
             # live-catalog section reads a warm snapshot here.
-            capabilities=talk_capabilities.instruction_section(),
-        ),
+            capabilities=(
+                "Canonical task tools and linked child work are available."
+                if bound is not None
+                else talk_capabilities.instruction_section()
+            ),
+        )
+        + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
         tools=tools,
+        automatic_response=bound is None,
         text_output=text_output,
     )
 
@@ -379,6 +400,7 @@ async def talk_status(request: Request) -> dict:
         "voiceMode": voice_mode or "native",
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
+        "taskContinuity": talk_dashboard_tasks.context_support(),
         # Tri-state, not a bool: no plugin context is ever bound in the web
         # server process, so the only question that matters here is whether the
         # api_server lane can reach a real agent. This route is the page's
@@ -400,6 +422,9 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    bound = None
+    if "task" in body and body["task"] is not None:
+        bound = await _task_call(TASKS.join, request, body["task"])
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
     if text_output:
@@ -427,9 +452,20 @@ async def create_session(request: Request) -> dict:
             auth.token,
             voice,
             text_output=text_output,
+            **({"bound": bound} if bound is not None else {}),
         )
     except talk_wire.TalkWireError as exc:
+        if bound is not None:
+            await _task_call(TASKS.close, request, TASKS.descriptor(bound))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if bound is not None:
+        return {
+            "ok": True,
+            **descriptor.to_wire(),
+            "authSource": auth.source,
+            "voiceMode": voice_mode,
+            "task": TASKS.descriptor(bound),
+        }
     # Bind the browser lane's return route before it can dispatch anything
     # (hermes-talk#35). The mint IS this lane's connect handshake: /tool is
     # only reachable after it, and every run started through /tool is owed to
@@ -479,6 +515,8 @@ async def run_tool(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    if "connection_id" in body:
+        return await _task_call(TASKS.tool, request, body)
     name = str(body.get("name") or "").strip()
     arguments = body.get("arguments")
     if not isinstance(arguments, dict):
@@ -558,9 +596,7 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
             ),
         )
     try:
-        api_key, voice_id, model = talk_config.cascade_voice_config(
-            talk_config.talk_provider()
-        )
+        api_key, voice_id, model = talk_config.cascade_voice_config(talk_config.talk_provider())
         return (api_key, voice_id, model, talk_config.elevenlabs_voice_settings())
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -616,9 +652,7 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
     )
 
 
-async def _cascade_pcm_stream(
-    request, config: tuple[str, str, str, dict]
-) -> AsyncIterator[bytes]:
+async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
     A fresh CascadeVoice per request: one POST == one response's speech. The
@@ -666,9 +700,7 @@ async def _cascade_pcm_stream(
                     voice.handle_event(_relay_transcript(done, final=True))
                     state["completed"] = True
                     return
-                _log.warning(
-                    "dashboard cascade relay: unrecognized stream line — answer cancelled"
-                )
+                _log.warning("dashboard cascade relay: unrecognized stream line — answer cancelled")
                 return
         except ClientDisconnect:
             # The browser vanished mid-upload (barge-in, tab closed, socket
@@ -739,7 +771,67 @@ async def list_runs(request: Request) -> dict:
 #: Every route in this plugin, for the guard-coverage invariant test. A new
 #: route that is not listed here (or not gated) fails that test rather than
 #: shipping open.
-ROUTE_HANDLERS = (talk_status, create_session, run_tool, cascade_tts, list_runs)
+async def _task_call(function, request, body):
+    try:
+        return await asyncio.to_thread(function, request, body)
+    except DashboardTaskError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
+    except (HistoryError, TaskEventError) as exc:
+        mapped = DashboardTaskError(
+            "connection_stale"
+            if getattr(exc, "code", "") in {"stale_generation", "stale_attachment", "not_attached"}
+            else "gateway_refused",
+            409,
+        )
+        raise HTTPException(status_code=409, detail=mapped.detail()) from exc
+
+
+@router.post("/event")
+async def task_event(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.event, request, await _json_body(request))
+
+
+@router.post("/state")
+async def task_state(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.state, request, await _json_body(request))
+
+
+@router.get("/result")
+async def task_result(request: Request):
+    require_dashboard_auth(request)
+    query = request.query_params
+    try:
+        body = {
+            "connection_id": query.get("connection_id"),
+            "generation": int(query.get("generation", "")),
+            "run_id": int(query.get("run_id", "")),
+        }
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400, detail=DashboardTaskError("invalid_event", 400).detail()
+        ) from None
+    return await _task_call(TASKS.result, request, body)
+
+
+@router.post("/close")
+async def task_close(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.close, request, await _json_body(request))
+
+
+ROUTE_HANDLERS = (
+    talk_status,
+    create_session,
+    run_tool,
+    cascade_tts,
+    list_runs,
+    task_event,
+    task_state,
+    task_result,
+    task_close,
+)
 
 
 __all__ = [

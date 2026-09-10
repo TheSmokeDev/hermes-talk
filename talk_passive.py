@@ -88,6 +88,7 @@ class HistoryOwner:
 class HistoryMessage:
     role: str
     content: str = field(repr=False)
+    message_id: int | None = None
 
     def wire(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -175,7 +176,9 @@ class HistorySnapshot:
                     or row["id"] <= 0
                 ):
                     raise HistoryError("malformed_response")
-                messages.extend(dialogue_messages([HistoryMessage(row["role"], row["content"])]))
+                messages.extend(
+                    dialogue_messages([HistoryMessage(row["role"], row["content"], row["id"])])
+                )
             if sum(len(row.content.encode("utf-8")) for row in messages) > caps.max_snapshot_bytes:
                 raise HistoryError("malformed_response")
             return cls(
@@ -248,6 +251,7 @@ class HistoryTransport:
     named_profile: bool = False
     timeout_s: float = 3.0
     _http_transport: httpx.BaseTransport | None = field(default=None, repr=False, compare=False)
+    actor_scope: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         parsed = urlsplit(self.base_url)
@@ -269,9 +273,13 @@ class HistoryTransport:
         ):
             raise HistoryError("invalid_input")
         identifier(self.profile)
+        if self.actor_scope is not None:
+            identifier(self.actor_scope)
 
     @classmethod
-    def configured_gateway(cls, *, profile: str, named_profile: bool = False) -> HistoryTransport:
+    def configured_gateway(
+        cls, *, profile: str, named_profile: bool = False, actor_scope: str | None = None
+    ) -> HistoryTransport:
         try:
             from . import talk_config
         except ImportError:  # pragma: no cover - flat Hermes plugin load
@@ -281,6 +289,7 @@ class HistoryTransport:
             profile,
             talk_config.api_server_key() or "",
             named_profile=named_profile,
+            actor_scope=actor_scope,
         )
 
     @property
@@ -293,7 +302,9 @@ class HistoryTransport:
         return HistoryOwner(
             digest([self.base_url.rstrip("/"), self.prefix]),
             self.profile,
-            digest([self.surface, self.credential]),
+            digest([self.surface, self.credential, self.actor_scope])
+            if self.actor_scope is not None
+            else digest([self.surface, self.credential]),
             session_id(selected_session),
         )
 

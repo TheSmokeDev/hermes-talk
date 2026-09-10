@@ -82,8 +82,8 @@ VOICE_PREAMBLE = (
     "summarize the new version and ask again. "
     "You cannot click, type, or drive a screen yourself, but agents you "
     "delegate to run the full Hermes toolset — files, shell, browser, "
-    "computer use, and connected apps. Never answer \"I can't\" when the "
-    "honest answer is \"I can hand that to an agent.\" "
+    'computer use, and connected apps. Never answer "I can\'t" when the '
+    'honest answer is "I can hand that to an agent." '
     "When you hand work to delegate_task, the brief you write is the ONLY "
     "thing that agent ever sees. It starts fresh, with no access to this "
     "call, so never pass 'do that', 'what we just discussed', or any other "
@@ -124,6 +124,12 @@ _HOST_TRANSCRIPT_CONTRACT = (
     "a second canonical Hermes inference turn. The temporary live transcript is handed off "
     "after the call closes for durable-memory review."
 )
+_TASK_TRANSCRIPT_CONTRACT = (
+    "This call continues an existing canonical Hermes task. Genuine finalized user input is "
+    "saved through the verified task-origin contract; completed assistant speech is saved "
+    "under separate event identities. Pending or failed receipts are not proof of saved history. "
+    "Long work runs in linked children while this realtime voice manager remains available."
+)
 
 #: The one true sentence about WHERE this session is running, per lane
 #: (hermes-talk#64). A session asked "where are you running from?" used to
@@ -149,8 +155,7 @@ LANE_LINES: dict[str, str] = {
 #: What an unrecognized or absent lane ships: true on every surface, and it
 #: names no control the session cannot vouch for.
 GENERIC_LANE_LINE = (
-    "You are live on a voice call; the operator can end it from the surface "
-    "they joined on."
+    "You are live on a voice call; the operator can end it from the surface they joined on."
 )
 
 #: Cap on the mint-time host summary line. It is one line of prompt, never a
@@ -221,6 +226,7 @@ def build_instructions(
     *,
     tools: list[dict] | None = None,
     host_execution: bool = False,
+    canonical_task: bool = False,
     lane: str | None = None,
     host_summary: str | None = None,
     capabilities: str | None = None,
@@ -278,7 +284,9 @@ def build_instructions(
     sections.append(current_moment())
     contracts = [
         _tool_contract(tools, host_execution=host_execution),
-        _HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT,
+        _TASK_TRANSCRIPT_CONTRACT
+        if canonical_task
+        else (_HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT),
     ]
     return VOICE_PREAMBLE + "\n\n" + "\n\n".join([*contracts, *sections])
 

@@ -179,7 +179,8 @@ def api_poll_observation(
         raise TaskEventError("unsupported")
     if payload.get("run_id") != binding.api_run_id:
         raise TaskEventError("foreign_owner")
-    if payload.get("session_id") and payload["session_id"] != binding.worker_session_id:
+    observed_session = payload.get("child_session_id") or payload.get("session_id")
+    if observed_session and observed_session != binding.worker_session_id:
         raise TaskEventError("foreign_owner")
     state = payload.get("status")
     if not isinstance(state, str) or state not in _RUN_STATES:

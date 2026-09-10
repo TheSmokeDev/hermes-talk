@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from subprocess import run
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_JS = ROOT / "dashboard" / "dist" / "index.js"
 
@@ -12,6 +14,485 @@ DASHBOARD_JS = ROOT / "dashboard" / "dist" / "index.js"
 #: waits at 1s (`waitFor`), so this only has to cover node's cold start — which
 #: on a cold windows-latest runner has exceeded 10s and failed main for nothing.
 NODE_TIMEOUT_S = 60
+
+
+TASK_HARNESS = r"""
+const fs = require("fs"), vm = require("vm"), assert = require("assert");
+const requests = [], sent = [], errors = [], stages = [];
+let sequence = 0, fetchOverride = null;
+const callbacks = {
+  onStatus() {}, onError(m) { errors.push(m); }, onTranscript() {},
+  onTaskStage(row) { stages.push(row); }, onTaskState() {},
+};
+const window = {
+  __HERMES_TALK_TEST_HOOK__: true,
+  __HERMES_PLUGINS__: { register() {} },
+  __HERMES_PLUGIN_SDK__: {
+    React: { createElement() {} },
+    hooks: { useState() {}, useEffect() {}, useRef() {}, useCallback() {} }, components: {},
+    async fetchJSON(url, opts = {}) {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      if (url.endsWith("/event")) {
+        assert(body && ["input.final", "response.started", "response.final", "response.done",
+          "interaction.settle", "interaction.incomplete"].includes(body.kind),
+          "invalid event kind");
+        assert(!Object.hasOwn(body, "type"), "provider type leaked onto task-event wire");
+      }
+      requests.push({ url, body, signal: opts.signal });
+      if (fetchOverride) {
+        const result = fetchOverride(url, body, opts);
+        if (result !== undefined) return result;
+      }
+      if (body && body.kind === "input.final") return {
+        interaction_id: "interaction-" + body.input_id, input_id: body.input_id,
+        canonical_state: "saved",
+        origin_turn_id: "turn-" + body.input_id, event_id: "event-" + body.input_id,
+          state: "staged",
+      };
+      if (url.endsWith("/state")) return { task: {}, history: { messages: [] }, interactions: [],
+        jobs: [] };
+      if (url.includes("/result?")) return { ok: true,
+        output: "<script>full available result</script>", truncated: false };
+      if (url.endsWith("/tool")) return { ok: true, output: "WORK_STARTED #7 kind=agent" };
+      return { ok: true, state: "staged" };
+    },
+  },
+  crypto: { randomUUID() { return "uuid-" + (++sequence); } },
+  sessionStorage: { getItem() { return ""; }, setItem() {} }, setTimeout, clearTimeout,
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
+  window, setTimeout, clearTimeout, AbortController, console,
+}, { filename: "index.js" });
+const Transport = window.__HERMES_TALK_TEST__.TalkTransport;
+const make = (generation = 3) => {
+  const t = new Transport({ task: { connection_id: "opaque-connection", generation } }, callbacks);
+  t.channel = { readyState: "open", send(s) { sent.push(JSON.parse(s)); }, close() {} };
+  return t;
+};
+const emit = (t, event) => t.handleEvent(JSON.stringify(event));
+const waitFor = async (predicate) => {
+  const deadline = Date.now() + 1500;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out; requests=" + JSON.stringify(
+      requests) + "; errors=" + errors);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+};
+const drain = () => new Promise((resolve) => setTimeout(resolve, 20));
+const events = (kind) => requests.filter((r) => r.body && r.body.kind === kind);
+const creates = () => sent.filter((m) => m.type === "response.create");
+const created = (t, id, request = creates().at(-1)) => {
+  emit(t, { type: "response.created", response: { id, metadata: request.response.metadata } });
+};
+const done = (t, id, output = []) => emit(t, { type: "response.done", response: { id, output,
+  status: "completed" } });
+"""
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        r"""
+let release;
+fetchOverride = (url, body) => body && body.kind === "input.final"
+  ? new Promise((resolve) => { release = () => resolve({ input_id: body.input_id,
+    interaction_id: "typed-interaction", state: "staged" }); })
+  : undefined;
+const t = make(), pending = t.sendTyped("Original typed request");
+await waitFor(() => release);
+assert.equal(sent.length, 0, "provider input escaped stage barrier");
+release(); assert.equal(await pending, true);
+assert.equal(sent[0].item.content[0].text, "Original typed request");
+assert.equal(sent[0].item.id, events("input.final")[0].body.input_id);
+assert.equal(events("input.final")[0].body.input_type, "typed");
+assert.equal(creates()[0].response.metadata.talk_interaction_id, "typed-interaction");
+assert.equal(creates()[0].response.input[0].id, sent[0].item.id);
+created(t, "typed-response");
+emit(t, { type: "response.output_text.done", response_id: "typed-response",
+  item_id: "assistant-item", text: "Answer" });
+done(t, "typed-response");
+await waitFor(() => events("interaction.settle").length === 1);
+assert.equal(events("response.final")[0].body.output_item_id, "assistant-item");
+assert.equal(events("response.started")[0].body.response_id, "typed-response");
+assert.equal(events("interaction.settle")[0].body.interaction_id, "typed-interaction");
+t.stop();
+""",
+        r"""
+let release;
+fetchOverride = (url, body) => body && body.kind === "input.final"
+  ? new Promise((resolve) => { release = () => resolve({ input_id: body.input_id,
+    interaction_id: "voice-interaction", state: "staged" }); })
+  : undefined;
+const t = make();
+emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "audio-1",
+  transcript: "Original utterance" });
+await waitFor(() => release);
+assert.equal(creates().length, 0);
+release(); await drain();
+assert.equal(creates().length, 0, "ASR final alone created a response");
+assert.equal(events("interaction.settle").length, 0, "ASR final became passive persistence");
+emit(t, { type: "input_audio_buffer.committed", item_id: "other-item" });
+await drain(); assert.equal(creates().length, 0);
+emit(t, { type: "input_audio_buffer.committed", item_id: "audio-1",
+  previous_item_id: "other-item" });
+await waitFor(() => creates().length === 1);
+assert.equal(creates()[0].response.metadata.talk_input_id, "audio-1");
+assert.equal(events("input.final")[0].body.text, "Original utterance");
+assert.equal(events("input.final")[0].body.input_type, "voice");
+t.stop();
+""",
+        r"""
+const t = make();
+emit(t, { type: "input_audio_buffer.committed", item_id: "audio-2" });
+emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "audio-2",
+  transcript: "Original action" });
+await waitFor(() => creates().length === 1);
+emit(t, { type: "response.created", response: { id: "unlinked", metadata: {} } });
+emit(t, { type: "response.function_call_arguments.done", response_id: "unlinked",
+  call_id: "bad-call", name: "delegate_task",
+  arguments: '{"goal":"Generated goal must never become input"}' });
+done(t, "unlinked");
+await drain();
+assert.equal(requests.filter((r) => r.url.endsWith("/tool")).length, 0);
+assert.equal(events("response.started").length, 0);
+assert.equal(events("interaction.settle").length, 0);
+assert(errors.some((m) => m.includes("unlinked")));
+assert.equal(events("input.final").length, 1);
+assert.equal(events("input.final")[0].body.text, "Original action");
+created(t, "linked");
+const altered = JSON.parse(JSON.stringify(creates()[0]));
+altered.response.metadata.talk_input_id = "wrong-source";
+created(t, "wrong", altered);
+await drain(); assert.equal(events("response.started").length, 1);
+t.stop();
+""",
+        r"""
+let releaseFirst;
+fetchOverride = (url, body) => url.endsWith("/tool") && body.call_id === "call-1"
+  ? new Promise((resolve) => { releaseFirst = () => resolve({ ok: true, output: "first result" });
+    }) : undefined;
+const t = make(); await t.sendTyped("Do two things"); created(t, "r1");
+done(t, "r1", [
+  { type: "function_call", id: "fc1", call_id: "call-1" },
+  { type: "function_call", id: "fc2", call_id: "call-2" },
+]);
+await drain(); assert.equal(events("interaction.settle").length, 0);
+const call = (id) => emit(t, { type: "response.function_call_arguments.done", response_id: "r1",
+  call_id: id, name: "delegate_task", arguments: '{"goal":"A generated child goal"}' });
+call("call-1"); call("call-2"); call("call-2");
+await waitFor(() => releaseFirst);
+assert.equal(requests.filter((r) => r.url.endsWith("/tool")).length, 1, "tools did not serialize");
+assert.equal(creates().length, 1, "continued before tool results");
+releaseFirst(); await waitFor(() => creates().length === 2);
+const tools = requests.filter((r) => r.url.endsWith("/tool"));
+assert.equal(tools.length, 2);
+assert.deepEqual(tools.map((r) => r.body.call_id), ["call-1", "call-2"]);
+for (const tool of tools) {
+  assert.equal(tool.body.connection_id, "opaque-connection"); assert.equal(tool.body.generation, 3);
+  assert.equal(tool.body.interaction_id, events("input.final")[0].body.input_id.replace(/^/,
+    "interaction-"));
+  assert.equal(tool.body.response_id, "r1");
+}
+assert.deepEqual(events("response.done")[0].body.tool_call_ids, ["call-1", "call-2"]);
+assert.equal(events("interaction.settle").length, 0, "settled while continuation pending");
+assert.equal(creates()[1].response.metadata.talk_previous_response_id, "r1");
+created(t, "r2");
+emit(t, { type: "response.output_text.done", response_id: "r2", item_id: "final-answer",
+  text: "Done" });
+done(t, "r2");
+await waitFor(() => events("interaction.settle").length === 1);
+assert.equal(events("interaction.settle")[0].body.response_id, "r2");
+assert.equal(events("response.started")[1].body.previous_response_id, "r1");
+assert.equal(events("input.final").length, 1);
+t.stop();
+""",
+        r"""
+const t = make();
+t.watchForRun("WORK_STARTED #7 kind=agent"); t.pollRun(7, "agent");
+emit(t, { type: "conversation.item.created", item: { id: "synthetic-result", type: "message",
+  role: "user", content: [{ type: "input_text", text: "Work run #7 finished" }] } });
+await t.task.refresh();
+const result = await t.task.result("run-7"); await drain();
+assert.equal(result.output, "<script>full available result</script>");
+assert.equal(requests.filter((r) => r.url.endsWith("/runs")).length, 0);
+assert.equal(events("input.final").length, 0);
+assert.equal(sent.length, 0, "replay/results caused automatic speech");
+assert(requests.some((r) => r.url.includes(
+  "connection_id=opaque-connection&generation=3&run_id=run-7")));
+t.stop();
+""",
+        r"""
+let release;
+fetchOverride = (url, body) => body && body.kind === "input.final"
+  ? new Promise((resolve) => { release = () => resolve({ input_id: body.input_id,
+    interaction_id: "old-interaction" }); }) : undefined;
+const old = make(3), pending = old.sendTyped("Old input");
+await waitFor(() => release);
+old.stop(); const stageCount = stages.length;
+assert(events("input.final")[0].signal.aborted);
+fetchOverride = null;
+const replacement = make(4); await replacement.sendTyped("Replacement input");
+const sentCount = sent.length; release(); assert.equal(await pending, false); await drain();
+assert.equal(sent.length, sentCount, "old stage sent into replacement connection");
+assert.equal(stages.filter((s) => s.text === "Old input").length, stageCount);
+emit(old, { type: "conversation.item.input_audio_transcription.completed", item_id: "late",
+  transcript: "Late" });
+assert.equal(events("input.final").length, 2);
+assert.equal(requests.filter((r) => r.url.endsWith("/close")).length, 1);
+assert.deepEqual(requests.find((r) => r.url.endsWith("/close")).body, {
+  connection_id: "opaque-connection", generation: 3 });
+replacement.stop();
+""",
+        r"""
+let release;
+fetchOverride = (url) => url.endsWith("/tool") ? new Promise((resolve) => { release = (
+  ) => resolve({ ok: true, output: "late result" }); }) : undefined;
+const t = make(); await t.sendTyped("Action"); created(t, "r1");
+emit(t, { type: "response.function_call_arguments.done", response_id: "r1", call_id: "call",
+  name: "delegate_task", arguments: "{}" });
+done(t, "r1", [{ type: "function_call", id: "fc", call_id: "call" }]);
+await waitFor(() => release);
+const before = sent.length; t.stop(); release(); await drain();
+assert.equal(sent.length, before, "late tool result continued after stop");
+assert.equal(events("interaction.settle").length, 0);
+assert(requests.find((r) => r.url.endsWith("/tool")).signal.aborted);
+assert.equal(errors.length, 0, "closed task reported a late error");
+""",
+        r"""
+const t = make(); await t.sendTyped("Original"); created(t, "r1");
+emit(t, { type: "response.function_call_arguments.done", response_id: "r1",
+  call_id: "unannounced", name: "delegate_task", arguments: "{}" });
+done(t, "r1", []);
+await waitFor(() => events("interaction.incomplete").length === 1);
+assert.equal(events("interaction.incomplete")[0].body.reason, "missing_tool_calls");
+assert.equal(events("interaction.settle").length, 0);
+assert.equal(creates().length, 1);
+t.stop();
+""",
+        r"""
+const t = make();
+await t.sendTyped("First question");
+const firstInput = events("input.final")[0].body.input_id;
+created(t, "first-response");
+done(t, "first-response", [{ id: "first-answer", type: "message",
+  content: [{ type: "output_text", text: "First answer" }] }]);
+await waitFor(() => t.task.completedGroups.length === 1);
+emit(t, { type: "conversation.item.created", item: { id: "synthetic-result", type: "message",
+  role: "user", content: [{ type: "input_text", text: "A background result" }] } });
+emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "other-unsettled",
+  transcript: "Other speech without a committed item" });
+emit(t, { type: "input_audio_buffer.committed", item_id: "failed-input" });
+emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "failed-input",
+  transcript: "Interrupted speech" });
+await waitFor(() => creates().length === 2);
+created(t, "failed-response");
+emit(t, { type: "response.done", response: { id: "failed-response", status: "cancelled",
+  output: [{ id: "partial-answer", type: "message",
+    content: [{ type: "output_text", text: "Incomplete answer" }] }] } });
+await waitFor(() => events("interaction.incomplete").length === 1);
+await t.sendTyped("Second question");
+const secondRequest = creates().at(-1), currentInput = events("input.final").at(-1).body.input_id;
+assert.deepEqual(secondRequest.response.input.map((item) => item.id),
+  [firstInput, "first-answer", currentInput]);
+assert.equal(secondRequest.response.metadata.talk_input_id, currentInput);
+assert.equal(secondRequest.response.metadata.talk_interaction_id, "interaction-" + currentInput);
+assert.equal(secondRequest.response.metadata.talk_previous_response_id, "");
+assert.equal(events("input.final").length, 4, "synthetic result was staged as original input");
+created(t, "second-response"); done(t, "second-response");
+await waitFor(() => events("interaction.settle").length === 2);
+t.stop();
+""",
+        r"""
+const t = make(), inputIds = [];
+for (let index = 0; index < 33; index++) {
+  await t.sendTyped("Question " + index);
+  inputIds.push(events("input.final").at(-1).body.input_id);
+  created(t, "r" + index);
+  done(t, "r" + index, [{ type: "message", id: "answer" + index,
+    content: [{ type: "output_text", text: "Answer " + index }] }]);
+  await waitFor(() => t.task.completedGroups.length &&
+    t.task.completedGroups.at(-1).items.includes("answer" + index));
+}
+await t.sendTyped("Latest question");
+const references = creates().at(-1).response.input.map((item) => item.id);
+assert.equal(references.length, 65, "prior-reference bound exceeded");
+assert.deepEqual(references.slice(0, 2), [inputIds[1], "answer1"]);
+assert(!references.includes(inputIds[0]) && !references.includes("answer0"),
+  "oldest interaction was only partially trimmed");
+assert.equal(references.at(-1), events("input.final").at(-1).body.input_id);
+t.stop();
+""",
+    ],
+    ids=["typed-stage", "asr-before-commit", "explicit-linkage", "continuation-barrier",
+      "inert-results", "stop-stage", "stop-tool", "missing-call", "completed-turn-context",
+      "bounded-context-groups"],
+)
+def test_dashboard_bound_task_protocol(scenario):
+    script = TASK_HARNESS + "\n(async () => {\n" + scenario + r"""
+process.exit(0);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_dashboard_task_picker_rendering_and_page_generation_fences():
+    script = TASK_HARNESS + r"""
+const slots = [], listeners = {};
+let cursor = 0, effects = [], latestTransport, heldSession, sessionRelease;
+const sdk = window.__HERMES_PLUGIN_SDK__;
+sdk.React.createElement = (tag, props, ...children) => ({ tag, props: props || {}, children });
+sdk.components = { Button: "button", Input: "input" };
+sdk.hooks = {
+  useState(initial) {
+    const index = cursor++;
+    if (!(index in slots)) slots[index] = initial;
+    return [slots[index], (value) => { slots[index] = typeof value === "function" ? value(
+      slots[index]) : value; }];
+  },
+  useRef(initial) { const index = cursor++; if (!(index in slots)) slots[index] = {
+    current: initial }; return slots[index]; },
+  useCallback(callback) { cursor++; return callback; },
+  useEffect(effect, deps) {
+    const index = cursor++, previous = slots[index];
+    if (!previous || deps.some((dep, at) => dep !== previous.deps[at])) {
+      effects.push(() => {
+        if (previous && previous.cleanup) previous.cleanup();
+        slots[index] = { deps, cleanup: effect() };
+      });
+    }
+  },
+};
+// React's useCallback preserves the callback when its dependencies are equal.
+sdk.hooks.useCallback = (callback, deps) => {
+  const index = cursor++, previous = slots[index];
+  if (!previous || deps.some((dep, at) => dep !== previous.deps[at])) slots[index] = { deps,
+    callback };
+  return slots[index].callback;
+};
+window.location = { href: "https://dashboard.example/plugins/hermes-talk" };
+window.addEventListener = (name, callback) => { listeners[name] = callback; };
+window.removeEventListener = (name) => { delete listeners[name]; };
+fetchOverride = (url, body) => {
+  if (url.endsWith("/status")) return { configured: true, voices: ["marin"], voice: "marin",
+    taskContinuity: { supported: true } };
+  if (url.startsWith("/api/sessions?")) return { sessions: [{ id: "chosen-task",
+    title: "Selected task" }] };
+  if (url.endsWith("/session")) {
+    const session = { task: Object.assign({}, body.task, {
+      connection_id: "page-connection", generation: 8, context: {
+        workspace: "explicitly unavailable" },
+      history: { messages: [{ id: "canonical-1", role: "user",
+        content: "<img src=x onerror=bad()>Saved history" }] },
+    }) };
+    if (heldSession) return new Promise((resolve) => { sessionRelease = () => resolve(session); });
+    return session;
+  }
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
+  window, setTimeout, clearTimeout, AbortController, console,
+  document: { title: "Dashboard task page" }, navigator: { mediaDevices: {} },
+    RTCPeerConnection: function () {},
+}, { filename: "index.js" });
+const Page = window.__HERMES_TALK_TEST__.TalkPage;
+window.__HERMES_TALK_TEST__.TalkTransport.prototype.start = async function () {
+  latestTransport = this;
+  this.channel = { readyState: "open", send(s) { sent.push(JSON.parse(s)); }, close() {} };
+};
+const render = () => { cursor = 0; effects = []; const tree = Page(); effects.forEach((f) => f());
+  return tree; };
+const nodes = (tree) => !tree || typeof tree !== "object" ? []
+  : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.children)];
+const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
+  : Array.isArray(tree) ? tree.map(label).join(" ") : label(tree.children);
+const button = (tree, text) => nodes(tree).find((node) => node.tag === "button" && label(
+  node) === text);
+(async () => {
+  render(); await drain(); let tree = render();
+  assert(requests.some((r) => r.url === "/api/sessions?profile=default&order=recent&limit=20"));
+  assert(label(tree).includes("Legacy unbound Talk (no task history)"));
+  const picker = nodes(tree).find((node) => node.tag === "select" && label(node).includes(
+    "Selected task"));
+  picker.props.onChange({ target: { value: "chosen-task" } }); tree = render();
+  button(tree, "Join / resume task").props.onClick(); await drain(); tree = render();
+  const body = requests.find((r) => r.url.endsWith("/session")).body;
+  assert.equal(body.task.session_id, "chosen-task"); assert.equal(body.task.profile, "default");
+  assert(body.task.tab_id.startsWith("tab_"));
+  assert.deepEqual(body.task.page_reference, { url: window.location.href,
+    title: "Dashboard task page" });
+  assert(label(tree).includes("Canonical task history"));
+  assert(label(tree).includes("<img src=x onerror=bad()>Saved history"));
+  assert(!nodes(tree).some((
+    node) => node.tag === "img" || node.props && node.props.dangerouslySetInnerHTML));
+  latestTransport.cb.onTaskState({ task: latestTransport.session.task,
+    history: latestTransport.session.task.history,
+    interactions: [{ id: "staged-1", input_id: "input-1", text: "Not yet saved", state: "staged",
+      canonical_state: "pending", origin_turn_id: "origin-1", responses: [], actions: [] }],
+    jobs: [{ run_id: "job-1", action_id: "action-1", status: "done", goal: "Child goal",
+      result_available: true, approval: { state: "unsupported" } }],
+    events: { next_cursor: 12, retention_gap: true, snapshot_refetch_required: true, events: [
+      { event_id: "run-event", kind: "run_state", observed_index: 12, source_seq: 1,
+        source_epoch: "epoch-b", canonical_revision: null, state: "done",
+        origin_turn_id: "origin-1", action_id: "action-1", label: "<script>Run observed</script>" },
+      { event_id: "saved-event", kind: "history_saved", observed_index: 11, source_seq: 90,
+        source_epoch: "epoch-a", canonical_revision: 4, state: "saved",
+        origin_turn_id: "origin-1", action_id: "receipt-1", label: "History receipt observed" },
+    ] },
+  });
+  tree = render();
+  assert(label(tree).includes("staged · canonical: pending"));
+  assert(label(tree).includes("Approval: unsupported"));
+  const observationText = label(tree);
+  assert(observationText.includes("Observation retention gap: earlier events are unavailable."));
+  assert(observationText.includes("Snapshot refetch required: observations may be incomplete."));
+  assert(observationText.indexOf("Observed index: 11") <
+    observationText.indexOf("Observed index: 12"), "observed order followed source sequence");
+  assert(observationText.includes("Source sequence: 90 · source epoch: epoch-a"));
+  assert(observationText.includes("canonical revision: 4"));
+  assert(observationText.includes("canonical revision: unavailable"));
+  assert(nodes(tree).some((node) => node.tag === "a" &&
+    node.props.href === "#ht-interaction-staged-1" && label(node) === "origin-1"));
+  assert(nodes(tree).some((node) => node.tag === "a" &&
+    node.props.href === "#ht-job-job-1" && label(node) === "action-1"));
+  assert(observationText.includes("<script>Run observed</script>"));
+  assert(!nodes(tree).some((node) => node.tag === "script"));
+  assert.equal(sent.length, 0, "observation replay triggered provider speech");
+  button(tree, "View available result").props.onClick(); await drain(); tree = render();
+  assert(label(tree).includes("<script>full available result</script>"));
+  assert(!nodes(tree).some((node) => node.tag === "script"));
+  assert.equal(sent.length, 0, "task replay/result view spoke automatically");
+  button(tree, "Stop").props.onClick(); tree = render();
+  heldSession = true;
+  button(tree, "Join / resume task").props.onClick(); await waitFor(() => sessionRelease);
+    tree = render();
+  button(tree, "Cancel connection").props.onClick(); sessionRelease(); await drain();
+    tree = render();
+  assert(button(tree, "Join / resume task"), "late session mint revived cancelled page");
+  assert.equal(requests.filter((r) => r.url.endsWith("/close")).length, 2);
+  heldSession = false;
+  button(tree, "Join / resume task").props.onClick(); await drain(); tree = render();
+  listeners.pagehide(); await drain();
+  assert(latestTransport.closed, "pagehide did not close transport");
+  assert.equal(requests.filter((r) => r.url.endsWith("/close")).length, 3);
+  process.exit(0);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_dashboard_serializes_tool_calls_and_continues_once_after_response_done():
