@@ -20,8 +20,10 @@ from dataclasses import dataclass
 import httpx
 
 try:
+    from . import talk_realtime as rt
     from .talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_realtime as rt
     from talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 
 OPENAI_REALTIME_OFFER_URL = "https://api.openai.com/v1/realtime/calls"
@@ -29,6 +31,7 @@ OPENAI_REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 MINT_TIMEOUT_S = 30.0
+_DEFAULT_TURN_DETECTION = rt.RealtimeTurnDetection()
 
 
 class TalkWireError(Exception):
@@ -59,6 +62,40 @@ class TalkSessionDescriptor:
         }
 
 
+def encode_turn_detection(
+    turn_detection: rt.RealtimeTurnDetection,
+    *,
+    automatic_response: bool,
+) -> dict:
+    """Encode neutral endpointing as an OpenAI Realtime turn detector."""
+
+    mode = turn_detection.mode
+    eagerness = turn_detection.semantic_eagerness
+    if mode is rt.RealtimeTurnDetectionMode.SEMANTIC_VAD:
+        return {
+            "type": "semantic_vad",
+            "eagerness": (
+                eagerness.value
+                if eagerness is not None
+                else rt.RealtimeSemanticEagerness.AUTO.value
+            ),
+            "create_response": automatic_response,
+            "interrupt_response": True,
+        }
+    if eagerness is not None:
+        raise ValueError("semantic eagerness is valid only for semantic turn detection")
+    if mode in {
+        rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+        rt.RealtimeTurnDetectionMode.SERVER_VAD,
+    }:
+        return {
+            "type": "server_vad",
+            "create_response": automatic_response,
+            "interrupt_response": True,
+        }
+    raise ValueError(f"unsupported OpenAI turn detection mode: {mode!r}")
+
+
 def build_session_payload(
     *,
     model: str = DEFAULT_TALK_MODEL,
@@ -66,6 +103,7 @@ def build_session_payload(
     instructions: str,
     tools: list[dict] | None = None,
     automatic_response: bool = True,
+    turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
 ) -> dict:
     """OpenAI Realtime session config — server VAD, barge-in enabled.
@@ -80,11 +118,10 @@ def build_session_payload(
     audio: dict = {
         "input": {
             "noise_reduction": {"type": "near_field"},
-            "turn_detection": {
-                "type": "server_vad",
-                "create_response": automatic_response,
-                "interrupt_response": True,
-            },
+            "turn_detection": encode_turn_detection(
+                turn_detection,
+                automatic_response=automatic_response,
+            ),
             "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
         },
     }
@@ -154,6 +191,7 @@ def mint_ephemeral_session(
     instructions: str,
     tools: list[dict] | None = None,
     automatic_response: bool = True,
+    turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
@@ -170,6 +208,7 @@ def mint_ephemeral_session(
         tools=tools,
         automatic_response=automatic_response,
         text_output=text_output,
+        turn_detection=turn_detection,
     )
     payload = post_client_secret(auth_token, session)
     secret, expires_at_ms = parse_client_secret(payload)
@@ -191,6 +230,7 @@ __all__ = [
     "TalkUpstreamError",
     "TalkWireError",
     "build_session_payload",
+    "encode_turn_detection",
     "mint_ephemeral_session",
     "parse_client_secret",
     "post_client_secret",

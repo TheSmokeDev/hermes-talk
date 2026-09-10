@@ -108,6 +108,37 @@ except Exception as exc:  # noqa: BLE001 - an optional host surface must never
     # poison hermes-talk's own imports. Every released Hermes lands here.
     _CORE_IMPORT_ERROR = exc
 
+_TURN_DETECTION_IMPORT_ERROR: BaseException | None = None
+try:
+    from agent.realtime_voice_provider import (
+        RealtimeSemanticEagerness,
+        RealtimeTurnDetection,
+        RealtimeTurnDetectionMode,
+    )
+except Exception as exc:  # noqa: BLE001 - pre-semantic core heads lack these names
+    _TURN_DETECTION_IMPORT_ERROR = exc
+    RealtimeSemanticEagerness = None  # type: ignore[assignment]
+    RealtimeTurnDetection = None  # type: ignore[assignment]
+    RealtimeTurnDetectionMode = None  # type: ignore[assignment]
+
+
+def turn_detection_available() -> bool:
+    """True when the host contract carries the semantic turn-detection names.
+
+    A pre-semantic core head (today's #101808) still gets the full core lane;
+    only turn-detection controls degrade to provider-native. Never raises.
+    """
+
+    return _CORE_IMPORT_ERROR is None and _TURN_DETECTION_IMPORT_ERROR is None
+
+
+def _contract_turn_modes(*names: str) -> frozenset:
+    """Contract turn-detection modes by member name; empty on pre-semantic heads."""
+
+    if not turn_detection_available():
+        return frozenset()
+    return frozenset(getattr(RealtimeTurnDetectionMode, name) for name in names)
+
 
 def core_contract_available() -> bool:
     """True when this host exposes the exact core realtime contract we target."""
@@ -117,10 +148,10 @@ def core_contract_available() -> bool:
 
 def core_contract_diagnostic() -> dict[str, Any]:
     """Read-only receipt for ``talk doctor`` / ``talk_status``. Never raises."""
-
     available = core_contract_available()
     return {
         "contract_available": available,
+        "turn_detection_available": turn_detection_available(),
         "provider_names": list(PROVIDER_NAMES),
         "detail": "" if available else type(_CORE_IMPORT_ERROR).__name__,
     }
@@ -355,6 +386,8 @@ if _CORE_IMPORT_ERROR is None:
         input_audio = PCM16_24K
         output_audio = PCM16_24K
 
+        supported_turn_detection_modes = _contract_turn_modes("PROVIDER_NATIVE")
+
         def __init__(
             self,
             *,
@@ -390,6 +423,34 @@ if _CORE_IMPORT_ERROR is None:
                 ),
             }
 
+        def _talk_turn_detection(self, turn_detection: Any) -> rt.RealtimeTurnDetection:
+            if turn_detection is None:
+                # Pre-semantic host: the setup carries no turn_detection at all.
+                return rt.RealtimeTurnDetection()
+            if turn_detection.mode not in self.supported_turn_detection_modes:
+                raise ValueError(
+                    f"{self.display_name} does not support turn detection mode "
+                    f"{turn_detection.mode.value}"
+                )
+            modes = {
+                RealtimeTurnDetectionMode.PROVIDER_NATIVE: (
+                    rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+                ),
+                RealtimeTurnDetectionMode.SERVER_VAD: (rt.RealtimeTurnDetectionMode.SERVER_VAD),
+                RealtimeTurnDetectionMode.SEMANTIC_VAD: (rt.RealtimeTurnDetectionMode.SEMANTIC_VAD),
+            }
+            eagerness = {
+                None: None,
+                RealtimeSemanticEagerness.AUTO: rt.RealtimeSemanticEagerness.AUTO,
+                RealtimeSemanticEagerness.LOW: rt.RealtimeSemanticEagerness.LOW,
+                RealtimeSemanticEagerness.MEDIUM: rt.RealtimeSemanticEagerness.MEDIUM,
+                RealtimeSemanticEagerness.HIGH: rt.RealtimeSemanticEagerness.HIGH,
+            }
+            return rt.RealtimeTurnDetection(
+                mode=modes[turn_detection.mode],
+                semantic_eagerness=eagerness[turn_detection.semantic_eagerness],
+            )
+
         def _talk_setup(self, setup: RealtimeVoiceSetup) -> Any:
             for label, requested, expected in (
                 ("input", setup.input_audio, self.input_audio),
@@ -412,12 +473,13 @@ if _CORE_IMPORT_ERROR is None:
                     )
                     for tool in setup.tools
                 ),
-                automatic_response=setup.automatic_response,
+                turn_detection=self._talk_turn_detection(getattr(setup, "turn_detection", None)),
             )
 
         async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
             # Shape first: an unusable setup is refused before any credential is
             # resolved and before a socket is opened.
+            self.validate_setup(setup)
             talk_setup = self._talk_setup(setup)
             resolver = self._auth_resolver or self._resolve_auth
             auth = resolver()
@@ -466,6 +528,9 @@ if _CORE_IMPORT_ERROR is None:
         provider_tag = "gpt-realtime speech-to-speech"
         env_key = "OPENAI_API_KEY"
         env_url = "https://platform.openai.com/api-keys"
+        supported_turn_detection_modes = _contract_turn_modes(
+            "PROVIDER_NATIVE", "SERVER_VAD", "SEMANTIC_VAD"
+        )
 
         def default_model(self) -> str | None:
             return talk_config.talk_model() or talk_config.DEFAULT_TALK_MODEL
@@ -527,6 +592,9 @@ if _CORE_IMPORT_ERROR is None:
         provider_tag = "grok-voice speech-to-speech"
         env_key = "XAI_API_KEY"
         env_url = "https://console.x.ai"
+        supported_turn_detection_modes = _contract_turn_modes(
+            "PROVIDER_NATIVE", "SERVER_VAD"
+        )
 
         def default_model(self) -> str | None:
             return talk_config.talk_grok_model() or talk_config.DEFAULT_GROK_MODEL
@@ -684,8 +752,8 @@ __all__ = [
     "TalkGrokCoreProvider",
     "TalkOpenAICoreProvider",
     "build_providers",
-    "core_contract_available",
     "core_contract_diagnostic",
     "redact",
     "translate_event",
+    "turn_detection_available",
 ]
