@@ -702,3 +702,108 @@ def test_host_conflict_is_terminal_and_scrubs_text(host, tmp_path):
     result = attachment.flush(event, token)
     assert (result.state, result.code) == ("conflicted", "event_conflict")
     assert box.diagnostics()["pending_bytes"] == 0
+
+
+@pytest.mark.parametrize("during_reconnect", [False, True])
+def test_retired_event_preserves_unrelated_pending_dialogue(host, tmp_path, during_reconnect):
+    attachment, box = client(host, tmp_path)
+    token = attachment.attach()
+    event_a, _ = queued(attachment, event_id="event-a", text="retired A")
+    host.lose_commit = True
+    assert attachment.flush(event_a, token).state == "pending"
+    event_b, _ = queued(attachment, event_id="event-b", text="unsaved B")
+    host.retired = True
+    if during_reconnect:
+        token = attachment.attach()
+    else:
+        assert attachment.flush(event_a, token).code == "retired"
+        assert attachment.snapshot is None
+    assert box.pending(attachment.owner) == (event_b,)
+    assert box.get(attachment.owner, event_b).messages[0].content == "unsaved B"
+    assert attachment.flush(event_b, attachment.attach()).state == "saved"
+    assert [row["content"] for row in host.rows].count("unsaved B") == 1
+
+
+def test_retry_reattach_cas_cannot_reclaim_newer_connection(host, tmp_path, monkeypatch):
+    old, box = client(host, tmp_path)
+    token = old.attach()
+    event, _ = queued(old)
+    host.busy = True
+    assert old.flush(event, token).code == "busy"
+    host.busy = False
+    entered, release = threading.Event(), threading.Event()
+    begin = box.begin
+
+    def delayed_begin(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return begin(*args, **kwargs)
+
+    monkeypatch.setattr(box, "begin", delayed_begin)
+    with ThreadPoolExecutor() as pool:
+        future = pool.submit(old.flush, event, token)
+        assert entered.wait(5)
+        newer, _ = client(host, tmp_path)
+        fresh = newer.attach()
+        calls_before_release = len(host.calls)
+        release.set()
+        with pytest.raises(HistoryError, match="stale_generation"):
+            future.result(timeout=5)
+    assert len(host.calls) == calls_before_release
+    assert newer.refresh_snapshot(fresh).conversation_id == "root"
+    assert newer.flush(event, fresh).state == "saved"
+
+
+def test_callback_invalidation_cas_rejects_late_writer(host, tmp_path, monkeypatch):
+    old, box = client(host, tmp_path)
+    token = old.attach()
+    event, _ = queued(old)
+    host.override["commit"] = host.error("target_missing", 404)
+    entered, release = threading.Event(), threading.Event()
+    invalidate = box.invalidate
+
+    def delayed_invalidate(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return invalidate(*args, **kwargs)
+
+    monkeypatch.setattr(box, "invalidate", delayed_invalidate)
+    with ThreadPoolExecutor() as pool:
+        future = pool.submit(old.flush, event, token)
+        assert entered.wait(5)
+        newer, _ = client(host, tmp_path)
+        fresh = newer.attach()
+        release.set()
+        with pytest.raises(HistoryError, match="stale_generation"):
+            future.result(timeout=5)
+    assert box.pending(newer.owner) == (event,)
+    assert newer.refresh_snapshot(fresh).conversation_id == "root"
+    host.override.clear()
+    assert newer.flush(event, fresh).state == "saved"
+
+
+@pytest.mark.parametrize("code,status", [("retired", 410), ("target_missing", 404)])
+def test_stale_terminal_error_cannot_invalidate_new_generation(host, tmp_path, code, status):
+    old, box = client(host, tmp_path)
+    token = old.attach()
+    event_a, _ = queued(old)
+    entered, release = threading.Event(), threading.Event()
+
+    def delay(operation):
+        if operation == "commit":
+            entered.set()
+            assert release.wait(5)
+
+    host.before = delay
+    host.override["commit"] = host.error(code, status)
+    with ThreadPoolExecutor() as pool:
+        future = pool.submit(old.flush, event_a, token)
+        assert entered.wait(5)
+        newer, _ = client(host, tmp_path)
+        fresh = newer.attach()
+        event_b, _ = queued(newer, event_id="event-b", text="new generation B")
+        release.set()
+        with pytest.raises(HistoryError, match="stale_generation"):
+            future.result(timeout=5)
+    assert box.pending(newer.owner) == (event_a, event_b)
+    assert newer.refresh_snapshot(fresh).conversation_id == "root"

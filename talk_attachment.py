@@ -124,11 +124,22 @@ class TalkAttachment:
         self._authority = None
         self._snapshot = None
 
-    def _host_error(self, exc: HistoryError):
+    def _host_error(self, exc: HistoryError, token: CaptureToken, event_id: str | None = None):
+        self._check(token)
         if exc.code in {"target_missing", "target_unavailable", "retired"}:
+            # A retired receipt says only that this event's canonical rows are gone.
+            # Only confirmed target deletion invalidates the whole owner's queue.
+            if exc.code == "target_missing" or event_id is not None:
+                self._outbox.invalidate(
+                    self._owner,
+                    code=exc.code,
+                    connection_id=self._connection,
+                    generation=token.generation,
+                    event_id=None if exc.code == "target_missing" else event_id,
+                )
             self._forget_context()
-            self._outbox.invalidate(self._owner, code=exc.code)
-            self._token = None
+            if exc.code == "target_missing":
+                self._token = None
         elif exc.code in {"stale_attachment", "unauthorized", "malformed_response"}:
             self._forget_context()
 
@@ -145,39 +156,40 @@ class TalkAttachment:
             **change,
         )
 
-    def _reattach(self) -> CaptureToken:
+    def _advance(self, expected: CaptureToken | None = None) -> CaptureToken:
+        generation = self._outbox.begin(
+            self._owner,
+            self._connection,
+            expected_generation=expected.generation if expected else None,
+        )
         self._forget_context()
-        generation = self._outbox.begin(self._owner, self._connection)
         token = CaptureToken(self._owner, self._connection, generation)
         self._token = token
+        return token
+
+    def _reattach(self, token: CaptureToken) -> CaptureToken:
+        self._check(token)
+        data = self._transport.request(
+            "attach",
+            {"tab_id": self._connection, "session_id": self._owner.session_id},
+        )
+        self._check(token)
+        self._profile(data)
+        if (
+            data.get("tab_id") != self._connection
+            or data.get("session_id") != self._owner.session_id
+            or type(data.get("generation")) is not int
+            or data["generation"] < 1
+        ):
+            raise HistoryError("malformed_response")
         try:
-            data = self._transport.request(
-                "attach",
-                {
-                    "tab_id": self._connection,
-                    "session_id": self._owner.session_id,
-                },
-            )
-            self._check(token)
-            self._profile(data)
-            if (
-                data.get("tab_id") != self._connection
-                or data.get("session_id") != self._owner.session_id
-                or type(data.get("generation")) is not int
-                or data["generation"] < 1
-            ):
-                raise HistoryError("malformed_response")
-            try:
-                attachment_id = identifier(data.get("attachment_id"))
-            except HistoryError:
-                raise HistoryError("malformed_response") from None
-            snapshot = HistorySnapshot.parse(data.get("snapshot"))
-            self._authority = AttachmentAuthority(token, attachment_id, data["generation"])
-            self._snapshot = snapshot
-            return token
-        except HistoryError as exc:
-            self._host_error(exc)
-            raise
+            attachment_id = identifier(data.get("attachment_id"))
+        except HistoryError:
+            raise HistoryError("malformed_response") from None
+        snapshot = HistorySnapshot.parse(data.get("snapshot"))
+        self._authority = AttachmentAuthority(token, attachment_id, data["generation"])
+        self._snapshot = snapshot
+        return token
 
     def attach(self) -> CaptureToken:
         """Negotiate, reconcile this original owner's pending events, then attach.
@@ -188,21 +200,26 @@ class TalkAttachment:
         with self._lock:
             self._forget_context()
             self._caps = None
-            generation = self._outbox.begin(self._owner, self._connection)
-            token = CaptureToken(self._owner, self._connection, generation)
-            self._token = token
+            token = self._advance()
             try:
                 self._caps = HistoryCapabilities.parse(self._transport.request("capabilities"))
                 self._check(token)
                 for event_id in self._outbox.pending(self._owner):
                     event = self._outbox.get(self._owner, event_id)
-                    receipt = self._reconcile(event)
+                    try:
+                        receipt = self._reconcile(event)
+                    except HistoryError as exc:
+                        if exc.code != "retired":
+                            raise
+                        self._host_error(exc, token, event_id)
+                        continue
                     self._check(token)
                     if receipt is not None:
                         self._mark(event_id, token, state="saved")
-                return self._reattach()
+                token = self._advance(token)
+                return self._reattach(token)
             except HistoryError as exc:
-                self._host_error(exc)
+                self._host_error(exc, token)
                 raise
 
     def refresh_snapshot(self, token: CaptureToken) -> HistorySnapshot:
@@ -220,7 +237,7 @@ class TalkAttachment:
                 self._snapshot = snapshot
                 return snapshot
             except HistoryError as exc:
-                self._host_error(exc)
+                self._host_error(exc, token)
                 raise
 
     def enqueue(
@@ -324,7 +341,8 @@ class TalkAttachment:
                     if receipt is not None:
                         self._mark(event_id, token, state="saved")
                         return HistoryDelivery("saved", receipt=receipt)
-                    token = self._reattach()
+                    token = self._advance(token)
+                    self._reattach(token)
                 if self._authority is None:
                     raise HistoryError("not_attached")
                 if (
@@ -353,7 +371,7 @@ class TalkAttachment:
                 self._mark(event_id, token, state="saved")
                 return HistoryDelivery("saved", receipt=receipt)
             except HistoryError as exc:
-                self._host_error(exc)
+                self._host_error(exc, token, event_id)
                 if exc.code in {"target_missing", "target_unavailable", "retired"}:
                     return HistoryDelivery("failed", exc.code)
                 if exc.code in {"outbox_unavailable", "stale_generation"}:
@@ -381,13 +399,9 @@ class TalkAttachment:
             self._forget_context()
             if authority is None:
                 return
-            try:
-                data = self._transport.request("detach", authority.wire())
-                if data != {"status": "detached"}:
-                    raise HistoryError("malformed_response")
-            except HistoryError as exc:
-                self._host_error(exc)
-                raise
+            data = self._transport.request("detach", authority.wire())
+            if data != {"status": "detached"}:
+                raise HistoryError("malformed_response")
 
     def diagnostics(self) -> dict:
         with self._lock:

@@ -138,9 +138,13 @@ class HistoryOutbox:
         if row is None or row["owner"] != owner.key or row["generation"] != generation:
             raise HistoryError("stale_generation")
 
-    def begin(self, owner: HistoryOwner, connection_id: str) -> int:
+    def begin(
+        self, owner: HistoryOwner, connection_id: str, *, expected_generation: int | None = None
+    ) -> int:
         scope = self._scope(owner, connection_id)
         with self._db() as db:
+            if expected_generation is not None:
+                self._check(db, owner, connection_id, expected_generation)
             row = db.execute(
                 "SELECT generation FROM connections WHERE scope=?", (scope,)
             ).fetchone()
@@ -282,20 +286,33 @@ class HistoryOutbox:
                 return prior[0]
             return state
 
-    def invalidate(self, owner: HistoryOwner, *, code: str):
+    def invalidate(
+        self,
+        owner: HistoryOwner,
+        *,
+        code: str,
+        connection_id: str,
+        generation: int,
+        event_id: str | None = None,
+    ):
         if code not in {"retired", "target_missing", "target_unavailable"}:
             raise HistoryError("invalid_input")
+        if event_id is None and code != "target_missing":
+            raise HistoryError("invalid_input")
         with self._db() as db:
+            self._check(db, owner, connection_id, generation)
             db.execute(
                 """UPDATE events SET state='failed',code=?,messages='',bytes=0,
                 owner='',owner_json='',conversation_id='',origin_turn_id='',connection_id=''
-                WHERE owner=?""",
-                (code, owner.key),
+                WHERE owner=?"""
+                + (" AND event_id=?" if event_id is not None else ""),
+                (code, owner.key, event_id) if event_id is not None else (code, owner.key),
             )
-            db.execute(
-                "UPDATE connections SET owner='',generation=generation+1 WHERE owner=?",
-                (owner.key,),
-            )
+            if event_id is None:
+                db.execute(
+                    "UPDATE connections SET owner='',generation=generation+1 WHERE owner=?",
+                    (owner.key,),
+                )
 
     def pending(self, owner: HistoryOwner) -> tuple[str, ...]:
         if owner.profile != self._profile:

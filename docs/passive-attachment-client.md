@@ -57,6 +57,9 @@ callbacks and discards context before exact-generation detach, even if its respo
 is lost. Host restart, deletion and message retirement have no push notification in
 v1; refresh/reconcile is required to learn that state. Invalid attachments discard
 cached context; deletion/retirement scrub derived owner references and queued text.
+Receipt retirement scrubs only that event; unrelated pending dialogue survives.
+Only confirmed target deletion purges the owner's queue. Reconnect and error
+callbacks compare the expected generation inside the outbox writer transaction.
 
 The derived SQLite outbox lives at `state/talk-history-outbox.sqlite3` beneath the
 explicit profile home. Admission is transactional across processes and bounded to
