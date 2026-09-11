@@ -530,6 +530,10 @@ class GeminiRealtimeSession:
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
+        if setup.task_continuity:
+            raise rt.RealtimeSessionError(
+                "Gemini canonical task input/response linkage is unsupported"
+            )
         try:
             _validate_turn_detection(setup)
         except rt.RealtimeSessionError:
@@ -618,6 +622,8 @@ class GeminiRealtimeSession:
             elif isinstance(command, rt.RemoveContext):
                 self._degrade_receipt("conversation context delete")
             elif isinstance(command, rt.StartResponse):
+                if command.input is not None or command.conversation is not None:
+                    raise rt.RealtimeSessionError("Gemini isolated task responses are unsupported")
                 if command.metadata or command.allow_tools is not None:
                     self._degrade_receipt("per-response metadata and tool gating")
                 if not tool_result_present:

@@ -290,14 +290,7 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
-    """Assemble instructions and mint. Blocking — called on a worker thread.
-
-    ``text_output`` is the cascade lane: the minted session asks the provider
-    for TEXT output instead of synthesized audio, and the browser streams the
-    text deltas back through the cascade relay to be spoken server-side.
-    """
-
+def _session_tools(bound=None):
     # The browser owns this lane's microphone, so the pause tool is not
     # offered here (default_talk_tools' pausable stays False).
     tools = talk_tools.default_talk_tools()
@@ -322,6 +315,18 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
                     }
             elif tool["name"] == "resolve_approval":
                 tool["parameters"]["properties"]["approval_id"] = {"type": "string"}
+    return tools
+
+
+def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
+    """Assemble instructions and mint. Blocking — called on a worker thread.
+
+    ``text_output`` is the cascade lane: the minted session asks the provider
+    for TEXT output instead of synthesized audio, and the browser streams the
+    text deltas back through the cascade relay to be spoken server-side.
+    """
+
+    tools = _session_tools(bound)
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),
@@ -881,6 +886,34 @@ async def _target_session(request, body, *, initial=False):
             await asyncio.to_thread(TARGETS.cancel, prepared)
 
 
+@router.post("/native/attach")
+async def native_task_attach(request: Request):
+    """Bind a native client through real dashboard authentication; mint no voice credentials."""
+    require_dashboard_auth(request)
+    body = await _json_body(request)
+    prepared = await _task_call(
+        lambda req, data: TARGETS.prepare(req, data, initial="connection_id" not in data),
+        request, body,
+    )
+    if isinstance(prepared, dict):
+        return prepared
+    activated = False
+    try:
+        selection = await _task_call(TARGETS.activate, request, prepared)
+        activated = True
+        bound = prepared.bound
+        tools = _session_tools(bound)
+        instructions = talk_identity.build_instructions(
+            None, tools=tools, lane="cli", canonical_task=True,
+            capabilities="Canonical task tools and linked child work are available.",
+        ) + "\n\n" + TASKS.instructions(bound)
+        return {"ok": True, "task": TASKS.descriptor(bound), "instructions": instructions,
+                "tools": tools, "selection": selection, "voice_state": "not_connected"}
+    finally:
+        if not activated:
+            await asyncio.to_thread(TARGETS.cancel, prepared)
+
+
 @router.post("/targets")
 async def task_targets(request: Request):
     require_dashboard_auth(request)
@@ -960,6 +993,7 @@ ROUTE_HANDLERS = (
     task_result,
     task_close,
     task_targets,
+    native_task_attach,
     task_switch,
 )
 

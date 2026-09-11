@@ -33,6 +33,23 @@ def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(value))
 
 
+def _freeze_json(value):
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def wire_value(value):
+    """Copy immutable provider evidence back to plain wire data."""
+    if isinstance(value, Mapping):
+        return {key: wire_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [wire_value(item) for item in value]
+    return value
+
+
 class SessionState(StrEnum):
     """Observable lifecycle of a provider session."""
 
@@ -119,6 +136,7 @@ class SessionSetup:
     #: refuse at their own boundary rather than silently speaking anyway.
     text_output: bool = False
     turn_detection: RealtimeTurnDetection = RealtimeTurnDetection()
+    task_continuity: bool = False
 
     def __post_init__(self) -> None:
         _identifier(self.model, "model")
@@ -198,6 +216,7 @@ class Transcript(RealtimeEvent):
     #: Which response produced this transcript. Always None for input audio —
     #: the operator's own speech belongs to no response.
     response_id: str | None = None
+    item_id: str | None = None
 
     def __post_init__(self) -> None:
         expected_role = {
@@ -207,6 +226,7 @@ class Transcript(RealtimeEvent):
         if self.role is not expected_role:
             raise ValueError("Transcript role must match its audio provenance")
         _identifier(self.response_id, "response_id", optional=True)
+        _identifier(self.item_id, "item_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,9 +270,18 @@ class ToolCallsCancelled(RealtimeEvent):
 @dataclass(frozen=True, slots=True)
 class ResponseFinished(RealtimeEvent):
     response_id: str | None = None
+    status: str | None = None
+    output: tuple[Mapping[str, Any], ...] | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.response_id, "response_id", optional=True)
+        if self.status not in {None, "completed", "cancelled", "failed", "incomplete"}:
+            raise ValueError("Invalid terminal response status")
+        if self.output is not None:
+            if (not isinstance(self.output, (list, tuple)) or len(self.output) > 64
+                or any(not isinstance(item, Mapping) for item in self.output)):
+                raise ValueError("Invalid terminal response output")
+            object.__setattr__(self, "output", tuple(_freeze_json(item) for item in self.output))
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,14 +337,36 @@ class RemoveContext(RealtimeCommand):
 class StartResponse(RealtimeCommand):
     metadata: Mapping[str, str] = field(default_factory=dict)
     allow_tools: bool | None = None
+    input: tuple[Mapping[str, Any], ...] | None = None
+    conversation: str | None = None
+    instructions: str | None = None
+    max_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _frozen_mapping(self.metadata))
+        if self.conversation not in {None, "auto", "none"}:
+            raise ValueError("Invalid response conversation")
+        if self.conversation == "none" and (self.input is None or self.allow_tools is not False):
+            raise ValueError("Isolated responses require explicit input and disabled tools")
+        if self.input is not None:
+            if (not isinstance(self.input, (list, tuple)) or len(self.input) > 128
+                or any(not isinstance(item, Mapping) for item in self.input)):
+                raise ValueError("Invalid response input")
+            object.__setattr__(self, "input", tuple(_freeze_json(item) for item in self.input))
+        if self.instructions is not None and (not isinstance(self.instructions, str)
+                                             or len(self.instructions) > 16000):
+            raise ValueError("Invalid response instructions")
+        if self.max_output_tokens is not None and (type(self.max_output_tokens) is not int
+                                                  or not 1 <= self.max_output_tokens <= 4096):
+            raise ValueError("Invalid response token bound")
 
 
 @dataclass(frozen=True, slots=True)
 class CancelResponse(RealtimeCommand):
-    pass
+    response_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _identifier(self.response_id, "response_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,9 +384,11 @@ class TruncateOutput(RealtimeCommand):
 class SubmitToolResult(RealtimeCommand):
     call_id: str
     output: str
+    item_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.call_id, "call_id")
+        _identifier(self.item_id, "item_id", optional=True)
 
 
 class RealtimeSessionError(RuntimeError):
@@ -391,4 +444,5 @@ __all__ = [
     "TranscriptProvenance",
     "TranscriptRole",
     "TruncateOutput",
+    "wire_value",
 ]

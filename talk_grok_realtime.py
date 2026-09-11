@@ -157,13 +157,23 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
     if isinstance(command, rt.RemoveContext):
         return {"type": "conversation.item.delete", "item_id": command.item_id}
     if isinstance(command, rt.StartResponse):
+        if command.input is not None or command.conversation is not None:
+            raise rt.RealtimeSessionError(
+                "Grok explicit task input/context isolation is unverified"
+            )
         response: dict[str, Any] = {}
         if command.metadata:
             response["metadata"] = dict(command.metadata)
         if command.allow_tools is False:
             response["tool_choice"] = "none"
+        if command.instructions is not None:
+            response["instructions"] = command.instructions
+        if command.max_output_tokens is not None:
+            response["max_output_tokens"] = command.max_output_tokens
         return {"type": "response.create", **({"response": response} if response else {})}
     if isinstance(command, rt.CancelResponse):
+        if command.response_id is not None:
+            raise rt.RealtimeSessionError("Grok response-ID cancellation is unverified")
         return {"type": "response.cancel"}
     if isinstance(command, rt.TruncateOutput):
         return {
@@ -177,6 +187,7 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             "type": "conversation.item.create",
             "item": {
                 "type": "function_call_output",
+                **({"id": command.item_id} if command.item_id else {}),
                 "call_id": command.call_id,
                 "output": command.output,
             },
@@ -293,6 +304,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=False,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.output_audio_transcript.done":
             completed = event.get("transcript")
@@ -302,6 +314,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=True,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type in {
             "conversation.item.input_audio_transcription.delta",
@@ -320,6 +333,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 text=snapshot.strip(),
                 final=False,
                 provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+                item_id=event.get("item_id"),
             )
         if event_type == "conversation.item.input_audio_transcription.completed":
             # On the live wire (smoke, 2026-08-28) xAI emits this event more
@@ -332,9 +346,10 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 return None
             return rt.Transcript(
                 role=rt.TranscriptRole.USER,
-                text=transcript.strip(),
+                text=transcript,
                 final=True,
                 provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+                item_id=event.get("item_id"),
             )
         if event_type == "response.function_call_arguments.done":
             return rt.FunctionCall(
@@ -346,7 +361,9 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
             )
         if event_type == "response.done":
             response = _mapping(event.get("response"))
-            return rt.ResponseFinished(response_id=response.get("id"))
+            return rt.ResponseFinished(
+                response_id=response.get("id"), status=response.get("status"), output=response.get("output")
+            )
         if event_type == "error":
             return rt.ProviderFailure(
                 detail=_error_detail(event) or "Provider reported a session error"
@@ -648,6 +665,10 @@ class GrokRealtimeSession:
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
+        if setup.task_continuity:
+            raise rt.RealtimeSessionError(
+                "Grok canonical task context isolation needs protocol proof"
+            )
         try:
             _validate_turn_detection(setup)
         except rt.RealtimeSessionError:
