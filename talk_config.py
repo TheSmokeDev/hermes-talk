@@ -23,6 +23,12 @@ from pathlib import Path
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
 DEFAULT_AGENT_TIMEOUT_S = 1_800
+#: Model for the GPT-Live delegation lane (``TALK_VOICE_MODE=live``). GPT-Live
+#: is a server-side relay that manages its own spoken conversation and
+#: delegates backend work out; the model named here is the one that runs the
+#: live voice, not the ephemeral-secret Realtime model. Fail-closed: an empty
+#: or unknown model refuses at mint time rather than guessing a metered model.
+LIVE_TALK_MODEL = "gpt-4.1-mini"
 
 #: Realtime voice providers selectable through ``TALK_PROVIDER``. The list is
 #: fail-closed on purpose: a provider knob that guesses silently would spend
@@ -54,7 +60,7 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: provider as the brain and hands speech synthesis to a streaming TTS the
 #: operator chooses. Fail-closed like the provider list: a mode knob that
 #: guesses silently would spend the wrong metered TTS key.
-TALK_VOICE_MODES = ("native", "cascade")
+TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
 #: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
 #: today; the list exists so a typo refuses instead of silently selecting.
@@ -604,10 +610,12 @@ def voice_mode() -> str:
     """Voice synthesis mode, resolved at call time. Fail-closed.
 
     ``TALK_VOICE_MODE`` = ``native`` (default; the provider synthesizes its
-    own voice, exactly the pre-cascade behaviour) or ``cascade`` (the
-    provider thinks in text, a streaming TTS speaks). Any other value
-    refuses with the valid names rather than silently picking one — a
-    misread mode would spend the wrong metered key or mute the call.
+    own voice, exactly the pre-cascade behaviour), ``cascade`` (the
+    provider thinks in text, a streaming TTS speaks), or ``live`` (GPT-Live
+    client delegation — the provider runs the voice and delegates backend
+    work to the bound task controller). Any other value refuses with the
+    valid names rather than silently picking one — a misread mode would
+    spend the wrong metered key or mute the call.
     """
 
     raw = (

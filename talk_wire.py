@@ -21,15 +21,20 @@ import httpx
 
 try:
     from . import talk_realtime as rt
-    from .talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
+    from .talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE, LIVE_TALK_MODEL
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_realtime as rt
-    from talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
+    from talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE, LIVE_TALK_MODEL
 
 OPENAI_REALTIME_OFFER_URL = "https://api.openai.com/v1/realtime/calls"
 OPENAI_REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+#: GPT-Live is a server-side relay: the caller POSTs the browser's SDP offer
+#: here (with the raw credential, which never leaves the process) and receives
+#: the provider's SDP answer plus a session id. Unlike Realtime's ephemeral
+#: two-step dial, there is no client secret handed to the browser in live mode.
+LIVE_SESSIONS_URL = "https://api.openai.com/v1/live/sessions"
 MINT_TIMEOUT_S = 30.0
 _DEFAULT_TURN_DETECTION = rt.RealtimeTurnDetection()
 
@@ -57,6 +62,29 @@ class TalkSessionDescriptor:
             "clientSecret": self.client_secret,
             "expiresAt": self.expires_at_ms,
             "offerUrl": self.offer_url,
+            "model": self.model,
+            "voice": self.voice,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TalkLiveDescriptor:
+    """Client-facing GPT-Live session metadata — SDP answer only.
+
+    Carries the provider's SDP answer and session id. There is NO credential:
+    the raw key that minted the session never leaves this process and never
+    appears in a descriptor (or any error raised here).
+    """
+
+    session_id: str
+    sdp: str
+    model: str
+    voice: str
+
+    def to_wire(self) -> dict:
+        return {
+            "sessionId": self.session_id,
+            "sdp": self.sdp,
             "model": self.model,
             "voice": self.voice,
         }
@@ -221,17 +249,105 @@ def mint_ephemeral_session(
     )
 
 
+def post_live_session(auth_token: str, payload: dict):
+    """POST a GPT-Live session payload. Isolated for tests.
+
+    The raw credential rides only the Authorization header here and never
+    appears in the returned response object's parsed form.
+    """
+
+    return httpx.post(
+        LIVE_SESSIONS_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+        },
+        timeout=MINT_TIMEOUT_S,
+    )
+
+
+def mint_live_session(
+    *,
+    auth_token: str,
+    sdp_offer: str,
+    instructions: str,
+    voice: str = DEFAULT_TALK_VOICE,
+    model: str = LIVE_TALK_MODEL,
+) -> TalkLiveDescriptor:
+    """Relay a browser SDP offer to the GPT-Live session endpoint.
+
+    GPT-Live is a server-side relay. The caller hands this layer the
+    browser's WebRTC SDP offer; this layer POSTs it (with the raw credential,
+    which never leaves the process) to ``POST /v1/live/sessions`` and returns
+    the provider's SDP answer plus session id. No ephemeral secret ever
+    reaches the client.
+
+    The error path redacts the provider's response BODY: upstream error
+    bodies sometimes echo the caller's Authorization header back, so only the
+    HTTP status plus a bounded reason-phrase/flag survive — never the raw
+    ``text`` body.
+    """
+
+    session: dict = {
+        "type": "live",
+        "model": model,
+        "instructions": instructions,
+        "audio": {"output": {"voice": voice}},
+        "delegation": {"type": "client"},
+    }
+    payload: dict = {
+        "session": session,
+        "transport": {"type": "webrtc", "sdp": sdp_offer},
+    }
+    if not isinstance(sdp_offer, str) or not sdp_offer.strip():
+        raise TalkWireError("mint_live_session requires a non-empty SDP offer")
+    response = post_live_session(auth_token, payload)
+    if response.status_code // 100 != 2:
+        # Redacted: never echo the provider's verbatim body into an exception,
+        # a response, or a log line — a hostile body could leak our own key.
+        reason = response.reason_phrase or "upstream error"
+        raise TalkUpstreamError(
+            f"GPT-Live session create failed ({response.status_code}): {reason}"
+        )
+    try:
+        body = response.json()
+    except Exception as exc:
+        raise TalkUpstreamError("GPT-Live session create returned non-JSON") from exc
+    if not isinstance(body, dict):
+        raise TalkUpstreamError("GPT-Live session create returned invalid payload")
+    session_block = body.get("session")
+    transport = body.get("transport")
+    if not isinstance(session_block, dict) or not isinstance(transport, dict):
+        raise TalkUpstreamError(
+            "GPT-Live session create response lacked session or transport"
+        )
+    session_id = session_block.get("id")
+    sdp = transport.get("sdp")
+    if not isinstance(session_id, str) or not session_id:
+        raise TalkUpstreamError("GPT-Live session create response had no session id")
+    if not isinstance(sdp, str) or not sdp:
+        raise TalkUpstreamError("GPT-Live session create response had no SDP answer")
+    return TalkLiveDescriptor(
+        session_id=session_id, sdp=sdp, model=model, voice=voice
+    )
+
+
 __all__ = [
     "CLIENT_SECRETS_URL",
     "INPUT_TRANSCRIPTION_MODEL",
+    "LIVE_SESSIONS_URL",
     "OPENAI_REALTIME_OFFER_URL",
     "OPENAI_REALTIME_WS_URL",
+    "TalkLiveDescriptor",
     "TalkSessionDescriptor",
     "TalkUpstreamError",
     "TalkWireError",
     "build_session_payload",
     "encode_turn_detection",
     "mint_ephemeral_session",
+    "mint_live_session",
     "parse_client_secret",
     "post_client_secret",
+    "post_live_session",
 ]

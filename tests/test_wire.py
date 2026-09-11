@@ -205,3 +205,133 @@ def test_input_only_mint_passes_false_into_the_http_payload(monkeypatch):
     )
 
     assert seen["audio"]["input"]["turn_detection"]["create_response"] is False
+
+
+class _FakeResponse:
+    """Minimal stand-in for ``httpx.Response`` consumed by the live mint."""
+
+    def __init__(self, status_code, body, reason_phrase=None, json_raise=False):
+        self.status_code = status_code
+        self.reason_phrase = reason_phrase
+        self._body = body
+        self._json_raise = json_raise
+
+    def json(self):
+        if self._json_raise:
+            raise ValueError("not json")
+        return self._body
+
+
+_LIVE_OFFER = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n"  # a minimal SDP offer
+
+
+def test_live_mint_relays_an_sdp_offer_and_returns_the_answer(monkeypatch):
+    seen = {}
+
+    def fake_post(auth_token, payload):
+        seen["auth_token"] = auth_token
+        seen["payload"] = payload
+        return _FakeResponse(
+            200,
+            {
+                "session": {"id": "ses_live_123"},
+                "transport": {"type": "webrtc", "sdp": "v=0 answer"},
+            },
+        )
+
+    monkeypatch.setattr(talk_wire, "post_live_session", fake_post)
+
+    descriptor = talk_wire.mint_live_session(
+        auth_token="sk-live-secret",
+        sdp_offer=_LIVE_OFFER,
+        instructions="be brief",
+        voice="cedar",
+    )
+
+    assert seen["auth_token"] == "sk-live-secret"
+    assert seen["payload"]["session"]["type"] == "live"
+    assert seen["payload"]["session"]["delegation"] == {"type": "client"}
+    assert seen["payload"]["transport"]["sdp"] == _LIVE_OFFER
+    assert descriptor.session_id == "ses_live_123"
+    assert descriptor.sdp == "v=0 answer"
+    # The raw credential never reaches the descriptor (or anything a client
+    # can read).
+    assert "sk-live-secret" not in json.dumps(descriptor.to_wire())
+
+
+def test_live_mint_never_leaks_the_credential(monkeypatch):
+    seen = {}
+
+    def fake_post(auth_token, payload):
+        seen["auth_token"] = auth_token
+        seen["payload"] = payload
+        return _FakeResponse(
+            200,
+            {
+                "session": {"id": "ses_live_456"},
+                "transport": {"type": "webrtc", "sdp": "v=0 answer"},
+            },
+        )
+
+    monkeypatch.setattr(talk_wire, "post_live_session", fake_post)
+
+    descriptor = talk_wire.mint_live_session(
+        auth_token="sk-live-secret", sdp_offer=_LIVE_OFFER, instructions="x"
+    )
+
+    assert "sk-live-secret" not in json.dumps(descriptor.to_wire())
+    assert "sk-live-secret" not in repr(descriptor)
+
+
+def test_live_mint_redacts_the_upstream_error_body(monkeypatch):
+    # A hostile/leaky upstream body must never survive into the exception.
+    def fake_post(_auth_token, _payload):
+        return _FakeResponse(
+            401,
+            {"error": {"message": "sk-live-secret leaked by provider"}},
+            reason_phrase="Unauthorized",
+        )
+
+    monkeypatch.setattr(talk_wire, "post_live_session", fake_post)
+
+    with pytest.raises(talk_wire.TalkUpstreamError) as excinfo:
+        talk_wire.mint_live_session(
+            auth_token="sk-live-secret", sdp_offer=_LIVE_OFFER, instructions="x"
+        )
+
+    message = str(excinfo.value)
+    assert "sk-live-secret" not in message
+    assert "leaked by provider" not in message
+    assert "Unauthorized" in message
+
+
+def test_live_mint_rejects_a_missing_sdp_offer():
+    with pytest.raises(talk_wire.TalkWireError):
+        talk_wire.mint_live_session(
+            auth_token="k", sdp_offer="", instructions="x"
+        )
+
+
+def test_live_mint_refuses_a_non_json_body(monkeypatch):
+    def fake_post(_auth_token, _payload):
+        return _FakeResponse(200, None, json_raise=True)
+
+    monkeypatch.setattr(talk_wire, "post_live_session", fake_post)
+
+    with pytest.raises(talk_wire.TalkUpstreamError):
+        talk_wire.mint_live_session(
+            auth_token="k", sdp_offer=_LIVE_OFFER, instructions="x"
+        )
+
+
+def test_live_mint_refuses_a_payload_missing_transport(monkeypatch):
+    def fake_post(_auth_token, _payload):
+        return _FakeResponse(200, {"session": {"id": "s"}})
+
+    monkeypatch.setattr(talk_wire, "post_live_session", fake_post)
+
+    with pytest.raises(talk_wire.TalkUpstreamError):
+        talk_wire.mint_live_session(
+            auth_token="k", sdp_offer=_LIVE_OFFER, instructions="x"
+        )
+

@@ -814,6 +814,11 @@ def test_voice_mode_cascade_accepted(monkeypatch):
     assert talk_config.voice_mode() == "cascade"
 
 
+def test_voice_mode_live_accepted(monkeypatch):
+    monkeypatch.setenv("TALK_VOICE_MODE", " live ")
+    assert talk_config.voice_mode() == "live"
+
+
 def test_voice_mode_unknown_refuses(monkeypatch):
     monkeypatch.setenv("TALK_VOICE_MODE", "telepathy")
     with pytest.raises(talk_config.TalkConfigError, match="TALK_VOICE_MODE"):

@@ -290,12 +290,18 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
+def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None, sdp_offer=None):
     """Assemble instructions and mint. Blocking — called on a worker thread.
 
     ``text_output`` is the cascade lane: the minted session asks the provider
     for TEXT output instead of synthesized audio, and the browser streams the
     text deltas back through the cascade relay to be spoken server-side.
+
+    ``sdp_offer`` is the GPT-Live lane (``voice_mode() == "live"``): the
+    browser hands this route its WebRTC SDP offer and the plugin relays it to
+    ``POST /v1/live/sessions``, keeping the raw credential in this process.
+    The returned descriptor carries the provider's SDP answer and session id
+    — no ephemeral secret, no credential.
     """
 
     # The browser owns this lane's microphone, so the pause tool is not
@@ -322,6 +328,30 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
                     }
             elif tool["name"] == "resolve_approval":
                 tool["parameters"]["properties"]["approval_id"] = {"type": "string"}
+    if sdp_offer is not None:
+        # GPT-Live lane: relay the browser's SDP offer to the provider. The
+        # returned descriptor carries the SDP answer + session id, never a
+        # credential. Tools are still assembled above so the bound controller's
+        # canonical tools are what the live session advertises.
+        return talk_wire.mint_live_session(
+            auth_token=auth_token,
+            sdp_offer=sdp_offer,
+            voice=voice,
+            instructions=talk_identity.build_instructions(
+                None if bound is not None else talk_host.host().identity_sections(),
+                tools=tools,
+                lane="dashboard",
+                canonical_task=bound is not None,
+                # The session route already paid for the catalog warm, so the
+                # live-catalog section reads a warm snapshot here.
+                capabilities=(
+                    "Canonical task tools and linked child work are available."
+                    if bound is not None
+                    else talk_capabilities.instruction_section()
+                ),
+            )
+            + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
+        )
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
         model=talk_config.talk_model(),
@@ -449,7 +479,22 @@ async def create_session(request: Request) -> dict:
     if "task" in body and body["task"] is not None:
         bound = await _task_call(TASKS.join, request, body["task"])
     voice_mode = _resolve_voice_mode()
+    live_mode = voice_mode == "live"
     text_output = voice_mode == "cascade"
+    sdp = None
+    if live_mode:
+        # GPT-Live relay: the browser POSTs its WebRTC SDP offer here and we
+        # hand it to POST /v1/live/sessions. The response carries the SDP
+        # answer + session id — never a credential.
+        sdp = body.get("sdp")
+        if not isinstance(sdp, str) or not sdp.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "TALK_VOICE_MODE=live needs an SDP offer in the session body "
+                    "(sdp)."
+                ),
+            )
     if text_output:
         # A cascade session has no provider voice to validate — the mint asks
         # for text output and the relay speaks. The cascade config refuses
@@ -466,6 +511,19 @@ async def create_session(request: Request) -> dict:
         auth = talk_auth.resolve_auth()
     except talk_auth.TalkAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if live_mode and auth.source == talk_auth.SOURCE_CODEX_OAUTH:
+        # GPT-Live client delegation needs a real OpenAI project API key; a
+        # Codex OAuth credential is a different billing/entitlement tier that
+        # has no GPT-Live access. Refuse loudly instead of silently falling
+        # back to a metered key or returning an opaque upstream 403.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "TALK_VOICE_MODE=live requires a project API key "
+                "(TALK_OPENAI_API_KEY), not Codex OAuth. Set the key or leave "
+                "live mode off."
+            ),
+        )
     try:
         # Off the event loop: the mint is a 30s-timeout HTTP call and identity
         # assembly reads files and may initialize a memory provider. On the
@@ -475,7 +533,8 @@ async def create_session(request: Request) -> dict:
             auth.token,
             voice,
             text_output=text_output,
-            **({"bound": bound} if bound is not None else {}),
+            sdp_offer=sdp,
+            **(dict(bound=bound) if bound is not None else {}),
         )
     except talk_wire.TalkWireError as exc:
         if bound is not None:
