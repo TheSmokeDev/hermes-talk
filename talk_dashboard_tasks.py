@@ -87,6 +87,14 @@ BOUND_TOOLS = frozenset(
 CHILD_TOOLS = frozenset({"delegate_task", "search_memory", "search_vault"})
 
 
+def codex_worker_available(capabilities):
+    feature = capabilities.get("features", {}).get("linked_child_dispatch", {})
+    support = feature.get("external_workers", {})
+    return (isinstance(support, dict) and type(support.get("version")) is int
+            and support["version"] == 1 and isinstance(support.get("names"), list)
+            and "hermes-talk-codex" in support["names"])
+
+
 def update_preference_tool():
     return {
         "type": "function",
@@ -640,6 +648,14 @@ class DashboardTasks:
                         "correlation_id": action["action_id"],
                     },
                 }
+                worker = arguments.get("worker", "hermes")
+                if (not isinstance(worker, str) or worker not in {"hermes", "codex"}
+                    or (worker != "hermes" and name != "delegate_task")):
+                    raise DashboardTaskError("unsupported_tool", 400)
+                if worker == "codex":
+                    if not codex_worker_available(bound.capabilities):
+                        raise DashboardTaskError("child_dispatch_unsupported", 409)
+                    action["request_body"]["child"]["worker"] = "hermes-talk-codex"
             elif name == "steer_work":
                 if set(arguments) not in ({"run_id"}, {"api_run_id"}):
                     raise DashboardTaskError("invalid_event", 400)
@@ -752,7 +768,7 @@ class DashboardTasks:
             raise DashboardTaskError("connection_stale", 409)
         return saved, output
 
-    def _dispatch(self, bound, action):
+    def _dispatch(self, bound, action, *, recover=False):
         if action["state"] == "accepted":
             return action
         if action["state"] not in {"prepared", "uncertain"}:
@@ -768,6 +784,10 @@ class DashboardTasks:
             saved = bound.stages.record_original_receipt(
                 action, state="accepted", api_run_id=receipt["run_id"]
             )
+            if not recover and receipt.get("replayed") is not True and not bound.closed:
+                with self._lock:
+                    bound.job_observations.setdefault(action["run_id"], ("queued", None, None))
+
             if saved is None:
                 raise DashboardTaskError("connection_stale", 409)
             return saved
@@ -865,7 +885,7 @@ class DashboardTasks:
                         bound.token, action["run_id"], state="uncertain"
                     )
                 with suppress(DashboardTaskError, HistoryError):
-                    self._dispatch(bound, action)
+                    self._dispatch(bound, action, recover=True)
         for record in interactions:
             if record.get("settled_response") and record["state"] not in {
                 "saved",
@@ -1087,6 +1107,7 @@ class DashboardTasks:
             "run_id": action["run_id"],
             "status": result["status"],
             "output": output,
+            "artifacts": result.get("artifacts") or [],
             "truncated": False,
         }
 

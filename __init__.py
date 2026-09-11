@@ -20,6 +20,7 @@ import logging
 try:
     from . import (
         talk_cli,
+        talk_codex_provider,
         talk_config,
         talk_core_provider,
         talk_core_realtime,
@@ -33,6 +34,7 @@ try:
     )
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
     import talk_cli
+    import talk_codex_provider
     import talk_config
     import talk_core_provider
     import talk_core_realtime
@@ -274,6 +276,15 @@ def register(ctx) -> None:
         _unsupported("realtime voice provider", "realtime_voice_provider")
 
     _register_core_realtime_providers(ctx)
+
+    register_worker = getattr(ctx, "register_task_worker_provider", None)
+    if callable(register_worker):
+        provider = talk_codex_provider.build_provider(ctx)
+        if provider is not None:
+            try:
+                register_worker(provider)
+            except Exception as exc:  # noqa: BLE001 - optional registration preserves other surfaces
+                logger.warning("Talk task-worker registration failed: %s", type(exc).__name__)
 
     _attempt_registration(
         ctx,

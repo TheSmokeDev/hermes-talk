@@ -34,6 +34,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
   "talk_config",
+  "talk_codex_wire",
+  "talk_codex_store",
+  "talk_codex_worker",
+  "talk_codex_provider",
   "talk_auth",
   "talk_doctor",
   "talk_setup",
@@ -120,6 +124,10 @@ known-first-party = [
   "talk_check",
   "talk_cli",
   "talk_config",
+  "talk_codex_wire",
+  "talk_codex_store",
+  "talk_codex_worker",
+  "talk_codex_provider",
   "talk_dashboard_gateway",
   "talk_dashboard_store",
   "talk_dashboard_tasks",
