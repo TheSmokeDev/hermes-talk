@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,7 +39,18 @@ SCRIPT = Path(__file__).parent / "fixtures" / "codex_app_server.py"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["complete", "approval_replay", "drop_turn"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "complete",
+        "approval_replay",
+        "drop_turn",
+        "ignore_interrupt",
+        "ack_no_terminal",
+        "lease_steer",
+        "lease_approval",
+    ],
+)
 async def test_dashboard_to_real_host_to_scripted_codex_preserves_ownership(
     tmp_path, monkeypatch, scenario
 ):
@@ -47,13 +60,28 @@ async def test_dashboard_to_real_host_to_scripted_codex_preserves_ownership(
     )
     monkeypatch.setattr("agent.model_metadata.fetch_model_metadata", lambda *a, **kw: {})
     wires = []
+    timers = []
+    if scenario.startswith("lease_"):
+        from agent import periodic_scheduler
+
+        original_schedule = periodic_scheduler.schedule
+
+        def schedule(callback, interval, *args, **kwargs):
+            timers.append(callback)
+            return original_schedule(callback, interval, *args, **kwargs)
+
+        monkeypatch.setattr(periodic_scheduler, "schedule", schedule)
+    monkeypatch.setattr(talk_codex_worker.CodexWorker, "CANCEL_TIMEOUT_S", 0.25)
+    wire_scenario = {"lease_steer": "hold", "lease_approval": "approval_replay"}.get(
+        scenario, scenario
+    )
 
     def wire(command, *, cwd):
         assert command[1:] == ("app-server", "--listen", "stdio://")
         process = CodexAppServer(
-            (sys.executable, "-u", str(SCRIPT), str(tmp_path / "peer.json"), scenario),
+            (sys.executable, "-u", str(SCRIPT), str(tmp_path / "peer.json"), wire_scenario),
             cwd=cwd,
-            timeout=2,
+            timeout=8 if scenario.startswith("lease_") else 2,
             version_command=(sys.executable, str(SCRIPT), "--version"),
         )
         wires.append(process)
@@ -213,21 +241,106 @@ async def test_dashboard_to_real_host_to_scripted_codex_preserves_ownership(
                         until(lambda s: not s["jobs"][0]["approval"].get("approvals")), 10
                     )
                     await tool("stop", "Stop the worker", "stop_work", {"run_id": local_run})
-                await asyncio.wait_for(
-                    until(lambda s: s["jobs"][0]["result_available"]), 20
-                )
+                elif scenario in {"ignore_interrupt", "ack_no_terminal"}:
+                    await asyncio.wait_for(
+                        until(lambda s: s["jobs"][0]["steering"]["supported"]), 15
+                    )
+                    await tool("stop", "Stop the worker", "stop_work", {"run_id": local_run})
+                elif scenario.startswith("lease_"):
+                    from gateway.platforms.api_server_task_workers import current_worker
+
+                    await asyncio.wait_for(
+                        until(
+                            lambda s: (
+                                s["jobs"][0]["steering"]["supported"]
+                                and (
+                                    scenario != "lease_approval"
+                                    or s["jobs"][0]["approval"].get("approvals")
+                                )
+                            )
+                        ),
+                        15,
+                    )
+                    remote = bound.stages.action(bound.token, local_run)["api_run_id"]
+                    binding = current_worker(adapter._active_run_agents[remote], remote)
+                    worker = binding.session.worker
+                    original_authorize = worker.authorize
+                    entered, release = threading.Event(), threading.Event()
+
+                    def gate():
+                        entered.set()
+                        assert release.wait(12)
+                        return original_authorize()
+
+                    worker.authorize = gate
+                    operation = asyncio.create_task(
+                        tool(
+                            "late",
+                            "A queued operation",
+                            "resolve_approval" if scenario == "lease_approval" else "steer_work",
+                            {"run_id": local_run, "choice": "once"}
+                            if scenario == "lease_approval"
+                            else {"run_id": local_run},
+                        )
+                    )
+                    try:
+                        assert await asyncio.to_thread(entered.wait, 10)
+                        child_id = binding.child_id
+                        with db._read_ctx() as conn:
+                            holder = conn.execute(
+                                "SELECT holder FROM session_turn_leases WHERE conversation_id=?",
+                                (child_id,),
+                            ).fetchone()[0]
+                        changed = db._execute_write(
+                            lambda conn: (
+                                conn.execute(
+                                    "UPDATE session_turn_leases "
+                                "SET holder='replacement-worker',expires_at=? "
+                                    "WHERE conversation_id=? AND holder=?",
+                                    (time.time() + 60, child_id, holder),
+                                ).rowcount
+                            )
+                        )
+                        assert changed == 1
+                        assert not binding.session.request.still_authorized()
+                        for callback in timers:
+                            callback()
+                        db._execute_write(
+                            lambda conn: conn.execute(
+                                "UPDATE session_turn_leases SET holder=?,expires_at=? "
+                                "WHERE conversation_id=?",
+                                (holder, time.time() + 60, child_id),
+                            )
+                        )
+                        assert not binding.session.request.still_authorized()
+                    finally:
+                        release.set()
+                    await asyncio.wait_for(operation, 12)
+                await asyncio.wait_for(until(lambda s: s["jobs"][0]["result_available"]), 20)
                 result = await call(manager.result, {**capture, "run_id": local_run})
-                assert result["status"] == (
-                    "cancelled" if scenario == "approval_replay" else "completed"
-                ), result
-                assert "Second section [artifact](result.md)" in result["output"]
+                if scenario in {"ignore_interrupt", "ack_no_terminal"}:
+                    assert (
+                        result["status"] == "failed"
+                        and result["error"] == "cancellation_unconfirmed"
+                    )
+                    assert result["output"] == "Partial work before stop"
+                elif scenario.startswith("lease_"):
+                    assert result["status"] == "failed"
+                else:
+                    assert result["status"] == (
+                        "cancelled" if scenario == "approval_replay" else "completed"
+                    ), result
+                    assert "Second section [artifact](result.md)" in result["output"]
+                    assert result["artifacts"][0]["changes"][0]["diff"] == "+full artifact"
                 assert result["truncated"] is False
-                assert result["artifacts"][0]["changes"][0]["diff"] == "+full artifact"
                 rows = db.get_messages("same-session")
                 assert sum(row["content"] == original for row in rows) == 1
                 state = json.loads((tmp_path / "peer.json").read_text(encoding="utf-8"))
                 methods = [row.get("method") for row in state["requests"]]
                 assert methods.count("thread/start") == methods.count("turn/start") == 1
+                if scenario.startswith("lease_"):
+                    assert "turn/steer" not in methods
+                    assert not state.get("approval_replies")
                 if scenario == "approval_replay":
                     steer = next(
                         row for row in state["requests"] if row.get("method") == "turn/steer"

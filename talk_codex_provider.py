@@ -74,7 +74,9 @@ def build_provider(ctx):
                     continue
                 with suppress(CodexWorkerError):
                     if (
-                        self.request.still_authorized()
+                        not self.cancelled.is_set()
+                        and not self.closed.is_set()
+                        and self.request.still_authorized()
                         and self.worker.snapshot()["turn_id"] == turn_id
                     ):
                         self.worker.control(action_id, text=text)

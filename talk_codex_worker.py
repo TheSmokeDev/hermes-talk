@@ -72,6 +72,8 @@ class CodexWorkerConfig:
 
 
 class CodexWorker:
+    CANCEL_TIMEOUT_S = 10.0
+
     def __init__(
         self,
         jobs: CodexJobs,
@@ -119,6 +121,9 @@ class CodexWorker:
         self._controls = threading.RLock()
         self._pending_approvals = {}
         self._resolved_approvals = set()
+
+    def _work_authorized(self):
+        return not self.cancel_event.is_set() and self.authorize() is True
 
     def snapshot(self):
         return self.jobs.read(self.owner, self.job_id)
@@ -354,7 +359,7 @@ class CodexWorker:
             row = self._pending_approvals.pop(request_id)
             self._resolved_approvals.add(request_id)
             self.wire.send(
-                {"id": row["id"], "result": {"decision": decision}}, authorize=self.authorize
+                {"id": row["id"], "result": {"decision": decision}}, authorize=self._work_authorized
             )
             self.on_change(self.snapshot())
             return {
@@ -401,7 +406,7 @@ class CodexWorker:
                 )
             try:
                 result = self.wire.request(
-                    method, params, authorize=None if cancel else self.authorize
+                    method, params, authorize=None if cancel else self._work_authorized
                 )
                 if not cancel and result.get("turnId") != record["turn_id"]:
                     raise CodexWorkerError("foreign_thread")
@@ -420,7 +425,11 @@ class CodexWorker:
                 return record
             if record["state"] not in {"prepared", "thread_ready"} and not record["thread_id"]:
                 raise CodexWorkerError("outcome_unknown")
-            if self.cancel_event.is_set():
+            if (
+                self.cancel_event.is_set()
+                and record["state"] in {"prepared", "thread_ready"}
+                and record["turn_id"] is None
+            ):
                 return self._update(state="interrupted")
             self.wire = self.wire_factory().start()
             if record["state"] == "prepared":
@@ -436,7 +445,7 @@ class CodexWorker:
                                 "and approval policy."
                             ),
                         },
-                        authorize=self.authorize,
+                        authorize=self._work_authorized,
                     )
                 )
                 thread = self._thread(response)
@@ -444,7 +453,9 @@ class CodexWorker:
             else:
                 thread = self._thread(
                     self.wire.request(
-                        "thread/read", {"threadId": record["thread_id"], "includeTurns": True}
+                        "thread/read",
+                        {"threadId": record["thread_id"], "includeTurns": True},
+                        authorize=self.authorize,
                     )
                 )
                 found = self._recover_turn(thread)
@@ -452,7 +463,9 @@ class CodexWorker:
                     return self.snapshot()
                 response = self._policy(
                     self.wire.request(
-                        "thread/resume", {"threadId": record["thread_id"], **self.request["policy"]}
+                        "thread/resume",
+                        {"threadId": record["thread_id"], **self.request["policy"]},
+                        authorize=self.authorize,
                     )
                 )
                 thread = self._thread(response)
@@ -475,18 +488,22 @@ class CodexWorker:
                         "clientUserMessageId": self.request["action_id"],
                         "input": self._input(),
                     },
-                    authorize=self.authorize,
+                    authorize=self._work_authorized,
                 )
                 self._turn(response.get("turn"))
             renewed = time.monotonic()
             cancel_sent = False
+            cancel_deadline = None
             while self.snapshot()["state"] not in TERMINAL:
                 message = self.wire.event()
                 if message is not None:
                     self._event(message)
                 if self.cancel_event.is_set() and not cancel_sent:
+                    cancel_deadline = time.monotonic() + self.CANCEL_TIMEOUT_S
                     self.control("cancel-" + self.job_id, cancel=True)
                     cancel_sent = True
+                if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
+                    raise CodexWorkerError("cancellation_unconfirmed")
                 if time.monotonic() - renewed >= 5:
                     self._update()
                     renewed = time.monotonic()

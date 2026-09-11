@@ -57,11 +57,16 @@ Approval requests retain their server RPC ID, process generation, thread, turn a
 item. Only the current original request can be answered; a duplicate response or
 reconnect cannot approve the next request. A written decision is labelled a transport
 handoff, not proof that an action ran. Unsupported server requests are refused. Owner
-validity is rechecked at the subprocess write boundary for work and approvals.
+validity and the exact canonical child lease are rechecked at the subprocess write
+boundary for work and approvals. Cancellation/retirement prevents queued new writes;
+the narrow interrupt path can still stop the original worker.
 
 If a response is lost, the adapter reads only its recorded thread and correlates the
 original `clientUserMessageId`. It never starts a replacement turn to simulate recovery.
-The host adapter makes one bounded reconciliation attempt after a disconnected process
+After stop is requested, interruption has a ten-second outcome deadline. A missing
+interrupt reply or terminal event closes the owned process and preserves the original
+mapping/partial result as `cancellation_unconfirmed`; it never claims confirmed stop or
+starts a replacement. The host adapter makes one bounded reconciliation attempt after a disconnected process
 with a known thread. A thread start with no recoverable ID stays unknown. Stored
 in-progress work without a live active turn also stays unknown. Another explicit user
 action is needed to authorize replacement work; a retry does not imply it.

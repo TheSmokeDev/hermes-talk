@@ -1108,6 +1108,7 @@ class DashboardTasks:
             "status": result["status"],
             "output": output,
             "artifacts": result.get("artifacts") or [],
+            "error": result.get("error"),
             "truncated": False,
         }
 

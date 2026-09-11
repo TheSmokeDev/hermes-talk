@@ -206,3 +206,20 @@ def test_malformed_configuration_is_a_fixed_refusal(tmp_path, field, value):
     config = CodexWorkerConfig(True, sys.executable, str(tmp_path), "explicit-model")
     with pytest.raises(CodexWorkerError):
         replace(config, **{field: value}).validate()
+
+
+@pytest.mark.parametrize("scenario", ["ignore_interrupt", "ack_no_terminal"])
+def test_unconfirmed_cancellation_exits_with_partial_result_and_no_replacement(tmp_path, scenario):
+    worker = setup(tmp_path, scenario)
+    worker.CANCEL_TIMEOUT_S = 0.25
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(worker.run)
+        wait_for(lambda: worker.snapshot()["output"] == "Partial work before stop")
+        worker.cancel_event.set()
+        result = running.result(timeout=8)
+    assert result["state"] == "unknown" and result["error"] == "cancellation_unconfirmed"
+    assert result["output"] == "Partial work before stop"
+    assert worker.approvals() == []
+    assert worker.wire.process.poll() is not None
+    assert sum(row.get("method") == "turn/interrupt" for row in peer(tmp_path)["requests"]) == 1
+    assert peer(tmp_path)["processes"] == 1

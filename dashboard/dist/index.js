@@ -2040,6 +2040,7 @@
           job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
           results[job.run_id] && h("div", null,
             h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
+            results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
             h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
             (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
               h("div", { key: index },

@@ -126,6 +126,14 @@ for line in sys.stdin:
         notify("turn/started", {"threadId": "thread-owned", "turn": turn})
         if scenario == "complete":
             finish()
+        if scenario in {"ignore_interrupt", "ack_no_terminal"}:
+            partial = {"type": "agentMessage", "id": "partial", "text": "Partial work before stop"}
+            state["thread"]["turns"][0]["items"].append(partial)
+            save()
+            notify(
+                "item/completed",
+                {"threadId": "thread-owned", "turnId": "turn-owned", "item": partial},
+            )
         if scenario == "foreign":
             notify("turn/completed", {"threadId": "foreign-thread", "turn": turn})
         if scenario in {"approval", "approval_replay"}:
@@ -158,8 +166,11 @@ for line in sys.stdin:
         result(message, {"turnId": "turn-owned"})
     elif method == "turn/interrupt":
         assert params["threadId"] == "thread-owned" and params["turnId"] == "turn-owned"
+        if scenario == "ignore_interrupt":
+            continue
         result(message, {})
-        finish("interrupted")
+        if scenario != "ack_no_terminal":
+            finish("interrupted")
     elif message.get("id") == 901 and "result" in message:
         state["approval_replies"] = state.get("approval_replies", 0) + 1
         save()
