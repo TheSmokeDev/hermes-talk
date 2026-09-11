@@ -417,6 +417,7 @@ if _CORE_IMPORT_ERROR is None:
             instructions=instructions,
             tools=None,
             automatic_response=False,
+            turn_detection=talk_config.turn_detection("openai"),
         )
         session.pop("model", None)
         return {"type": "session.update", "session": session}
@@ -1314,6 +1315,7 @@ if _CORE_IMPORT_ERROR is None:
 
         async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
             _validate_setup(setup)
+            turn_detection = talk_config.turn_detection("openai")
             model = setup.model or talk_config.talk_model()
             voice = setup.voice or talk_config.talk_voice()
             instructions = setup.instructions or ""
@@ -1329,6 +1331,7 @@ if _CORE_IMPORT_ERROR is None:
                     instructions=instructions,
                     tools=None,
                     automatic_response=False,
+                    turn_detection=turn_detection,
                     session_update=_session_update(
                         model=model, voice=voice, instructions=instructions
                     ),

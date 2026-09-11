@@ -47,9 +47,6 @@ _REAL_CONTRACT_MARKERS = (
     "OutputAudio",
     "OutputTranscript",
     "RealtimeAudioFormat",
-    "RealtimeSemanticEagerness",
-    "RealtimeTurnDetection",
-    "RealtimeTurnDetectionMode",
     "RealtimeCapability",
     "RealtimeToolResult",
     "RealtimeVoiceProvider",
@@ -91,12 +88,23 @@ def _load_real_contract():
             "agent.realtime_voice_provider", candidate
         )
         module = importlib.util.module_from_spec(spec)
+        prior = sys.modules.get(spec.name)
+        sys.modules[spec.name] = module
         try:
             spec.loader.exec_module(module)
-        except Exception:  # noqa: BLE001 - a checkout we cannot load is not ours
+        except Exception as exc:  # noqa: BLE001 - an explicit fixture must not silently skip
+            if env_var == "HERMES_TALK_CORE_CONTRACT":
+                pytest.fail(f"Explicit host contract failed to load: {type(exc).__name__}: {exc}")
             continue
+        finally:
+            if prior is None:
+                sys.modules.pop(spec.name, None)
+            else:
+                sys.modules[spec.name] = prior
         if _is_the_shipped_contract(module):
             return module
+        if env_var == "HERMES_TALK_CORE_CONTRACT":
+            pytest.fail("Explicit host fixture does not supply the base realtime contract")
 
     try:
         installed = importlib.import_module("agent.realtime_voice_provider")
@@ -147,6 +155,13 @@ def core():
             else:
                 sys.modules[name] = value
         importlib.import_module("talk_core_provider")
+
+
+@pytest.fixture
+def semantic_core(core):
+    if not core.turn_detection_available():
+        pytest.skip("This older host has no semantic turn-detection contract")
+    return core
 
 
 PLUGIN_LOGGER = "hermes_plugins.hermes_talk"
@@ -864,7 +879,8 @@ def test_the_setup_the_provider_gets_is_the_hosts_setup(core):
     }
 
 
-def test_provider_turn_detection_capability_matrix_is_exact(core):
+def test_provider_turn_detection_capability_matrix_is_exact(semantic_core):
+    core = semantic_core
     mode = core.contract.RealtimeTurnDetectionMode
 
     assert core.TalkOpenAICoreProvider.supported_turn_detection_modes == frozenset(mode)
@@ -889,8 +905,9 @@ def test_provider_turn_detection_capability_matrix_is_exact(core):
     ],
 )
 def test_openai_turn_detection_bridge_is_exhaustive(
-    core, core_mode_name, talk_mode, eagerness_name
+    semantic_core, core_mode_name, talk_mode, eagerness_name
 ):
+    core = semantic_core
     c = core.contract
     session = FakeTalkSession()
     provider = core.TalkOpenAICoreProvider(
@@ -929,8 +946,9 @@ def test_openai_turn_detection_bridge_is_exhaustive(
     ],
 )
 def test_unsupported_turn_detection_is_refused_before_auth_or_session_factory(
-    core, provider_name, mode_name
+    semantic_core, provider_name, mode_name
 ):
+    core = semantic_core
     calls = []
     provider = getattr(core, provider_name)(
         auth_resolver=lambda: calls.append("auth"),

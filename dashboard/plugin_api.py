@@ -337,8 +337,16 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
         + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
         tools=tools,
         automatic_response=bound is None,
+        turn_detection=_resolve_turn_detection(),
         text_output=text_output,
     )
+
+
+def _resolve_turn_detection():
+    try:
+        return talk_config.turn_detection("openai")
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _resolve_voice_mode() -> str:
@@ -429,6 +437,7 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    _resolve_turn_detection()
     if isinstance(body.get("task"), dict) and "target_id" in body["task"]:
         return await _target_session(request, body, initial=True)
     bound = None
@@ -804,6 +813,7 @@ async def _task_call(function, request, body):
 
 
 async def _target_session(request, body, *, initial=False):
+    _resolve_turn_detection()
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
     if text_output:

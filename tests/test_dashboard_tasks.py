@@ -730,6 +730,8 @@ def test_bound_mint_uses_real_route_and_manual_response_without_ambient_owner(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TALK_VOICE_MODE", "native")
     monkeypatch.setenv("TALK_VOICE", "marin")
+    monkeypatch.setenv("TALK_TURN_DETECTION", "semantic_vad")
+    monkeypatch.setenv("TALK_SEMANTIC_EAGERNESS", "low")
     monkeypatch.setattr(
         api.talk_auth,
         "resolve_auth",
@@ -760,7 +762,10 @@ def test_bound_mint_uses_real_route_and_manual_response_without_ambient_owner(
     request.json = body
     response = asyncio.run(api.create_session(request))
     assert response["task"]["history"]["messages"][0]["content"] == "Earlier typed task"
-    assert minted[0]["audio"]["input"]["turn_detection"]["create_response"] is False
+    assert minted[0]["audio"]["input"]["turn_detection"] == {
+        "type": "semantic_vad", "eagerness": "low",
+        "create_response": False, "interrupt_response": True,
+    }
     steering = next(tool for tool in minted[0]["tools"] if tool["name"] == "steer_work")
     assert set(steering["parameters"]["properties"]) == {"run_id", "api_run_id"}
     assert "steer_work" not in {tool["name"] for tool in api.talk_tools.default_talk_tools()}

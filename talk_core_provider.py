@@ -473,13 +473,16 @@ if _CORE_IMPORT_ERROR is None:
                     )
                     for tool in setup.tools
                 ),
+                automatic_response=setup.automatic_response,
                 turn_detection=self._talk_turn_detection(getattr(setup, "turn_detection", None)),
             )
 
         async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
             # Shape first: an unusable setup is refused before any credential is
             # resolved and before a socket is opened.
-            self.validate_setup(setup)
+            validate = getattr(self, "validate_setup", None)
+            if callable(validate):
+                validate(setup)
             talk_setup = self._talk_setup(setup)
             resolver = self._auth_resolver or self._resolve_auth
             auth = resolver()
@@ -752,6 +755,7 @@ __all__ = [
     "TalkGrokCoreProvider",
     "TalkOpenAICoreProvider",
     "build_providers",
+    "core_contract_available",
     "core_contract_diagnostic",
     "redact",
     "translate_event",

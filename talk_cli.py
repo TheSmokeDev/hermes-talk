@@ -130,7 +130,8 @@ def build_session_update(
     """
 
     session = talk_wire.build_session_payload(
-        model=model, voice=voice, instructions=instructions, tools=tools
+        model=model, voice=voice, instructions=instructions, tools=tools,
+        turn_detection=talk_config.turn_detection("openai"),
     )
     return {
         "type": "session.update",
@@ -1238,6 +1239,8 @@ def _mint_session(
     instructions: str,
     tools: list[dict],
     text_output: bool = False,
+    automatic_response: bool = True,
+    turn_detection=None,
 ) -> talk_wire.TalkSessionDescriptor:
     """Mint the ephemeral session, translating a 401 into its remediation.
 
@@ -1254,6 +1257,8 @@ def _mint_session(
             instructions=instructions,
             tools=tools,
             text_output=text_output,
+            automatic_response=automatic_response,
+            turn_detection=turn_detection or talk_config.turn_detection("openai"),
         )
     except talk_wire.TalkUpstreamError as exc:
         if "(401)" in str(exc):
@@ -1325,6 +1330,7 @@ def resolve_provider_lane() -> ProviderLane:
     """
 
     provider = talk_config.talk_provider()
+    talk_config.turn_detection(provider)
     if provider == "grok":
         return ProviderLane(
             provider=provider,
@@ -1387,6 +1393,8 @@ def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession
                 for tool in setup.tools
             ],
             text_output=setup.text_output,
+            automatic_response=setup.automatic_response,
+            turn_detection=setup.turn_detection,
         ),
     )
 
@@ -1499,6 +1507,7 @@ async def run_talk_session(
         auth = lane_pick.auth
         model = lane_pick.model
         voice = lane_pick.voice
+        turn_detection = talk_config.turn_detection(provider)
         # Cascade voice mode: the provider thinks in text, ElevenLabs speaks.
         # Resolved HERE, next to the provider pick, so every fail-closed knob
         # (mode, TTS provider, key, voice id) refuses before a single secret
@@ -1608,6 +1617,7 @@ async def run_talk_session(
         instructions=instructions,
         tools=_tool_definitions(tools),
         automatic_response=authorization_ledger is None,
+        turn_detection=turn_detection,
         text_output=voice_mode == "cascade",
     )
     pending: list[talk_realtime.RealtimeCommand] = []

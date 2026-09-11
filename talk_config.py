@@ -384,6 +384,35 @@ def session_key() -> str | None:
     return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
 
 
+def turn_detection(provider: str | None = None):
+    """Resolve a supported detector before opening provider or microphone resources."""
+    try:
+        from . import talk_realtime as rt
+    except ImportError:
+        import talk_realtime as rt
+
+    provider = provider or talk_provider()
+    raw = os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+    eagerness = os.environ.get("TALK_SEMANTIC_EAGERNESS")
+    supported = {
+        "openai": {"provider_native", "server_vad", "semantic_vad"},
+        "grok": {"provider_native", "server_vad"},
+        "gemini": {"provider_native"},
+    }
+    if raw not in supported.get(provider, set()):
+        raise TalkConfigError(f"TALK_TURN_DETECTION is invalid or unsupported for {provider}")
+    try:
+        return rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode(raw),
+            semantic_eagerness=(rt.RealtimeSemanticEagerness(eagerness.strip().lower())
+                               if eagerness is not None else None),
+        )
+    except (ValueError, TypeError):
+        raise TalkConfigError(
+            "TALK_SEMANTIC_EAGERNESS requires semantic_vad and auto, low, medium or high"
+        ) from None
+
+
 def talk_provider() -> str:
     """Realtime voice provider, resolved at call time. Fail-closed.
 
@@ -1019,5 +1048,6 @@ __all__ = [
     "talk_provider",
     "talk_voice",
     "trust_declared_read_only",
+    "turn_detection",
     "voice_mode",
 ]

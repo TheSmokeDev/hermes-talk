@@ -217,3 +217,22 @@ and interruption timing belong to the following timing slice.
 Protocol: [OpenAI Realtime client events](https://platform.openai.com/docs/api-reference/realtime-client-events/conversation/item/create).
 Presentation design reference: [Codex backend prompt](https://github.com/openai/codex/blob/94697375cb9d2aa8ae74d61957c6b396819bec94/codex-rs/prompts/templates/realtime/backend_prompt.md).
 The implementation and instructions above are original; no Codex source text was copied.
+
+
+## Turn detection
+
+`TALK_TURN_DETECTION` selects `provider_native` (default), `server_vad`, or
+`semantic_vad`. `TALK_SEMANTIC_EAGERNESS` accepts `auto`, `low`, `medium` or `high`
+only in semantic mode. These settings are validated at startup and apply to dashboard,
+terminal and Discord session construction. The dashboard uses OpenAI; changing this
+setting does not add other dashboard providers. OpenAI supports all three modes,
+Grok supports native/server, and Gemini supports native only. Unsupported combinations
+refuse before session/audio startup. Bound dashboard and authorized Discord input keep
+manual response creation regardless of endpointing choice.
+
+The provider-neutral endpointing types, wire adapters, optional host detection and
+content-free benchmark originate in Kevin Rajan's (@kvnloo) PR #107. Integration preserves
+those commits and adds configuration wiring, old-host session-open compatibility and
+manual-response preservation. Endpointing decides when a user turn ends; announcement
+and playback gating are separate. Offline payload/trace tests do not establish live
+endpointing quality.

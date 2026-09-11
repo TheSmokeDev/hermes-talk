@@ -361,7 +361,7 @@ class _OpenAIWireSession:
         instructions: str,
         tools: list[dict] | None,
         automatic_response: bool,
-        turn_detection: rt.RealtimeTurnDetection,
+        turn_detection: rt.RealtimeTurnDetection | None = None,
         session_update: dict[str, Any],
         text_output: bool = False,
     ) -> None:
@@ -377,7 +377,7 @@ class _OpenAIWireSession:
                     instructions=instructions,
                     tools=tools,
                     automatic_response=automatic_response,
-                    turn_detection=turn_detection,
+                    turn_detection=turn_detection or rt.RealtimeTurnDetection(),
                     text_output=text_output,
                 )
             finally:
