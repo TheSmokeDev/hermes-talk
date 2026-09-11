@@ -335,7 +335,9 @@ async def test_dashboard_to_real_host_to_scripted_codex_preserves_ownership(
                 assert result["truncated"] is False
                 rows = db.get_messages("same-session")
                 assert sum(row["content"] == original for row in rows) == 1
-                state = json.loads((tmp_path / "peer.json").read_text(encoding="utf-8"))
+                state = json.loads(
+                    sorted(tmp_path.glob("peer-*.json"))[-1].read_text(encoding="utf-8")
+                )
                 methods = [row.get("method") for row in state["requests"]]
                 assert methods.count("thread/start") == methods.count("turn/start") == 1
                 if scenario.startswith("lease_"):

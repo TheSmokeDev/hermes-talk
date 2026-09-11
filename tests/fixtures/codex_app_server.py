@@ -10,23 +10,33 @@ if "--version" in sys.argv:
     print("codex-cli " + os.environ.get("FAKE_CODEX_VERSION", "0.154.0"))
     raise SystemExit
 
-path = Path(sys.argv[1])
+base = Path(sys.argv[1])
 scenario = sys.argv[2]
-state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"requests": []}
+folder, prefix = base.parent, base.stem
+
+
+def snapshots():
+    return sorted(folder.glob(f"{prefix}-*.json"))
+
+
+def latest():
+    found = snapshots()
+    return found[-1] if found else None
+
+
+prior = latest()
+state = json.loads(prior.read_text(encoding="utf-8")) if prior else {"requests": []}
 state["processes"] = state.get("processes", 0) + 1
+sequence = (int(prior.stem.rsplit("-", 1)[1]) + 1) if prior else 1
 
 
 def save():
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state), encoding="utf-8")
-    for attempt in range(30):
-        try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            if attempt == 29:
-                raise
-            time.sleep(0.005)
+    # Fresh name per write: replacing one shared file raced the reader on Windows.
+    global sequence
+    staging = folder / f"{prefix}-{sequence:08d}.tmp"
+    staging.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(staging, folder / f"{prefix}-{sequence:08d}.json")
+    sequence += 1
 
 
 def send(message):
