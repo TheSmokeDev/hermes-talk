@@ -2,10 +2,12 @@
 
 import json
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -58,6 +60,52 @@ def wait_for(check):
             return
         time.sleep(0.01)
     raise AssertionError("Scripted worker did not reach the expected state")
+
+
+class _Run:
+    """A worker.run() in flight, joined with a deadline instead of forever."""
+
+    def __init__(self, worker):
+        self._done = threading.Event()
+        self._value: Any = None
+        self._error: BaseException | None = None
+        self.thread = threading.Thread(target=self._call, args=(worker,), daemon=True)
+        self.thread.start()
+
+    def _call(self, worker):
+        try:
+            self._value = worker.run()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by result()
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def result(self, timeout=None) -> Any:
+        if not self._done.wait(timeout):
+            raise AssertionError("worker.run() never returned; the worker is wedged")
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+@contextmanager
+def run_worker(worker):
+    """Run the worker off-thread and bound the join.
+
+    A plain executor context manager calls ``shutdown(wait=True)`` on exit, so
+    one wedged worker thread hangs the whole process forever — which on a slow
+    Windows runner is indistinguishable from a very long test. The thread here
+    is a daemon and the join is bounded, so a stuck worker fails the test
+    loudly and cannot hold interpreter exit open.
+    """
+
+    running = _Run(worker)
+    try:
+        yield running
+    finally:
+        if worker.wire is not None:
+            worker.wire.close()
+        assert running._done.wait(10), "worker.run() never returned; the worker is wedged"
 
 
 def test_disabled_worker_starts_no_process_or_job(tmp_path):
@@ -122,20 +170,16 @@ def test_version_mismatch_starts_no_app_server(tmp_path, monkeypatch):
 
 def test_exact_steering_and_cancellation_keep_original_thread_and_turn(tmp_path):
     worker = setup(tmp_path, "hold")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        running = pool.submit(worker.run)
-        try:
-            wait_for(lambda: worker.snapshot()["state"] == "running")
-            original = "  Keep the prefix.\n  Add this correction exactly.  "
-            receipt = worker.control("steer-one", text=original)
-            assert receipt["state"] == "queued"
-            assert worker.control("steer-one", text=original) == receipt
-            with pytest.raises(CodexWorkerError, match="event_conflict"):
-                worker.control("steer-one", text="changed")
-            assert worker.control("cancel-one", cancel=True)["state"] == "cancel_requested"
-            assert running.result(timeout=5)["state"] == "interrupted"
-        finally:
-            worker.wire.close()
+    with run_worker(worker) as running:
+        wait_for(lambda: worker.snapshot()["state"] == "running")
+        original = "  Keep the prefix.\n  Add this correction exactly.  "
+        receipt = worker.control("steer-one", text=original)
+        assert receipt["state"] == "queued"
+        assert worker.control("steer-one", text=original) == receipt
+        with pytest.raises(CodexWorkerError, match="event_conflict"):
+            worker.control("steer-one", text="changed")
+        assert worker.control("cancel-one", cancel=True)["state"] == "cancel_requested"
+        assert running.result(timeout=5)["state"] == "interrupted"
     steering = [row for row in peer(tmp_path)["requests"] if row.get("method") == "turn/steer"]
     assert len(steering) == 1 and steering[0]["params"]["input"][0]["text"] == original
     assert steering[0]["params"]["expectedTurnId"] == "turn-owned"
@@ -144,22 +188,18 @@ def test_exact_steering_and_cancellation_keep_original_thread_and_turn(tmp_path)
 
 def test_current_approval_once_and_replay_cannot_authorize_a_new_request(tmp_path):
     worker = setup(tmp_path, "approval_replay")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        running = pool.submit(worker.run)
-        try:
-            wait_for(lambda: bool(worker.approvals()))
-            current = worker.approvals()[0]
-            with pytest.raises(CodexWorkerError, match="approval_unavailable"):
-                worker.approve("foreign", "once")
-            assert worker.approve(current["request_id"], "once")["evidence"] == "transport_handoff"
-            wait_for(lambda: peer(tmp_path).get("approval_replies") == 1)
-            with pytest.raises(CodexWorkerError, match="approval_unavailable"):
-                worker.approve(current["request_id"], "once")
-            assert worker.approvals() == []
-            worker.control("stop-approved-job", cancel=True)
-            assert running.result(timeout=5)["state"] == "interrupted"
-        finally:
-            worker.wire.close()
+    with run_worker(worker) as running:
+        wait_for(lambda: bool(worker.approvals()))
+        current = worker.approvals()[0]
+        with pytest.raises(CodexWorkerError, match="approval_unavailable"):
+            worker.approve("foreign", "once")
+        assert worker.approve(current["request_id"], "once")["evidence"] == "transport_handoff"
+        wait_for(lambda: peer(tmp_path).get("approval_replies") == 1)
+        with pytest.raises(CodexWorkerError, match="approval_unavailable"):
+            worker.approve(current["request_id"], "once")
+        assert worker.approvals() == []
+        worker.control("stop-approved-job", cancel=True)
+        assert running.result(timeout=5)["state"] == "interrupted"
     assert peer(tmp_path)["approval_replies"] == 1
 
 
@@ -216,8 +256,7 @@ def test_malformed_configuration_is_a_fixed_refusal(tmp_path, field, value):
 def test_unconfirmed_cancellation_exits_with_partial_result_and_no_replacement(tmp_path, scenario):
     worker = setup(tmp_path, scenario)
     worker.CANCEL_TIMEOUT_S = 0.25
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        running = pool.submit(worker.run)
+    with run_worker(worker) as running:
         wait_for(lambda: worker.snapshot()["output"] == "Partial work before stop")
         worker.cancel_event.set()
         result = running.result(timeout=8)

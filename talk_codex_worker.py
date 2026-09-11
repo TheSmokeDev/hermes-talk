@@ -73,6 +73,8 @@ class CodexWorkerConfig:
 
 class CodexWorker:
     CANCEL_TIMEOUT_S = 10.0
+    #: A live peer keeps streaming; this much silence means it is wedged.
+    PROGRESS_TIMEOUT_S = 300.0
 
     def __init__(
         self,
@@ -492,18 +494,22 @@ class CodexWorker:
                 )
                 self._turn(response.get("turn"))
             renewed = time.monotonic()
+            progress = time.monotonic()
             cancel_sent = False
             cancel_deadline = None
             while self.snapshot()["state"] not in TERMINAL:
                 message = self.wire.event()
                 if message is not None:
                     self._event(message)
+                    progress = time.monotonic()
                 if self.cancel_event.is_set() and not cancel_sent:
                     cancel_deadline = time.monotonic() + self.CANCEL_TIMEOUT_S
                     self.control("cancel-" + self.job_id, cancel=True)
                     cancel_sent = True
                 if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
                     raise CodexWorkerError("cancellation_unconfirmed")
+                if time.monotonic() - progress >= self.PROGRESS_TIMEOUT_S:
+                    raise CodexWorkerError("outcome_unknown")
                 if time.monotonic() - renewed >= 5:
                     self._update()
                     renewed = time.monotonic()
