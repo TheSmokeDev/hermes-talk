@@ -689,3 +689,68 @@ def test_active_source_renews_only_its_associated_run(tmp_path):
     store.observe_poll(token, lease, 7, poll(status="running"))
     with sqlite3.connect(tmp_path / "state" / "talk-history-outbox.sqlite3") as db:
         assert [row[0] for row in db.execute("SELECT run_id FROM task_event_runs")] == [7]
+
+
+def test_preferences_survive_event_expiry_and_surface_reconnect(tmp_path):
+    now = [1.0]
+    store, box, token = scope(tmp_path, clock=lambda: now[0], ttl=10)
+    assert store.preferences(token) == {"update_mode": "important"}
+    store.set_update_preference(token, "frequent")
+    store.observe_rpc(token, rpc(store, token), replay(frame(1)))
+    now[0] = 12.0
+    assert store.page(token)["events"] == []
+    terminal_token = CaptureToken(token.owner, "terminal", box.begin(token.owner, "terminal"))
+    resumed = TaskEvents(box, terminal_token, clock=lambda: now[0])
+    assert resumed.preferences(terminal_token) == {"update_mode": "frequent"}
+    resumed.set_update_preference(terminal_token, "completion")
+    assert store.preferences(token) == {"update_mode": "completion"}
+
+
+def test_preferences_fence_owner_generation_and_canonical_deletion(tmp_path):
+    store, box, token = scope(tmp_path)
+    other, _, foreign = scope(tmp_path, parent="other", tab="other-tab")
+    store.set_update_preference(token, "completion")
+    other.set_update_preference(foreign, "frequent")
+    with pytest.raises(TaskEventError, match="foreign_owner"):
+        store.preferences(foreign)
+    with pytest.raises(TaskEventError, match="foreign_owner"):
+        store.set_update_preference(foreign, "important")
+    fresh = CaptureToken(
+        token.owner, token.connection_id, box.begin(token.owner, token.connection_id)
+    )
+    with pytest.raises(HistoryError):
+        store.set_update_preference(token, "important")
+    with pytest.raises(HistoryError):
+        store.preferences(token)
+    assert store.preferences(fresh)["update_mode"] == "completion"
+    box.invalidate(token.owner, code="target_missing", connection_id=fresh.connection_id,
+                   generation=fresh.generation)
+    with pytest.raises(HistoryError):
+        store.preferences(fresh)
+    with box._db() as db:
+        assert db.execute("SELECT count(*) FROM task_preferences WHERE owner=?",
+                          (token.owner.key,)).fetchone()[0] == 0
+    assert other.preferences(foreign)["update_mode"] == "frequent"
+
+
+@pytest.mark.parametrize("mode", [None, "quiet", [], {}, True])
+def test_invalid_preferences_leave_existing_setting_unchanged(tmp_path, mode):
+    store, _, token = scope(tmp_path)
+    store.set_update_preference(token, "completion")
+    with pytest.raises(TaskEventError, match="invalid_event"):
+        store.set_update_preference(token, mode)
+    assert store.preferences(token)["update_mode"] == "completion"
+
+
+def test_preference_capacity_does_not_evict_other_owners(tmp_path):
+    store, box, token = scope(tmp_path)
+    with box._db() as db:
+        db.executemany("INSERT INTO task_preferences VALUES (?,?)",
+                       [(f"owner-{i}", "frequent") for i in range(256)])
+    with pytest.raises(TaskEventError, match="capacity"):
+        store.set_update_preference(token, "completion")
+    assert store.preferences(token)["update_mode"] == "important"
+    with box._db() as db:
+        assert db.execute("SELECT count(*) FROM task_preferences").fetchone()[0] == 256
+        db.execute("UPDATE task_preferences SET owner=? WHERE owner='owner-0'", (token.owner.key,))
+    assert store.set_update_preference(token, "completion")["update_mode"] == "completion"

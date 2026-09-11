@@ -85,3 +85,11 @@ source/run records indefinitely.
 
 Dashboard/terminal/Discord wiring and dispatch-origin/linked-child integration remain
 separate. No remote/Codex or provider capability is inferred from these local modules.
+
+
+`preferences` and `set_update_preference` read/write task settings under the same owner
+and generation fence, in a separate table that outlives derived event TTL. The dashboard
+uses `speech_candidates` to select current-generation live observations according to the
+saved mode; this does not change the silent replay contract of `page`. The dashboard
+reauthorizes each candidate at speech preparation and opts into an atomic preference
+check when claiming its delivery. Canonical target deletion also removes preferences.

@@ -303,7 +303,9 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
     tools = talk_tools.default_talk_tools()
     if bound is not None:
         tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
-        tools += [talk_dashboard_tasks.steering_tool()]
+        tools += [
+            talk_dashboard_tasks.steering_tool(), talk_dashboard_tasks.update_preference_tool()
+        ]
         if getattr(bound, "target_record", None) is not None:
             tools += talk_target_selection.selection_tools()
         for tool in tools:
@@ -905,6 +907,24 @@ async def task_result(request: Request):
     return await _task_call(TASKS.result, request, body)
 
 
+@router.post("/preference")
+async def task_preference(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.update_preference, request, await _json_body(request))
+
+
+@router.post("/speech")
+async def task_speech(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.speech, request, await _json_body(request))
+
+
+@router.post("/speech/receipt")
+async def task_speech_receipt(request: Request):
+    require_dashboard_auth(request)
+    return await _task_call(TASKS.speech_receipt, request, await _json_body(request))
+
+
 @router.post("/close")
 async def task_close(request: Request):
     require_dashboard_auth(request)
@@ -919,6 +939,9 @@ ROUTE_HANDLERS = (
     list_runs,
     task_event,
     task_state,
+    task_preference,
+    task_speech,
+    task_speech_receipt,
     task_result,
     task_close,
     task_targets,

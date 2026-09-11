@@ -75,6 +75,8 @@ class ApprovalReader:
 
 
 class TaskEvents:
+    UPDATE_MODES = ("important", "completion", "frequent")
+
     def __init__(
         self,
         outbox: HistoryOutbox,
@@ -91,6 +93,10 @@ class TaskEvents:
         self._outbox, self._owner = outbox, token.owner
         self._max_events, self._ttl, self._clock = max_events, ttl_s, clock
         with self._fenced(token) as db:
+            # Task settings outlive derived observations. Do not attach this table
+            # to task_event_owners, whose rows expire with the replay cache.
+            db.execute("""CREATE TABLE IF NOT EXISTS task_preferences (
+                owner TEXT PRIMARY KEY, update_mode TEXT NOT NULL)""")
             db.execute("""CREATE TABLE IF NOT EXISTS task_event_owners (
                 owner TEXT PRIMARY KEY, floor_idx INTEGER NOT NULL DEFAULT 0,
                 expires REAL NOT NULL)""")
@@ -128,6 +134,33 @@ class TaskEvents:
                 (SELECT idx FROM task_events WHERE owner=?)""",
                 (token.connection_id, token.generation, self._owner.key),
             )
+
+    def preferences(self, token):
+        with self._fenced(token) as db:
+            row = db.execute(
+                "SELECT update_mode FROM task_preferences WHERE owner=?", (self._owner.key,)
+            ).fetchone()
+            return {"update_mode": row[0] if row else "important"}
+
+    def set_update_preference(self, token, mode):
+        with self._fenced(token) as db:
+            return self._set_update_preference(db, mode)
+
+    def _set_update_preference(self, db, mode):
+        if mode not in self.UPDATE_MODES:
+            raise TaskEventError("invalid_event")
+        exists = db.execute(
+            "SELECT 1 FROM task_preferences WHERE owner=?", (self._owner.key,)
+        ).fetchone()
+        count = db.execute("SELECT count(*) FROM task_preferences").fetchone()[0]
+        if not exists and count >= 256:
+            raise TaskEventError("capacity")
+        db.execute(
+            "INSERT INTO task_preferences(owner,update_mode) VALUES (?,?) "
+            "ON CONFLICT(owner) DO UPDATE SET update_mode=excluded.update_mode",
+            (self._owner.key, mode),
+        )
+        return {"update_mode": mode}
 
     def _fenced(self, token):
         if not isinstance(token, CaptureToken) or token.owner != self._owner:
@@ -623,9 +656,59 @@ class TaskEvents:
                 "speak": False,
             }
 
-    def queue_speech(self, token, event_id, *, playback_supported=False):
+    @staticmethod
+    def _speech_eligible(event, mode):
+        state = event.get("state")
+        if state in {"completed", "failed", "cancelled", "lost"}:
+            return True
+        if mode != "completion" and (
+            state == "waiting_for_approval"
+            or event["kind"] in {"approval_reference", "source_error"}
+        ):
+            return True
+        return mode == "frequent" and (
+            event["kind"] == "tool_completed" or state == "running"
+        )
+
+    def speech_candidates(self, token):
+        with self._db(token) as db:
+            preference = db.execute(
+                "SELECT update_mode FROM task_preferences WHERE owner=?", (self._owner.key,)
+            ).fetchone()
+            mode = preference[0] if preference else "important"
+            rows = db.execute(
+                "SELECT e.*,s.state AS delivery FROM task_events e "
+                "LEFT JOIN task_event_speech s ON s.event_idx=e.idx "
+                "WHERE e.owner=? ORDER BY e.idx DESC", (self._owner.key,)
+            ).fetchall()
+            latest, selected, result = {}, set(), []
+            for row in rows:
+                event = json.loads(row["data"])
+                signature = tuple(
+                    event.get(key) for key in ("kind", "state", "label", "approval_id")
+                )
+                source = row["source_id"]
+                latest.setdefault(source, signature)
+                if (source in selected or signature != latest[source] or not row["live"]
+                    or row["connection_id"] != token.connection_id
+                    or row["generation"] != token.generation):
+                    continue
+                selected.add(source)
+                if row["delivery"] is None and self._speech_eligible(event, mode):
+                    result.append(event)
+            return list(reversed(result[:8]))
+
+    def queue_speech(self, token, event_id, *, playback_supported=False, respect_preference=False):
         with self._db(token) as db:
             event = self._event(db, event_id)
+            if respect_preference:
+                preference = db.execute(
+                    "SELECT update_mode FROM task_preferences WHERE owner=?", (self._owner.key,)
+                ).fetchone()
+                if not self._speech_eligible(
+                    json.loads(event["data"]), preference[0] if preference else "important"
+                ):
+                    raise TaskEventError("replay_not_speakable")
             if not event["live"] or (event["generation"], event["connection_id"]) != (
                 token.generation,
                 token.connection_id,
