@@ -327,6 +327,10 @@ class HistoryOutbox:
                     (owner.key, event_id),
                 )
             if event_id is None:
+                if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_preferences'"
+                ).fetchone():
+                    db.execute("DELETE FROM task_preferences WHERE owner=?", (owner.key,))
                 if has_task_projection:
                     db.execute("DELETE FROM task_event_owners WHERE owner=?", (owner.key,))
                 db.execute(

@@ -177,3 +177,43 @@ update a switched connection. State replay does not speak, submit tools or grant
 Stopping playback or muting affects audio. Interrupting the current voice response
 uses the existing provider transport. `stop_work` cancels the owning job. Steering
 does none of these and never silently falls back to cancellation or restart.
+
+
+## Full results and spoken updates
+
+Each task saves an update frequency: **Completion and important updates** (default),
+**Completion only**, or **Include meaningful milestones**. Change it in the task panel
+or ask the bound voice manager to change it. The setting belongs to the verified
+host/profile/actor/task, survives reconnect and event-cache expiry, and is available to
+other adapters using the same `HistoryOwner`. It does not enable an unimplemented surface.
+Voice setting changes and their retry receipts commit atomically. Concurrent setting
+changes follow SQLite transaction order; retrying an older action returns its recorded
+outcome without applying the old setting again. The profile supports 256 saved task
+settings and refuses new entries at capacity. Canonical task deletion removes its setting.
+
+A live status change can request a short spoken takeaway while the full available result
+stays in the task panel. Initial/recovered observations remain silent. Optional milestone
+speech follows the saved setting; failure and terminal results remain eligible in every
+mode. Completion-only suppresses optional pending-approval speech, but the current approval
+view remains visible and host-owned. Heartbeats with unchanged phase/status do not create
+new speech opportunities. Each speech preparation rereads the original owning run and,
+when relevant, its current approval state. A foreign or revoked target is refused.
+
+The full-result endpoint preserves all available text, including embedded artifact
+references, or serializes a multipart result as complete inert JSON. Results remain subject
+to the existing 2 MiB gateway response cap; this does not add an arbitrary file-download
+proxy. Empty and failed results retain their real status. The speech input is a separately
+labelled excerpt capped at 12,000 characters; it never replaces the original result.
+
+Summary responses use Realtime `conversation: none`, explicit input, empty tools and
+`tool_choice: none`. Their metadata and response IDs are separate from ordinary dialogue.
+They cannot stage user input, satisfy a conversation-response barrier, call a tool, or
+launch follow-on work. The server requests at most 220 output tokens and one or two
+sentences; speech quality and model compliance still need live acceptance. A transport
+handoff is recorded as sent, never as proof the operator heard it. Durable attempts prevent
+duplicate and reconnect speech. Comprehensive speech/playback gating, stale-event recovery
+and interruption timing belong to the following timing slice.
+
+Protocol: [OpenAI Realtime client events](https://platform.openai.com/docs/api-reference/realtime-client-events/conversation/item/create).
+Presentation design reference: [Codex backend prompt](https://github.com/openai/codex/blob/94697375cb9d2aa8ae74d61957c6b396819bec94/codex-rs/prompts/templates/realtime/backend_prompt.md).
+The implementation and instructions above are original; no Codex source text was copied.

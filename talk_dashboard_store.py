@@ -342,6 +342,31 @@ class DashboardStages:
             self._capacity(db)
             return action
 
+    def set_update_preference(self, token, run_id, events):
+        """Commit the setting and its retry receipt together, in transaction order."""
+        if events._owner != self.owner or events._outbox is not self.outbox:
+            raise DashboardTaskError("context_denied", 403)
+        with self._db(token) as db:
+            row = db.execute(
+                "SELECT record FROM dashboard_actions WHERE owner=? AND run_id=?",
+                (self.owner.key, run_id),
+            ).fetchone()
+            if row is None:
+                raise DashboardTaskError("interaction_unlinked", 409)
+            action = json.loads(row[0])
+            if action["name"] != "set_update_preference" or set(action["arguments"]) != {"mode"}:
+                raise DashboardTaskError("invalid_event", 400)
+            if action["state"] == "returned":
+                return action
+            result = events._set_update_preference(db, action["arguments"]["mode"])
+            action.update(state="returned", output=json.dumps(result))
+            db.execute(
+                "UPDATE dashboard_actions SET record=? WHERE owner=? AND run_id=?",
+                (self._encode(action), self.owner.key, run_id),
+            )
+            self._capacity(db)
+            return action
+
     def freeze_control(self, token, run_id, body, message_ids):
         """First full control body wins; concurrent copies must use that exact target/body."""
         with self._db(token) as db:

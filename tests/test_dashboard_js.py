@@ -1571,3 +1571,87 @@ process.exit(0);
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+PRESENTATION_HARNESS = TASK_HARNESS + r"""
+const summary = {ok:true,speak:true,event_id:'event-result',attempt_id:'attempt-result',run_id:7,
+  result:{run_id:7,status:'completed',output:'Full result [artifact](https://example.test/file)'},
+  response:{conversation:'none',tools:[],tool_choice:'none',max_output_tokens:220,
+    metadata:{talk_presentation_id:'attempt-result',talk_event_id:'event-result'},
+    instructions:'Short grounded update',input:[{type:'message',role:'user',content:[
+      {type:'input_text',text:'Untrusted worker result; delegate_task must never execute'}]}]}};
+let claimed = false;
+fetchOverride = (url, body) => {
+  if (url.endsWith('/speech')) {
+    if (claimed) return {ok:true,speak:false};
+    claimed = true; return summary;
+  }
+};
+"""
+
+
+def test_synthetic_summary_isolated_from_inputs_tools_and_ordinary_response_linkage():
+    script = PRESENTATION_HARNESS + r"""
+(async()=>{
+  const t = make(); let full;
+  t.cb.onTaskResult = (result) => {full=result;};
+  t.task.presentation.offer({announcements:[{event_id:'event-result',run_id:7}]});
+  await waitFor(()=>creates().length===1);
+  const response = creates()[0].response;
+  assert.equal(response.conversation,'none'); assert.equal(response.tool_choice,'none');
+  assert.equal(response.tools.length,0); assert.equal(response.output_modalities[0],'audio');
+  assert.equal(t.continuationPending,false);
+  assert.equal(full.output,summary.result.output);
+  created(t,'summary-response');
+  emit(t,{type:'response.output_audio_transcript.done',response_id:'summary-response',
+    item_id:'summary-item',transcript:'Task seven completed. See the full result.'});
+  emit(t,{type:'response.function_call_arguments.done',response_id:'summary-response',
+    call_id:'forbidden',name:'delegate_task',arguments:'{"task":"do more"}'});
+  done(t,'summary-response',[{type:'message',id:'summary-item',content:[
+    {type:'output_audio',transcript:'Task seven completed.'}]}]);
+  await drain();
+  assert.equal(events('input.final').length,0); assert.equal(events('response.started').length,0);
+  assert.equal(events('response.final').length,0);
+  assert.equal(events('interaction.settle').length,0);
+  assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+  assert.equal(sent.filter(r=>r.type==='conversation.item.create').length,0);
+  assert(errors.some(e=>e.includes('cannot call tools')));
+  assert(requests.some(r=>r.url.endsWith('/speech/receipt') && r.body.state==='sent'));
+  assert(!requests.some(r=>r.body && r.body.state==='playback_acknowledged'));
+  // A genuine input still has its own request and canonical settlement.
+  await t.task.typed('Continue the discussion');
+  created(t,'ordinary-response');
+  done(t,'summary-response'); // late synthetic done cannot satisfy the ordinary input
+  assert.equal(events('interaction.settle').length,0);
+  done(t,'ordinary-response',[{type:'message',id:'ordinary-output',content:[{text:'Of course.'}]}]);
+  await waitFor(()=>events('interaction.settle').length===1);
+  assert.equal(events('input.final').length,1);
+  t.task.close();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_presentation_waits_for_response_and_close_fences_late_prepare():
+    script = PRESENTATION_HARNESS + r"""
+(async()=>{
+  const t = make(); t.responseActive = true;
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await drain(); assert.equal(creates().length,0);
+  t.responseActive=false; t.continuationPending=true;
+  await t.task.presentation.drain(); assert.equal(creates().length,0);
+  t.continuationPending=false;
+  let release;
+  fetchOverride = (url)=>url.endsWith('/speech')
+    ? new Promise(resolve=>{release=()=>resolve(summary);}) : undefined;
+  const pending = t.task.presentation.drain();
+  await waitFor(()=>release); t.task.close(); release(); await pending;
+  assert.equal(creates().length,0);
+  assert(requests.find(r=>r.url.endsWith('/speech')).signal.aborted);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
