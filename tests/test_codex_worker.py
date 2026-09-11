@@ -44,7 +44,11 @@ def setup(tmp_path, scenario="complete", *, enabled=True, jobs=None, context="Re
 
 
 def peer(tmp_path):
-    return json.loads((tmp_path / "peer.json").read_text(encoding="utf-8"))
+    return json.loads(sorted(tmp_path.glob("peer-*.json"))[-1].read_text(encoding="utf-8"))
+
+
+def peer_wrote_nothing(tmp_path):
+    return not list(tmp_path.glob("peer-*.json"))
 
 
 def wait_for(check):
@@ -59,7 +63,7 @@ def wait_for(check):
 def test_disabled_worker_starts_no_process_or_job(tmp_path):
     with pytest.raises(CodexWorkerError, match="worker_disabled"):
         setup(tmp_path, enabled=False)
-    assert not (tmp_path / "peer.json").exists()
+    assert peer_wrote_nothing(tmp_path)
     jobs = CodexJobs(HistoryOutbox(tmp_path, profile="default"))
     with jobs.outbox._db() as db:
         assert db.execute("SELECT count(*) FROM codex_jobs").fetchone()[0] == 0
@@ -113,7 +117,7 @@ def test_version_mismatch_starts_no_app_server(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_VERSION", "0.999.0")
     worker = setup(tmp_path)
     assert worker.run()["error"] == "unsupported_version"
-    assert not (tmp_path / "peer.json").exists()
+    assert peer_wrote_nothing(tmp_path)
 
 
 def test_exact_steering_and_cancellation_keep_original_thread_and_turn(tmp_path):
@@ -172,7 +176,7 @@ def test_foreign_owner_and_changed_original_request_are_refused(tmp_path):
             {**worker.request, "goal": "different"},
             worker.config,
         )
-    assert not (tmp_path / "peer.json").exists()
+    assert peer_wrote_nothing(tmp_path)
 
 
 def test_stalled_stdin_cannot_hold_worker_shutdown_forever(tmp_path):
