@@ -1003,6 +1003,8 @@ def completed_job(environment, output="A complete result"):
     host.jobs[remote].update(status="completed", updated_at=200.0, last_event="run.completed",
                              output=output)
     state = manager.state(request, context)
+    context["timing"] = {"sequence": 1, "operator_speaking": False, "playback_active": False,
+                         "response_pending": False, "input_pending": False, "tools_pending": False}
     return bound, context, action["run_id"], state["announcements"][0]["event_id"]
 
 
@@ -1121,3 +1123,17 @@ def test_concurrent_summary_prepare_claims_speech_once(environment):
                    for _ in range(2)]
         results = [future.result(timeout=5) for future in futures]
     assert sum(result["speak"] for result in results) == 1
+
+
+def test_busy_readiness_cannot_claim_and_stale_readiness_cannot_send(environment):
+    manager, request, _, _ = environment
+    bound, context, _, event_id = completed_job(environment)
+    busy = {**context, "timing": {**context["timing"], "operator_speaking": True}}
+    assert manager.speech(request, {**busy, "event_id": event_id})["speak"] is False
+    assert bound.events.speech_candidates(bound.token)
+    context["timing"]["sequence"] = 2
+    prepared = manager.speech(request, {**context, "event_id": event_id})
+    assert prepared["speak"] is True
+    manager.speech_receipt(request, {**context, "event_id": event_id,
+                                     "attempt_id": prepared["attempt_id"], "state": "deferred"})
+    assert bound.events.speech_candidates(bound.token)

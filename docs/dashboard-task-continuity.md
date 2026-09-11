@@ -236,3 +236,29 @@ those commits and adds configuration wiring, old-host session-open compatibility
 manual-response preservation. Endpointing decides when a user turn ends; announcement
 and playback gating are separate. Offline payload/trace tests do not establish live
 endpointing quality.
+
+
+## Announcement timing and interruption
+
+The dashboard supplies content-free readiness observations to a Python-owned
+`SpeechTiming` gate scoped to its capture token. Speech waits for operator silence,
+complete input/response/tool continuation, and drained native or cascade playback.
+Readiness is ordered by sequence and expires after five seconds. A stale or missing
+snapshot cannot claim speech. The browser rechecks readiness after preparation; a
+proven-unsent queued attempt can be deferred, while sent/unknown attempts cannot.
+
+Barge-in and typed follow-ups interrupt task-summary speech without cancelling a worker.
+WebRTC uses response-ID cancellation plus `output_audio_buffer.clear`; cascade playback
+aborts its relay and drains local PCM. Late synthetic responses are cancelled under their
+original identity. A server buffer-drained event ends the playback gate, but is not proof
+that the operator heard the audio. No playback acknowledgement is fabricated.
+
+A missing speech-stop or native playback-stop event can recover after 30 seconds and
+700 ms of measured quiet audio, with a measurement from the past second. The analyser
+retains only activity/timing values; it records no microphone or output audio. Continuous
+measured speech still blocks. If measurement is unavailable or suspended, a real provider
+stop event remains necessary. Missing transcription can time out after 12 seconds; an
+ordinary reply without events times out after 45 seconds and is marked incomplete. A
+summary without response events for 30 seconds becomes unknown rather than being retried.
+Polling/sample ticks apply these bounds; they are recovery thresholds, not live latency
+measurements. Genuine input retains its canonical origin even when its response fails.

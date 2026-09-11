@@ -732,6 +732,20 @@ class TaskEvents:
             )
             return SpeechAttempt(event_id, attempt, token)
 
+    def defer_speech(self, token, attempt):
+        """Release only a proven-unsent attempt; sent/unknown audio never regains eligibility."""
+        if attempt.capture != token:
+            raise TaskEventError("invalid_delivery")
+        with self._db(token) as db:
+            event = self._event(db, attempt.event_id)
+            changed = db.execute(
+                "DELETE FROM task_event_speech WHERE event_idx=? AND attempt_id=? "
+                "AND connection_id=? AND generation=? AND state='queued'",
+                (event["idx"], attempt.attempt_id, token.connection_id, token.generation),
+            ).rowcount
+            if changed != 1:
+                raise TaskEventError("invalid_delivery")
+
     def acknowledge_speech(self, token, attempt, state):
         if attempt.capture != token or state not in {"sent", "playback_acknowledged", "unknown"}:
             raise TaskEventError("invalid_delivery")
