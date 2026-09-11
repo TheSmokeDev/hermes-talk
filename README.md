@@ -363,6 +363,37 @@ The cascade speaks on every Talk surface:
 | Discord (`talk join`) | The same shared session loop; cascade PCM24k takes the relay's exact path through the 24k→48k voice-channel conversion. |
 | Dashboard tab | The browser keeps its WebRTC socket but mints a text-output session and relays the model's text deltas to `POST /api/plugins/hermes-talk/cascade-tts`; the server-side cascade speaks them and streams PCM back. The ElevenLabs key never reaches the browser — the route sits behind the same `TALK_DASHBOARD_TOKEN` / loopback gate as the mint, and barge-in aborts the fetch, which cancels the TTS exactly like the terminal lane. |
 
+## GPT-Live — live client delegation (`TALK_VOICE_MODE=live`)
+
+GPT-Live is a separate OpenAI voice surface with client delegation: the
+provider runs the spoken conversation and delegates backend work out, so
+long-running tools and agent runs continue while you keep talking. It is a
+server-side relay — the browser posts its WebRTC SDP offer to the plugin's
+`/session`, the plugin relays it to `POST /v1/live/sessions` (the raw
+credential never leaves the process), and the SDP answer plus session id
+come back. No ephemeral secret ever reaches the client in live mode.
+
+Delegated work (`session.delegation.created`) is dispatched through the
+BOUND task controller — `/tool` with the selected connection/generation —
+never the legacy process-wide `/runs` polling loop. Each delegation id is
+claimed once (a repeat or a changed payload under the same id is refused),
+live transcript deltas are retained as timestamped, bound fragments (never
+concatenated into an invented completed user turn), full results and
+artifacts land in the task panel, and only bounded verified updates are
+spoken. A correction routes through steering/stop on the same job — it never
+starts replacement work.
+
+```bash
+TALK_VOICE_MODE=live \
+TALK_OPENAI_API_KEY=<your-project-key> \
+hermes talk
+```
+
+Live mode requires an OpenAI **project API key** (`TALK_OPENAI_API_KEY`) and
+refuses to silently fall back to Codex OAuth (a different entitlement tier
+with no GPT-Live access). `TALK_VOICE_MODE` remains fail-closed and defaults
+to `native`, byte-identical to pre-live behavior.
+
 ## Use
 
 ```bash
@@ -718,7 +749,7 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model (bare id; the adapter adds the wire prefix) |
 | `TALK_GEMINI_VOICE` | `Puck` | Gemini Live voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede` (fail-closed, case-sensitive) |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first; set-but-blank refuses; free-tier keys work |
-| `TALK_VOICE_MODE` | `native` | `native` (provider voices, unchanged) or `cascade` (provider thinks in text, ElevenLabs speaks); fail-closed |
+| `TALK_VOICE_MODE` | `native` | `native` (provider voices, unchanged), `cascade` (provider thinks in text, ElevenLabs speaks), or `live` (GPT-Live client delegation, server-side SDP relay — requires an OpenAI project API key, refuses Codex OAuth fallback); fail-closed |
 | `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider — the only value today; fail-closed |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first; set-but-blank refuses; rides the `xi-api-key` header, never the URL |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with — **required** in cascade mode (stock or cloned, from your ElevenLabs account) |

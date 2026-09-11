@@ -24,6 +24,18 @@ named rather than smoothed.
   fail-fast refusals on unsupported modes, and the semantic names are probed
   as an optional capability so pre-semantic core heads keep the full lane
   with provider-native turn detection instead of losing it.
+- GPT-Live voice mode (`TALK_VOICE_MODE=live`), a server-side SDP relay to
+  `POST /v1/live/sessions` with client delegation. The browser posts its
+  WebRTC SDP offer to `/session`, the plugin relays it (keeping the raw
+  credential in-process), and the SDP answer plus session id come back —
+  no ephemeral secret ever reaches the client. Delegated work dispatches
+  through the BOUND task controller (`/tool` with connection_id/generation),
+  never the legacy process-wide `/runs` loop: each delegation id is claimed
+  once, a repeated or changed payload under the same id is refused, live
+  transcript deltas are retained as timestamped bound fragments (never an
+  invented completed user turn), results land in the task panel, and only
+  bounded verified updates are spoken. Live mode requires an OpenAI project
+  API key and refuses silently falling back to Codex OAuth.
 
 ## [0.17.3] — 2026-09-09
 
