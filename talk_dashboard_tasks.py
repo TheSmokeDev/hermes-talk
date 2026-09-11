@@ -662,11 +662,64 @@ class DashboardTasks:
                 self, bound, action, authorize=lambda: self.binding(request, body, write=True)
             )
             output = control_output(action)
+        elif name == "resolve_approval":
+            action, output = self._resolve_approval(request, body, bound, action)
         else:
             output = self._read_or_control(bound, name, arguments)
             action = bound.stages.update_action(bound.token, action["run_id"], state="returned")
         self.binding(request, body)
         return {"ok": True, "output": output[:4000], "action": self._action_view(action)}
+
+    def _resolve_approval(self, request, body, bound, action):
+        action, claimed = bound.stages.claim_approval(bound.token, action["run_id"])
+        if not claimed:
+            return action, action.get("output") or (
+                "Approval outcome is unconfirmed. This call cannot submit another decision."
+            )
+        submitted = False
+        try:
+            arguments = action["arguments"]
+            job = bound.stages.action(bound.token, arguments.get("run_id"))
+            if not job.get("api_run_id"):
+                raise DashboardTaskError("result_unavailable", 409)
+            current = bound.gateway.approvals(job["api_run_id"])
+            requested = arguments.get("approval_id")
+            matching = [
+                row for row in current["approvals"]
+                if isinstance(row, dict)
+                and (requested is None or row.get("request_id") == requested)
+            ]
+            if len(matching) != 1:
+                raise DashboardTaskError("approval_reader_unsupported", 409)
+            choice = arguments.get("choice")
+            if choice not in {"once", "session", "deny"} or choice not in matching[0].get(
+                "choices", []
+            ):
+                raise DashboardTaskError("invalid_event", 400)
+            action = bound.stages.freeze_approval(
+                bound.token, action["run_id"], job["api_run_id"], matching[0]["request_id"], choice
+            )
+            self.binding(request, body, write=True)
+            submitted = True
+            result = bound.gateway.approve(
+                action["approval_api_run_id"], action["request_body"]["request_id"], choice
+            )
+            output = json.dumps({**action["request_body"], "host_response": result})
+            saved = bound.stages.record_original_receipt(action, state="returned", output=output)
+        except (DashboardTaskError, HistoryError) as exc:
+            output = (
+                "Approval outcome is unconfirmed; this call will not submit another decision."
+                if submitted
+                else "Approval request refused; this call cannot select another request."
+            )
+            saved = bound.stages.record_original_receipt(
+                action, state="returned" if submitted else "failed", output=output, error=exc.code
+            )
+            if not submitted:
+                raise
+        if saved is None:
+            raise DashboardTaskError("connection_stale", 409)
+        return saved, output
 
     def _dispatch(self, bound, action):
         if action["state"] == "accepted":
@@ -728,26 +781,6 @@ class DashboardTasks:
             raise DashboardTaskError("result_unavailable", 409)
         if name == "stop_work":
             return json.dumps(bound.gateway.stop(action["api_run_id"]))
-        if name == "resolve_approval":
-            current = bound.gateway.approvals(action["api_run_id"])
-            pending = current["approvals"]
-            requested = arguments.get("approval_id")
-            matching = [
-                row
-                for row in pending
-                if isinstance(row, dict)
-                and (requested is None or row.get("request_id") == requested)
-            ]
-            if len(matching) != 1:
-                raise DashboardTaskError("approval_reader_unsupported", 409)
-            choice = arguments.get("choice")
-            if choice not in {"once", "session", "deny"} or choice not in matching[0].get(
-                "choices", []
-            ):
-                raise DashboardTaskError("invalid_event", 400)
-            return json.dumps(
-                bound.gateway.approve(action["api_run_id"], matching[0]["request_id"], choice)
-            )
         result = bound.gateway.run(action["api_run_id"])
         return json.dumps(
             {"run_id": run_id, "status": result.get("status"), "output": result.get("output", "")}

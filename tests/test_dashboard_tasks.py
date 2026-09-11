@@ -19,7 +19,7 @@ import pytest
 
 from talk_dashboard_gateway import DashboardTaskError
 from talk_dashboard_tasks import DashboardOwnerContext, DashboardTasks
-from talk_passive import HistoryTransport, digest
+from talk_passive import HistoryError, HistoryTransport, digest
 
 ROOT = Path(__file__).resolve().parents[1]
 CAPS = {
@@ -609,6 +609,110 @@ def test_current_approval_read_is_owning_run_scoped_and_revocation_is_not_replay
     assert not any(
         method == "POST" and path.endswith("/approval") for method, path, _, _ in host.requests
     )
+
+
+def approval_call(environment):
+    _, _, host, _ = environment
+    bound, context = join(environment)
+    job = child(environment, context, input_event(environment, context))["action"]["run_id"]
+    decision = input_event(environment, context, input_id="approval-input", text="Approve once")
+    event(environment, context, "response.started", interaction_id=decision["interaction_id"],
+          response_id="approval-response")
+    host.pending = [{"request_id": "approval-a", "allow_session": False}]
+    return bound, {
+        **context, "interaction_id": decision["interaction_id"],
+        "response_id": "approval-response", "call_id": "approval-call",
+        "name": "resolve_approval", "arguments": {"run_id": job, "choice": "once"},
+    }
+
+
+@pytest.mark.parametrize("lose_response", [False, True])
+def test_approval_retry_cannot_resolve_the_next_request(environment, monkeypatch, lose_response):
+    manager, request, host, _ = environment
+    bound, body = approval_call(environment)
+    original = type(bound.gateway).approve
+
+    def approve(gateway, run_id, approval_id, choice):
+        result = original(gateway, run_id, approval_id, choice)
+        host.pending = [{"request_id": "approval-b", "allow_session": False}]
+        if lose_response:
+            raise DashboardTaskError("gateway_unavailable", 503)
+        return result
+
+    monkeypatch.setattr(type(bound.gateway), "approve", approve)
+    first = manager.tool(request, body)
+    second = manager.tool(request, body)
+    assert second["output"] == first["output"]
+    assert [row["request_id"] for row in host.pending] == ["approval-b"]
+    posts = [payload for method, path, payload, _ in host.requests
+             if method == "POST" and path.endswith("/approval")]
+    assert posts == [{"request_id": "approval-a", "choice": "once"}]
+    stored = bound.stages.action(bound.token, first["action"]["run_id"])
+    assert stored["request_body"] == posts[0]
+    assert stored["state"] == "returned"
+    if lose_response:
+        assert "unconfirmed" in first["output"]
+
+
+def test_failed_approval_selection_cannot_later_select_another_request(environment):
+    manager, request, host, _ = environment
+    _, body = approval_call(environment)
+    host.pending.clear()
+    with pytest.raises(DashboardTaskError):
+        manager.tool(request, body)
+    host.pending = [{"request_id": "approval-b", "allow_session": False}]
+    assert "refused" in manager.tool(request, body)["output"]
+    assert not any(method == "POST" and path.endswith("/approval")
+                   for method, path, _, _ in host.requests)
+
+
+def test_approval_read_cannot_authorize_after_connection_closes(environment, monkeypatch):
+    manager, request, host, _ = environment
+    bound, body = approval_call(environment)
+    original = type(bound.gateway).approvals
+
+    def approvals(gateway, run_id):
+        current = original(gateway, run_id)
+        manager.close(request, body)
+        return current
+
+    monkeypatch.setattr(type(bound.gateway), "approvals", approvals)
+    with pytest.raises((DashboardTaskError, HistoryError)):
+        manager.tool(request, body)
+    assert not any(method == "POST" and path.endswith("/approval")
+                   for method, path, _, _ in host.requests)
+    assert host.pending[0]["request_id"] == "approval-a"
+
+
+def test_concurrent_approval_retry_does_not_submit_a_second_decision(environment, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager, request, host, _ = environment
+    bound, body = approval_call(environment)
+    entered, release = threading.Event(), threading.Event()
+    original = type(bound.gateway).approve
+
+    def approve(gateway, run_id, approval_id, choice):
+        entered.set()
+        assert release.wait(5)
+        result = original(gateway, run_id, approval_id, choice)
+        host.pending = [{"request_id": "approval-b", "allow_session": False}]
+        return result
+
+    monkeypatch.setattr(type(bound.gateway), "approve", approve)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(manager.tool, request, body)
+        try:
+            assert entered.wait(5)
+            assert "unconfirmed" in manager.tool(request, body)["output"]
+        finally:
+            release.set()
+        completed = first.result(timeout=5)
+    assert manager.tool(request, body)["output"] == completed["output"]
+    assert [row["request_id"] for row in host.pending] == ["approval-b"]
+    assert sum(method == "POST" and path.endswith("/approval")
+               for method, path, _, _ in host.requests) == 1
 
 
 def test_bound_mint_uses_real_route_and_manual_response_without_ambient_owner(

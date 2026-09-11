@@ -123,11 +123,13 @@ fetchOverride = (url, body) => body && body.kind === "input.final"
   ? new Promise((resolve) => { release = () => resolve({ input_id: body.input_id,
     interaction_id: "typed-interaction", state: "staged" }); })
   : undefined;
-const t = make(), pending = t.sendTyped("Original typed request");
+const original = "  Original typed request\nwith a second line\t ";
+const t = make(), pending = t.sendTyped(original);
 await waitFor(() => release);
 assert.equal(sent.length, 0, "provider input escaped stage barrier");
 release(); assert.equal(await pending, true);
-assert.equal(sent[0].item.content[0].text, "Original typed request");
+assert.equal(sent[0].item.content[0].text, original);
+assert.equal(events("input.final")[0].body.text, original);
 assert.equal(sent[0].item.id, events("input.final")[0].body.input_id);
 assert.equal(events("input.final")[0].body.input_type, "typed");
 assert.equal(creates()[0].response.metadata.talk_interaction_id, "typed-interaction");

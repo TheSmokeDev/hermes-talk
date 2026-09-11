@@ -210,7 +210,8 @@
     }
 
     async typed(text) {
-      const row = this.stage(clientId("item_"), "typed", text.trim());
+      if (typeof text !== "string" || !text.trim()) return false;
+      const row = this.stage(clientId("item_"), "typed", text);
       if (!row) return false;
       const receipt = await row.ready;
       if (!receipt || this.closed || row.incomplete) return false;

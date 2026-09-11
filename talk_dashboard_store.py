@@ -364,6 +364,50 @@ class DashboardStages:
                 self._capacity(db)
             return action
 
+    def claim_approval(self, token, run_id):
+        """One caller may select/submit an approval; retries never acquire new authority."""
+        with self._db(token) as db:
+            row = db.execute(
+                "SELECT record FROM dashboard_actions WHERE owner=? AND run_id=?",
+                (self.owner.key, run_id),
+            ).fetchone()
+            if row is None:
+                raise DashboardTaskError("interaction_unlinked", 409)
+            action = json.loads(row[0])
+            if action["name"] != "resolve_approval":
+                raise DashboardTaskError("invalid_event", 400)
+            claimed = action["state"] == "prepared"
+            if claimed:
+                action["state"] = "approval_checking"
+                db.execute(
+                    "UPDATE dashboard_actions SET record=? WHERE owner=? AND run_id=?",
+                    (self._encode(action), self.owner.key, run_id),
+                )
+            return action, claimed
+
+    def freeze_approval(self, token, run_id, api_run_id, request_id, choice):
+        with self._db(token) as db:
+            row = db.execute(
+                "SELECT record FROM dashboard_actions WHERE owner=? AND run_id=?",
+                (self.owner.key, run_id),
+            ).fetchone()
+            if row is None:
+                raise DashboardTaskError("interaction_unlinked", 409)
+            action = json.loads(row[0])
+            if action["name"] != "resolve_approval" or action["state"] != "approval_checking":
+                raise DashboardTaskError("event_conflict", 409)
+            action.update(
+                state="approval_submitting",
+                request_body={"request_id": identifier(request_id), "choice": choice},
+                approval_api_run_id=identifier(api_run_id),
+            )
+            db.execute(
+                "UPDATE dashboard_actions SET record=? WHERE owner=? AND run_id=?",
+                (self._encode(action), self.owner.key, run_id),
+            )
+            self._capacity(db)
+            return action
+
     def record_original_receipt(self, original, **fields):
         """Record a response for an existing authorized action after voice disconnect.
 
@@ -401,6 +445,7 @@ class DashboardStages:
                     "call_id",
                     "control_body",
                     "control_api_run_id",
+                    "approval_api_run_id",
                     "name",
                 )
             ):
