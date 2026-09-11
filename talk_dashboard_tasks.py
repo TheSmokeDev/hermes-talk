@@ -30,6 +30,15 @@ try:
         identifier,
         session_id,
     )
+    from .talk_run_control import (
+        control_output,
+        require_steering,
+        steer_action,
+        support_view,
+    )
+    from .talk_run_control import (
+        steering_tool as steering_tool,
+    )
     from .talk_task_events import TaskEvents
     from .talk_task_sources import TaskEventError
 except ImportError:  # pragma: no cover - flat plugin load
@@ -46,6 +55,15 @@ except ImportError:  # pragma: no cover - flat plugin load
         identifier,
         session_id,
     )
+    from talk_run_control import (
+        control_output,
+        require_steering,
+        steer_action,
+        support_view,
+    )
+    from talk_run_control import (
+        steering_tool as steering_tool,
+    )
     from talk_task_events import TaskEvents
     from talk_task_sources import TaskEventError
 
@@ -57,6 +75,7 @@ BOUND_TOOLS = frozenset(
         "check_work",
         "list_agents",
         "stop_work",
+        "steer_work",
         "resolve_approval",
         "talk_status",
         "talk_capabilities",
@@ -595,10 +614,33 @@ class DashboardTasks:
                         "correlation_id": action["action_id"],
                     },
                 }
+            elif name == "steer_work":
+                if set(arguments) not in ({"run_id"}, {"api_run_id"}):
+                    raise DashboardTaskError("invalid_event", 400)
+                record["mode"] = "control" if record["mode"] != "execution" else "execution"
+                action["control_input"] = record["text"]
+                action["control_origin"] = {
+                    "event_id": record["event_id"],
+                    "origin_turn_id": record["origin_turn_id"],
+                }
+                action["control_target_run_id"] = arguments.get("run_id")
+                action["control_api_run_id"] = control_api_run_id
+                action["control_phase"] = "prepared"
             elif name in {"stop_work", "resolve_approval"}:
                 record["mode"] = "control" if record["mode"] != "execution" else "execution"
             action["request_body"] = action.get("request_body")
 
+        control_api_run_id = None
+        if name == "steer_work":
+            if set(arguments) == {"run_id"}:
+                job = bound.stages.action(bound.token, arguments["run_id"])
+                if job["name"] not in CHILD_TOOLS or not job.get("api_run_id"):
+                    raise DashboardTaskError("steering_target_denied", 409)
+                control_api_run_id = job["api_run_id"]
+            elif set(arguments) == {"api_run_id"}:
+                control_api_run_id = identifier(arguments["api_run_id"])
+            else:
+                raise DashboardTaskError("invalid_event", 400)
         action = bound.stages.prepare_action(
             bound.token,
             body.get("interaction_id"),
@@ -615,6 +657,11 @@ class DashboardTasks:
                 if action["state"] == "accepted"
                 else "The original request is pending confirmation; do not submit another task."
             )
+        elif name == "steer_work":
+            action = steer_action(
+                self, bound, action, authorize=lambda: self.binding(request, body, write=True)
+            )
+            output = control_output(action)
         else:
             output = self._read_or_control(bound, name, arguments)
             action = bound.stages.update_action(bound.token, action["run_id"], state="returned")
@@ -664,7 +711,7 @@ class DashboardTasks:
                     ),
                     "task_mode": "canonical",
                     "linked_children": True,
-                    "steering": "unsupported",
+                    "steering": self._steering_capability(bound),
                     "resource_admission": "unsupported",
                 }
             )
@@ -707,11 +754,32 @@ class DashboardTasks:
         )
 
     @staticmethod
+    def _steering_capability(bound):
+        try:
+            return {
+                "state": "per_run_verification_required",
+                **require_steering(bound.capabilities),
+            }
+        except DashboardTaskError:
+            return "unsupported"
+
+    @staticmethod
     def _action_view(action):
-        return {
+        view = {
             key: action.get(key)
-            for key in ("action_id", "run_id", "state", "canonical_message_ids", "error")
+            for key in ("action_id", "run_id", "name", "state", "canonical_message_ids", "error")
         }
+        if action["name"] == "steer_work":
+            view["control"] = action.get("control_receipt") or {
+                "status": "unknown",
+                "source": "client_observation",
+                "evidence": "pending",
+                "target_run_id": action.get("control_target_run_id"),
+                "api_run_id": action["control_api_run_id"],
+                "action_id": action["action_id"],
+                "origin_turn_id": action["control_origin"]["origin_turn_id"],
+            }
+        return view
 
     def _recover(self, bound):
         interactions, actions = bound.stages.records(bound.token)
@@ -719,6 +787,12 @@ class DashboardTasks:
             with suppress(DashboardTaskError, HistoryError):
                 self._persist_original(bound, record, recover=True)
         for action in actions:
+            if action["name"] == "steer_work":
+                with suppress(DashboardTaskError, HistoryError):
+                    steer_action(self, bound, action)
+                    record = bound.stages.get(bound.token, action["interaction_id"])
+                    self._link_origin(bound, record)
+                continue
             if action["state"] in {"prepared", "submitting", "uncertain"} and action.get(
                 "request_body"
             ):
@@ -741,7 +815,14 @@ class DashboardTasks:
         bound = self.binding(request, body)
         self._store_proof(bound.gateway, bound.context, bound.target_record)
         bound.attachment.refresh_snapshot(bound.token)
+        bound.capabilities = bound.gateway.capabilities()
         interactions, actions = bound.stages.records(bound.token)
+        for action in actions:
+            if action["name"] == "steer_work":
+                with suppress(DashboardTaskError, HistoryError):
+                    steer_action(self, bound, action)
+                    record = bound.stages.get(bound.token, action["interaction_id"])
+                    self._link_origin(bound, record)
         jobs = []
         candidates = [action for action in actions if action.get("api_run_id")]
         with self._lock:
@@ -769,6 +850,7 @@ class DashboardTasks:
                         + bound.connection_id
                         + f"&generation={bound.generation}&run_id={action['run_id']}",
                         "approval": {"state": "not_refreshed", "actionable": False},
+                        "steering": {"supported": False, "reason": "not_refreshed"},
                     }
                 )
                 continue
@@ -798,6 +880,7 @@ class DashboardTasks:
                     + bound.connection_id
                     + f"&generation={bound.generation}&run_id={action['run_id']}",
                 }
+                job["steering"] = support_view(bound, action["api_run_id"])
                 try:
                     approvals = bound.gateway.approvals(action["api_run_id"])
                     job["approval"] = {

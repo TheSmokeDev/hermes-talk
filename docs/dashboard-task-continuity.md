@@ -70,8 +70,8 @@ groups are bounded and retained for current-call continuity.
 
 Bound tools include target listing/switch intents/Return, linked delegation/search,
 current work/status checks, owning-run
-stop and current approval resolution. Steering and resource-admission declarations
-are explicitly unavailable in this bound slice; legacy unbound behavior is unchanged.
+stop, origin-linked steering and current approval resolution. Resource-admission
+declarations remain unavailable in this bound slice; legacy unbound behavior is unchanged.
 The voice manager remains available while child work runs. State refresh rotates
 through at most four jobs per request; all known job references remain visible with
 last-observation labels when not refreshed. Result links retrieve the full currently
@@ -137,8 +137,8 @@ the verified dashboard actor, scoped together with that gateway credential and t
 
 Offline peers, denied credentials, missing tasks and unsupported hosts are refusals,
 with no local substitute. History truncation stays visible, and completed job results
-do not automatically speak. Steering remains explicitly unsupported until its host
-control contract is integrated. Actual remote/provider acceptance is a separate live
+do not automatically speak. Steering requires the same peer's advertised run-control
+contract and an authoritative live target. Actual remote/provider acceptance is a separate live
 verification step, not established by local fixture tests.
 
 Selection state stores only opaque target references, safe labels and a Return stack
@@ -147,3 +147,33 @@ entries expire after ten minutes. Global bounds are 64 selectors and 1,024 catal
 entries. Pending preparation leases expire after 90 seconds and use revision/nonce
 checks; stale preparations cannot replace a newer selection. Remote derived buffers
 live under the authenticated local profile's state directory, not a remote-provided path.
+
+## Correcting an existing job
+
+Ask to correct a known task job or provide its exact API run ID. `steer_work` uses
+the original linked user input, its canonical origin and the existing owning run.
+The generated tool arguments select only the job; they cannot replace your words.
+Talk first verifies the owning session, current target and host's version-1
+`features.run_steering` capability, then freezes the complete control request.
+The same authenticated `/v1/runs/{id}/steer` route handles local and configured-peer
+controls. No run-list discovery, replacement job or implicit stop is involved.
+
+Recorded origins need `passive_receipt` support for that runtime. An ordinary run
+may also advertise `pending`: its host can bind the already staged event and origin
+atomically while the execution lease holds up passive persistence. The returned
+canonical receipt is reconciled into the existing input; no second parent request
+is created. Older hosts and linked children without an original receipt remain
+explicitly unavailable or pending. Origins are never dropped to bypass a refusal.
+
+The action panel distinguishes host receipts from client observations. **Queued**
+means backend queue admission; it does not prove delivery or application. Rejected
+and unsupported controls say why. **Unconfirmed** means acceptance is unknown.
+After a lost response, reconnect and state refresh only read the original action.
+An explicit retry may send the identical frozen body and action ID only after the
+host returns the exact receipt-not-found result. A durable unknown receipt never
+causes another submission. Late responses stay with their original action and cannot
+update a switched connection. State replay does not speak, submit tools or grant approvals.
+
+Stopping playback or muting affects audio. Interrupting the current voice response
+uses the existing provider transport. `stop_work` cancels the owning job. Steering
+does none of these and never silently falls back to cancellation or restart.

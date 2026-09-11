@@ -1134,6 +1134,22 @@
       ") / " + (target.profile || "unavailable profile");
   }
 
+  function controlLabel(control) {
+    if (!control) return "Control receipt unavailable";
+    if (control.status === "queued" && control.source === "host_receipt" &&
+        control.evidence === "backend_queue_ack")
+      return "Queued to existing job · delivery and application unconfirmed";
+    if (control.status === "rejected") return "Correction rejected · " + (control.evidence || "unavailable");
+    if (control.status === "unsupported") return "Steering unavailable · " + (control.evidence || "unsupported");
+    return "Correction unconfirmed · keep the original action";
+  }
+
+  function steeringLabel(steering) {
+    return steering && steering.supported === true
+      ? "Steering available for this running job"
+      : "Steering unavailable · " + ((steering || {}).reason || "not refreshed");
+  }
+
   function TalkPage() {
     const [status, setStatus] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -1643,6 +1659,10 @@
           id: "ht-interaction-" + encodeURIComponent(row.id) },
           h("div", { className: "ht-role" }, row.state + " · canonical: " + row.canonical_state),
           h("div", { className: "ht-text" }, row.text),
+          (row.actions || []).filter((action) => action.name === "steer_work").map((action) =>
+            h("div", { key: action.action_id, className: "ht-out" }, controlLabel(action.control) +
+              " · action " + action.action_id + " · existing job " +
+              ((action.control || {}).target_run_id || (action.control || {}).api_run_id || "unavailable"))),
           h("div", { className: "ht-out" }, JSON.stringify({ responses: row.responses, actions: row.actions,
             canonical_message_ids: row.canonical_message_ids }, null, 2)))),
         h("div", { className: "ht-card-head" }, "Observation / action log"),
@@ -1678,6 +1698,7 @@
           id: "ht-job-" + encodeURIComponent(job.run_id) },
           h("div", { className: "ht-role" }, job.status + " · run " + job.run_id + " · action " + job.action_id),
           h("div", { className: "ht-text" }, job.goal),
+          h("div", { className: "ht-out" }, steeringLabel(job.steering)),
           h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
           job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
           results[job.run_id] && h("div", { className: "ht-text" }, results[job.run_id].output),
@@ -1722,7 +1743,8 @@
   }
 
   if (window.__HERMES_TALK_TEST_HOOK__) {
-    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, TalkPage: TalkPage };
+    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, TalkPage: TalkPage,
+      controlLabel: controlLabel, steeringLabel: steeringLabel };
   }
   window.__HERMES_PLUGINS__.register("hermes-talk", TalkPage);
 })();

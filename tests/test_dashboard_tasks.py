@@ -657,6 +657,9 @@ def test_bound_mint_uses_real_route_and_manual_response_without_ambient_owner(
     response = asyncio.run(api.create_session(request))
     assert response["task"]["history"]["messages"][0]["content"] == "Earlier typed task"
     assert minted[0]["audio"]["input"]["turn_detection"]["create_response"] is False
+    steering = next(tool for tool in minted[0]["tools"] if tool["name"] == "steer_work")
+    assert set(steering["parameters"]["properties"]) == {"run_id", "api_run_id"}
+    assert "steer_work" not in {tool["name"] for tool in api.talk_tools.default_talk_tools()}
     assert "Earlier typed task" in minted[0]["instructions"]
     assert "wrong-profile-secret" not in minted[0]["instructions"]
     assert "existing canonical Hermes task" in minted[0]["instructions"]

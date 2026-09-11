@@ -342,6 +342,28 @@ class DashboardStages:
             self._capacity(db)
             return action
 
+    def freeze_control(self, token, run_id, body, message_ids):
+        """First full control body wins; concurrent copies must use that exact target/body."""
+        with self._db(token) as db:
+            row = db.execute(
+                "SELECT record FROM dashboard_actions WHERE owner=? AND run_id=?",
+                (self.owner.key, run_id),
+            ).fetchone()
+            if row is None:
+                raise DashboardTaskError("interaction_unlinked", 409)
+            action = json.loads(row[0])
+            if action["name"] != "steer_work":
+                raise DashboardTaskError("invalid_event", 400)
+            if action.get("control_body") is None:
+                action["control_body"] = body
+                action["canonical_message_ids"] = message_ids
+                db.execute(
+                    "UPDATE dashboard_actions SET record=? WHERE owner=? AND run_id=?",
+                    (self._encode(action), self.owner.key, run_id),
+                )
+                self._capacity(db)
+            return action
+
     def record_original_receipt(self, original, **fields):
         """Record a response for an existing authorized action after voice disconnect.
 
@@ -357,6 +379,8 @@ class DashboardStages:
             "child_session_id",
             "updated_at",
             "output",
+            "control_receipt",
+            "control_phase",
         }
         if not set(fields) <= allowed:
             raise DashboardTaskError("invalid_event", 400)
@@ -370,12 +394,30 @@ class DashboardStages:
             action = json.loads(row[0])
             if any(
                 action.get(key) != original.get(key)
-                for key in ("idempotency_key", "request_body", "interaction_id", "call_id")
+                for key in (
+                    "idempotency_key",
+                    "request_body",
+                    "interaction_id",
+                    "call_id",
+                    "control_body",
+                    "control_api_run_id",
+                    "name",
+                )
             ):
                 raise DashboardTaskError("event_conflict", 409)
             remote = fields.get("api_run_id")
             if remote and action.get("api_run_id") not in {None, remote}:
                 raise DashboardTaskError("event_conflict", 409)
+            if action.get("control_phase") == "settled" and fields.get("control_receipt"):
+                # A late timeout cannot downgrade an already verified receipt. Host unknown
+                # stays read-only, but a later authoritative settlement can resolve it.
+                previous = action["control_receipt"]
+                if (
+                    previous.get("status") != "unknown"
+                    or previous.get("source") != "host_receipt"
+                    or fields["control_receipt"].get("source") != "host_receipt"
+                ):
+                    return action
             action.update(fields)
             db.execute(
                 "UPDATE dashboard_actions SET record=? WHERE owner=? AND id=?",

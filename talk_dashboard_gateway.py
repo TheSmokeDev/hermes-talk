@@ -46,6 +46,9 @@ class DashboardTaskError(Exception):
         "selection_store_unavailable": "The local selection state could not be read safely.",
         "selection_busy": "A target change is already being prepared for this tab.",
         "return_empty": "There is no previous authorized target to return to.",
+        "steering_unsupported": "This host cannot steer that existing job with an origin receipt.",
+        "steering_origin_pending": "The original correction is awaiting its canonical receipt.",
+        "steering_target_denied": "That run does not belong to this canonical task.",
     }
 
     def __init__(self, code: str, status: int = 409, *, retryable=False):
@@ -62,7 +65,9 @@ class DashboardTaskError(Exception):
 class TaskGateway:
     transport: HistoryTransport
 
-    def _request(self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024):
+    def _request(
+        self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024, not_found=None
+    ):
         """Suffix is chosen only by the fixed methods below, never by a browser/model."""
         prefix = f"/p/{self.transport.profile}" if self.transport.named_profile else ""
         headers = {"Authorization": "Bearer " + self.transport.credential}
@@ -92,6 +97,8 @@ class TaskGateway:
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError
+            if status == 404 and not_found and data.get("error") == not_found:
+                return None
             if status not in {200, 202}:
                 code = data.get("error")
                 if isinstance(code, dict):
@@ -184,6 +191,22 @@ class TaskGateway:
 
     def stop(self, run_id):
         return self._request("POST", "/v1/runs/" + identifier(run_id) + "/stop", body={})
+
+    def steering(self, run_id):
+        return self._request("GET", "/v1/runs/" + identifier(run_id) + "/steer", max_bytes=16384)
+
+    def steer_receipt(self, run_id, action_id):
+        return self._request(
+            "GET",
+            "/v1/runs/" + identifier(run_id) + "/steer?action_id=" + identifier(action_id),
+            max_bytes=16384,
+            not_found="steer_receipt_not_found",
+        )
+
+    def steer(self, run_id, body):
+        return self._request(
+            "POST", "/v1/runs/" + identifier(run_id) + "/steer", body=body, max_bytes=16384
+        )
 
     def approve(self, run_id, request_id, choice):
         if choice not in {"once", "session", "deny"}:

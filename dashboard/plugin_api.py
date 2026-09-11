@@ -303,6 +303,7 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
     tools = talk_tools.default_talk_tools()
     if bound is not None:
         tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
+        tools += [talk_dashboard_tasks.steering_tool()]
         if getattr(bound, "target_record", None) is not None:
             tools += talk_target_selection.selection_tools()
         for tool in tools:

@@ -89,6 +89,31 @@ const done = (t, id, output = []) => emit(t, { type: "response.done", response: 
 """
 
 
+def test_steering_receipt_labels_and_replay_are_inert():
+    script = (
+        TASK_HARNESS
+        + r"""
+const hooks = window.__HERMES_TALK_TEST__;
+assert(hooks.controlLabel({status:'queued',source:'host_receipt',evidence:'backend_queue_ack'})
+  .includes('delivery and application unconfirmed'));
+assert(hooks.controlLabel({status:'queued',source:'client_observation'}).includes('unconfirmed'));
+assert(hooks.controlLabel({status:'applied'}).includes('unconfirmed'));
+assert(hooks.controlLabel({status:'unsupported'}).includes('unavailable'));
+assert(hooks.steeringLabel({supported:true}).includes('available for this running job'));
+assert(hooks.steeringLabel({supported:'true'}).includes('unavailable'));
+assert(hooks.steeringLabel({supported:false,reason:'not_refreshed'}).includes('not_refreshed'));
+assert.equal(requests.length,0); assert.equal(sent.length,0);
+"""
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
