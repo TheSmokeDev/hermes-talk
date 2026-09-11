@@ -315,6 +315,11 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
                 )
                 tool["parameters"]["properties"].pop("resource_keys", None)
                 tool["parameters"]["properties"].pop("execution_mode", None)
+                if talk_dashboard_tasks.codex_worker_available(bound.capabilities):
+                    tool["parameters"]["properties"]["worker"] = {
+                        "type": "string", "enum": ["hermes", "codex"],
+                        "description": "Use codex only when explicitly selected by the operator.",
+                    }
             elif tool["name"] == "resolve_approval":
                 tool["parameters"]["properties"]["approval_id"] = {"type": "string"}
     return talk_wire.mint_ephemeral_session(

@@ -2040,7 +2040,12 @@
           job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
           results[job.run_id] && h("div", null,
             h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
-            h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied.")),
+            results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
+            h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
+            (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
+              h("div", { key: index },
+                h("div", { className: "ht-role" }, "Artifact changes"),
+                h("pre", { className: "ht-out" }, JSON.stringify(artifact, null, 2))))),
           results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport.")))),
 
       h("form", { className: "ht-token-row", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },

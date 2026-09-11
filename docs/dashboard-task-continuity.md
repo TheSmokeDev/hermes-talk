@@ -262,3 +262,13 @@ ordinary reply without events times out after 45 seconds and is marked incomplet
 summary without response events for 30 seconds becomes unknown rather than being retried.
 Polling/sample ticks apply these bounds; they are recovery thresholds, not live latency
 measurements. Genuine input retains its canonical origin even when its response fails.
+
+
+## Optional Codex work
+
+A host with the configured [Codex worker](codex-workers.md) exposes an explicit worker
+choice in the bound delegation tool. It runs under the same canonical parent, linked
+child, origin, steering and approval routes. The result panel includes complete available
+text and supplied artifact changes, including partial results after cancellation.
+Fresh jobs can announce completion even if they finish before the first status poll;
+initial/recovered jobs remain silent.
