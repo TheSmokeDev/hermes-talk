@@ -20,6 +20,11 @@ jobs:
   test:
     # No secrets, no network: the suite runs against scripted Realtime
     # transcripts and a stub plugin context, and never opens an audio device.
+    #
+    # A healthy job finishes in ~3 minutes (Windows), so 15 is ~5x headroom.
+    # Without a ceiling a wedged test holds the runner for GitHub's 6-hour
+    # default, which reads as "still running" long after it has failed.
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
