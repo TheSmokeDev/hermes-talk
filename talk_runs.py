@@ -1215,6 +1215,26 @@ def get_run(run_id: int) -> dict | None:
         return snapshot
 
 
+def resolve_run_record(run_id: int) -> dict | None:
+    """Read one live or durable run for reconnect display, without claiming delivery.
+
+    The bounded history tail owns its retention limit; the UI's 100-row listing
+    cap must not hide an exact requested run. Missing/unreadable remains unknown.
+    """
+    live = get_run(run_id)
+    if live is not None:
+        return live
+    stored = _load_history().get(run_id)
+    if not isinstance(stored, dict):
+        return None
+    record = dict(stored)
+    record["runId"] = run_id
+    record["fromHistory"] = True
+    if record.get("status") not in TERMINAL_STATUSES:
+        record["status"] = "lost"
+    return record
+
+
 def list_runs(limit: int = 10, include_history: bool = False) -> list[dict]:
     """Most-recent runs first, newest ``limit`` entries.
 
@@ -1399,6 +1419,7 @@ __all__ = [
     "release_process",
     "reset_for_tests",
     "resolve_execution_mode",
+    "resolve_run_record",
     "start_run",
     "started_sentinel",
     "terminate_process",

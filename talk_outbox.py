@@ -99,6 +99,7 @@ class HistoryOutbox:
             db = sqlite3.connect(self._path, timeout=2)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA secure_delete=ON")
+            db.execute("PRAGMA foreign_keys=ON")
             db.execute("BEGIN IMMEDIATE")
             if prune:
                 # Retention cleanup must survive a subsequent admission/read refusal.
@@ -162,6 +163,15 @@ class HistoryOutbox:
     def check(self, owner: HistoryOwner, connection_id: str, generation: int):
         with self._db() as db:
             self._check(db, owner, connection_id, generation)
+
+    @contextmanager
+    def fenced(
+        self, owner: HistoryOwner, connection_id: str, generation: int
+    ) -> Iterator[sqlite3.Connection]:
+        """Atomic generation fence for shared derived-state projections, never host state."""
+        with self._db() as db:
+            self._check(db, owner, connection_id, generation)
+            yield db
 
     def end(self, owner: HistoryOwner, connection_id: str, generation: int):
         with self._db() as db:
@@ -308,7 +318,17 @@ class HistoryOutbox:
                 + (" AND event_id=?" if event_id is not None else ""),
                 (code, owner.key, event_id) if event_id is not None else (code, owner.key),
             )
+            has_task_projection = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_event_owners'"
+            ).fetchone()
+            if event_id is not None and has_task_projection:
+                db.execute(
+                    "DELETE FROM task_events WHERE owner=? AND canonical_event=?",
+                    (owner.key, event_id),
+                )
             if event_id is None:
+                if has_task_projection:
+                    db.execute("DELETE FROM task_event_owners WHERE owner=?", (owner.key,))
                 db.execute(
                     "UPDATE connections SET owner='',generation=generation+1 WHERE owner=?",
                     (owner.key,),
