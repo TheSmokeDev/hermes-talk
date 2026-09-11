@@ -1655,3 +1655,103 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
     result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
                  text=True, timeout=NODE_TIMEOUT_S)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("scenario", [
+    r"""
+  let now=1000; t.task.timing.clock=()=>now;
+  emit(t,{type:'input_audio_buffer.speech_started',item_id:'operator-item'});
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await drain(); assert.equal(creates().length,0);
+  now=32000; t.task.timing.sample('input',true);
+  await t.task.presentation.drain(); assert.equal(creates().length,0);
+  now=32900; t.task.timing.sample('input',false);
+  await t.task.presentation.drain();
+  assert.equal(creates().length,1);
+  assert(errors.some(e=>e.includes('measured silence')));
+""",
+    r"""
+  t.task.timing.nativePlaying=true;
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await drain(); assert.equal(creates().length,0);
+  t.task.timing.nativePlaying=false;
+  t.pcmContext={currentTime:1}; t.pcmNextTime=2;
+  await t.task.presentation.drain(); assert.equal(creates().length,0);
+  t.pcmContext.currentTime=3; t.cascadeReqs.add('draining-tts');
+  await t.task.presentation.drain(); assert.equal(creates().length,0);
+  t.cascadeReqs.clear(); await t.task.presentation.drain();
+  assert.equal(creates().length,1);
+""",
+    r"""
+  let release;
+  fetchOverride=(url)=>url.endsWith('/speech')
+    ? new Promise(resolve=>{release=()=>resolve(summary);}) : undefined;
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await waitFor(()=>release);
+  emit(t,{type:'input_audio_buffer.speech_started',item_id:'operator-item'});
+  release(); await waitFor(()=>requests.some(r=>r.body && r.body.state==='deferred'));
+  assert.equal(creates().length,0); assert.equal(t.task.presentation.pending.length,1);
+  t.task.timing.speakingSince=null;
+  fetchOverride=(url)=>url.endsWith('/speech') ? summary : undefined;
+  await t.task.presentation.drain(); assert.equal(creates().length,1);
+""",
+    r"""
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await waitFor(()=>creates().length===1);
+  emit(t,{type:'input_audio_buffer.speech_started',item_id:'operator-item'});
+  created(t,'late-summary');
+  emit(t,{type:'response.function_call_arguments.done',response_id:'late-summary',
+    call_id:'forbidden',name:'stop_work',arguments:'{"run_id":7}'});
+  await drain();
+  assert(sent.some(r=>r.type==='response.cancel' && r.response_id==='late-summary'));
+  assert(sent.some(r=>r.type==='output_audio_buffer.clear'));
+  assert(requests.some(r=>r.body && r.body.state==='unknown'));
+  assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+""",
+    r"""
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await waitFor(()=>creates().length===1); created(t,'summary-response');
+  emit(t,{type:'output_audio_buffer.started',response_id:'summary-response'});
+  done(t,'summary-response'); await drain();
+  assert.equal(t.task.timing.snapshot().playback_active,true);
+  emit(t,{type:'output_audio_buffer.stopped',response_id:'summary-response'});
+  assert.equal(t.task.timing.snapshot().playback_active,false);
+  assert(!requests.some(r=>r.body && r.body.state==='playback_acknowledged'));
+""",
+    r"""
+  let now=1000; t.task.timing.clock=()=>now;
+  await t.task.typed('Keep this real input');
+  assert.equal(creates().length,1);
+  t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
+  await drain(); assert.equal(creates().length,1);
+  now=47000; await t.task.presentation.drain();
+  assert.equal(creates().length,2);
+  await waitFor(()=>events('interaction.incomplete').length===1);
+  assert.equal(events('input.final').length,1);
+""",
+])
+def test_speech_timing_blocks_recovers_and_preserves_worker_ownership(scenario):
+    script = PRESENTATION_HARNESS + "\n(async()=>{const t=make();\n" + scenario + r"""
+  t.task.close();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_old_playback_stop_does_not_clear_the_current_response():
+    script = TASK_HARNESS + r"""
+const t=make();
+emit(t,{type:'output_audio_buffer.started',response_id:'old-response'});
+emit(t,{type:'output_audio_buffer.started',response_id:'current-response'});
+emit(t,{type:'output_audio_buffer.stopped',response_id:'old-response'});
+assert.equal(t.task.timing.snapshot().playback_active,true);
+emit(t,{type:'output_audio_buffer.stopped',response_id:'current-response'});
+assert.equal(t.task.timing.snapshot().playback_active,false);
+t.task.close();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr

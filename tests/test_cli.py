@@ -2295,3 +2295,25 @@ def test_a_caller_named_lane_buys_no_summary(monkeypatch, tmp_path):
     assert seen["lane"] == "discord"
     assert seen["host_summary"] is None
     assert talk_identity.LANE_LINES["discord"] in seen["instructions"]
+
+
+@pytest.mark.parametrize("provider,mode", [("grok", "semantic_vad"), ("gemini", "server_vad")])
+def test_unsupported_endpointing_refuses_before_resolving_credentials(monkeypatch, provider, mode):
+    monkeypatch.setenv("TALK_PROVIDER", provider)
+    monkeypatch.setenv("TALK_TURN_DETECTION", mode)
+    monkeypatch.setattr(talk_cli, "_grok_auth", lambda: pytest.fail("credentials read"))
+    monkeypatch.setattr(talk_cli, "_gemini_auth", lambda: pytest.fail("credentials read"))
+    with pytest.raises(talk_cli.talk_config.TalkConfigError, match="TALK_TURN_DETECTION"):
+        talk_cli.resolve_provider_lane()
+
+
+def test_cli_mint_keeps_manual_response_and_semantic_detection(monkeypatch):
+    rt = talk_cli.talk_realtime
+    seen = []
+    monkeypatch.setattr(talk_cli.talk_wire, "mint_ephemeral_session", lambda **kw: seen.append(kw))
+    detection = rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD)
+    talk_cli._mint_session(types.SimpleNamespace(token="fixture", source="fixture"),
+                           model="fixture", voice="cedar", instructions="", tools=[],
+                           automatic_response=False, turn_detection=detection)
+    assert seen[0]["automatic_response"] is False
+    assert seen[0]["turn_detection"] is detection

@@ -88,12 +88,23 @@ def _load_real_contract():
             "agent.realtime_voice_provider", candidate
         )
         module = importlib.util.module_from_spec(spec)
+        prior = sys.modules.get(spec.name)
+        sys.modules[spec.name] = module
         try:
             spec.loader.exec_module(module)
-        except Exception:  # noqa: BLE001 - a checkout we cannot load is not ours
+        except Exception as exc:  # noqa: BLE001 - an explicit fixture must not silently skip
+            if env_var == "HERMES_TALK_CORE_CONTRACT":
+                pytest.fail(f"Explicit host contract failed to load: {type(exc).__name__}: {exc}")
             continue
+        finally:
+            if prior is None:
+                sys.modules.pop(spec.name, None)
+            else:
+                sys.modules[spec.name] = prior
         if _is_the_shipped_contract(module):
             return module
+        if env_var == "HERMES_TALK_CORE_CONTRACT":
+            pytest.fail("Explicit host fixture does not supply the base realtime contract")
 
     try:
         installed = importlib.import_module("agent.realtime_voice_provider")
@@ -144,6 +155,13 @@ def core():
             else:
                 sys.modules[name] = value
         importlib.import_module("talk_core_provider")
+
+
+@pytest.fixture
+def semantic_core(core):
+    if not core.turn_detection_available():
+        pytest.skip("This older host has no semantic turn-detection contract")
+    return core
 
 
 PLUGIN_LOGGER = "hermes_plugins.hermes_talk"
@@ -861,6 +879,94 @@ def test_the_setup_the_provider_gets_is_the_hosts_setup(core):
     }
 
 
+def test_provider_turn_detection_capability_matrix_is_exact(semantic_core):
+    core = semantic_core
+    mode = core.contract.RealtimeTurnDetectionMode
+
+    assert core.TalkOpenAICoreProvider.supported_turn_detection_modes == frozenset(mode)
+    assert core.TalkGrokCoreProvider.supported_turn_detection_modes == frozenset(
+        {mode.PROVIDER_NATIVE, mode.SERVER_VAD}
+    )
+    assert core.TalkGeminiCoreProvider.supported_turn_detection_modes == frozenset(
+        {mode.PROVIDER_NATIVE}
+    )
+
+
+@pytest.mark.parametrize(
+    ("core_mode_name", "talk_mode", "eagerness_name"),
+    [
+        ("PROVIDER_NATIVE", rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE, None),
+        ("SERVER_VAD", rt.RealtimeTurnDetectionMode.SERVER_VAD, None),
+        (
+            "SEMANTIC_VAD",
+            rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            "HIGH",
+        ),
+    ],
+)
+def test_openai_turn_detection_bridge_is_exhaustive(
+    semantic_core, core_mode_name, talk_mode, eagerness_name
+):
+    core = semantic_core
+    c = core.contract
+    session = FakeTalkSession()
+    provider = core.TalkOpenAICoreProvider(
+        auth_resolver=lambda: types.SimpleNamespace(token="t", source="test"),
+        session_factory=lambda auth: session,
+    )
+    eagerness = (
+        None if eagerness_name is None else getattr(c.RealtimeSemanticEagerness, eagerness_name)
+    )
+    setup = c.RealtimeVoiceSetup(
+        instructions="hi",
+        turn_detection=c.RealtimeTurnDetection(
+            mode=getattr(c.RealtimeTurnDetectionMode, core_mode_name),
+            semantic_eagerness=eagerness,
+        ),
+    )
+
+    async def run():
+        opened = await provider.open_session(setup)
+        await opened.close()
+
+    asyncio.run(run())
+    assert session.connected_with.turn_detection.mode is talk_mode
+    expected_eagerness = (
+        None if eagerness_name is None else getattr(rt.RealtimeSemanticEagerness, eagerness_name)
+    )
+    assert session.connected_with.turn_detection.semantic_eagerness is expected_eagerness
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "mode_name"),
+    [
+        ("TalkGrokCoreProvider", "SEMANTIC_VAD"),
+        ("TalkGeminiCoreProvider", "SERVER_VAD"),
+        ("TalkGeminiCoreProvider", "SEMANTIC_VAD"),
+    ],
+)
+def test_unsupported_turn_detection_is_refused_before_auth_or_session_factory(
+    semantic_core, provider_name, mode_name
+):
+    core = semantic_core
+    calls = []
+    provider = getattr(core, provider_name)(
+        auth_resolver=lambda: calls.append("auth"),
+        session_factory=lambda auth: calls.append("session"),
+    )
+    c = core.contract
+    setup = c.RealtimeVoiceSetup(
+        instructions="hi",
+        turn_detection=c.RealtimeTurnDetection(
+            mode=getattr(c.RealtimeTurnDetectionMode, mode_name)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported turn detection mode"):
+        asyncio.run(provider.open_session(setup))
+    assert calls == []
+
+
 def test_an_unset_model_or_voice_falls_back_to_the_lanes_default(core):
     import talk_config
 
@@ -1023,3 +1129,95 @@ def test_the_setup_schema_names_an_env_var_and_never_a_value(core):
         assert provider.default_model()
         assert provider.default_voice()
         assert provider.list_voices()
+
+
+def _synthetic_old_head_contract():
+    """Minimal #101808-shaped core: API v2 with every base name, no turn-detection names.
+
+    Binds the exact head the maintainer reviewed against: the three semantic
+    turn-detection symbols are absent, so the adapter must degrade to native
+    instead of dropping the whole core lane.
+    """
+
+    module = types.ModuleType("agent.realtime_voice_provider")
+    module.REALTIME_VOICE_PROVIDER_API_VERSION = 2
+    module.PCM16_24K = object()
+    capability_members = (
+        "TOOL_CALLING",
+        "INPUT_TRANSCRIPTION",
+        "OUTPUT_TRANSCRIPTION",
+        "EXPLICIT_RESPONSE",
+        "RESPONSE_CANCELLATION",
+        "OUTPUT_TRUNCATION",
+        "DYNAMIC_CONTEXT",
+        "TOOL_CALL_CANCELLATION",
+    )
+    module.RealtimeCapability = type(
+        "RealtimeCapability", (), {name: object() for name in capability_members}
+    )
+    for name in (
+        "InputAudioCommitted",
+        "InputSpeechStarted",
+        "InputSpeechStopped",
+        "InputTranscript",
+        "OutputAudio",
+        "OutputTranscript",
+        "RealtimeAudioFormat",
+        "RealtimeToolResult",
+        "RealtimeVoiceEvent",
+        "RealtimeVoiceProvider",
+        "RealtimeVoiceSession",
+        "RealtimeVoiceSetup",
+        "ResponseCompleted",
+        "ResponseStarted",
+        "SessionClosed",
+        "SessionFailure",
+        "SessionReady",
+        "ToolCall",
+        "ToolCallCancelled",
+    ):
+        setattr(module, name, type(name, (), {}))
+    assert not hasattr(module, "RealtimeTurnDetectionMode")
+    return module
+
+
+def test_old_head_contract_keeps_core_lane_with_native_only_turn_detection():
+    """The #101808 head must not take the whole core lane down with it."""
+
+    contract = _synthetic_old_head_contract()
+    saved = {
+        name: sys.modules.get(name)
+        for name in ("agent", "agent.realtime_voice_provider", "talk_core_provider")
+    }
+    package = types.ModuleType("agent")
+    package.__path__ = []
+    package.realtime_voice_provider = contract
+    sys.modules["agent"] = package
+    sys.modules["agent.realtime_voice_provider"] = contract
+    sys.modules.pop("talk_core_provider", None)
+    try:
+        module = importlib.import_module("talk_core_provider")
+        assert module.core_contract_available()
+        assert not module.turn_detection_available()
+        providers = module.build_providers()
+        assert len(providers) == 3
+        assert all(p.supported_turn_detection_modes == frozenset() for p in providers)
+        native = providers[0]._talk_turn_detection(None)
+        assert native == rt.RealtimeTurnDetection()
+        assert native.mode == rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+        class _UnsupportedMode:
+            value = "semantic_vad"
+
+        semantic = types.SimpleNamespace(mode=_UnsupportedMode(), semantic_eagerness=None)
+        with pytest.raises(ValueError, match="does not support turn detection mode"):
+            providers[0]._talk_turn_detection(semantic)
+        diagnostic = module.core_contract_diagnostic()
+        assert diagnostic["contract_available"] is True
+        assert diagnostic["turn_detection_available"] is False
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+        importlib.import_module("talk_core_provider")

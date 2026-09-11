@@ -97,6 +97,110 @@
     } catch (e) { return clientId("tab_"); }
   }
 
+  class TaskSpeechTiming {
+    constructor(task) {
+      this.task = task;
+      this.clock = () => Date.now();
+      this.sequence = 0;
+      this.speakingSince = null;
+      this.nativePlaying = false;
+      this.nativeResponseId = null;
+      this.outputChangedAt = 0;
+      this.awaiting = new Map();
+      this.samples = {};
+    }
+
+    sample(kind, active) {
+      const now = this.clock(), previous = this.samples[kind];
+      this.samples[kind] = { at: now, active: active,
+        voicedAt: active ? now : previous ? previous.voicedAt : -Infinity };
+    }
+
+    quiet(kind) {
+      const sample = this.samples[kind], now = this.clock();
+      return sample && now - sample.at <= 1000 && !sample.active && now - sample.voicedAt >= 700;
+    }
+
+    observe(event) {
+      const now = this.clock(), task = this.task;
+      if (event.type === "input_audio_buffer.speech_started") this.speakingSince = now;
+      if (event.type === "input_audio_buffer.speech_stopped") {
+        this.speakingSince = null;
+        if (!task.inputs.has(event.item_id)) this.awaiting.set(event.item_id || "unknown", now + 12000);
+      }
+      if (event.type === "input_audio_buffer.committed" && !task.inputs.has(event.item_id)) {
+        this.awaiting.set(event.item_id || "unknown", now + 12000);
+      }
+      if (event.type === "conversation.item.input_audio_transcription.completed") {
+        this.awaiting.delete(event.item_id); this.awaiting.delete("unknown");
+      }
+      if (event.type === "output_audio_buffer.started") {
+        this.nativePlaying = true; this.nativeResponseId = event.response_id; this.outputChangedAt = now;
+      }
+      if (["output_audio_buffer.stopped", "output_audio_buffer.cleared"].includes(event.type) &&
+          event.response_id === this.nativeResponseId) {
+        this.nativePlaying = false; this.nativeResponseId = null; this.outputChangedAt = now;
+      }
+      const response = task.responses.get(event.response_id || (event.response || {}).id);
+      if (response) response.last_at = now;
+    }
+
+    recover() {
+      const now = this.clock(), task = this.task, transport = task.transport;
+      if (this.speakingSince !== null && now - this.speakingSince >= 30000 && this.quiet("input")) {
+        this.speakingSince = null;
+        task.report("Recovered a missing speech-stop event after measured silence.");
+      }
+      if (this.nativePlaying && now - this.outputChangedAt >= 30000 && this.quiet("output")) {
+        this.nativePlaying = false;
+        task.report("Playback timing recovered after measured silence; delivery remains unconfirmed.");
+      }
+      for (const [id, expires] of this.awaiting) {
+        if (now >= expires) { this.awaiting.delete(id); task.report("Input transcription timing expired."); }
+      }
+      let expired = false;
+      for (const request of task.requests.values()) {
+        if (!request.claimed && !request.row.incomplete && now - request.created_at >= 45000) {
+          request.claimed = true; expired = true;
+          task.incomplete(request.row, "response_failed");
+        }
+      }
+      for (const response of task.responses.values()) {
+        const tools = Array.from(response.calls.values()).some((call) => !call.done);
+        if (!response.done && !response.row.incomplete && !tools && now - response.last_at >= 45000) {
+          expired = true; task.incomplete(response.row, "response_failed");
+          transport.send({ type: "response.cancel", response_id: response.id });
+        }
+      }
+      if (expired) {
+        transport.responseActive = Array.from(task.responses.values()).some((r) => !r.done && !r.row.incomplete);
+        transport.continuationPending = Array.from(task.requests.values()).some((r) => !r.claimed && !r.row.incomplete);
+      }
+      const summary = task.presentation.active;
+      if (summary && now - summary.last_at >= 30000 && !this.nativePlaying) task.presentation.interrupt();
+    }
+
+    snapshot() {
+      this.recover();
+      const task = this.task, transport = task.transport, now = this.clock();
+      const active = Array.from(task.responses.values()).filter((response) => !response.row.incomplete);
+      const output = this.samples.output;
+      return {
+        sequence: ++this.sequence,
+        operator_speaking: this.speakingSince !== null ||
+          Boolean(this.samples.input && now - this.samples.input.voicedAt < 700),
+        playback_active: this.nativePlaying || Boolean(output && now - output.voicedAt < 700) ||
+          transport.cascadeReqs.size > 0 || Boolean(transport.pcmContext &&
+            transport.pcmContext.currentTime < transport.pcmNextTime),
+        response_pending: transport.responseActive || transport.continuationPending ||
+          active.some((response) => !response.done || !response.finished),
+        input_pending: this.awaiting.size > 0 || Array.from(task.inputs.values()).some((row) =>
+          !row.incomplete && !row.remembered),
+        tools_pending: active.some((response) => Array.from(response.calls.values()).some((call) => !call.done)),
+      };
+    }
+  }
+
   /** Synthetic summaries have no interaction, ordinary response, or tool authority. */
   class TaskPresentation {
     constructor(task) {
@@ -105,17 +209,20 @@
       this.active = null;
       this.preparing = false;
       this.responses = new Set();
+      this.cancelled = new Set();
     }
 
     offer(state) {
+      this.task.timing.recover();
       this.pending = (state.announcements || []).slice(0, 8);
       void this.drain();
     }
 
     idle() {
       const transport = this.task.transport;
-      return !this.task.closed && !transport.closed && !transport.responseActive &&
-        !transport.continuationPending && transport.channel && transport.channel.readyState === "open";
+      if (this.task.closed || transport.closed || !transport.channel || transport.channel.readyState !== "open") return false;
+      const state = this.task.timing.snapshot();
+      return !Object.keys(state).some((key) => key !== "sequence" && state[key]);
     }
 
     async drain() {
@@ -124,9 +231,14 @@
       let prepared = null;
       try {
         const next = this.pending.shift();
-        prepared = await this.task.request("/speech", { event_id: next.event_id });
+        prepared = await this.task.request("/speech", { event_id: next.event_id,
+          timing: this.task.timing.snapshot() });
         if (!prepared.speak || this.task.closed) return;
-        if (!this.idle()) { await this.receipt(prepared, "unknown"); return; }
+        if (!this.idle()) {
+          await this.receipt(prepared, "deferred");
+          this.pending.unshift(next);
+          return;
+        }
         const response = prepared.response;
         if (!response || response.conversation !== "none" || response.tool_choice !== "none" ||
             !Array.isArray(response.tools) || response.tools.length || !Array.isArray(response.input) ||
@@ -136,12 +248,14 @@
           throw new Error("Invalid isolated task presentation.");
         }
         const transport = this.task.transport;
+        prepared.last_at = this.task.timing.clock();
         this.active = prepared;
         if (prepared.result && transport.cb.onTaskResult) transport.cb.onTaskResult(prepared.result);
         if (!transport.send({ type: "response.create", event_id: prepared.attempt_id,
           response: Object.assign({}, response, { output_modalities: [transport.cascade ? "text" : "audio"] }) })) {
           this.active = null;
-          await this.receipt(prepared, "unknown");
+          await this.receipt(prepared, "deferred");
+          this.pending.unshift(next);
           return;
         }
         await this.receipt(prepared, "sent");
@@ -151,18 +265,33 @@
     }
 
     receipt(prepared, state) {
-      return this.task.request("/speech/receipt", { event_id: prepared.event_id,
-        attempt_id: prepared.attempt_id, state: state });
+      const prior = prepared.receiptTail || Promise.resolve();
+      prepared.receiptTail = prior.then(() => this.task.request("/speech/receipt", {
+        event_id: prepared.event_id, attempt_id: prepared.attempt_id, state: state }));
+      return prepared.receiptTail;
     }
 
     handle(event) {
       const response = event.response || {};
       const meta = response.metadata || {};
       const current = this.active;
+      if (event.type === "error" && current && (event.error || {}).event_id === current.attempt_id) {
+        this.interrupt();
+        return false;
+      }
       if (event.type === "response.created" && meta.talk_presentation_id) {
+        if (this.cancelled.has(meta.talk_presentation_id)) {
+          if (response.id) {
+            this.responses.add(response.id);
+            this.task.transport.send({ type: "response.cancel", response_id: response.id });
+            this.task.transport.clearPlayback();
+          }
+          return true;
+        }
         if (current && !current.response_id && meta.talk_presentation_id === current.attempt_id &&
             meta.talk_event_id === current.event_id && response.id) {
           current.response_id = response.id;
+          current.last_at = this.task.timing.clock();
           this.responses.add(response.id);
           if (this.responses.size > 64) this.responses.delete(this.responses.values().next().value);
         } else this.task.report("Unlinked task summary refused.");
@@ -172,6 +301,7 @@
       if (!id || !this.responses.has(id)) return false;
       // Late synthetic events can never be reclassified as ordinary dialogue.
       if (!current || id !== current.response_id) return true;
+      current.last_at = this.task.timing.clock();
       const transport = this.task.transport;
       if (event.type === "response.function_call_arguments.done") {
         this.task.report("Task summaries cannot call tools.");
@@ -192,6 +322,7 @@
       if (event.type === "response.done") {
         this.active = null;
         if (response.status !== "completed") {
+          transport.clearPlayback();
           void this.receipt(current, "unknown").catch((err) => this.task.report(errorText(err)));
         }
         void this.task.refresh();
@@ -202,6 +333,9 @@
     interrupt() {
       if (!this.active) return;
       const current = this.active;
+      this.cancelled.add(current.attempt_id);
+      if (this.cancelled.size > 64) this.cancelled.delete(this.cancelled.values().next().value);
+      this.task.transport.clearPlayback();
       if (current.response_id) this.task.transport.send({ type: "response.cancel", response_id: current.response_id });
       void this.receipt(current, "unknown").catch((err) => this.task.report(errorText(err)));
       this.active = null;
@@ -222,6 +356,7 @@
       this.completedGroups = [];
       this.toolTail = Promise.resolve();
       this.stateTail = null;
+      this.timing = new TaskSpeechTiming(this);
       this.presentation = new TaskPresentation(this);
     }
 
@@ -308,7 +443,7 @@
         return existing;
       }
       const row = { input_id: inputId, type: type, text: text, tail: Promise.resolve(),
-        requested: false, incomplete: false, items: [inputId] };
+        requested: false, incomplete: false, items: [inputId], created_at: this.timing.clock() };
       this.inputs.set(inputId, row);
       this.notice(row, "staging");
       row.ready = this.request("/event", {
@@ -356,11 +491,12 @@
     requestResponse(row, previous) {
       if (this.closed || row.incomplete) return;
       if (!previous && row.requested) return;
+      this.presentation.interrupt();
       row.requested = true;
       const token = clientId("req_");
       const metadata = { talk_request_id: token, talk_interaction_id: row.receipt.interaction_id,
         talk_input_id: row.input_id, talk_previous_response_id: previous || "" };
-      this.requests.set(token, { row: row, previous: previous || "", claimed: false });
+      this.requests.set(token, { row: row, previous: previous || "", claimed: false, created_at: this.timing.clock() });
       // Explicit input references keep overlapping ASR completions from selecting
       // whichever utterance happens to be last in the provider conversation.
       const prior = this.completedGroups.filter((group) => !group.row.incomplete && group.row !== row)
@@ -388,11 +524,11 @@
         this.report("Response is unlinked: provider response metadata did not identify a staged input.");
         return;
       }
-      if (this.responses.has(response.id)) return;
+      if (this.responses.has(response.id) || request.row.incomplete) return;
       if (request.claimed) { this.incomplete(request.row, "linkage_ambiguous"); return; }
       request.claimed = true;
       const current = { id: response.id, row: request.row, previous: request.previous,
-        calls: new Map(), declared: null, done: false, finished: false };
+        calls: new Map(), declared: null, done: false, finished: false, last_at: this.timing.clock() };
       this.responses.set(response.id, current);
       const body = { kind: "response.started", response_id: response.id };
       if (request.previous) body.previous_response_id = request.previous;
@@ -655,6 +791,7 @@
       // stopPcmPlayback() clears them alongside the generation bump.
       this.pcmPrev = null;
       this.pcmPos = 0;
+      this.timingMeters = [];
       // One receipt per session for a relay that failed for a real reason.
       this.cascadeFailureLogged = false;
       this.task = session && session.task ? new TaskContinuity(this, session.task) : null;
@@ -675,6 +812,7 @@
       peer.addEventListener("track", (event) => {
         const stream = event.streams[0];
         if (this.audio && stream) this.audio.srcObject = stream;
+        if (stream && this.task) this.meter(stream, "output");
       });
 
       const media = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -683,6 +821,7 @@
         return;
       }
       this.media = media;
+      if (this.task) this.meter(media, "input");
       media.getAudioTracks().forEach((track) => peer.addTrack(track, media));
 
       const channel = peer.createDataChannel("oai-events");
@@ -743,6 +882,12 @@
         try { this.offerAbort.abort(); } catch (e) { /* already aborted */ }
         this.offerAbort = null;
       }
+      for (const meter of this.timingMeters) {
+        window.clearTimeout(meter.timer);
+        try { meter.source.disconnect(); } catch (e) { /* already disconnected */ }
+        try { Promise.resolve(meter.context.close()).catch(() => {}); } catch (e) { /* already closed */ }
+      }
+      this.timingMeters = [];
       try { this.abortCascade(); } catch (e) { /* already torn down */ }
       if (this.pcmContext) {
         const ctx = this.pcmContext;
@@ -770,6 +915,44 @@
       if (this.audio) {
         try { this.audio.remove(); } catch (e) { /* already removed */ }
         this.audio = null;
+      }
+    }
+
+    meter(stream, kind) {
+      const Context = window.AudioContext || window.webkitAudioContext;
+      if (!Context || !this.task || this.closed) return;
+      let context;
+      try {
+        context = new Context();
+        const source = context.createMediaStreamSource(stream), analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser); // Measurement only; no microphone loopback or recording.
+        const meter = { context: context, source: source, timer: null };
+        this.timingMeters.push(meter);
+        const samples = new Uint8Array(analyser.fftSize);
+        const tick = () => {
+          if (this.closed || this.task.closed) return;
+          if (context.state === "running") {
+            analyser.getByteTimeDomainData(samples);
+            let sum = 0;
+            for (const value of samples) sum += Math.pow((value - 128) / 128, 2);
+            this.task.timing.sample(kind, Math.sqrt(sum / samples.length) >= 0.02);
+            void this.task.presentation.drain();
+          }
+          meter.timer = window.setTimeout(tick, 100);
+        };
+        tick();
+      } catch (err) {
+        if (context) { try { Promise.resolve(context.close()).catch(() => {}); } catch (e) { /* unavailable */ } }
+        this.task.report("Audio timing measurement unavailable; recovery requires provider stop events.");
+      }
+    }
+
+    clearPlayback() {
+      if (this.cascade) this.abortCascade();
+      else if (this.task) {
+        this.send({ type: "output_audio_buffer.clear" });
+        this.task.timing.nativePlaying = false;
       }
     }
 
@@ -802,6 +985,7 @@
       } catch (e) {
         return;
       }
+      if (this.task) this.task.timing.observe(event);
       if (this.task && this.task.presentation.handle(event)) return;
       switch (event.type) {
         case "input_audio_buffer.committed":
@@ -853,8 +1037,16 @@
           else this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
+        case "output_audio_buffer.started":
+        case "output_audio_buffer.stopped":
+        case "output_audio_buffer.cleared":
+          if (this.task) void this.task.presentation.drain();
+          return;
         case "input_audio_buffer.speech_started":
-          if (this.task) this.task.presentation.interrupt();
+          if (this.task) {
+            this.task.presentation.interrupt();
+            if (this.responseActive || this.task.timing.nativePlaying) this.clearPlayback();
+          }
           this.cb.onStatus("Listening…");
           // Barge-in kills the cascade mid-word too: abort the relay fetch
           // (the server cancels the TTS on EOF) and stop every queued buffer.

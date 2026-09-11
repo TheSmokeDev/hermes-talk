@@ -754,3 +754,24 @@ def test_preference_capacity_does_not_evict_other_owners(tmp_path):
         assert db.execute("SELECT count(*) FROM task_preferences").fetchone()[0] == 256
         db.execute("UPDATE task_preferences SET owner=? WHERE owner='owner-0'", (token.owner.key,))
     assert store.set_update_preference(token, "completion")["update_mode"] == "completion"
+
+
+def test_only_unsent_speech_can_be_deferred_without_losing_the_result(tmp_path):
+    store, _, token = scope(tmp_path)
+    bind(store, token)
+    lease = store.open_source(token, "job", mode="api_poll", source_session="worker", run_id=7)
+    store.observe_poll(token, lease, 7, poll(), live=True)
+    event_id = store.page(token)["events"][0]["event_id"]
+    first = store.queue_speech(token, event_id)
+    store.defer_speech(token, first)
+    second = store.queue_speech(token, event_id)
+    assert second.attempt_id != first.attempt_id
+    with pytest.raises(TaskEventError, match="invalid_delivery"):
+        store.acknowledge_speech(token, first, "sent")
+    store.acknowledge_speech(token, second, "sent")
+    with pytest.raises(TaskEventError, match="invalid_delivery"):
+        store.defer_speech(token, second)
+    store.acknowledge_speech(token, second, "unknown")
+    with pytest.raises(TaskEventError, match="invalid_delivery"):
+        store.defer_speech(token, second)
+    assert store.page(token)["events"][0]["state"] == "completed"

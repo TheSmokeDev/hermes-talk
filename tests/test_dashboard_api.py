@@ -626,3 +626,12 @@ def test_a_second_mint_does_not_retroactively_reattribute_an_in_flight_run(minte
     assert second_owner["talkSessionId"] != first_owner["talkSessionId"]
     ticket = talk_runs.get_run(run_id)["ticket"]
     assert ticket["talkSessionId"] == first_owner["talkSessionId"]
+
+
+def test_bad_endpointing_refuses_before_dashboard_provider_auth(monkeypatch):
+    monkeypatch.setenv("TALK_TURN_DETECTION", "invalid")
+    monkeypatch.setattr(api.talk_auth, "resolve_auth", lambda: pytest.fail("credentials read"))
+    with pytest.raises(api.HTTPException) as exc:
+        call(api.create_session, FakeRequest(body={}))
+    assert exc.value.status_code == 400
+    assert "TALK_TURN_DETECTION" in str(exc.value.detail)

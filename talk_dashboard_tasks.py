@@ -39,6 +39,7 @@ try:
     from .talk_run_control import (
         steering_tool as steering_tool,
     )
+    from .talk_speech_timing import SpeechTiming
     from .talk_task_events import SpeechAttempt, TaskEvents
     from .talk_task_sources import TaskEventError
 except ImportError:  # pragma: no cover - flat plugin load
@@ -64,6 +65,7 @@ except ImportError:  # pragma: no cover - flat plugin load
     from talk_run_control import (
         steering_tool as steering_tool,
     )
+    from talk_speech_timing import SpeechTiming
     from talk_task_events import SpeechAttempt, TaskEvents
     from talk_task_sources import TaskEventError
 
@@ -177,6 +179,7 @@ class BoundDashboard:
     target_record: dict | None = None
     return_depth: int = 0
     job_observations: dict = field(default_factory=dict)
+    speech_timing: SpeechTiming | None = None
 
     @property
     def token(self):
@@ -308,6 +311,7 @@ class DashboardTasks:
         self._recover(bound)
         bound.generation = bound.token.generation
         bound.events = TaskEvents(outbox, bound.token)
+        bound.speech_timing = SpeechTiming(bound.token)
         attachment.refresh_snapshot(bound.token)
         if activate:
             self.activate(bound)
@@ -1096,6 +1100,11 @@ class DashboardTasks:
 
     def speech(self, request, body):
         bound = self.binding(request, body, write=True)
+        if body.get("timing") is None:
+            return {"ok": True, "speak": False, "reason": "timing_unavailable"}
+        with self._lock:
+            if not bound.speech_timing.observe(bound.token, body["timing"]):
+                return {"ok": True, "speak": False, "reason": "speech_busy"}
         bound.attachment.refresh_snapshot(bound.token)
         event = next((item for item in bound.events.speech_candidates(bound.token)
                       if item["event_id"] == body.get("event_id")), None)
@@ -1129,6 +1138,8 @@ class DashboardTasks:
         if not any(item["event_id"] == event["event_id"]
                    for item in bound.events.speech_candidates(bound.token)):
             return {"ok": True, "speak": False}
+        if not bound.speech_timing.ready(bound.token):
+            return {"ok": True, "speak": False, "reason": "timing_stale"}
         try:
             attempt = bound.events.queue_speech(
                 bound.token, event["event_id"], respect_preference=True
@@ -1167,7 +1178,10 @@ class DashboardTasks:
         attempt = SpeechAttempt(
             identifier(body.get("event_id")), identifier(body.get("attempt_id")), bound.token
         )
-        bound.events.acknowledge_speech(bound.token, attempt, body.get("state"))
+        if body.get("state") == "deferred":
+            bound.events.defer_speech(bound.token, attempt)
+        else:
+            bound.events.acknowledge_speech(bound.token, attempt, body.get("state"))
         self.binding(request, body)
         return {"ok": True, "state": body["state"]}
 
