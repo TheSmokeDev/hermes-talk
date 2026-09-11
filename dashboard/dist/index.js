@@ -744,6 +744,14 @@
     return "not configured";
   }
 
+  function describeMode(voiceMode) {
+    // Provider-from-mode: the label reflects what TALK_VOICE_MODE chose (the
+    // operator's intent), not which credential happens to back it.
+    if (voiceMode === "live") return "GPT-Live (OpenAI)";
+    if (voiceMode === "cascade") return "Cascade (ElevenLabs+TTS)";
+    return "Realtime (OpenAI)"; // native (default)
+  }
+
   // -- transport ------------------------------------------------------------
 
   /**
@@ -774,6 +782,20 @@
       this.toolBatch = null;
       this.toolTail = Promise.resolve();
       this.cascade = session && session.voiceMode === "cascade";
+      // GPT-Live lane (session.voiceMode === "live"): the session was minted
+      // via the /session route relaying our SDP offer to POST /v1/live/sessions;
+      // the response carries {sessionId, sdp} and the task binding. Live mode
+      // speaks a different event set (session.*) and dispatches delegated work
+      // through the BOUND task controller (/tool with connection_id/generation),
+      // never the legacy process-wide /runs polling loop.
+      this.live = session && session.voiceMode === "live";
+      // Delegations are CLAIMED once per delegation id. A repeat or a changed
+      // payload under the same id is refused — never a second dispatch.
+      this.liveDelegations = new Map();
+      // Transcript evidence is kept as timestamped, bound, id-bearing fragments
+      // (the GPT-Live transcript-delta semantics), not concatenated into an
+      // invented completed user turn.
+      this.liveDeltas = [];
       // Every response gets its own relay stream; a tool-call continuation
       // can start streaming while the previous answer's PCM still drains, so
       // in-flight streams are a SET, and playback carries a generation that
@@ -852,6 +874,26 @@
       this.offerAbort = controller;
       const timer = window.setTimeout(() => controller.abort(), OFFER_TIMEOUT_MS);
       try {
+        if (this.live) {
+          // GPT-Live: relay the WebRTC offer through the plugin /session route
+          // (which POSTs to /v1/live/sessions server-side, keeping the raw
+          // credential in the process) and read the provider's SDP answer back.
+          // Must go through apiCall: a raw fetch() skips the dashboard's own
+          // session auth, so the plugin's /session gate 401s the handshake.
+          const data = await apiCall("/session", {
+            method: "POST",
+            body: JSON.stringify({ sdp: offer.sdp, voice: this.session.voice || "" }),
+          }, OFFER_TIMEOUT_MS);
+          const answer = data && data.sdp;
+          if (typeof answer !== "string" || !answer) throw new Error("GPT-Live returned no SDP answer.");
+          if (data && data.sessionId) this.sessionId = data.sessionId;
+          // Live delegation routes through the bound task controller when the
+          // server joined one; otherwise it is retained and never dispatched.
+          if (data && data.task && !this.task) {
+            this.task = new TaskContinuity(this, data.task);
+          }
+          return answer;
+        }
         const res = await fetch(this.session.offerUrl, {
           method: "POST",
           body: offer.sdp,
@@ -977,6 +1019,126 @@
       return true;
     }
 
+    /** Blocker 3: keep transcript evidence as bound fragments, never an
+     *  invented completed user turn. Live deltas are timestamped, id-bearing
+     *  fragments with distinct chronology; concatenating them (or building a
+     *  "The operator asked:" sentence from them) would fabricate an utterance
+     *  the operator never spoke. */
+    recordLiveDelta(role, delta) {
+      if (!this.live || this.closed || typeof delta !== "string" || !delta) return;
+      this.liveDeltas.push({
+        id: clientId("dlt_"),
+        role: role,
+        delta: delta,
+        at: Date.now(),
+      });
+      if (this.liveDeltas.length > 1024) this.liveDeltas.shift();
+    }
+
+    /** A changeable signature over a delegation's relevant fields, so a
+     *  changed payload under the SAME id is distinguishable from a retry. */
+    liveSignature(delegation) {
+      const pick = (v) => (typeof v === "string" ? String(v) : "");
+      return JSON.stringify([
+        pick(delegation.id),
+        pick(delegation.type),
+        pick(delegation.target),
+        pick(delegation.goal),
+      ]);
+    }
+
+    /** A bounded, VERIFIED spoken update. Synthetic updates must never
+     *  authorize more work — this only reports state; it never dispatches. */
+    reportLive(message) {
+      if (!this.live || this.closed) return;
+      this.cb.onStatus(String(message).slice(0, 200));
+      this.cb.onTranscript("assistant", String(message).slice(0, 200) + " ", false);
+    }
+
+    /** Blocker 1 + 2: claim a delegation ONCE and dispatch it through the bound
+     *  task controller (/tool with connection_id/generation), never the legacy
+     *  process-wide /runs loop. A repeat id is refused; a changed payload under
+     *  the same id is refused; a delegation whose context is insufficient is
+     *  RETAINED (not dispatched) until real context exists. */
+    handleLiveDelegation(event) {
+      if (!this.live || this.closed) return;
+      const delegation = event && event.delegation;
+      const id = delegation && (typeof delegation.id === "string" ? delegation.id : "");
+      if (!id) {
+        this.reportLive("Delegation lacked an id; refused.");
+        return;
+      }
+      const signature = this.liveSignature(delegation);
+      const claimed = this.liveDelegations.get(id);
+      if (claimed) {
+        if (claimed.signature !== signature) {
+          this.reportLive("Delegation " + id + " changed payload under the same id; refused.");
+          return;
+        }
+        this.reportLive("Delegation " + id + " already claimed; refusing duplicate work.");
+        return;
+      }
+      // CLAIM FIRST — a concurrent redelivery can never dispatch twice.
+      const record = { signature: signature, claimedAt: Date.now(), receipt: null };
+      this.liveDelegations.set(id, record);
+      if (!this.task) {
+        this.reportLive("GPT-Live delegation needs a bound task connection; retained.");
+        return;
+      }
+      // Blocker 3: only dispatch when the delegation carries its OWN real,
+      // bounded context. We never build a goal from partial fragments.
+      const goal = this.liveDelegationGoal(delegation);
+      if (!goal) {
+        this.reportLive("Delegation " + id + " retained until context is sufficient.");
+        return;
+      }
+      void this.dispatchLiveDelegation(id, record, goal);
+    }
+
+    /** The delegation's own real context, bounded to a verified length. When
+     *  absent, return null so the delegation is retained, never dispatched
+     *  with fabricated text. */
+    liveDelegationGoal(delegation) {
+      const candidate =
+        (typeof delegation.goal === "string" && delegation.goal) ||
+        (typeof delegation.task === "string" && delegation.task) ||
+        (typeof delegation.input === "string" && delegation.input) ||
+        (typeof delegation.prompt === "string" && delegation.prompt);
+      if (!candidate) return null;
+      const bound = candidate.trim().slice(0, 16000);
+      return bound || null;
+    }
+
+    /** Dispatch delegate_task through the BOUND controller. The durable
+     *  WORK_STARTED receipt is bound to the delegation record so a retry is
+     *  refused (the claim above) and the receipt survives. Results land in the
+     *  task panel (full) with only bounded updates spoken — never a fabricated
+     *  result. */
+    async dispatchLiveDelegation(id, record, goal) {
+      if (this.closed) return;
+      try {
+        if (!this.task) throw new Error("no bound task controller");
+        const res = await this.task.request("/tool", {
+          name: "delegate_task",
+          arguments: { task: goal },
+        });
+        if (this.closed) return;
+        const output = res && res.output ? String(res.output) : "(no output)";
+        record.receipt = output;
+        const started = WORK_STARTED_RE.exec(output);
+        if (started) {
+          this.reportLive("Delegation " + id + " started; work continues in the background.");
+        } else {
+          this.reportLive(output.slice(0, 200));
+        }
+        if (this.task) void this.task.refresh();
+      } catch (err) {
+        if (!this.closed) {
+          this.reportLive("Delegation " + id + " failed: " + errorText(err));
+        }
+      }
+    }
+
     handleEvent(data) {
       if (this.closed) return;
       let event;
@@ -988,6 +1150,34 @@
       if (this.task) this.task.timing.observe(event);
       if (this.task && this.task.presentation.handle(event)) return;
       switch (event.type) {
+        case "session.started":
+          // GPT-Live connected; the media track carries audio.
+          this.cb.onStatus("Connected: " + (event.session && event.session.id ? event.session.id : "") + "");
+          return;
+        case "session.created":
+          // Some GPT-Live builds emit this before session.started; idempotent.
+          return;
+        case "session.closed":
+          this.cb.onStatus("Conversation ended.");
+          this.stop();
+          return;
+        case "session.input_transcript.delta":
+          if (event.delta) this.cb.onTranscript("user", event.delta, false);
+          this.recordLiveDelta("user", event && event.delta);
+          return;
+        case "session.output_transcript.delta":
+          if (event.delta) this.cb.onTranscript("assistant", event.delta, false);
+          if (event.delta && this.cascade) this.cascadeSend({ delta: event.delta });
+          this.recordLiveDelta("assistant", event && event.delta);
+          return;
+        case "session.delegation.created":
+          this.handleLiveDelegation(event);
+          return;
+        case "session.usage.updated":
+          return;
+        case "session.error":
+          if (event && event.error) this.handleError(event.error);
+          return;
         case "input_audio_buffer.committed":
           if (this.task && event.item_id) {
             this.task.committed.add(event.item_id);
@@ -1688,12 +1878,21 @@
       const controller = new AbortController();
       sessionAbort.current = controller;
       try {
-        const body = voice ? { voice: voice } : {};
-        if (selectedTask) body.task = { target_id: selectedTask, tab_id: tabId.current,
-          page_reference: { url: window.location.href, title: document.title } };
-        const session = await apiCall("/session", {
-          method: "POST", body: JSON.stringify(body), signal: controller.signal,
-        });
+        const isLive = status && status.voiceMode === "live";
+        let session;
+        if (isLive) {
+          // GPT-Live: there is no upfront ephemeral mint — the transport
+          // builds the WebRTC offer and relays it (with the SDP) through
+          // POST /session to /v1/live/sessions, then uses the SDP answer.
+          session = { voiceMode: "live", voice: voice };
+        } else {
+          const body = voice ? { voice: voice } : {};
+          if (selectedTask) body.task = { target_id: selectedTask, tab_id: tabId.current,
+            page_reference: { url: window.location.href, title: document.title } };
+          session = await apiCall("/session", {
+            method: "POST", body: JSON.stringify(body), signal: controller.signal,
+          });
+        }
         if (epoch !== connectionEpoch.current || controller.signal.aborted) {
           new TalkTransport(session, {}).stop();
           return;
@@ -1858,7 +2057,7 @@
           h("h1", { className: "ht-title" }, "Talk"),
           h("div", { className: "ht-sub" },
             loading ? "Checking readiness…"
-              : ready ? "Ready via " + describeSource(status.source)
+              : ready ? "Ready via " + describeMode(status.voiceMode) + " (" + describeSource(status.source) + ")"
               : (status && status.detail) || "Not configured"
           )
         ),
@@ -1936,7 +2135,7 @@
       ),
 
       h("div", { className: "ht-metrics" },
-        h(Metric, { label: "Auth", value: status ? describeSource(status.source) : "…" }),
+        h(Metric, { label: "Provider", value: status ? describeMode(status.voiceMode) + " · " + describeSource(status.source) : "…" }),
         h(Metric, { label: "Model", value: (status && status.model) || "…" }),
         h(Metric, {
           label: "Session",

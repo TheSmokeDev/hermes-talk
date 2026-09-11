@@ -1755,3 +1755,161 @@ t.task.close();
     result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
                  text=True, timeout=NODE_TIMEOUT_S)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+LIVE_HARNESS = r"""
+const fs = require("fs"), vm = require("vm"), assert = require("assert");
+const requests = [], sent = [], errors = [], transcripts = [];
+let sequence = 0;
+const window = {
+  __HERMES_TALK_TEST_HOOK__: true,
+  __HERMES_PLUGINS__: { register() {} },
+  __HERMES_PLUGIN_SDK__: {
+    React: { createElement() {} },
+    hooks: { useState() {}, useEffect() {}, useRef() {}, useCallback() {} }, components: {},
+    async fetchJSON(url, opts = {}) {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      requests.push({ url, body, signal: opts.signal });
+      if (url.endsWith("/tool")) {
+        assert(body && body.name === "delegate_task", "only delegate_task is dispatched");
+        assert(body.connection_id === "opaque-connection",
+          "bound controller must carry connection_id");
+        assert(body.generation === 3, "bound controller must carry generation");
+        return { ok: true, output: "WORK_STARTED #42 kind=agent" };
+      }
+      if (url.endsWith("/state")) return { ok: true };
+      return { ok: true };
+    },
+  },
+  crypto: { randomUUID() { return "uuid-" + (++sequence); } },
+  sessionStorage: { getItem() { return ""; }, setItem() {} }, setTimeout, clearTimeout,
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
+  window, setTimeout, clearTimeout, AbortController, console,
+}, { filename: "index.js" });
+const Transport = window.__HERMES_TALK_TEST__.TalkTransport;
+const makeLive = () => {
+  return new Transport({ voiceMode: "live", voice: "cedar",
+    task: { connection_id: "opaque-connection", generation: 3 } }, {
+      onStatus: () => {}, onError: (m) => { errors.push(m); },
+      onTranscript: (role, text, final) => { transcripts.push([role, text, final]); },
+    });
+};
+const emit = (t, event) => t.handleEvent(JSON.stringify(event));
+const waitFor = async (predicate) => {
+  const deadline = Date.now() + 1500;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out; requests=" + JSON.stringify(requests));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+};
+const toolCalls = () => requests.filter((r) => (r.url || "").endsWith("/tool"));
+"""
+
+
+def test_live_delegation_claims_once_and_routes_through_bound_controller():
+    """Blocker 1 + 2: the same delegation id claims ONCE and dispatches through
+    the bound /tool (connection_id/generation), never the legacy /runs loop."""
+    script = LIVE_HARNESS + r"""
+(async()=>{
+  const t = makeLive();
+  const delegation = { id: "item_d1", type: "delegation", target: "client",
+    goal: "check the weather" };
+  emit(t, { type: "session.delegation.created", delegation: delegation });
+  emit(t, { type: "session.delegation.created", delegation: delegation });
+  await waitFor(() => toolCalls().length >= 1);
+  const calls = toolCalls();
+  if (calls.length !== 1) throw new Error("delegation dispatched " + calls.length + " times");
+  if (calls[0].body.arguments.task !== "check the weather") {
+    throw new Error("wrong goal: " + calls[0].body.arguments.task);
+  }
+  process.exit(0);
+})().catch((e)=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_delegation_changed_payload_under_same_id_is_refused():
+    """Blocker 1: a changed payload under the SAME delegation id must refuse —
+    never dispatch replacement work."""
+    script = LIVE_HARNESS + r"""
+(async()=>{
+  const t = makeLive();
+  emit(t, { type: "session.delegation.created",
+    delegation: { id: "item_d2", type: "delegation", target: "client", goal: "first request" } });
+  await waitFor(() => toolCalls().length >= 1);
+  emit(t, { type: "session.delegation.created",
+    delegation: { id: "item_d2", type: "delegation", target: "client", goal: "CHANGED request" } });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const calls = toolCalls();
+  if (calls.length !== 1) {
+    throw new Error("changed payload under same id dispatched work: " + calls.length);
+  }
+  process.exit(0);
+})().catch((e)=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_delegation_without_enough_context_is_retained_never_dispatched():
+    """Blocker 3: a delegation with NO real goal is retained (not dispatched)
+    and never turned into an invented completed user turn."""
+    script = LIVE_HARNESS + r"""
+(async()=>{
+  const t = makeLive();
+  emit(t, { type: "session.delegation.created",
+    delegation: { id: "item_d3", type: "delegation", target: "client" } });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  if (toolCalls().length !== 0) {
+    throw new Error("no-context delegation must be retained, not dispatched");
+  }
+  process.exit(0);
+})().catch((e)=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_transcript_deltas_are_kept_as_fragments_not_a_merged_turn():
+    """Blocker 3: live input/output deltas are retained as bound fragments
+    (id, chronology, text) — never synthesized into one completed turn."""
+    script = LIVE_HARNESS + r"""
+(async()=>{
+  const t = makeLive();
+  emit(t, { type: "session.input_transcript.delta", delta: "what is" });
+  emit(t, { type: "session.input_transcript.delta", delta: " the weather" });
+  emit(t, { type: "session.input_transcript.delta", delta: " today" });
+  const userEvents = t.liveDeltas.filter((d) => d.role === "user");
+  if (userEvents.length !== 3) throw new Error("expected 3 fragments, got " + userEvents.length);
+  if (userEvents.some((d) => !d.id || !d.delta || !d.at)) {
+    throw new Error("fragment lost ids/chronology/bounds");
+  }
+  process.exit(0);
+})().catch((e)=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_events_after_close_are_fenced():
+    """Blocker 3: late events after close must be fenced and never dispatch work."""
+    script = LIVE_HARNESS + r"""
+(async()=>{
+  const t = makeLive();
+  t.closed = true;
+  emit(t, { type: "session.delegation.created",
+    delegation: { id: "item_d4", type: "delegation", target: "client", goal: "late work" } });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  if (toolCalls().length !== 0) throw new Error("late delegation after close dispatched work");
+  process.exit(0);
+})().catch((e)=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
