@@ -68,7 +68,7 @@ def normalize_fragments(value):
             "event_id": protocol_id(item.get("event_id")),
             "role": item.get("role", "user"),
             "text": text,
-            "final": item.get("final", finality != "delta"),
+            "final": item.get("final", finality == "turn"),
             "finality": finality,
             "synthetic": item.get("synthetic", False),
             "modality": item.get("modality", "audio"),
@@ -77,10 +77,8 @@ def normalize_fragments(value):
             row["item_id"] = protocol_id(item["item_id"])
         if row["modality"] not in {"audio", "typed"}:
             raise DashboardTaskError("invalid_event", 400)
-        if (
-            row["role"] not in {"user", "assistant"}
-            or any(type(row[key]) is not bool for key in ("final", "synthetic"))
-            or row["final"] != (finality != "delta")
+        if row["role"] not in {"user", "assistant"} or any(
+            type(row[key]) is not bool for key in ("final", "synthetic")
         ):
             raise DashboardTaskError("invalid_event", 400)
         for key in ("start_ms", "end_ms"):
@@ -123,7 +121,7 @@ def resolve_fragments(fragments):
         rows.sort(
             key=lambda row: (
                 row["end_ms"] if row["end_ms"] is not None else row["start_ms"],
-                row["final"],
+                row["finality"] != "delta",
             )
         )
     resolved = []
@@ -135,8 +133,8 @@ def resolve_fragments(fragments):
             and old.get("item_id") == row["item_id"]
             and old["role"] == row["role"]
         ]
-        if not row["final"]:
-            if not any(resolved[index]["final"] for index in same):
+        if row["finality"] == "delta":
+            if not any(resolved[index]["finality"] != "delta" for index in same):
                 resolved.append(row)
             continue
         replaced = set(same)
@@ -150,7 +148,7 @@ def resolve_fragments(fragments):
             # Legacy finals without identity/timing replace only the unfinished tail.
             for index in range(len(resolved) - 1, -1, -1):
                 old = resolved[index]
-                if old["final"] or old.get("item_id") or old["role"] != row["role"]:
+                if old["finality"] != "delta" or old.get("item_id") or old["role"] != row["role"]:
                     break
                 replaced.add(index)
         position = min(replaced, default=len(resolved))
@@ -401,7 +399,7 @@ class LiveLedger:
                     for row in fragments
                     if row["event_id"] not in event_ids
                     and not (
-                        row["final"]
+                        row["finality"] != "delta"
                         and (
                             row.get("item_id") in item_ids
                             or any(_covers(row, old) for old in claimed)
@@ -560,7 +558,7 @@ class LiveCoordinator:
         finals = [
             row
             for row in resolve_fragments(fragments)
-            if row["final"] and not row["synthetic"] and row["text"].strip()
+            if row["finality"] == "turn" and not row["synthetic"] and row["text"].strip()
         ]
         receipts = ledger.receipts(session, finals) if finals else {}
         saved, updates = [], []

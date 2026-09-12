@@ -519,3 +519,39 @@ def test_async_accepted_job_survives_audio_close_and_reconciles_after_rejoin(env
         assert len(host.jobs) == len(decide.calls) == 1
 
     asyncio.run(run())
+
+
+def test_item_snapshot_replaces_deltas_without_claiming_turn_completion(environment):
+    coordinator, _, request, host, bound, body = setup(environment)
+    delta = fragment("delta", "hel", item="speech-item", start=0, end=50)
+    item = {
+        **fragment("item", "hello ", item="speech-item", finality="item", start=0, end=100),
+        "final": False,
+    }
+    rows = normalize_fragments([delta, item])
+    assert rows[1]["final"] is False and rows[1]["finality"] == "item"
+    assert resolve_fragments(rows) == [rows[1]]
+    capture = coordinator.transcript(request, {**body, "fragments": [delta, item]})
+    assert capture["acked_event_ids"] == ["delta", "item"] and capture["saved"] == []
+    assert len(host.rows[("default", "task-a")]) == 1
+    record = bound.stages.stage_live(
+        bound.token,
+        {
+            "provider_session_id": body["provider_session_id"],
+            "fragments": [rows[1]],
+        },
+    )
+    assert record["input_type"] == "voice_window"
+    turn = {**item, "event_id": "turn", "finality": "turn", "final": True}
+    final = coordinator.transcript(request, {**body, "fragments": [turn]})
+    assert final["saved"][0]["state"] == "saved"
+    assert host.rows[("default", "task-a")][-1]["content"] == "hello "
+
+
+def test_distinct_item_snapshots_and_legacy_final_boolean_keep_their_meanings():
+    first = {**fragment("one", "Yes ", item="first", finality="item"), "final": False}
+    second = {**fragment("two", "yes", item="second", finality="item"), "final": False}
+    rows = normalize_fragments([first, second])
+    assert "".join(row["text"] for row in resolve_fragments(rows)) == "Yes yes"
+    legacy = normalize_fragments([{"event_id": "legacy", "text": "Done", "final": True}])[0]
+    assert legacy["finality"] == "turn" and legacy["final"] is True

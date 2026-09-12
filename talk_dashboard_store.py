@@ -142,7 +142,10 @@ class DashboardStages:
         fragments = source_window["fragments"]
         text = "".join(item["text"] for item in fragments)
         input_id = self.live_input_id(source_window)
-        complete = len(fragments) == 1 and fragments[0]["final"]
+        complete = (
+            len(fragments) == 1
+            and fragments[0].get("finality", "turn" if fragments[0]["final"] else "delta") == "turn"
+        )
         return self._stage(
             token,
             input_id,
