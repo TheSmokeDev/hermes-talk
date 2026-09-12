@@ -4,10 +4,14 @@ The [README](../README.md) says what this is and why it's built the way it
 is. This page says how to run it — and, because that's the house style, how
 to **prove** it's running instead of assuming it is.
 
+For GPT-Live subscription/API setup, Codex workers, task binding, the microphone
+acceptance matrix and rollback, use [GPT-LIVE.md](GPT-LIVE.md). The legacy
+provider checks below are not acceptance proof for those new capabilities.
+
 ## Prerequisites
 
 - **Python ≥ 3.11** (the host's Python; `pyproject.toml` enforces it).
-- **Hermes Agent ≥ v0.17** — everything works on a stock v0.17 install.
+- **Hermes Agent ≥ v0.17** for the legacy voice lanes.
   One verb is version-gated: `redirect_agent`'s clean-abort path needs the
   host's public `AIAgent.redirect()` (**0.20+**). Below that it degrades
   to the steer queue and the spoken reply says queued — never a fake
@@ -18,6 +22,10 @@ to **prove** it's running instead of assuming it is.
   [PR #79716](https://github.com/NousResearch/hermes-agent/pull/79716)). On older Hermes the
   rest of Talk remains compatible, but those announcements fail closed and
   stay silent rather than risking a foreign session's result being spoken.
+- **Task features**: GPT-Live and shared task attachment require a host with
+  authenticated task history, linked-child execution/control and native binding.
+  Codex workers also require `PluginContext.register_task_worker_provider`; Discord
+  requires host-issued speaker/audience proofs. See [prerequisites](GPT-LIVE.md#prerequisites).
 - **Audio**: the terminal session needs the `[audio]` extra
   (`sounddevice` + PortAudio). The dashboard tab uses the browser's mic
   instead and needs nothing installed locally.
@@ -53,7 +61,13 @@ Two traps, both named:
    ```
 
 If you installed the pip package too, update it alongside:
-`pip install -U "hermes-talk[audio]"`.
+`pip install -U "hermes-talk[audio]"`. GPT-Live subscription audio on terminal or
+Discord also needs `[live]`: `python -m pip install -U "hermes-talk[audio,live]"`.
+
+A pinned Git install must be moved with an explicit full commit SHA; `update`
+will not move that pin. Preserve local changes before any replacement. Use the
+[stack upgrade and rollback procedure](GPT-LIVE.md#upgrade-and-rollback) when
+changing the host, plugin, dependencies or Codex together.
 
 ## Verify — the receipts
 
@@ -119,7 +133,11 @@ start services, or probe an api-server sidecar. Remediations are instructions
 only. Identity content, credentials, and Discord IDs are never included; only
 section/operator counts and lane/state receipts are emitted.
 
-### 3b. `hermes talk check` — the live proof
+### 3b. `hermes talk check` — the existing provider lane
+
+This command exercises `TALK_PROVIDER`; it does not verify GPT-Live, task-bound
+Codex work, or microphone behavior. Follow [operator acceptance](GPT-LIVE.md#operator-acceptance)
+for the new stack.
 
 ```bash
 hermes talk check            # doctor + one live provider turn + one bounded Hermes run
@@ -167,30 +185,20 @@ good looks like, field by field:
 ### 5. Dashboard
 
 With the Hermes dashboard running, `GET /api/plugins/hermes-talk/status`
-returns the same auth/lane/voice picture as JSON. From the machine itself
-no token is needed; from anywhere else the route requires
-`TALK_DASHBOARD_TOKEN` (see Configuration).
+returns the plugin version and configured voice lane. The host's authentication
+wraps these routes; the Talk token/loopback gate is an additional check. Task
+reads and controls also authorize the selected task. An open local port is not
+a grant to another task or profile.
 
-### 6. The wire canary — proving a session mints and connects
+### 6. Connection evidence
 
-The full end-to-end proof short of speech. `hermes talk` buffers its
-stdout when backgrounded, so **do not judge it by a redirected log file** —
-judge it by the process and the socket:
-
-```bash
-hermes talk &            # or run it in a second terminal
-# give it ~10s to mint and connect, then:
-
-# Linux:   ss -tpn state established '( dport = :443 )' | grep -i python
-# macOS:   lsof -iTCP:443 -sTCP:ESTABLISHED | grep -i python
-# Windows: Get-NetTCPConnection -State Established -RemotePort 443
-```
-
-An **established TLS connection to port 443** from the talk process means:
-the credential resolved, the ephemeral session minted, and the Realtime
-WebSocket is open and held. That is a live session waiting for a voice.
-Hang it up cleanly (Ctrl+C in its terminal, or stop that specific process
-— only that one).
+An established port-443 connection proves only that a transport connected. It
+cannot prove the selected billing option, provider readiness, microphone audio,
+or a completed task. Use `hermes talk check --no-run` for the existing provider
+session, and an operator-started call for audio. For GPT-Live, record the selected
+auth/model and complete the [six acceptance rows](GPT-LIVE.md#operator-acceptance).
+Stop a terminal call with Ctrl+C, a dashboard call with **Stop**, or Discord with
+`/talk leave`. Closing voice leaves accepted background jobs running.
 
 ### 7. `hermes talk diagnostics` — the redacted support bundle
 
@@ -232,7 +240,9 @@ documents a broken install is the successful outcome.
 
 All variables are resolved at call time, never cached at import. The
 README's [Knobs table](../README.md#knobs) covers the common ones; this is
-all of them. Canonical source: `talk_config.py` and `talk_auth.py`.
+all of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
+`talk_live_config.py`. Live and native task variables are grouped in
+[the Live guide](GPT-LIVE.md#choose-billing-and-voice).
 
 ### Session
 
@@ -270,7 +280,7 @@ surface restrictions are unchanged.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
-| `TALK_VOICE_MODE` | `native` | `native` = the provider synthesizes its own voice (the pre-cascade behavior, byte-identical). `cascade` = the provider session opens in text-output mode and ElevenLabs speaks the answer through the same playback sink. **Fail-closed** on any other value. Cascade requires `TALK_PROVIDER=openai` (grok/gemini text modes are not wired yet — the refusal names the provider). |
+| `TALK_VOICE_MODE` | `native` | `native` = provider voice; `cascade` = ElevenLabs speaks the provider's text; `live` = the separate GPT-Live adapter. Invalid modes refuse. Cascade requires `TALK_PROVIDER=openai`; Live configuration is [separate](GPT-LIVE.md#choose-billing-and-voice). |
 | `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider. **Fail-closed**; `elevenlabs` is the only value today. |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the other provider keys. The key rides the `xi-api-key` WebSocket header — never the URL, never a log line, never an error string. |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
@@ -483,6 +493,10 @@ none itself afterwards. Model-facing contract:
 
 ### Auth
 
+The following precedence applies to OpenAI Realtime. GPT-Live subscription mode
+ignores API keys, while explicit Live API mode uses only the configured API key;
+see [Live billing](GPT-LIVE.md#choose-billing-and-voice).
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_OPENAI_API_KEY` | unset | Talk-scoped key, first in order. **Set-but-empty is a hard refusal, never a fall-through.** |
@@ -516,6 +530,9 @@ that prints status codes and the first event type, never the token.
 run-history tee so test suites can't write into a real Hermes home.)
 
 ## Discord voice — talking in the channel Hermes is already in
+
+The following describes the legacy voice lane. Task-bound GPT-Live uses the
+[Discord commands and audience checks](GPT-LIVE.md#discord) in the Live guide.
 
 Inside the gateway, `/talk join` runs the call in the Discord voice
 channel the host is already sitting in. `/talk leave` ends it, `/talk
