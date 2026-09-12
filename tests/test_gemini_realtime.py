@@ -1640,3 +1640,95 @@ def test_controller_cancel_after_bundled_provider_interrupt_does_not_mute_the_ne
         return before, after
 
     assert asyncio.run(scenario()) == (rt.OutputAudio(b"before"), rt.OutputAudio(b"after!"))
+
+
+
+def test_gemini_native_controller_and_durable_coordinator_start_one_worker(tmp_path):
+    native_module = pytest.importorskip("talk_native_live", reason="native integration worktree")
+    coordinator_module = pytest.importorskip(
+        "talk_live_coordinator", reason="shared coordinator integration worktree"
+    )
+    import httpx
+    from test_dashboard_tasks import environment, join
+
+    from talk_native_api import NativeTaskAPI
+
+    class Audio:
+        playback_pending = False
+        played_ms = 0
+
+        def drain_playback(self):
+            pass
+
+        def queue_playback(self, _pcm):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    async def scenario():
+        env = environment.__wrapped__(tmp_path)
+        manager, request, host, _ = env
+        _bound, context = join(env)
+        decisions, requests = [], []
+
+        async def decide(**kwargs):
+            decisions.append(kwargs)
+            assert kwargs["source"]["fragments"][0]["text"] == "Inspect my requested project"
+            return {"name": "delegate_task", "arguments": {"task": "Inspect my requested project"},
+                    "message": ""}
+
+        coordinator = coordinator_module.LiveCoordinator(
+            manager, None, lambda _: [{"name": "delegate_task"}], decide=decide
+        )
+
+        async def serve(req):
+            body = json.loads(req.content)
+            path = req.url.path.rsplit("/", 1)[-1]
+            requests.append((path, body))
+            if path == "transcript":
+                result = await asyncio.to_thread(coordinator.transcript, request, body)
+            elif path == "delegation":
+                result = await coordinator.delegation(request, body)
+            else:
+                raise AssertionError(path)
+            return httpx.Response(200, json=result)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(serve))
+        api = NativeTaskAPI("http://127.0.0.1", client=http)
+        api.context = context
+        socket = _Socket([
+            {"setupComplete": {}},
+            {"serverContent": {"inputTranscription": {"text": "Inspect my requested project"}}},
+            _batch("actual-gemini-call"), _batch("actual-gemini-call"),
+        ])
+        session, _ = _adapter(socket)
+        await session.connect(_task_setup())
+        controller = native_module.NativeLiveTaskController(
+            api, session, {"task": context}, Audio()
+        )
+        try:
+            async for event in session:
+                await controller.handle(event)
+            await controller.drain()
+            body = next(body for path, body in requests if path == "delegation")
+            repeated = await coordinator.delegation(request, body)
+            assert len(host.jobs) == len(decisions) == 1
+            assert body["delegation_id"] == "actual-gemini-call"
+            assert body["fragments"][0]["final"] is False
+            assert body["fragments"][0]["text"] == "Inspect my requested project"
+            assert "proposed work" in body["prompt"]
+            assert "prompt" not in decisions[0]
+            assert len(socket.sent) == 2
+            responses = socket.sent[1]["toolResponse"]["functionResponses"]
+            assert len(responses) == 1 and responses[0]["id"] == "actual-gemini-call"
+            assert host.rows[("default", "task-a")][-1]["content"].startswith(
+                "[Captured Live transcript fragments; this is not a finalized utterance.]"
+            )
+            state = manager.state(request, context)
+            assert repeated["action"]["run_id"] == state["jobs"][0]["run_id"]
+        finally:
+            await controller.close()
+            await http.aclose()
+
+    asyncio.run(scenario())
