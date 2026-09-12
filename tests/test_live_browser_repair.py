@@ -98,7 +98,7 @@ def test_capture_ack_failure_retains_evidence_and_large_atomic_item_flushes_alon
 
 def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_request(environment):
     async def run():
-        started = asyncio.Event()
+        started, first_decision_done = asyncio.Event(), asyncio.Event()
         calls = []
 
         async def decide(**values):
@@ -106,6 +106,7 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
             if len(calls) == 1:
                 started.set()
                 await asyncio.sleep(25)
+                first_decision_done.set()
             return {"name": "delegate_task", "arguments": {"task": "Inspect captured request"},
                     "message": ""}
 
@@ -121,6 +122,7 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
         cursor = 0
         poll_count = 0
         seen = []
+        progress_while_first_pending = set()
         while binding.operations.get(receipt["operation_id"], {}).get("state") != "completed":
             assert time.monotonic() - start_time < 32
             await fixture.registry.binding(fixture.request, {
@@ -129,12 +131,20 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
                                                  item=None, role="assistant"))
             response = await binding.poll(cursor)
             seen.extend(response["events"])
+            # Each poll includes real host/SQLite work; prove concurrent progress, not loop speed.
+            if not first_decision_done.is_set():
+                if any(event.get("text") == " Still here " for event in response["events"]):
+                    progress_while_first_pending.add("caption")
+                if any(event.get("operation_id") == parallel["operation_id"]
+                       and event.get("state") == "completed" for event in response["events"]):
+                    progress_while_first_pending.add("parallel_completed")
             cursor = response["cursor"]
             poll_count += 1
             await asyncio.sleep(0.25)
         await wait_for(lambda: not binding.typed_pending)
         assert time.monotonic() - start_time >= 25
-        assert poll_count > 50 and not binding.closed
+        assert progress_while_first_pending == {"caption", "parallel_completed"}
+        assert not binding.closed
         assert len(calls) == len(fixture.host.jobs) == 2
         assert any(event.get("text") == " Still here " for event in seen)
         assert any(event.get("operation_id") == parallel["operation_id"]
