@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from urllib.parse import urlsplit
 
 import httpx
 
 
 class NativeTaskError(RuntimeError):
-    pass
+    def __init__(self, message, *, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class NativeTaskAPI:
@@ -37,13 +41,32 @@ class NativeTaskAPI:
         self.headers = headers
         self.context = None
         self.closed = False
+        self._attach_lock = asyncio.Lock()
 
-    async def request(self, path, body=None, *, bound=True, method="POST", params=None):
+    @classmethod
+    def configured(cls, origin=None, *, client=None):
+        origin = origin or os.environ.get("TALK_TASK_API_URL", "")
+        if not origin:
+            raise NativeTaskError(
+                "Set TALK_TASK_API_URL to the authenticated Hermes dashboard origin"
+            )
+        return cls(
+            origin,
+            session_token=os.environ.get("TALK_TASK_SESSION_TOKEN", ""),
+            talk_token=os.environ.get("TALK_DASHBOARD_TOKEN", ""),
+            client=client,
+        )
+
+    async def request(
+        self, path, body=None, *, bound=True, method="POST", params=None, expected_context=None
+    ):
         if self.closed:
             raise NativeTaskError("Task connection is closed")
         context = dict(self.context or {}) if bound else {}
         if bound and not context:
             raise NativeTaskError("Task is not attached")
+        if expected_context is not None and context != expected_context:
+            raise NativeTaskError("Task request belongs to an older connection")
         try:
             response = await self.client.request(
                 method,
@@ -59,7 +82,10 @@ class NativeTaskAPI:
         if self.closed or (bound and self.context != context):
             raise NativeTaskError("Task response belongs to an older connection")
         if not response.is_success:
-            raise NativeTaskError(f"Task service refused the request (HTTP {response.status_code})")
+            raise NativeTaskError(
+                f"Task service refused the request (HTTP {response.status_code})",
+                status=response.status_code,
+            )
         if len(response.content) > 4 * 1024 * 1024:
             raise NativeTaskError("Task response exceeds the supported size")
         try:
@@ -74,7 +100,29 @@ class NativeTaskAPI:
         return await self.request("/targets", {"peer_id": peer_id, "profile": profile}, bound=False)
 
     async def attach(
-        self, *, target_id=None, tab_id=None, back=False, reference=None, peer_id=None, profile=None
+        self,
+        *,
+        target_id=None,
+        tab_id=None,
+        back=False,
+        reference=None,
+        peer_id=None,
+        profile=None,
+        surface_context=None,
+    ):
+        async with self._attach_lock:
+            return await self._attach(
+                target_id=target_id,
+                tab_id=tab_id,
+                back=back,
+                reference=reference,
+                peer_id=peer_id,
+                profile=profile,
+                surface_context=surface_context,
+            )
+
+    async def _attach(
+        self, *, target_id, tab_id, back, reference, peer_id, profile, surface_context
     ):
         initial = self.context is None
         if initial:
@@ -88,13 +136,28 @@ class NativeTaskAPI:
                 else {"reference": reference, "peer_id": peer_id, "profile": profile}
             )
             body = {key: value for key, value in body.items() if value is not None}
+        if surface_context is not None:
+            allowed = {
+                "surface",
+                "guild_id",
+                "channel_id",
+                "operator_user_id",
+                "surface_token",
+                "surface_profile",
+                "anchor_session_id",
+            }
+            if not isinstance(surface_context, dict) or set(surface_context) - allowed:
+                raise NativeTaskError("Invalid native surface request fields")
+            body.update(surface_context)
         result = await self.request("/native/attach", body, bound=not initial)
         if result.get("ok") is not True:
             return result
         task = result.get("task") or {}
         if (
             not isinstance(task.get("connection_id"), str)
+            or not task["connection_id"]
             or type(task.get("generation")) is not int
+            or task["generation"] < 1
             or not isinstance(result.get("instructions"), str)
             or not isinstance(result.get("tools"), list)
         ):
@@ -102,8 +165,10 @@ class NativeTaskAPI:
         self.context = {"connection_id": task["connection_id"], "generation": task["generation"]}
         return result
 
-    async def result(self, run_id):
-        return await self.request("/result", method="GET", params={"run_id": run_id})
+    async def result(self, run_id, *, expected_context=None):
+        return await self.request(
+            "/result", method="GET", params={"run_id": run_id}, expected_context=expected_context
+        )
 
     async def close(self):
         if self.closed:
