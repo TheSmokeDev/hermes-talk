@@ -92,6 +92,15 @@ def resolve_live_config(env: Mapping[str, str] | None = None) -> LiveConfig:
             if not value:
                 raise LiveConfigError(f"{key} is set but empty")
             values[field_name] = value
+    mode = values.get("auth_mode", "subscription")
+    if mode in {"subscription", "api"}:
+        for field_name in ("model", "voice"):
+            key = f"TALK_LIVE_{mode.upper()}_{field_name.upper()}"
+            if key in source:
+                value = str(source[key]).strip().lower()
+                if not value:
+                    raise LiveConfigError(f"{key} is set but empty")
+                values[field_name] = value
     return LiveConfig(**values)
 
 

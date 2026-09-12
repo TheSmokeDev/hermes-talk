@@ -188,6 +188,7 @@ class BoundDashboard:
     return_depth: int = 0
     job_observations: dict = field(default_factory=dict)
     speech_timing: SpeechTiming | None = None
+    native_surface: object = field(default=None, repr=False)
 
     @property
     def token(self):
@@ -239,6 +240,8 @@ class DashboardTasks:
             or current_transport.owner(bound.attachment.owner.session_id) != bound.attachment.owner
         ):
             raise DashboardTaskError("context_denied", 403)
+        if bound.native_surface is not None:
+            bound.native_surface.verify()
         bound.outbox.check(bound.token.owner, bound.token.connection_id, bound.token.generation)
         if write:
             self._store_proof(bound.gateway, context, bound.target_record)
@@ -1008,6 +1011,12 @@ class DashboardTasks:
                     "source_window",
                 )
             }
+            if row.get("source_window") is not None:
+                source = row["source_window"]
+                row["source_window"] = {
+                    "session_reference": digest(source["provider_session_id"])[:16],
+                    "fragments": source["fragments"],
+                }
             row["responses"] = [
                 {
                     "response_id": response["response_id"],
@@ -1213,6 +1222,9 @@ class DashboardTasks:
         with self._lock:
             bound.closed = True
             self._bindings.pop(bound.connection_id, None)
+        if bound.native_surface is not None:
+            with suppress(DashboardTaskError):
+                bound.native_surface.revoke()
         with suppress(HistoryError):
             bound.attachment.close(bound.token)
         return {"ok": True, "state": "closed"}

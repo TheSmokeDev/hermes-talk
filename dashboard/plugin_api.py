@@ -61,6 +61,8 @@ import talk_config  # noqa: E402
 import talk_dashboard_tasks  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
+import talk_live_config  # noqa: E402
+import talk_native_surface  # noqa: E402
 import talk_realtime  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
@@ -414,6 +416,24 @@ async def talk_status(request: Request) -> dict:
         # the exact remediation when Start is pressed.
         voice_mode = ""
         detail_suffix += _status_problem("TALK_VOICE_MODE", exc)
+    if voice_mode == "live":
+        try:
+            config = talk_live_config.resolve_live_config()
+            auth = await asyncio.to_thread(talk_live_config.resolve_live_auth, config=config)
+            live_status = {"configured": True, "source": auth.source, "detail": "GPT-Live ready"}
+        except (talk_auth.TalkAuthError, talk_live_config.LiveConfigError) as exc:
+            live_status = {"configured": False, "source": None, "detail": str(exc)}
+            config = None
+        return {
+            "ok": True, **live_status, "voiceMode": "live",
+            "model": config.model if config else "", "voice": config.voice if config else "",
+            "liveAuth": config.auth_mode if config else "",
+            "voices": list(talk_live_config.SUBSCRIPTION_VOICES if config and
+                           config.auth_mode == "subscription" else talk_live_config.API_VOICES),
+            "version": talk_tools.plugin_version(),
+            "taskContinuity": talk_dashboard_tasks.context_support(),
+            "agentLoop": "canonical_task",
+        }
     status = talk_auth.auth_status()
     return {
         "ok": True,
@@ -454,6 +474,10 @@ async def create_session(request: Request) -> dict:
     if "task" in body and body["task"] is not None:
         bound = await _task_call(TASKS.join, request, body["task"])
     voice_mode = _resolve_voice_mode()
+    if voice_mode == "live":
+        if bound is None:
+            raise HTTPException(status_code=409, detail="Choose an authorized task for GPT-Live.")
+        return await _live_task_descriptor(bound)
     text_output = voice_mode == "cascade"
     if text_output:
         # A cascade session has no provider voice to validate — the mint asks
@@ -822,7 +846,44 @@ async def _task_call(function, request, body):
         raise HTTPException(status_code=409, detail=mapped.detail()) from exc
 
 
+async def _live_task_descriptor(bound, *, selection=None):
+    try:
+        config = talk_live_config.resolve_live_config()
+        auth = await asyncio.to_thread(talk_live_config.resolve_live_auth, config=config)
+    except (talk_auth.TalkAuthError, talk_live_config.LiveConfigError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "voiceMode": "live", "authSource": auth.source,
+            "liveAuth": config.auth_mode, "model": config.model, "voice": config.voice,
+            "live": {"transport": "webrtc"}, "task": TASKS.descriptor(bound),
+            **({"selection": selection} if selection is not None else {})}
+
+
+async def _target_live_session(request, body, *, initial):
+    # Resolve the requested billing lane before reserving a task; never mint a Realtime secret.
+    try:
+        config = talk_live_config.resolve_live_config()
+        await asyncio.to_thread(talk_live_config.resolve_live_auth, config=config)
+    except (talk_auth.TalkAuthError, talk_live_config.LiveConfigError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    prepared = await _task_call(
+        lambda req, data: TARGETS.prepare(req, data, initial=initial),
+        request, body["task"] if initial else body,
+    )
+    if isinstance(prepared, dict):
+        return prepared
+    activated = False
+    try:
+        selection = await _task_call(TARGETS.activate, request, prepared)
+        activated = True
+        return await _live_task_descriptor(prepared.bound, selection=selection)
+    finally:
+        if not activated:
+            await asyncio.to_thread(TARGETS.cancel, prepared)
+
+
 async def _target_session(request, body, *, initial=False):
+    if _resolve_voice_mode() == "live":
+        return await _target_live_session(request, body, initial=initial)
     _resolve_turn_detection()
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
@@ -891,24 +952,34 @@ async def native_task_attach(request: Request):
     """Bind a native client through real dashboard authentication; mint no voice credentials."""
     require_dashboard_auth(request)
     body = await _json_body(request)
+    previous = (await _task_call(TASKS.binding, request, body)
+                if "connection_id" in body else None)
+    selection_body = {key: value for key, value in body.items()
+                      if key not in talk_native_surface.FIELDS}
     prepared = await _task_call(
-        lambda req, data: TARGETS.prepare(req, data, initial="connection_id" not in data),
-        request, body,
+        lambda req, data: TARGETS.prepare(
+            req, data, initial="connection_id" not in data, reconnect=True),
+        request, selection_body,
     )
     if isinstance(prepared, dict):
         return prepared
     activated = False
     try:
+        bound = prepared.bound
+        surface_context = await _task_call(
+            lambda _request, data: talk_native_surface.prepare_surface(
+                bound, data, previous=previous), request, body,
+        )
         selection = await _task_call(TARGETS.activate, request, prepared)
         activated = True
-        bound = prepared.bound
         tools = _session_tools(bound)
         instructions = talk_identity.build_instructions(
-            None, tools=tools, lane="cli", canonical_task=True,
+            None, tools=tools, lane=surface_context["surface"], canonical_task=True,
             capabilities="Canonical task tools and linked child work are available.",
         ) + "\n\n" + TASKS.instructions(bound)
         return {"ok": True, "task": TASKS.descriptor(bound), "instructions": instructions,
-                "tools": tools, "selection": selection, "voice_state": "not_connected"}
+                "tools": tools, "selection": selection, "voice_state": "not_connected",
+                "surface_context": surface_context}
     finally:
         if not activated:
             await asyncio.to_thread(TARGETS.cancel, prepared)

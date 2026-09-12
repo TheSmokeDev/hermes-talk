@@ -72,7 +72,7 @@ class TargetSelection:
         if tab != bound.browser_tab:
             raise DashboardTaskError("connection_stale", 409)
 
-    def prepare(self, request, body, *, initial=False):
+    def prepare(self, request, body, *, initial=False, reconnect=False):
         if not isinstance(body, dict):
             raise DashboardTaskError("invalid_event", 400)
         allowed = (
@@ -118,7 +118,7 @@ class TargetSelection:
             if match["state"] != "resolved":
                 return {"ok": False, **match}
             target = match["target"]
-        if not initial and not back:
+        if not initial and not back and not reconnect:
             current = state.snapshot(tab)["current"]
             if current and current["target"]["target_id"] == target["target_id"]:
                 raise DashboardTaskError("target_already_selected", 409)

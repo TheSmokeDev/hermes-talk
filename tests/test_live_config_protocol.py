@@ -301,3 +301,16 @@ def test_public_context_commands_require_nullable_delegation_id(kind, wire):
 def test_legacy_commands_are_rejected(command):
     with pytest.raises(rt.RealtimeSessionError, match="not a GPT-Live"):
         protocol.encode_command(command)
+
+
+def test_separate_billing_settings_survive_auth_switch():
+    env = {"TALK_LIVE_SUBSCRIPTION_MODEL": "gpt-live-1-codex",
+           "TALK_LIVE_SUBSCRIPTION_VOICE": "cove", "TALK_LIVE_API_MODEL": "gpt-live-1",
+           "TALK_LIVE_API_VOICE": "marin"}
+    from talk_live_config import resolve_live_config
+
+    subscription = resolve_live_config(env)
+    api = resolve_live_config({**env, "TALK_LIVE_AUTH": "api"})
+    assert subscription.auth_mode == "subscription" and subscription.voice == "cove"
+    assert api.auth_mode == "api" and api.voice == "marin"
+    assert resolve_live_config(env) == subscription

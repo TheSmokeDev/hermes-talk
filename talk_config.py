@@ -54,7 +54,7 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: provider as the brain and hands speech synthesis to a streaming TTS the
 #: operator chooses. Fail-closed like the provider list: a mode knob that
 #: guesses silently would spend the wrong metered TTS key.
-TALK_VOICE_MODES = ("native", "cascade")
+TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
 #: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
 #: today; the list exists so a typo refuses instead of silently selecting.
@@ -605,7 +605,8 @@ def voice_mode() -> str:
 
     ``TALK_VOICE_MODE`` = ``native`` (default; the provider synthesizes its
     own voice, exactly the pre-cascade behaviour) or ``cascade`` (the
-    provider thinks in text, a streaming TTS speaks). Any other value
+    provider thinks in text, a streaming TTS speaks), or ``live`` (GPT-Live
+    with explicitly selected subscription or API billing). Any other value
     refuses with the valid names rather than silently picking one — a
     misread mode would spend the wrong metered key or mute the call.
     """
