@@ -6,7 +6,7 @@ and contributor notices apply to this integration.
 ## OpenClaw GPT-Live subscription integration
 
 The subscription request shape and model/voice catalog in `talk_live_config.py`
-and `talk_live_provider.py` adapt the OpenClaw implementation reviewed in
+and `talk_live_transport.py` adapt the OpenClaw implementation reviewed in
 [openclaw/openclaw PR #133079](https://github.com/openclaw/openclaw/pull/133079),
 authored by [steipete](https://github.com/steipete).
 Source revision: [`76378ddb777eacbe2c7f65c4247692b2f5830e97`](https://github.com/openclaw/openclaw/tree/76378ddb777eacbe2c7f65c4247692b2f5830e97).
