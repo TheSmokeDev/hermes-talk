@@ -60,6 +60,25 @@ class NativeTaskAPI:
     async def request(
         self, path, body=None, *, bound=True, method="POST", params=None, expected_context=None
     ):
+        if not bound:
+            return await self._request(
+                path, body, bound=False, method=method, params=params,
+                expected_context=expected_context,
+            )
+        # Preserve the caller's attachment before waiting. A switch retires the
+        # server binding before its receipt reaches us; old polls/actions must
+        # neither enter that gap nor move onto the newly accepted attachment.
+        expected_context = (
+            dict(self.context or {}) if expected_context is None else expected_context
+        )
+        async with self._attach_lock:
+            return await self._request(
+                path, body, method=method, params=params, expected_context=expected_context,
+            )
+
+    async def _request(
+        self, path, body=None, *, bound=True, method="POST", params=None, expected_context=None
+    ):
         if self.closed:
             raise NativeTaskError("Task connection is closed")
         context = dict(self.context or {}) if bound else {}
@@ -149,7 +168,7 @@ class NativeTaskAPI:
             if not isinstance(surface_context, dict) or set(surface_context) - allowed:
                 raise NativeTaskError("Invalid native surface request fields")
             body.update(surface_context)
-        result = await self.request("/native/attach", body, bound=not initial)
+        result = await self._request("/native/attach", body, bound=not initial)
         if result.get("ok") is not True:
             return result
         task = result.get("task") or {}
