@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -432,5 +434,88 @@ def test_recipient_and_delegated_capability_context_reaches_decision(environment
         await coordinator.delegation(request, body)
         assert decide.calls[0]["context"]["recipients"] == recipients
         assert decide.calls[0]["context"]["capabilities"] == capabilities
+
+    asyncio.run(run())
+
+
+def test_restart_recovers_a_completed_no_action_decision(environment):
+    async def run():
+        coordinator, decide, request, host, bound, body = setup(environment)
+        decide.name = ""
+        receipt = await coordinator.delegation(request, {**body, "admission": "async"})
+        completed = await settle(coordinator, request, body, receipt)
+        # The decision committed, but its HTTP/operation response was lost during restart.
+        with bound.stages._db(bound.token) as db:
+            row = db.execute(
+                "SELECT record FROM live_operations WHERE id=?", (receipt["operation_id"],)
+            ).fetchone()
+            operation = json.loads(row[0])
+            operation.update(state="deciding", result=None)
+            db.execute(
+                "UPDATE live_operations SET record=? WHERE id=?",
+                (json.dumps(operation), receipt["operation_id"]),
+            )
+        restarted = LiveCoordinator(coordinator.manager, None, coordinator.tools, decide=decide)
+        recovered = restarted.operation(request, {**body, "operation_id": receipt["operation_id"]})
+        assert recovered["state"] == "completed"
+        assert recovered["result"] == completed["result"]
+        assert len(decide.calls) == 1 and not host.jobs
+
+    asyncio.run(run())
+
+
+def test_restart_observes_but_never_dispatches_an_unissued_decision(environment):
+    coordinator, decide, request, host, bound, body = setup(environment)
+    _, operation, claimed = coordinator._admit(
+        request,
+        body,
+        body["provider_session_id"],
+        body["delegation_id"],
+        normalize_fragments(body["fragments"]),
+        body["offset_ms"],
+    )
+    assert claimed
+    bound.stages.complete_live_decision(
+        bound.token,
+        operation["interaction_id"],
+        {
+            "name": "delegate_task",
+            "arguments": {"task": "Original captured goal"},
+            "message": "",
+        },
+    )
+    result = coordinator.operation(request, {**body, "operation_id": operation["operation_id"]})
+    assert result["state"] == "uncertain"
+    assert not host.jobs and not decide.calls
+
+
+def test_async_accepted_job_survives_audio_close_and_reconciles_after_rejoin(environment):
+    async def run():
+        coordinator, decide, request, host, bound, body = setup(environment)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold():
+            entered.set()
+            assert release.wait(5)
+
+        host.before_run = hold
+        receipt = await coordinator.delegation(request, {**body, "admission": "async"})
+        task = coordinator._tasks[receipt["operation_id"]]
+        assert await asyncio.to_thread(entered.wait, 5)
+        await asyncio.to_thread(coordinator.manager.close, request, body)
+        release.set()
+        await asyncio.wait_for(task, 5)
+        assert bound.closed and len(host.jobs) == len(decide.calls) == 1
+        assert next(iter(host.jobs.values()))["status"] == "running"
+        with pytest.raises(DashboardTaskError, match="no longer current"):
+            coordinator.operation(request, {**body, "operation_id": receipt["operation_id"]})
+        host.before_run = None
+        _, context = join(environment)
+        restored = coordinator.operation(
+            request, {**context, "operation_id": receipt["operation_id"]}
+        )
+        assert restored["state"] == "completed"
+        assert restored["result"]["action"]["state"] == "accepted"
+        assert len(host.jobs) == len(decide.calls) == 1
 
     asyncio.run(run())

@@ -162,6 +162,8 @@ def resolve_fragments(fragments):
 class LiveLedger:
     def __init__(self, bound):
         self.bound = bound
+        token = bound.token
+        self._scope = token.owner.key, token.connection_id
 
         def initialize(db):
             db.execute("""CREATE TABLE IF NOT EXISTS live_transcripts (
@@ -196,7 +198,7 @@ class LiveLedger:
 
     @property
     def scope(self):
-        return self.bound.token.owner.key, self.bound.token.connection_id
+        return self._scope
 
     def append(self, session, fragments):
         session_key = digest(session)
@@ -833,8 +835,20 @@ class LiveCoordinator:
         bound = self.manager.binding(request, body)
         ledger = LiveLedger(bound)
         operation = ledger.operation(protocol_id(body.get("operation_id")))
+        record = bound.stages.get(bound.token, operation["interaction_id"])
+        decision = record.get("live_decision") or {}
         action = bound.stages.live_action(bound.token, operation["interaction_id"])
-        if (
+        if decision.get("state") == "completed" and not decision.get("name"):
+            operation = ledger.finish(
+                operation,
+                "completed",
+                {
+                    "ok": True,
+                    "kind": "commentary",
+                    "output": decision["message"][:4000] or "No task action was needed.",
+                },
+            )
+        elif (
             action
             and action["state"] in {"accepted", "returned"}
             and (operation["state"] != "completed")
@@ -864,4 +878,6 @@ class LiveCoordinator:
                 },
             )
         self.manager.binding(request, body)
+        if operation is None:
+            raise DashboardTaskError("result_unavailable", 404)
         return self._view(operation)
