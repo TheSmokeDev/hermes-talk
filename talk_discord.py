@@ -45,9 +45,10 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from . import talk_audio, talk_pause
+    from . import talk_audio, talk_config, talk_pause
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
+    import talk_config
     import talk_pause
 
 _log = logging.getLogger(__name__)
@@ -267,6 +268,7 @@ class _RealtimeSource:
         self._carry_lock = threading.Lock()
         self._served_lock = threading.Lock()
         self._frames_served = 0
+        self.authorize_playback = None
 
     @property
     def frames_served(self) -> int:
@@ -281,6 +283,14 @@ class _RealtimeSource:
             return bool(self._carry)
 
     def read(self) -> bytes:
+        if self.authorize_playback is not None and self.authorize_playback() is not True:
+            self.cleanup()
+            while True:
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    break
+            return SILENCE_FRAME
         with self._carry_lock:
             while len(self._carry) < DISCORD_FRAME_BYTES:
                 try:
@@ -409,6 +419,103 @@ class DiscordAudio:
         self._speaker_notifier_generation = 0
         self._last_speaker_key: Any = _UNSET
         self._input_paused = False
+        self._native_guard = None
+        self._native_admission = None
+
+    def bind_native_surface(self, proof):
+        """Bind only a host-verified room snapshot; membership changes revoke playback."""
+        try:
+            from .talk_core_session import OperatorPacketAdmission
+            from .talk_native_api import NativeTaskError
+        except ImportError:
+            from talk_core_session import OperatorPacketAdmission
+            from talk_native_api import NativeTaskError
+
+        try:
+            from gateway.discord_task_context import _explicitly_allowed
+        except ImportError:
+            raise NativeTaskError("Host explicit Discord audience policy is unavailable") from None
+
+        if not isinstance(proof, dict) or proof.get("surface") != "discord":
+            raise NativeTaskError("Discord task attachment has no verified room authority")
+        names = ("guild_id", "channel_id", "operator_user_id")
+        if any(type(proof.get(name)) is not int or proof[name] <= 0 for name in names):
+            raise NativeTaskError("Discord task attachment has invalid immutable identities")
+        audience = proof.get("audience_user_ids")
+        if (not isinstance(audience, list) or not audience
+            or any(type(value) is not int or value <= 0 for value in audience)
+            or len(audience) != len(set(audience))
+            or not isinstance(proof.get("audience_revision"), str)
+            or not proof["audience_revision"]):
+            raise NativeTaskError("Discord task attachment has no verified audience snapshot")
+        guild_id, channel_id, operator = (proof[name] for name in names)
+        allowed_audience = frozenset(audience)
+        bridge = self._bridge
+        if bridge is None:
+            raise NativeTaskError("Discord voice bridge is unavailable")
+
+        def authorized():
+            try:
+                if (self._bridge is not bridge or bridge["guild_id"] != guild_id
+                    or not self._published_bridge_is_exact(bridge)
+                    or operator not in talk_config.discord_operator_user_ids()
+                    or operator not in allowed_audience):
+                    return False
+                voice = bridge["voice_client"]
+                if not callable(getattr(voice, "is_connected", None)) or not voice.is_connected():
+                    return False
+                channel = voice.channel
+                if type(channel.id) is not int or channel.id != channel_id:
+                    return False
+                guild = getattr(channel, "guild", None)
+                adapter = bridge["adapter"]
+                if guild is None or type(guild.id) is not int or guild.id != guild_id:
+                    return False
+                members = tuple(channel.members)
+                ids = []
+                for member in members:
+                    if type(member.id) is not int or member.id <= 0:
+                        return False
+                    if type(getattr(member, "bot", None)) is not bool:
+                        return False
+                    if not member.bot:
+                        if _explicitly_allowed(adapter, member) is not True:
+                            return False
+                        ids.append(member.id)
+                if len(ids) != len(set(ids)) or frozenset(ids) != allowed_audience:
+                    return False
+                epoch = getattr(adapter, "_task_voice_epoch", None)
+                revision = (getattr(adapter, "_task_voice_revisions", {}) or {}).get(
+                    (guild_id, channel_id), 0)
+                if not isinstance(epoch, str) or not epoch or type(revision) is not int:
+                    return False
+                import hashlib
+                import json
+                current_revision = hashlib.sha256(json.dumps(
+                    [epoch, revision, sorted(str(value) for value in ids)],
+                    separators=(",", ":"),
+                ).encode()).hexdigest()
+                return current_revision == proof["audience_revision"]
+            except Exception:  # noqa: BLE001 - malformed or changed host identity revokes audio
+                return False
+
+        if not authorized():
+            self.drain_playback()
+            raise NativeTaskError("Discord operator or room audience is no longer authorized")
+        self._native_guard = authorized
+        self._native_admission = OperatorPacketAdmission(operator)
+        if self._source is not None:
+            self._source.authorize_playback = authorized
+        return authorized
+
+    def admit_native_packet(self, packet):
+        """Keep immutable per-packet speaker checks ahead of all provider audio ingress."""
+        if self._native_guard is None or not self._native_guard():
+            self.drain_playback()
+            raise talk_audio.TalkAudioError("Discord canonical room authority changed")
+        if packet is None:
+            return None
+        return self._native_admission.admit(packet)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -1183,6 +1290,9 @@ class DiscordAudio:
 
         if self._capture_only:
             raise talk_audio.TalkAudioError("capture-only Discord audio cannot queue playback")
+        if self._native_guard is not None and not self._native_guard():
+            self.drain_playback()
+            raise talk_audio.TalkAudioError("Discord canonical room authority changed")
         if not pcm:
             return
         converted, self._carry_sample = session_to_discord(pcm, carry=self._carry_sample)
@@ -1263,6 +1373,8 @@ __all__ = [
     "InputAudioPacket",
     "TalkDiscordError",
     "discord_to_session",
+    "native_command",
+    "native_session_active",
     "pause_session",
     "reset_for_tests",
     "resolve_voice_bridge",
@@ -1373,6 +1485,14 @@ def session_status() -> str:
         if last_failure:
             return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
+    if mode == "native-task":
+        with _SESSION_LOCK:
+            controller = _SESSION.get("controller")
+        if controller is None or not controller.current:
+            return f"Canonical task voice is starting on server {guild_id}."
+        selected = controller.attachment["task"]
+        return (f"Canonical task voice is connected on server {guild_id}, "
+                f"task {selected['session_id']}; say `talk leave` to stop.")
     if mode == "core":
         if core_status == "listening":
             return (
@@ -1611,7 +1731,8 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
 
 
 def start_session(
-    guild_id: int | None = None, *, host_execution_attachment=None
+    guild_id: int | None = None, *, host_execution_attachment=None,
+    native_task=None, native_task_api=None,
 ) -> str:
     """Start a realtime session on the host's voice connection.
 
@@ -1638,8 +1759,16 @@ def start_session(
     except ImportError:  # pragma: no cover - flat-module fallback
         import talk_cli
 
+    if native_task is not None and host_execution_attachment is not None:
+        return "Choose one canonical task attachment before joining Discord voice."
     audio = DiscordAudio(bridge["guild_id"])
     generation = None
+
+    def bind_controller(controller):
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is task and _SESSION.get("generation") == generation:
+                _SESSION["controller"] = controller
+
     # Written by the session before it returns its exit code, read by _done
     # after. Both run on this loop, so the write happens-before the read.
     refusal: dict[str, str] = {}
@@ -1746,7 +1875,13 @@ def start_session(
         _LAST_FAILURE_GENERATION = None
         _SESSION_GENERATION += 1
         generation = _SESSION_GENERATION
-        if host_execution_attachment is None:
+        if native_task is not None:
+            session = talk_cli.run_talk_session(
+                audio=audio, lane="discord", on_refusal=_note_refusal,
+                native_task=native_task, native_task_api=native_task_api,
+                on_native_controller=bind_controller,
+            )
+        elif host_execution_attachment is None:
             session = talk_cli.run_talk_session(
                 audio=audio, lane="discord", on_refusal=_note_refusal
             )
@@ -1765,9 +1900,8 @@ def start_session(
                 "guild_id": bridge["guild_id"],
                 "audio": audio,
                 "mode": (
-                    "provider-host-tools"
-                    if host_execution_attachment is not None
-                    else "legacy"
+                    "native-task" if native_task is not None else
+                    "provider-host-tools" if host_execution_attachment is not None else "legacy"
                 ),
                 "generation": generation,
             }
@@ -1777,6 +1911,8 @@ def start_session(
     # still has to mint, open a socket, and take the channel, and any of
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
+    if native_task is not None:
+        return "Starting canonical task voice; say `talk status` to check or `talk leave` to stop."
     if host_execution_attachment is not None:
         return (
             "Starting provider-owned Realtime voice with canonical Hermes tools; say "
@@ -1816,3 +1952,37 @@ def reset_for_tests() -> None:
         for notification in _NOTIFICATION_TASKS:
             notification.cancel()
         _NOTIFICATION_TASKS.clear()
+
+
+def native_session_active() -> bool:
+    with _SESSION_LOCK:
+        running = _SESSION.get("task")
+        return (_SESSION.get("mode") == "native-task" and running is not None
+                and not running.done())
+
+
+async def native_command(text, *, operator_user_id, guild_id, channel_id):
+    """Return an inert result to the authenticated host caller, without posting to a channel."""
+    try:
+        from .talk_native_api import NativeTaskError
+    except ImportError:
+        from talk_native_api import NativeTaskError
+    with _SESSION_LOCK:
+        controller = _SESSION.get("controller")
+        generation = _SESSION.get("generation")
+        running = _SESSION.get("task")
+    if controller is None or running is None or running.done():
+        raise NativeTaskError("No canonical Discord task connection is active")
+    proof = controller.attachment.get("surface_context") or {}
+    expected = {
+        "operator_user_id": operator_user_id, "guild_id": guild_id, "channel_id": channel_id,
+    }
+    if any(type(value) is not int or value <= 0 or proof.get(key) != value
+           for key, value in expected.items()):
+        raise NativeTaskError("Discord control caller does not match the immutable room operator")
+    controller.guard()
+    result = await controller.command(text)
+    with _SESSION_LOCK:
+        if _SESSION.get("generation") != generation or _SESSION.get("task") is not running:
+            raise NativeTaskError("Discord control result belongs to an older voice session")
+    return result

@@ -1317,6 +1317,7 @@ class ProviderLane:
     auth: talk_auth.TalkAuth
     model: str
     voice: str
+    configuration: object | None = None
 
 
 def resolve_provider_lane() -> ProviderLane:
@@ -1329,6 +1330,18 @@ def resolve_provider_lane() -> ProviderLane:
     exactly as the session start does.
     """
 
+    if talk_config.voice_mode() == "live":
+        try:
+            from .talk_live_config import LiveConfigError, resolve_live_auth, resolve_live_config
+        except ImportError:
+            from talk_live_config import LiveConfigError, resolve_live_auth, resolve_live_config
+        try:
+            config = resolve_live_config()
+            return ProviderLane(
+                "live", resolve_live_auth(config=config), config.model, config.voice, config
+            )
+        except LiveConfigError as exc:
+            raise talk_config.TalkConfigError(str(exc)) from None
     provider = talk_config.talk_provider()
     talk_config.turn_detection(provider)
     if provider == "grok":
@@ -1353,21 +1366,33 @@ def resolve_provider_lane() -> ProviderLane:
     )
 
 
-def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
+def _realtime_session(
+    auth: talk_auth.TalkAuth, *, provider=None, live_config=None,
+) -> talk_realtime.RealtimeSession:
     """Build the configured provider adapter behind the neutral session contract.
 
-    The provider comes from ``TALK_PROVIDER`` (call-time, fail-closed), never
-    from which keys happen to exist. The OpenAI branch is the historical
-    default and stays byte-identical to the pre-provider factory.
+    ``TALK_VOICE_MODE=live`` selects client delegation. Native provider voice
+    follows ``TALK_PROVIDER``; credentials never choose a provider.
     """
 
-    if talk_config.talk_provider() == "grok":
+    provider = provider or (
+        "live" if talk_config.voice_mode() == "live" else talk_config.talk_provider()
+    )
+    if provider == "live":
+        try:
+            from .talk_live_config import resolve_live_config
+            from .talk_live_realtime import LiveRealtimeSession
+        except ImportError:
+            from talk_live_config import resolve_live_config
+            from talk_live_realtime import LiveRealtimeSession
+        return LiveRealtimeSession(auth=auth, config=live_config or resolve_live_config())
+    if provider == "grok":
         return talk_grok_realtime.GrokRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
             aiohttp_module=_import_aiohttp(),
         )
-    if talk_config.talk_provider() == "gemini":
+    if provider == "gemini":
         return talk_gemini_realtime.GeminiRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
@@ -1454,6 +1479,10 @@ async def run_talk_session(
     lane: str = "cli",
     on_refusal=None,
     keyboard_control: bool = False,
+    native_task: dict | None = None,
+    native_task_api=None,
+    control_input=None,
+    on_native_controller=None,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -1494,6 +1523,25 @@ async def run_talk_session(
             with suppress(Exception):
                 on_refusal(reason)
         return 1
+
+    if native_task is not None or native_task_api is not None:
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+            return refuse(STARTUP_REFUSAL_CONFIGURATION)
+        return await run_native_talk_session(
+            audio=audio, session_factory=session_factory, lane=lane,
+            keyboard_control=keyboard_control, task=native_task or {}, api=native_task_api,
+            control_input=control_input, on_controller=on_native_controller, on_refusal=on_refusal,
+        )
+
+    try:
+        if talk_config.voice_mode() == "live":
+            print("talk: Live needs an explicit canonical task. Use --targets, then --task ID.",
+                  file=sys.stderr)
+            return refuse(STARTUP_REFUSAL_CONFIGURATION)
+    except talk_config.TalkConfigError as exc:
+        print(f"talk: {exc}", file=sys.stderr)
+        return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
@@ -2273,6 +2321,18 @@ async def run_talk_session(
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
     """Build the native ``hermes talk`` session/setup/doctor/check/diagnostics tree."""
 
+    subparser.add_argument("--task", dest="task_target", default=None,
+                           help="join an authorized canonical task by ID or exact catalog label")
+    subparser.add_argument("--task-api", default=None,
+                           help="authenticated Hermes dashboard origin (or TALK_TASK_API_URL)")
+    subparser.add_argument("--task-tab", default="terminal",
+                           help="stable native attachment identity for reconnect")
+    subparser.add_argument("--peer", dest="task_peer", default="local",
+                           help="explicit registered peer name")
+    subparser.add_argument("--profile", dest="task_profile", default="default",
+                           help="explicit authorized profile")
+    subparser.add_argument("--targets", action="store_true", default=False,
+                           help="list authorized task targets without starting audio")
     commands = subparser.add_subparsers(dest="talk_command")
     commands.add_parser(
         "setup",
@@ -2416,8 +2476,21 @@ def cli_entry(
 
     if keyboard_control is None:
         keyboard_control = args is not None
+    target = getattr(args, "task_target", None) or os.environ.get("TALK_TASK_TARGET")
+    native = None
+    if target or getattr(args, "targets", False) or getattr(args, "task_api", None):
+        native = {
+            "target_id": target, "origin": getattr(args, "task_api", None),
+            "tab_id": getattr(args, "task_tab", "terminal"),
+            "peer_id": getattr(args, "task_peer", "local"),
+            "profile": getattr(args, "task_profile", "default"),
+            "list_only": bool(getattr(args, "targets", False)),
+        }
     try:
-        code = asyncio.run(run_talk_session(keyboard_control=keyboard_control))
+        options = {"keyboard_control": keyboard_control}
+        if native is not None:
+            options["native_task"] = native
+        code = asyncio.run(run_talk_session(**options))
     except KeyboardInterrupt:
         print("\ntalk: hung up.")
         return 0
@@ -2459,3 +2532,329 @@ __all__ = [
     "subagent_phase_messages",
     "subagent_stop_messages",
 ]
+
+
+def start_native_keyboard_control(deliver, *, stdin=None, read_line=None):
+    """Read complete terminal commands with the same bounded, stoppable ownership."""
+    stdin = sys.stdin if stdin is None else stdin
+    if not keyboard_pause_control_available(stdin):
+        return None
+    stop = threading.Event()
+    buffer = []
+
+    def read():
+        if read_line is not None:
+            return read_line(stdin, stop)
+        if sys.platform == "win32":
+            import msvcrt
+            if not msvcrt.kbhit():
+                stop.wait(KEYBOARD_POLL_S)
+                return None
+            char = msvcrt.getwch()
+            if char in _WIN32_EXTENDED_KEY_PREFIXES:
+                msvcrt.getwch()
+                return None
+            if char in ("\r", "\n"):
+                line = "".join(buffer)
+                buffer.clear()
+                print(flush=True)
+                return line
+            if char == "\b":
+                if buffer:
+                    buffer.pop()
+                    print("\b \b", end="", flush=True)
+            elif char.isprintable() and len(buffer) < 65536:
+                buffer.append(char)
+                print(char, end="", flush=True)
+            return None
+        import select
+        ready, _, _ = select.select([stdin], [], [], KEYBOARD_POLL_S)
+        if not ready:
+            return None
+        line = stdin.readline()
+        if not line:
+            stop.set()
+            return None
+        return line.rstrip("\r\n")
+
+    def watch():
+        while not stop.is_set():
+            try:
+                line = read()
+            except (OSError, ValueError):
+                return
+            if line is not None and not stop.is_set():
+                deliver(line)
+
+    threading.Thread(target=watch, name="talk-native-input", daemon=True).start()
+    return stop.set
+
+
+async def run_native_talk_session(
+    *, audio=None, session_factory=None, lane="cli", keyboard_control=False,
+    task=None, api=None, control_input=None, on_controller=None, on_refusal=None,
+):
+    """Run canonical terminal/Discord Talk against the authenticated shared coordinator."""
+    try:
+        from .talk_native_api import NativeTaskAPI, NativeTaskError
+        from .talk_native_controller import NativeTaskController
+    except ImportError:
+        from talk_native_api import NativeTaskAPI, NativeTaskError
+        from talk_native_controller import NativeTaskController
+
+    task = dict(task or {})
+    current = None
+    keyboard_stop = None
+    workers = []
+    audio_started = False
+    activation_lock = asyncio.Lock()
+    ready = asyncio.Event()
+    activation_failed = asyncio.Event()
+    activation_error = None
+    seen_history, seen_jobs = set(), {}
+
+    def emit(value):
+        print("talk: " + json.dumps(value, ensure_ascii=False), flush=True)
+
+    def render_state(state):
+        for row in (state.get("history") or {}).get("messages", []):
+            key = (state.get("task", {}).get("session_id"), row.get("id"))
+            if key not in seen_history:
+                seen_history.add(key)
+                emit({"saved": row})
+        for job in state.get("jobs", []):
+            value = json.dumps(job, ensure_ascii=False, sort_keys=True)
+            if seen_jobs.get(job.get("run_id")) != value:
+                seen_jobs[job.get("run_id")] = value
+                emit({"job": job})
+
+    async def resolve_target(reference, *, peer_id=None, profile=None):
+        catalog = await api.catalog(
+            peer_id=peer_id or task.get("peer_id", "local"),
+            profile=profile or task.get("profile", "default"),
+        )
+        rows = [row for row in catalog.get("targets", []) if reference in {
+            row.get("target_id"), row.get("session_id"), row.get("label")
+        }]
+        if len(rows) != 1:
+            emit(catalog)
+            raise NativeTaskError("Choose one exact authorized task target from the catalog")
+        return rows[0]["target_id"]
+
+    async def activate(intent):
+        nonlocal current, activation_error
+        async with activation_lock:
+            intent = dict(intent)
+            if intent.get("back") is True:
+                fields = {"back": True}
+            else:
+                reference = intent.get("target_id") or intent.get("reference")
+                selected = reference if api.context is not None else await resolve_target(
+                    reference, peer_id=intent.get("peer_id"), profile=intent.get("profile")
+                )
+                fields = {"target_id": selected}
+            attached = await api.attach(
+                **fields, tab_id=task.get("tab_id", "terminal"),
+                surface_context=task.get("surface_context") or {"surface": lane},
+            )
+            if attached.get("ok") is not True:
+                emit(attached)
+                return False
+            try:
+                ready.clear()
+                previous, current = current, None
+                if previous is not None:
+                    await previous.close()
+                emit({"selected": attached.get("task"), "voice_state": "not_connected"})
+                guard = None
+                if lane == "discord":
+                    bind_surface = getattr(audio, "bind_native_surface", None)
+                    if not callable(bind_surface):
+                        raise NativeTaskError("Discord canonical room authority is unavailable")
+                    guard = bind_surface(attached.get("surface_context"))
+                setup = talk_realtime.SessionSetup(
+                    model=pick.model, voice=pick.voice, instructions=attached["instructions"],
+                    tools=_tool_definitions(attached["tools"]),
+                    automatic_response=pick.provider == "gemini", task_continuity=True,
+                    turn_detection=turn_detection,
+                )
+                provider_session = (session_factory(pick.auth) if session_factory else
+                    _realtime_session(pick.auth, provider=pick.provider,
+                                      live_config=getattr(pick, "configuration", None)))
+                try:
+                    await provider_session.connect(setup)
+                except BaseException:
+                    await provider_session.close()
+                    raise
+                controller_type = NativeTaskController
+                if (pick.provider == "live"
+                    or getattr(provider_session, "uses_client_delegation", False)):
+                    try:
+                        from .talk_native_live import NativeLiveTaskController
+                    except ImportError:
+                        from talk_native_live import NativeLiveTaskController
+                    controller_type = NativeLiveTaskController
+                current = controller_type(
+                    api, provider_session, attached, audio, on_state=render_state,
+                    on_result=lambda value: emit({"result": value}),
+                    on_notice=emit, on_caption=lambda value: emit({"caption": value.text})
+                    if value.final else None, on_selection=activate, authorize_surface=guard,
+                )
+                if on_controller is not None:
+                    on_controller(current)
+                await current.refresh(announce=False)
+                ready.set()
+                emit({"voice_state": "connected", "provider": pick.provider, "model": pick.model})
+                return True
+            except (NativeTaskError, talk_realtime.RealtimeSessionError,
+                    talk_config.TalkConfigError, talk_auth.TalkAuthError,
+                    talk_audio.TalkAudioError) as exc:
+                activation_error = exc
+                activation_failed.set()
+                emit({"voice_state": "not_connected", "reason": str(exc)})
+                return False
+
+    try:
+        api = api or NativeTaskAPI.configured(task.get("origin"))
+        if task.get("list_only"):
+            emit(await api.catalog(peer_id=task.get("peer_id", "local"),
+                                   profile=task.get("profile", "default")))
+            return 0
+        if not task.get("target_id"):
+            raise NativeTaskError("Choose an explicit canonical task before starting native Talk")
+        pick = resolve_provider_lane()
+        if lane == "discord" and pick.provider == "gemini":
+            raise NativeTaskError("Gemini Discord cannot gate responses to authorized speakers")
+        if talk_config.voice_mode() not in {"native", "live"}:
+            raise NativeTaskError("Canonical native surfaces require provider voice output")
+        if pick.provider == "live":
+            if (os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+                    != "provider_native" or os.environ.get("TALK_SEMANTIC_EAGERNESS") is not None):
+                raise NativeTaskError("Live requires provider_native turn detection")
+            turn_detection = talk_realtime.RealtimeTurnDetection()
+        else:
+            turn_detection = talk_config.turn_detection(pick.provider)
+        if lane == "discord" and not (task.get("surface_context") or {}).get("surface_token"):
+            raise NativeTaskError("Discord canonical voice requires a trusted room proof")
+        audio = audio or talk_audio.DuplexAudio()
+        audio.start()
+        audio_started = True
+        if not await activate({"target_id": task["target_id"]}):
+            return 1
+        loop = asyncio.get_running_loop()
+        commands = control_input or asyncio.Queue(maxsize=32)
+        resume_control = talk_pause.RESUME_COMMAND if lane == "discord" else None
+        if lane == "cli" and keyboard_control and keyboard_pause_control_available():
+            resume_control = talk_pause.RESUME_KEYBOARD
+        talk_pause.attach_session(
+            audio, lambda paused, source: emit({"microphone_paused": paused, "source": source}),
+            resume_control=resume_control,
+        )
+        if resume_control == talk_pause.RESUME_KEYBOARD:
+            def deliver(line):
+                def put():
+                    if not commands.full():
+                        commands.put_nowait(line)
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(put)
+            keyboard_stop = start_native_keyboard_control(deliver)
+        emit({"controls": "Type a message; /targets, /select ID, /return, /reconnect, "
+              "/state, /result ID, /preference MODE, /pause, /resume, /interrupt. "
+              "Enter pauses/resumes; Ctrl+C hangs up."})
+
+        async def receive():
+            while True:
+                await ready.wait()
+                active = current
+                async for event in active.session:
+                    if active is not current:
+                        break
+                    try:
+                        await active.handle(event)
+                    except (NativeTaskError, asyncio.CancelledError):
+                        if active is current:
+                            raise
+                        break
+                if active is current:
+                    await active.drain()
+                    return
+
+        async def microphone():
+            while True:
+                await ready.wait()
+                active = current
+                read_packet = getattr(audio, "read_input_packet", None)
+                if lane == "discord":
+                    packet = await asyncio.to_thread(read_packet)
+                    pcm = audio.admit_native_packet(packet)
+                else:
+                    pcm = audio.read_input_chunk()
+                if active is current and pcm:
+                    try:
+                        await active.send_audio(pcm)
+                    except NativeTaskError:
+                        if active is current:
+                            raise
+                else:
+                    await asyncio.sleep(IDLE_POLL_S)
+
+        async def refresh():
+            while True:
+                await asyncio.sleep(1)
+                await ready.wait()
+                active = current
+                try:
+                    await active.tick()
+                    await active.refresh()
+                except NativeTaskError:
+                    if active is current:
+                        raise
+
+        async def controls():
+            while True:
+                line = await commands.get()
+                await ready.wait()
+                try:
+                    result = await current.command(line)
+                    if result is not None:
+                        emit(result)
+                except NativeTaskError as exc:
+                    emit({"state": "refused", "reason": str(exc)})
+                finally:
+                    commands.task_done()
+
+        async def failed_activation():
+            await activation_failed.wait()
+            raise activation_error
+
+        workers = [asyncio.create_task(function())
+                   for function in (receive, microphone, refresh, controls, failed_activation)]
+        done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
+        for worker in done:
+            await worker
+        return 0
+    except (NativeTaskError, talk_config.TalkConfigError, talk_auth.TalkAuthError,
+            talk_realtime.RealtimeSessionError, talk_audio.TalkAudioError) as exc:
+        emit({"voice_state": "disconnected", "reason": str(exc)})
+        if on_refusal is not None:
+            on_refusal(STARTUP_REFUSAL_PROVIDER)
+        return 1
+    finally:
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        if keyboard_stop is not None:
+            keyboard_stop()
+        if audio is not None:
+            talk_pause.detach_session(audio)
+        try:
+            if current is not None:
+                await current.close()
+        finally:
+            try:
+                if api is not None:
+                    await api.close()
+            finally:
+                if audio_started:
+                    audio.stop()

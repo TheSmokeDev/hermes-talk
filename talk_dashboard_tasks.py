@@ -188,6 +188,7 @@ class BoundDashboard:
     return_depth: int = 0
     job_observations: dict = field(default_factory=dict)
     speech_timing: SpeechTiming | None = None
+    native_surface: object = field(default=None, repr=False)
 
     @property
     def token(self):
@@ -239,6 +240,8 @@ class DashboardTasks:
             or current_transport.owner(bound.attachment.owner.session_id) != bound.attachment.owner
         ):
             raise DashboardTaskError("context_denied", 403)
+        if bound.native_surface is not None:
+            bound.native_surface.verify()
         bound.outbox.check(bound.token.owner, bound.token.connection_id, bound.token.generation)
         if write:
             self._store_proof(bound.gateway, context, bound.target_record)
@@ -362,6 +365,9 @@ class DashboardTasks:
     @staticmethod
     def discard(bound):
         bound.closed = True
+        if bound.native_surface is not None:
+            with suppress(DashboardTaskError):
+                bound.native_surface.revoke()
         with suppress(HistoryError, DashboardTaskError):
             bound.attachment.close(bound.token)
 
@@ -533,7 +539,7 @@ class DashboardTasks:
                 bound.attachment.snapshot.conversation_id,
                 bound.token.connection_id,
                 bound.token.generation,
-                (HistoryMessage("user", record["text"]),),
+                (HistoryMessage("user", record.get("canonical_text", record["text"])),),
                 "pending",
                 0,
                 "",
@@ -639,7 +645,7 @@ class DashboardTasks:
                     origin["receipt_id"] = record["receipt_id"]
                 action["goal"] = goal
                 action["request_body"] = {
-                    "input": record["text"],
+                    "input": record.get("canonical_text", record["text"]),
                     "session_id": bound.attachment.owner.session_id,
                     "origin": origin,
                     "child": {
@@ -660,7 +666,7 @@ class DashboardTasks:
                 if set(arguments) not in ({"run_id"}, {"api_run_id"}):
                     raise DashboardTaskError("invalid_event", 400)
                 record["mode"] = "control" if record["mode"] != "execution" else "execution"
-                action["control_input"] = record["text"]
+                action["control_input"] = record.get("canonical_text", record["text"])
                 action["control_origin"] = {
                     "event_id": record["event_id"],
                     "origin_turn_id": record["origin_turn_id"],
@@ -1005,8 +1011,15 @@ class DashboardTasks:
                     "event_id",
                     "canonical_state",
                     "canonical_message_ids",
+                    "source_window",
                 )
             }
+            if row.get("source_window") is not None:
+                source = row["source_window"]
+                row["source_window"] = {
+                    "session_reference": digest(source["provider_session_id"])[:16],
+                    "fragments": source["fragments"],
+                }
             row["responses"] = [
                 {
                     "response_id": response["response_id"],
@@ -1212,6 +1225,9 @@ class DashboardTasks:
         with self._lock:
             bound.closed = True
             self._bindings.pop(bound.connection_id, None)
+        if bound.native_surface is not None:
+            with suppress(DashboardTaskError):
+                bound.native_surface.revoke()
         with suppress(HistoryError):
             bound.attachment.close(bound.token)
         return {"ok": True, "state": "closed"}

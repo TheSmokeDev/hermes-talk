@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.17.3"
+version = "0.18.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,6 +10,7 @@ dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
+live = ["aiortc>=1.14,<2"]
 # starlette is a TEST dependency, never a runtime one: the dashboard relay's
 # streaming response is a starlette response, and its ASGI behavior differs by
 # what the SERVER advertises (uvicorn says spec_version 2.3 for HTTP). Without
@@ -32,8 +33,21 @@ build-backend = "setuptools.build_meta"
 # it, so a roadmap entry here (talk_actuators, talk_flush) would
 # read as shipped while the wheel quietly omitted it — add each one as it lands.
 [tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 py-modules = [
   "talk_config",
+  "talk_live_audio",
+  "talk_live_browser",
+  "talk_live_config",
+  "talk_live_coordinator",
+  "talk_live_protocol",
+  "talk_live_realtime",
+  "talk_live_routes",
+  "talk_live_transport",
+  "talk_native_surface",
+  "talk_native_api",
+  "talk_native_controller",
+  "talk_native_live",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",
@@ -124,6 +138,18 @@ known-first-party = [
   "talk_check",
   "talk_cli",
   "talk_config",
+  "talk_live_audio",
+  "talk_live_browser",
+  "talk_live_config",
+  "talk_live_coordinator",
+  "talk_live_protocol",
+  "talk_live_realtime",
+  "talk_live_routes",
+  "talk_live_transport",
+  "talk_native_surface",
+  "talk_native_api",
+  "talk_native_controller",
+  "talk_native_live",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",

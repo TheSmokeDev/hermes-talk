@@ -13,7 +13,9 @@
 
 **It rides your ChatGPT or SuperGrok subscription. No API key required.**
 
-Works today: a native mic session in the terminal (`hermes talk`), a Discord voice channel (`/talk join`), and a **Talk** tab in the dashboard — on OpenAI Realtime, xAI Grok Voice, or Gemini Live. The voice model calls the host's own tools, hands work to real background agents while you keep talking, and when a delegated run hits an approval gate it asks you out loud and your spoken answer resolves it. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+
+**New in 0.18.0:** GPT-Live with separate subscription and API billing, plus Codex workers attached to a selected Hermes task. Subscription is the default, with no automatic paid fallback. These features require the compatible task-worker host. Setup, controls and verification: [GPT-Live and task workers](docs/GPT-LIVE.md).
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable && pip install "hermes-talk[audio]" && hermes talk
@@ -24,7 +26,7 @@ hermes plugins install TheSmokeDev/hermes-talk --enable && pip install "hermes-t
 
 ### 🔊 [Watch the 2:27 cut with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4) — delegate, keep talking, hear the result land.
 
-*Real session, 8× speed in the GIF. This is a voice demo; the sound is the point. Recorded at v0.3.0 — the flow is unchanged.*
+*Real Realtime session, 8× speed in the GIF, recorded at v0.3.0. It does not demonstrate the new GPT-Live or Codex-worker integration.*
 
 ## Is it working?
 
@@ -43,7 +45,9 @@ Doctor is read-only by design: it names which lane came up and what is
 missing, and never writes, probes, or refreshes a token (the one exception is
 `--probe`, Grok-only, which makes two live calls to `api.x.ai` and says so).
 
-### Prove it in one command — `hermes talk check`
+### Check the existing provider lane — `hermes talk check`
+
+`check` exercises the existing `TALK_PROVIDER` adapter and a bounded Hermes run. It does not certify GPT-Live, Codex-worker handoffs, or microphone behavior. Use the [Live acceptance checklist](docs/GPT-LIVE.md#operator-acceptance) for those.
 
 A green doctor can still hide a dead mint, a refused socket, or a
 delegation lane that never starts. `check` is the other half: it runs the
@@ -90,20 +94,25 @@ Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify
 
 | Surface | Start it | Audio | Providers |
 |---|---|---|---|
-| Terminal | `hermes talk` | native duplex mic + speaker (`sounddevice`, the `[audio]` extra) | OpenAI, Grok, Gemini; cascade voice |
+| Terminal | `hermes talk`; task attachment: `hermes talk --task TARGET` | native duplex mic + speaker (`[audio]`; add `[live]` for Live subscription) | OpenAI Realtime, Grok, Gemini, cascade; GPT-Live on an explicit task |
 | Inside a Hermes session | `/talk` | same as terminal | the one surface with an **attached** agent loop — memory lookups and delegation answer inline |
-| Discord voice channel | `/voice join`, then `/talk join` | borrows the host's own voice connection — never opens a second one | OpenAI, Grok; speaker-bound authority via `TALK_DISCORD_OPERATOR_USER_IDS` |
-| Dashboard **Talk** tab | `hermes dashboard` | browser-native WebRTC, no mic drivers | OpenAI only today; loopback-only until `TALK_DASHBOARD_TOKEN` is set |
+| Discord voice channel | `/voice join`, then `/talk join [TARGET]` | borrows the host's voice connection | OpenAI Realtime, Grok, cascade; GPT-Live with a verified operator and room audience |
+| Dashboard **Talk** tab | `hermes dashboard`, select a task, **Start** | browser WebRTC, no local audio drivers | OpenAI Realtime, cascade, GPT-Live; host authentication and the Talk route gate apply |
 
 ## Providers
 
 | Provider | `TALK_PROVIDER` | Auth | Notes |
 |---|---|---|---|
-| OpenAI Realtime | `openai` (default) | your ChatGPT subscription through the Codex CLI login (`codex login`) — **no API key** — or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | every surface; the only lane the dashboard tab and the cascade voice speak today |
+| OpenAI Realtime | `openai` (default) | ChatGPT subscription through `codex login`, or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | every surface; the provider used by cascade voice |
 | xAI Grok Voice | `grok` | an X Premium or SuperGrok login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | terminal + Discord; five voices |
 | Gemini Live | `gemini` | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | terminal + `hermes realtime`; no client-side cancel/truncate on the wire, so barge-in drops playback locally; Discord refuses it for now |
 
-The knob is fail-closed and never inferred from which keys exist. Full
+`TALK_VOICE_MODE=live` selects **GPT-Live** separately from this table.
+`TALK_LIVE_AUTH=subscription` is the default; `api` must be selected explicitly.
+Subscription failure never falls back to a paid API key. Model and voice settings
+are separate for each billing option; see [GPT-Live configuration](docs/GPT-LIVE.md#choose-billing-and-voice).
+
+The provider knob is fail-closed and never inferred from which keys exist. Full
 per-lane detail: [Provider details](#provider-details--openai-default-grok-or-gemini).
 
 ## What this actually is
@@ -160,11 +169,16 @@ pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip i
 hermes talk
 ```
 
-Zero core edits: a pure `register(ctx)` plugin surface, proven on a stock
-Hermes install. 1,600+ offline tests across 50+ files in [`tests/`](tests/),
-CI on ubuntu and windows, Python 3.11 to 3.13.
+The legacy voice lanes retain their older-host compatibility. Shared task
+attachment, GPT-Live handoffs and Codex workers additionally require the host
+capabilities listed in [GPT-Live prerequisites](docs/GPT-LIVE.md#prerequisites).
+Updating the plugin alone does not add those host capabilities. Offline tests
+are in [`tests/`](tests/); CI covers Ubuntu and Windows, Python 3.11 to 3.13.
 
 ## Quickstart — your first call on each surface
+
+These examples use the existing provider lanes. For GPT-Live, an explicit task
+and the updated host are required; follow [the Live guide](docs/GPT-LIVE.md#start-and-control-a-task).
 
 **Terminal** (simplest — start here):
 
@@ -198,6 +212,9 @@ nothing, run doctor first — it names the gap.
 
 ## Auth — no API key needed if you have ChatGPT
 
+This section describes **OpenAI Realtime**. GPT-Live uses the independent
+`TALK_LIVE_AUTH` selection described [here](docs/GPT-LIVE.md#choose-billing-and-voice).
+
 Signed into the [Codex CLI](https://github.com/openai/codex) (`codex login`)?
 Talk runs on your own ChatGPT subscription's Realtime entitlement — no key, no
 per-minute API bill. Bring a key instead if you'd rather.
@@ -224,9 +241,9 @@ When setup offers the API-key lane under an enabled OAuth preference, it reuses
 an existing metered key when present and separately confirms the required
 `TALK_PREFER_CODEX_OAUTH=false` policy transition.
 
-Whatever the lane, the session is minted server-side into an **ephemeral
-client secret** — the raw key or OAuth token touches exactly one OpenAI
-endpoint and never reaches the socket, a log line, or a client.
+For these Realtime lanes, Talk mints an **ephemeral client secret** for the
+audio connection. GPT-Live uses its own server-owned negotiation and sideband;
+provider keys, OAuth tokens and account IDs are never sent to the dashboard browser.
 
 ## Provider details — OpenAI (default), Grok, or Gemini
 
@@ -720,7 +737,11 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model (bare id; the adapter adds the wire prefix) |
 | `TALK_GEMINI_VOICE` | `Puck` | Gemini Live voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede` (fail-closed, case-sensitive) |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first; set-but-blank refuses; free-tier keys work |
-| `TALK_VOICE_MODE` | `native` | `native` (provider voices, unchanged) or `cascade` (provider thinks in text, ElevenLabs speaks); fail-closed |
+| `TALK_VOICE_MODE` | `native` | `native`, `cascade` (ElevenLabs voice), or `live` (GPT-Live); invalid values refuse |
+| `TALK_LIVE_AUTH` | `subscription` | GPT-Live billing: `subscription` or explicit `api`; no automatic paid fallback |
+| `TALK_LIVE_SUBSCRIPTION_MODEL` / `TALK_LIVE_SUBSCRIPTION_VOICE` | `gpt-live-1-codex` / `cove` | Subscription-only Live settings; [validated choices](docs/GPT-LIVE.md#choose-billing-and-voice) |
+| `TALK_LIVE_API_MODEL` / `TALK_LIVE_API_VOICE` | `gpt-live-1` / `marin` | API-only Live settings |
+| `TALK_TASK_API_URL` / `TALK_TASK_TARGET` | unset | Authenticated Hermes dashboard origin and explicit terminal task; [attachment guide](docs/GPT-LIVE.md#start-and-control-a-task) |
 | `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider — the only value today; fail-closed |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first; set-but-blank refuses; rides the `xi-api-key` header, never the URL |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with — **required** in cascade mode (stock or cloned, from your ElevenLabs account) |
@@ -915,4 +936,5 @@ field-tested feedback from a second live consumer on the upstream
 
 ## License
 
-MIT
+[MIT](LICENSE). Adapted-source licenses and contributor credits are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

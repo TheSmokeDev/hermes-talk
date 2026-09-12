@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
+import shlex
 
 try:
     from . import (
@@ -169,7 +171,10 @@ def _register_talk_command(ctx) -> None:
             "canonical core voice lane (core join); "
             "gateway also supports pause, resume, leave and status"
         ),
-        "args_hint": "[join|core join|pause|resume|leave|status]",
+        "args_hint": (
+            "[join [TARGET [PEER PROFILE]]|select TARGET|return|reconnect|"
+            "say TEXT|pause|resume|leave|status]"
+        ),
     }
     if contextual:
         kwargs["invocation_context"] = True
@@ -193,7 +198,8 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
     terminal that nobody is looking at, and the gateway has a better room.
     """
 
-    sub = (raw_args or "").strip().lower()
+    raw = (raw_args or "").strip()
+    sub = raw.lower()
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -213,6 +219,18 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
             if talk_cli.cli_entry(keyboard_control=False) == 0
             else ("Voice session ended with errors — see stderr.")
         )
+
+    canonical = talk_discord.native_session_active()
+    requested = raw.split(maxsplit=1)[0].lower() if raw else "join"
+    explicit_target = requested == "join" and len(raw.split(maxsplit=1)) > 1
+    native_join = requested == "join" and (
+        explicit_target or os.environ.get("TALK_TASK_TARGET")
+        or talk_config.voice_mode() == "live"
+    )
+    if canonical or native_join or requested in {
+        "select", "return", "reconnect", "state", "result", "preference", "interrupt", "say",
+    }:
+        return _canonical_discord_command(raw, invocation)
 
     if sub in {"leave", "stop", "hang up"}:
         return talk_discord.stop_session()
@@ -245,6 +263,107 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
             return talk_discord.start_session(host_execution_attachment=attachment)
         return talk_discord.start_session()
     return talk_discord.JOIN_USAGE
+
+
+
+def _canonical_discord_command(raw, invocation):
+    capture = getattr(invocation, "capture_discord_task_context_proof", None)
+    if not callable(capture):
+        return "Canonical task voice requires an authorized Discord command on a compatible host."
+    try:
+        context = capture()
+        identifiers = {key: int(context[key]) for key in (
+            "guild_id", "channel_id", "operator_user_id",
+        )}
+        if (any(value <= 0 for value in identifiers.values())
+                or not isinstance(context["proof"], str)
+                or not isinstance(context["anchor_session_id"], str)):
+            raise ValueError("Invalid host context")
+        parts = shlex.split(raw) if raw else ["join"]
+    except Exception:  # noqa: BLE001 - host refusal details and proofs stay private
+        return "Canonical task voice was refused: verify the operator and every listener's access."
+    operation, arguments = parts[0].lower(), parts[1:]
+    if operation == "join":
+        if len(arguments) not in {0, 1, 3}:
+            return "Use /talk join [TARGET [PEER PROFILE]]."
+        if talk_discord.native_session_active():
+            return "Canonical task voice is already starting or active; use /talk select or leave."
+        peer = arguments[1] if len(arguments) == 3 else "local"
+        profile = arguments[2] if len(arguments) == 3 else context.get("profile", "default")
+        task = {
+            "target_id": (arguments[0] if arguments else
+                          os.environ.get("TALK_TASK_TARGET") or context["anchor_session_id"]),
+            "peer_id": peer, "profile": profile,
+            "tab_id": "discord-" + "-".join(str(value) for value in identifiers.values()),
+            "surface_context": {
+                "surface": "discord", **identifiers, "surface_token": context["proof"],
+                "surface_profile": context.get("profile", "default"),
+                "anchor_session_id": context["anchor_session_id"],
+            },
+        }
+        with talk_discord._SESSION_LOCK:
+            previous = talk_discord._SESSION.get("task")
+        receipt = talk_discord.start_session(guild_id=identifiers["guild_id"], native_task=task)
+        with talk_discord._SESSION_LOCK:
+            running = talk_discord._SESSION.get("task")
+            if (running is not None and running is not previous and not running.done()
+                    and talk_discord._SESSION.get("mode") == "native-task"):
+                talk_discord._SESSION["native_start_control"] = (
+                    running, talk_discord._SESSION.get("generation"), dict(identifiers),
+                )
+        return receipt
+    with talk_discord._SESSION_LOCK:
+        expected_session = (
+            talk_discord._SESSION.get("task"), talk_discord._SESSION.get("generation"),
+        )
+    return _canonical_discord_control(operation, arguments, identifiers, expected_session)
+
+
+async def _canonical_discord_control(operation, arguments, identifiers, expected_session):
+    try:
+        if operation in {"leave", "stop"} and not arguments:
+            with talk_discord._SESSION_LOCK:
+                running, generation = expected_session
+                if (running is None or running.done()
+                        or talk_discord._SESSION.get("task") is not running
+                        or talk_discord._SESSION.get("generation") != generation):
+                    raise ValueError("Voice session changed before leave")
+                starting = talk_discord._SESSION.get("controller") is None
+                if starting and talk_discord._SESSION.get("native_start_control") != (
+                    running, generation, identifiers,
+                ):
+                    raise ValueError("Startup caller does not match its immutable operator")
+            if not starting:
+                # Connected sessions retain their full operator and live audience checks.
+                await talk_discord.native_command("/state", **identifiers)
+            with talk_discord._SESSION_LOCK:
+                if (talk_discord._SESSION.get("task") is not running
+                        or talk_discord._SESSION.get("generation") != generation):
+                    raise ValueError("Voice session changed during leave")
+            # No await between the ownership fence and synchronous cancellation.
+            return talk_discord.stop_session()
+        aliases = {"mute": "pause", "unmute": "resume", "status": "state"}
+        operation = aliases.get(operation, operation)
+        if operation == "say":
+            if not arguments:
+                return "Use /talk say TEXT to send typed input to the selected task."
+            command = " ".join(arguments)
+        else:
+            command = "/" + shlex.join([operation, *arguments])
+        result = await talk_discord.native_command(command, **identifiers)
+        if operation in {"select", "return", "reconnect"}:
+            return ("Task voice connected." if result.get("selected") is True
+                    else "Task voice connection was not confirmed; check the selected task.")
+        if operation in {"state", "result", "targets"}:
+            return (
+                "Task access checked. Inspect full task content in the authenticated Talk "
+                "dashboard or terminal; this text channel has no private-task audience grant."
+            )
+        if operation in {"pause", "resume"}:
+            return "Microphone paused." if operation == "pause" else "Microphone resumed."
+        return "Task command processed. Inspect its receipt in Talk."
+    except Exception:  # noqa: BLE001 - task content and credential errors stay out of text channels
+        return "Task command was refused or its outcome is unconfirmed. Inspect the original task."
 
 
 def _on_session_end(**kwargs) -> None:

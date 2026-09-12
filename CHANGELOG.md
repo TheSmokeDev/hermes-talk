@@ -11,9 +11,25 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## [Unreleased]
+## [0.18.0] — 2026-09-12
+
+GPT-Live connects voice conversation to Hermes tasks and Codex background
+workers on dashboard, terminal and Discord. Subscription is the default;
+API billing is selected explicitly.
 
 ### Added
+- GPT-Live with subscription authentication by default and explicit API billing,
+  separate validated model/voice settings, browser WebRTC, native subscription
+  WebRTC and native API WebSockets. Subscription failure never spends an API key.
+- Shared task handoffs across dashboard, terminal and Discord: exact typed input,
+  background delegation, task selection/return, steering, current approvals,
+  cancellation, complete results and reconnect recovery. Discord controls and
+  delivery require a current host-issued operator/audience binding.
+- Opt-in Codex CLI 0.154.0 workers through the host's profile-scoped worker hook,
+  preserving Hermes job ownership and original Codex thread/turn identity.
+- [GPT-Live operating guide](docs/GPT-LIVE.md) and
+  [source notices](THIRD_PARTY_NOTICES.md), including OpenClaw PR #133079's MIT
+  subscription integration and JakeStevenson's selectively incorporated PR #135 ideas.
 - Added a deterministic, content-free endpointing trace evaluator that reports
   nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
   and false-activation counts without retaining audio or transcripts.

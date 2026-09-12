@@ -1351,3 +1351,625 @@ def test_gemini_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._gemini_auth()
     assert auth.token == "gemini-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+def test_typed_input_preserves_text_without_inventing_a_provider_item_id():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup())
+        await adapter.send((rt.AddInputText("local-input-1", "  Original\ntext  "),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == [
+        {
+            "clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": "  Original\ntext  "}]}],
+                "turnComplete": False,
+            }
+        }
+    ]
+
+
+def _task_setup(model="gemini-3.1-flash-live-preview"):
+    return rt.SessionSetup(
+        model=model,
+        voice="Puck",
+        instructions="Use Hermes for actions.",
+        automatic_response=True,
+        task_continuity=True,
+        tools=(rt.ToolDefinition("delegate_task", "Delegate", {"type": "object"}),),
+    )
+
+
+def _batch(*ids):
+    return {
+        "toolCall": {
+            "functionCalls": [
+                {"id": call_id, "name": "delegate_task", "args": {"goal": "proposed work"}}
+                for call_id in ids
+            ]
+        }
+    }
+
+
+def test_task_mode_captures_partial_input_before_real_batch_and_keeps_wire_ids():
+    async def scenario():
+        packet = _batch("call-a", "call-b")
+        packet["serverContent"] = {"inputTranscription": {"text": "  start the job"}}
+        socket = _Socket(
+            [
+                {"setupComplete": {}},
+                packet,
+                _batch("call-a", "call-b"),
+                {
+                    "serverContent": {
+                        "inputTranscription": {"text": " after this."},
+                        "outputTranscription": {"text": "I am checking."},
+                        "generationComplete": True,
+                        "turnComplete": True,
+                    }
+                },
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        events = []
+        async for event in adapter:
+            events.append(event)
+            if isinstance(event, rt.DelegationRequested):
+                await adapter.send(
+                    (rt.SubmitDelegationResult(event.delegation_id, "Job 12 started."),)
+                )
+                await adapter.send(
+                    (rt.SubmitDelegationResult(event.delegation_id, "Job 12 started."),)
+                )
+        await adapter.close()
+        return socket, adapter, events
+
+    socket, adapter, events = asyncio.run(scenario())
+    assert adapter.uses_client_delegation is True
+    assert adapter.session_identity_origin == "adapter_connection"
+    assert adapter.supports_live_context is True
+    assert adapter.supports_silent_live_context is False
+    assert adapter.emits_output_lifecycle is True
+    assert isinstance(events[0], rt.SessionReady)
+    assert events[1] == rt.Transcript(
+        rt.TranscriptRole.USER,
+        "  start the job",
+        False,
+        rt.TranscriptProvenance.INPUT_AUDIO,
+    )
+    delegation = events[2]
+    assert isinstance(delegation, rt.DelegationRequested)
+    assert delegation.delegation_id == "call-a"
+    assert [call["id"] for call in json.loads(delegation.prompt)["proposals"]] == [
+        "call-a",
+        "call-b",
+    ]
+    assert sum(isinstance(event, rt.DelegationRequested) for event in events) == 1
+    assert not any(
+        isinstance(event, (rt.ResponseStarted, rt.ResponseFinished, rt.FunctionCall))
+        for event in events
+    )
+    transcripts = [event for event in events if isinstance(event, rt.Transcript)]
+    assert all(
+        not event.final and event.item_id is None and event.response_id is None
+        for event in transcripts
+    )
+    assert [event.text for event in transcripts] == [
+        "  start the job",
+        " after this.",
+        "I am checking.",
+    ]
+    responses = socket.sent[1:]
+    assert len(responses) == 1
+    returned = responses[0]["toolResponse"]["functionResponses"]
+    assert [(call["id"], call["name"]) for call in returned] == [
+        ("call-a", "delegate_task"),
+        ("call-b", "delegate_task"),
+    ]
+    assert all(call["response"]["result"] == "Job 12 started." for call in returned)
+    assert all("whole proposed batch" in call["response"]["scope"] for call in returned)
+
+
+@pytest.mark.parametrize("cancel_first", [True, False])
+def test_cancelling_one_provider_call_retires_batch_and_suppresses_late_result(cancel_first):
+    async def scenario():
+        call = _batch("call-a", "call-b")
+        cancel = {"toolCallCancellation": {"ids": ["call-b"]}}
+        socket = _Socket([cancel, call] if cancel_first else [call, cancel])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        events = [event async for event in adapter]
+        await adapter.send((rt.SubmitDelegationResult("call-a", "Already complete."),))
+        await adapter.close()
+        return socket.sent[1:], events
+
+    sent, events = asyncio.run(scenario())
+    assert sent == []
+    assert rt.DelegationRetired("call-a") in events
+    assert sum(isinstance(event, rt.DelegationRequested) for event in events) == (
+        0 if cancel_first else 1
+    )
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"toolCall": {"functionCalls": [{"id": "c", "name": "delegate_task", "args": "wrong"}]}},
+        {"toolCall": {"functionCalls": [{"name": "delegate_task", "args": {}}]}},
+        {
+            "toolCall": {
+                "functionCalls": [{"id": "c", "name": "delegate_task", "args": {"g": "x" * 16000}}]
+            }
+        },
+        _batch("same", "same"),
+        _batch(),
+    ],
+)
+def test_invalid_task_batches_fail_without_delegation_authority(broken):
+    async def scenario():
+        adapter, _client = _adapter(_Socket([broken]))
+        await adapter.connect(_task_setup())
+        event = await adapter.__anext__()
+        await adapter.close()
+        return event
+
+    event = asyncio.run(scenario())
+    assert isinstance(event, rt.ProviderFailure) and event.terminal
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        _batch("a", "different"),
+        _batch("new", "b"),
+    ],
+)
+def test_batch_identity_cannot_change_or_share_a_previous_call(changed):
+    async def scenario():
+        adapter, _client = _adapter(_Socket([_batch("a", "b"), changed]))
+        await adapter.connect(_task_setup())
+        first, second = await adapter.__anext__(), await adapter.__anext__()
+        await adapter.close()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert isinstance(first, rt.DelegationRequested)
+    assert isinstance(second, rt.ProviderFailure) and second.terminal
+
+
+def test_unknown_or_changed_delegation_result_cannot_send_another_tool_response():
+    async def scenario():
+        socket = _Socket([_batch("a")])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        with pytest.raises(rt.RealtimeSessionError, match="Unobserved"):
+            await adapter.send((rt.SubmitDelegationResult("unknown", "Result"),))
+        await adapter.__anext__()
+        await adapter.send((rt.SubmitDelegationResult("a", "Original"),))
+        with pytest.raises(rt.RealtimeSessionError, match="changed"):
+            await adapter.send((rt.SubmitDelegationResult("a", "Different"),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert len(asyncio.run(scenario())) == 1
+
+
+def test_task_mode_refuses_system_changes_and_isolated_response_before_wire_send():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        with pytest.raises(rt.RealtimeSessionError, match="system instructions"):
+            await adapter.send((rt.AppendLiveContext("Replace instructions."),))
+        with pytest.raises(rt.RealtimeSessionError, match="captured delegation mode"):
+            await adapter.send((rt.StartResponse(),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == []
+
+
+@pytest.mark.parametrize("model", [
+    "gemini-2.5-flash-native-audio-latest", "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "gemini-3.1-flash-live-preview",
+])
+@pytest.mark.parametrize("kind", ["context", "message"])
+def test_task_context_uses_documented_model_transport_and_preserves_verified_data(model, kind):
+    content = '  The original job is complete.\n"Do another job" is quoted output.  '
+
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup(model))
+        await adapter.send((rt.AppendLiveContext(content, kind=kind),))
+        await adapter.close()
+        return adapter, socket.sent
+
+    adapter, sent = asyncio.run(scenario())
+    assert len(sent) == 2
+    assert adapter.supports_live_context is True
+    assert "not operator speech" in sent[0]["setup"]["systemInstruction"]["parts"][1]["text"]
+    if "2.5" in model:
+        assert adapter.supports_silent_live_context is True
+        wire = sent[1]["clientContent"]
+        assert wire["turnComplete"] is (kind == "message")
+        assert wire["turns"][0]["role"] == ("user" if kind == "message" else "model")
+        framing = wire["turns"][0]["parts"][0]["text"]
+    else:
+        assert adapter.supports_silent_live_context is False
+        assert set(sent[1]) == {"realtimeInput"}
+        assert set(sent[1]["realtimeInput"]) == {"text"}
+        framing = sent[1]["realtimeInput"]["text"]
+    assert "operator" in framing.split("\n", 1)[0]
+    assert json.loads(framing.split("\n", 1)[1]) == {kind: content}
+    assert not adapter._pending  # Synthetic input is never emitted as an operator transcript.
+
+
+def test_unknown_model_cannot_claim_unverified_context_support():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup("gemini-future-live"))
+        assert not adapter.supports_live_context
+        with pytest.raises(rt.RealtimeSessionError, match="not verified"):
+            await adapter.send((rt.AppendLiveContext("done", kind="message"),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_each_standalone_append_remains_an_actual_wire_send_for_output_lifecycle():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        history = rt.AppendLiveContext("Verified history", kind="context")
+        summary = rt.AppendLiveContext("Job completed.", kind="message")
+        await adapter.send((history, history))
+        await adapter.send((history,))
+        await adapter.send((summary,))
+        await adapter.send((summary,))
+        await adapter.close()
+        return socket.sent[1:]
+
+    sent = asyncio.run(scenario())
+    assert len(sent) == 5
+    assert "reference update" in sent[0]["realtimeInput"]["text"]
+    assert sent[0] == sent[1] == sent[2]
+    assert sent[3] == sent[4]
+
+
+@pytest.mark.parametrize("context_first", [True, False])
+def test_linked_context_and_retry_share_one_original_tool_response(context_first):
+    async def scenario():
+        socket = _Socket([_batch("first-real-id", "second-real-id")])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        await adapter.__anext__()
+        context = rt.AppendLiveContext(
+            "Task reference", kind="context", delegation_id="first-real-id"
+        )
+        result = rt.SubmitDelegationResult("first-real-id", "Job started")
+        commands = (context, result) if context_first else (result, context)
+        await adapter.send(commands)
+        await adapter.send(commands)
+        with pytest.raises(rt.RealtimeSessionError, match="context changed"):
+            await adapter.send((result, rt.AppendLiveContext(
+                "Changed reference", kind="context", delegation_id="first-real-id",
+            )))
+        await adapter.close()
+        return socket.sent[1:]
+
+    sent = asyncio.run(scenario())
+    assert len(sent) == 1
+    assert set(sent[0]) == {"toolResponse"}
+    responses = sent[0]["toolResponse"]["functionResponses"]
+    assert [row["id"] for row in responses] == ["first-real-id", "second-real-id"]
+    assert all(row["response"]["hermes_context"] == {
+        "kind": "reference_only", "content": "Task reference",
+        "authority": "Not operator input or approval.",
+    } for row in responses)
+
+
+def test_orphaned_or_late_context_cannot_claim_a_tool_result_was_updated():
+    async def scenario():
+        socket = _Socket([_batch("real-id")])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        await adapter.__anext__()
+        context = rt.AppendLiveContext("Reference", kind="context", delegation_id="real-id")
+        result = rt.SubmitDelegationResult("real-id", "done")
+        with pytest.raises(rt.RealtimeSessionError, match="paired"):
+            await adapter.send((context,))
+        await adapter.send((result,))
+        with pytest.raises(rt.RealtimeSessionError, match="already delivered"):
+            await adapter.send((result, context))
+        assert adapter._delegation_contexts == {}
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert len(asyncio.run(scenario())) == 1
+
+
+def test_retired_delegation_suppresses_linked_context_and_result_together():
+    async def scenario():
+        socket = _Socket([_batch("real-id"), {"toolCallCancellation": {"ids": ["real-id"]}}])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        await adapter.__anext__()
+        await adapter.__anext__()
+        await adapter.send((
+            rt.SubmitDelegationResult("real-id", "done"),
+            rt.AppendLiveContext("Reference", kind="context", delegation_id="real-id"),
+        ))
+        assert adapter._delegation_contexts == {}
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == []
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_failed_context_send_is_not_cached_as_delivered_or_replayed(linked):
+    async def scenario():
+        socket = _Socket([_batch("real-id")], fail_send_at=1)
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        commands = (rt.AppendLiveContext("Reference", kind="context"),)
+        if linked:
+            await adapter.__anext__()
+            commands = (
+                rt.SubmitDelegationResult("real-id", "done"),
+                rt.AppendLiveContext("Reference", kind="context", delegation_id="real-id"),
+            )
+        with pytest.raises(rt.RealtimeSessionError, match="scripted send failure"):
+            await adapter.send(commands)
+        assert adapter.state is rt.SessionState.FAILED
+        assert adapter._delegation_contexts == adapter._delegation_results == {}
+        with pytest.raises(rt.RealtimeSessionError, match="not connected"):
+            await adapter.send(commands)
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_task_mode_interruption_drops_cancelled_audio_until_provider_turn_boundary():
+    def output(text):
+        return {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": _b64(text)}}
+                    ]
+                }
+            }
+        }
+
+    async def scenario():
+        socket = _Socket(
+            [output(b"old voice"), {"serverContent": {"turnComplete": True}}, output(b"new voice")]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        await adapter.send((rt.CancelResponse(),))
+        events = [event async for event in adapter]
+        await adapter.close()
+        return socket.sent[1:], events
+
+    sent, events = asyncio.run(scenario())
+    assert sent == []
+    assert [event.data for event in events if isinstance(event, rt.OutputAudio)] == [b"new voice"]
+
+
+
+def test_task_cancellation_capacity_fails_closed_instead_of_forgetting_old_retractions():
+    async def scenario():
+        ids = [f"cancel-{index}" for index in range(gemini_rt.MAX_CANCELLED_CALL_IDS + 1)]
+        adapter, _client = _adapter(_Socket([{"toolCallCancellation": {"ids": ids}}]))
+        await adapter.connect(_task_setup())
+        event = await adapter.__anext__()
+        await adapter.close()
+        return event, adapter
+
+    event, adapter = asyncio.run(scenario())
+    assert isinstance(event, rt.ProviderFailure) and event.terminal
+    assert "capacity" in event.detail
+    assert "cancel-0" in adapter._cancelled_call_ids
+
+
+
+def test_controller_cancel_after_bundled_provider_interrupt_does_not_mute_the_next_turn():
+    def output(data):
+        return {"modelTurn": {"parts": [{"inlineData": {
+            "mimeType": "audio/pcm;rate=24000", "data": _b64(data),
+        }}]}}
+
+    async def scenario():
+        socket = _Socket([
+            {"serverContent": output(b"before")},
+            {"serverContent": {
+                **output(b"discard tail"), "interrupted": True, "turnComplete": True,
+            }},
+            {"serverContent": output(b"after!")},
+        ])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        before = await adapter.__anext__()
+        interruption = await adapter.__anext__()
+        assert isinstance(interruption, rt.OutputInterrupted)
+        await adapter.send((rt.CancelResponse(),))
+        assert isinstance(await adapter.__anext__(), rt.OutputTurnCompleted)
+        after = await adapter.__anext__()
+        await adapter.close()
+        return before, after
+
+    assert asyncio.run(scenario()) == (rt.OutputAudio(b"before"), rt.OutputAudio(b"after!"))
+
+
+
+@pytest.mark.parametrize("model", [
+    "gemini-2.5-flash-native-audio-latest", "gemini-3.1-flash-live-preview",
+])
+def test_gemini_native_controller_and_durable_coordinator_preserve_action_authority(
+    tmp_path, model,
+):
+    native_module = pytest.importorskip("talk_native_live", reason="native integration worktree")
+    coordinator_module = pytest.importorskip(
+        "talk_live_coordinator", reason="shared coordinator integration worktree"
+    )
+    import httpx
+    from test_dashboard_tasks import environment, join
+
+    from talk_native_api import NativeTaskAPI
+
+    class Audio:
+        playback_pending = False
+        played_ms = 0
+
+        def __init__(self):
+            self.queued = []
+            self.drains = 0
+
+        def drain_playback(self):
+            self.drains += 1
+
+        def queue_playback(self, pcm):
+            self.queued.append(pcm)
+
+        def reset_played_ms(self):
+            pass
+
+    async def scenario():
+        env = environment.__wrapped__(tmp_path)
+        manager, request, host, _ = env
+        _bound, context = join(env)
+        decisions, requests, notices = [], [], []
+
+        async def decide(**kwargs):
+            decisions.append(kwargs)
+            source = kwargs["source"]["fragments"][0]["text"]
+            if source == "Tell me the verified status":
+                return {"name": "", "arguments": {}, "message": "The original job is running."}
+            assert source in {"Inspect my requested project", "Inspect my second project"}
+            return {"name": "delegate_task", "arguments": {"task": source}, "message": ""}
+
+        coordinator = coordinator_module.LiveCoordinator(
+            manager, None, lambda _: [{"name": "delegate_task"}], decide=decide
+        )
+
+        async def serve(req):
+            body = json.loads(req.content)
+            path = req.url.path.rsplit("/", 1)[-1]
+            requests.append((path, body))
+            if path == "transcript":
+                result = await asyncio.to_thread(coordinator.transcript, request, body)
+            elif path == "delegation":
+                result = await coordinator.delegation(request, body)
+            elif path == "typed":
+                result = await coordinator.typed(request, body)
+            else:
+                raise AssertionError(path)
+            return httpx.Response(200, json=result)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(serve))
+        api = NativeTaskAPI("http://127.0.0.1", client=http)
+        api.context = context
+        socket = _Socket()
+        session, _ = _adapter(socket)
+        await session.connect(_task_setup(model))
+        audio = Audio()
+        controller = native_module.NativeLiveTaskController(
+            api, session, {"task": context}, audio, on_notice=notices.append,
+        )
+
+        async def deliver(packets):
+            socket.events = iter(packets)
+            async for event in session:
+                await controller.handle(event)
+                await controller.drain()
+                if isinstance(event, rt.OutputTurnCompleted):
+                    return
+            raise AssertionError("Script must keep the provider connected at a real turn boundary")
+
+        try:
+            await deliver([
+                {"setupComplete": {}},
+                {"serverContent": {"inputTranscription": {"text": "Inspect my requested project"}}},
+                _batch("actual-gemini-call"), _batch("actual-gemini-call"),
+                {"serverContent": {"turnComplete": True}},
+            ])
+            body = next(body for path, body in requests if path == "delegation")
+            repeated = await coordinator.delegation(request, body)
+            assert len(host.jobs) == len(decisions) == 1
+            assert body["delegation_id"] == "actual-gemini-call"
+            assert body["fragments"][0]["final"] is False
+            assert body["fragments"][0]["text"] == "Inspect my requested project"
+            assert "proposed work" in body["prompt"]
+            assert "prompt" not in decisions[0]
+            assert len(socket.sent) == 2
+            responses = socket.sent[1]["toolResponse"]["functionResponses"]
+            assert len(responses) == 1 and responses[0]["id"] == "actual-gemini-call"
+            assert host.rows[("default", "task-a")][-1]["content"].startswith(
+                "[Captured Live transcript fragments; this is not a finalized utterance.]"
+            )
+            state = manager.state(request, context)
+            assert repeated["action"]["run_id"] == state["jobs"][0]["run_id"]
+
+            await controller._send_history_context("Verified selected-task history")
+            assert ("clientContent" if "2.5" in model else "realtimeInput") in socket.sent[-1]
+            assert controller.provider_response_active is ("3.1" in model)
+            if "3.1" in model:
+                await deliver([{"serverContent": {"turnComplete": True}}])
+
+            await controller.typed("Tell me the verified status", input_id="actual-typed-input")
+            assert controller.provider_response_active
+            assert "The original job is running." in json.dumps(socket.sent[-1])
+            await deliver([
+                {"serverContent": {
+                    "modelTurn": {"parts": [{"inlineData": {
+                        "mimeType": "audio/pcm;rate=24000", "data": _b64(b"summary audio"),
+                    }}]},
+                    "outputTranscription": {"text": "The original job is running."},
+                }},
+                _batch("synthetic-proposal"), _batch("synthetic-proposal"),
+                {"serverContent": {"interrupted": True, "turnComplete": True}},
+            ])
+            assert len(host.jobs) == 1 and len(decisions) == 2
+            assert audio.queued == [b"summary audio"]
+            assert not controller.operator_speaking and not controller.provider_response_active
+            synthetic = [
+                fragment for path, request_body in requests if path == "transcript"
+                for fragment in request_body["fragments"] if fragment["role"] == "assistant"
+            ]
+            assert synthetic and all(row.get("synthetic") is True for row in synthetic)
+            refusal = [
+                response for packet in socket.sent
+                for response in packet.get("toolResponse", {}).get("functionResponses", [])
+                if response["id"] == "synthetic-proposal"
+            ]
+            assert len(refusal) == 1
+            assert "No new operator input" in refusal[0]["response"]["result"]
+            assert any(
+                row.get("reason") == "delegation_has_no_new_operator_input" for row in notices
+            )
+
+            await deliver([
+                {"serverContent": {"inputTranscription": {"text": "Inspect my second project"}}},
+                _batch("next-real-call"),
+                {"serverContent": {"turnComplete": True}},
+            ])
+            assert len(host.jobs) == 2 and len(decisions) == 3
+            assert all("prompt" not in decision for decision in decisions)
+            assert decisions[-1]["source"]["fragments"][0]["text"] == "Inspect my second project"
+            assert decisions[-1]["source"]["fragments"][0]["final"] is False
+            assert sum(path == "delegation" for path, _ in requests) == 2
+        finally:
+            await controller.close()
+            await http.aclose()
+
+    asyncio.run(scenario())

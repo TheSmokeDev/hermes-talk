@@ -292,3 +292,46 @@ def test_preferred_blank_oauth_fails_closed_without_spending_a_key(
 
     with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
         talk_auth.resolve_auth()
+
+
+def test_resolved_oauth_keeps_account_identity_server_side(monkeypatch, tmp_path):
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() + 3600))
+    resolved = talk_auth.resolve_auth(env={}, codex_home=home)
+    assert resolved.account_id == "acct-1"
+    assert "acct-1" not in repr(resolved)
+    assert resolved.token not in repr(resolved)
+    receipt = talk_auth.auth_diagnostic(env={}, codex_home=home)
+    assert "account_id" not in receipt
+    assert "acct-1" not in json.dumps(receipt)
+
+
+def test_live_subscription_refresh_preserves_account_and_ignores_metered_key(monkeypatch, tmp_path):
+    from talk_live_config import resolve_live_auth
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
+    monkeypatch.setattr(talk_auth, "_post_token_form", lambda fields: {
+        "access_token": _jwt_with_exp(time.time() + 3600), "refresh_token": "refreshed",
+        "expires_in": 3600,
+    })
+    resolved = resolve_live_auth(env={"OPENAI_API_KEY": "paid"}, codex_home=home)
+    assert resolved.account_id == "acct-1"
+    assert resolved.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert json.loads((home / "auth.json").read_text())["tokens"]["account_id"] == "acct-1"
+
+
+def test_live_subscription_refresh_race_keeps_winners_account(monkeypatch, tmp_path):
+    from talk_live_config import resolve_live_auth
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
+    winner = _jwt_with_exp(time.time() + 3700)
+    def raced(_):
+        _write_codex_auth(home, access=winner)
+        data = json.loads((home / "auth.json").read_text())
+        data["tokens"]["account_id"] = "winner-account"
+        (home / "auth.json").write_text(json.dumps(data))
+        raise talk_auth.TalkAuthError("refresh token already consumed")
+    monkeypatch.setattr(talk_auth, "_post_token_form", raced)
+    resolved = resolve_live_auth(env={}, codex_home=home)
+    assert resolved.token == winner
+    assert resolved.account_id == "winner-account"

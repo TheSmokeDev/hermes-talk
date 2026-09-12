@@ -27,7 +27,17 @@ plugins:
 ```
 
 Use the actual Codex executable and an existing absolute workspace. On Windows use
-an absolute executable path. This integration currently verifies **Codex CLI 0.154.0**
+the native `codex.exe`, not `codex.cmd` or a PowerShell shim. After
+`npm install -g @openai/codex@0.154.0`, find the native binary in PowerShell:
+
+```powershell
+Get-ChildItem -LiteralPath (Join-Path (npm root -g) '@openai') -Recurse -File -Filter codex.exe |
+    Select-Object -ExpandProperty FullName
+```
+
+Choose the binary matching the installed platform, verify it directly with
+`& 'C:/absolute/path/to/codex.exe' --version`, and put that absolute path in
+`executable`. This integration currently verifies **Codex CLI 0.154.0**
 before launching `app-server --listen stdio://`; a different version refuses. Codex
 uses its own configured authentication. This setup does not create, read out, or copy
 credentials. Disabled or malformed configuration starts no worker process or job.
@@ -40,8 +50,11 @@ profile's registry. When it is advertised, the bound `delegate_task` tool gains
 `worker: codex`. Ask explicitly to use a Codex worker; ordinary delegation still uses
 Hermes. For a configured remote peer, install/configure the worker on that peer.
 The dashboard sends the same authenticated linked-child request to that peer; it does
-not execute the peer's job on the dashboard machine. Hosted-room execution needs its
-own permission mapping and is refused by this initial gateway worker contract.
+not execute the peer's job on the dashboard machine. Discord voice can dispatch a
+worker only with the compatible host's current event-issued operator/audience proof;
+reads, controls, approvals and spoken delivery recheck that room binding. Existing
+RoomLink hosted-room grants remain separate and cannot dispatch external workers.
+See [Discord operation](GPT-LIVE.md#discord).
 
 ## Ownership, controls and recovery
 

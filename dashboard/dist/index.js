@@ -1,11 +1,10 @@
 /**
  * hermes-talk — Dashboard Plugin
  *
- * A live Realtime voice session in the browser. The backend at
- * /api/plugins/hermes-talk/ mints an EPHEMERAL client secret; this page dials
- * OpenAI directly with it over WebRTC (audio on the media track, events on the
- * `oai-events` data channel), relays every model function call back to
- * /tool, and polls /runs so a background run is spoken when it lands.
+ * Browser voice sessions use WebRTC audio. Realtime uses an ephemeral secret
+ * and relays function calls to the task coordinator. GPT-Live negotiates SDP
+ * through Hermes; its server sideband owns delegation and publishes captions
+ * and results to the browser. Long-lived provider credentials stay server-side.
  *
  * Plain IIFE, no build step — same shape as the in-tree kanban and
  * achievements plugins. Uses window.__HERMES_PLUGIN_SDK__ for React and the
@@ -32,6 +31,7 @@
   const TOOL_TIMEOUT_MS = 6500;
   const RUN_POLL_MS = 5000;
   const IDLE_POLL_MS = 20000;
+  const LIVE_POLL_MS = 750;
   /** How long to watch each run kind before letting go. The work continues. */
   const RUN_POLL_CAPS_MS = { agent: 2700000, skill: 600000 };
   const DEFAULT_RUN_CAP_MS = 600000;
@@ -386,7 +386,7 @@
       if (this.stateTail) return this.stateTail;
       this.stateTail = this.request("/state", {}).then((state) => {
         if (!this.closed && this.transport.cb.onTaskState) this.transport.cb.onTaskState(state);
-        if (!this.closed) this.presentation.offer(state);
+        if (!this.closed && !this.transport.live) this.presentation.offer(state);
       }).catch((err) => this.report(errorText(err))).finally(() => { this.stateTail = null; });
       return this.stateTail;
     }
@@ -741,6 +741,8 @@
     if (source === "configured") return "TALK_OPENAI_API_KEY";
     if (source === "env") return "OPENAI_API_KEY";
     if (source === "codex-oauth") return "Codex OAuth (ChatGPT sign-in)";
+    if (source === "subscription") return "ChatGPT subscription";
+    if (source === "api") return "OpenAI API";
     return "not configured";
   }
 
@@ -835,7 +837,7 @@
       peer.addEventListener("connectionstatechange", () => {
         if (this.closed) return;
         if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-          this.cb.onError("Realtime connection closed.");
+          this.cb.onError((this.live ? "Live" : "Realtime") + " connection closed.");
           this.stop();
         }
       });
@@ -1445,6 +1447,177 @@
     }
   }
 
+  /** Live audio is browser WebRTC; every task action remains on the server. */
+  class LiveTransport extends TalkTransport {
+    constructor(session, callbacks) {
+      super(session, callbacks);
+      this.live = true;
+      this.bindingId = null;
+      this.liveCursor = 0;
+      this.liveTimer = null;
+      this.livePolling = false;
+    }
+
+    async start() {
+      if (this.closed) throw new Error("Live connection already closed.");
+      if (!this.task || !this.task.context.connection_id ||
+          !Number.isInteger(this.task.context.generation) ||
+          !this.session.live || this.session.live.transport !== "webrtc") {
+        throw new Error("GPT-Live requires an authorized task and WebRTC session.");
+      }
+      try {
+        await super.start();
+        if (this.closed) return;
+        this.peer.addEventListener("connectionstatechange", () => {
+          if (!this.closed && this.peer && this.peer.connectionState === "disconnected") {
+            this.fail("Live audio disconnected. Rejoin the task to reconnect.");
+          }
+        });
+        this.channel.addEventListener("close", () => {
+          if (!this.closed) this.fail("Live connection closed. Rejoin the task to reconnect.");
+        });
+        this.channel.addEventListener("error", () => {
+          if (!this.closed) this.fail("Live audio channel failed. Rejoin the task to reconnect.");
+        });
+        void this.pollEvents();
+      } catch (err) {
+        this.stop();
+        throw err;
+      }
+    }
+
+    async postOffer(offer) {
+      const controller = new AbortController();
+      this.offerAbort = controller;
+      const timer = window.setTimeout(() => controller.abort(), OFFER_TIMEOUT_MS);
+      let result;
+      try {
+        result = await apiCall("/live/session", { method: "POST",
+          body: JSON.stringify(Object.assign({ sdp: offer.sdp }, this.task.context)),
+          signal: controller.signal });
+        if (this.closed || controller.signal.aborted) {
+          if (result && typeof result.binding_id === "string") this.closeBinding(result.binding_id);
+          throw new Error("Live connection setup cancelled.");
+        }
+        if (!result || result.ok !== true || typeof result.binding_id !== "string" ||
+            !result.binding_id || typeof result.sdp !== "string" || !result.sdp) {
+          if (result && typeof result.binding_id === "string") this.closeBinding(result.binding_id);
+          throw new Error("Live WebRTC setup did not return a valid session.");
+        }
+        this.bindingId = result.binding_id;
+        return result.sdp;
+      } finally {
+        window.clearTimeout(timer);
+        if (this.offerAbort === controller) this.offerAbort = null;
+      }
+    }
+
+    // Provider events cannot acquire execution authority through the browser.
+    handleEvent() {}
+    send() { return false; }
+    clearPlayback() {}
+
+    liveTiming() {
+      const timing = this.task.timing, now = timing.clock();
+      if (!["input", "output"].every((kind) => timing.samples[kind] &&
+          now - timing.samples[kind].at <= 1000)) return null;
+      return timing.snapshot();
+    }
+
+    async sendTyped(text) {
+      if (this.closed || !this.bindingId || typeof text !== "string" || !text.trim()) return false;
+      try {
+        const result = await this.task.request("/live/input", {
+          binding_id: this.bindingId, input_id: clientId("live_input_"), text: text });
+        if (!result || result.ok !== true) throw new Error("Live typed input was not accepted.");
+        return true;
+      } catch (err) {
+        if (!this.closed) this.fail(errorText(err));
+        throw err;
+      }
+    }
+
+    async pollEvents() {
+      if (this.closed || !this.bindingId || this.livePolling) return;
+      this.livePolling = true;
+      try {
+        const reply = await this.task.request("/live/events", {
+          binding_id: this.bindingId, after: this.liveCursor, timing: this.liveTiming() });
+        if (!reply || reply.ok !== true || !Array.isArray(reply.events) ||
+            !Number.isSafeInteger(reply.cursor) || reply.cursor < this.liveCursor) {
+          throw new Error("Live event stream could not be reconciled. Rejoin the task.");
+        }
+        for (const event of reply.events) {
+          if (this.closed) return;
+          if (!event || !Number.isSafeInteger(event.sequence) || event.sequence < 1 ||
+              event.sequence > reply.cursor) throw new Error("Invalid Live event sequence.");
+          if (event.sequence <= this.liveCursor) continue;
+          if (event.type === "transcript") {
+            if (!["user", "assistant"].includes(event.role) || typeof event.text !== "string" ||
+                typeof event.final !== "boolean") throw new Error("Invalid Live transcript event.");
+            if (event.text) this.cb.onTranscript(event.role, event.text, event.final);
+          } else if (event.type === "result") {
+            const result = event.result || event;
+            if (result.run_id !== undefined && this.cb.onTaskResult) {
+              const full = event.result_available === true && result.output === undefined
+                ? await this.task.result(result.run_id) : result;
+              if (this.closed) return;
+              this.cb.onTaskResult(full);
+            }
+            if (event.selection && this.cb.onSelectionIntent) {
+              await this.cb.onSelectionIntent(event.selection, this);
+              if (this.closed) return;
+            }
+            void this.task.refresh();
+          } else if (event.type === "error") {
+            throw new Error(typeof event.message === "string" ? event.message : "Live session failed.");
+          }
+          this.liveCursor = event.sequence;
+        }
+        this.liveCursor = reply.cursor;
+      } catch (err) {
+        if (!this.closed) this.fail(errorText(err));
+      } finally {
+        this.livePolling = false;
+        if (!this.closed) this.liveTimer = window.setTimeout(() => {
+          this.liveTimer = null;
+          void this.pollEvents();
+        }, LIVE_POLL_MS);
+      }
+    }
+
+    fail(message) {
+      if (this.closed) return;
+      if (this.cb.onError) this.cb.onError(message);
+      this.stop();
+    }
+
+    closeBinding(bindingId) {
+      void apiCall("/live/close", { method: "POST", keepalive: true,
+        body: JSON.stringify(Object.assign({ binding_id: bindingId }, this.task.context)) }).catch(() => {});
+    }
+
+    stop() {
+      const wasClosed = this.closed;
+      window.clearTimeout(this.liveTimer);
+      this.liveTimer = null;
+      if (this.bindingId) {
+        this.closeBinding(this.bindingId);
+        this.bindingId = null;
+      }
+      if (this.audio) {
+        try { this.audio.pause(); this.audio.srcObject = null; } catch (e) { /* already stopped */ }
+      }
+      super.stop();
+      if (!wasClosed && this.cb.onClosed) this.cb.onClosed();
+    }
+  }
+
+  function makeTransport(session, callbacks) {
+    return session && session.voiceMode === "live"
+      ? new LiveTransport(session, callbacks) : new TalkTransport(session, callbacks);
+  }
+
   // -- page -----------------------------------------------------------------
 
   function targetLabel(target) {
@@ -1623,14 +1796,14 @@
     const appendTranscript = useCallback((role, text, final) => {
       setTranscript((prev) => {
         const last = prev[prev.length - 1];
-        if (role === "assistant" && !final) {
-          if (last && last.role === "assistant" && !last.final) {
+        if (!final) {
+          if (last && last.role === role && !last.final) {
             const merged = Object.assign({}, last, { text: last.text + text });
             return prev.slice(0, -1).concat([merged]);
           }
           return prev.concat([{ id: rowId.current++, role: role, text: text, final: false }]);
         }
-        if (role === "assistant" && last && last.role === "assistant" && !last.final) {
+        if (last && last.role === role && !last.final) {
           const done = Object.assign({}, last, { text: text, final: true });
           return prev.slice(0, -1).concat([done]);
         }
@@ -1640,10 +1813,11 @@
 
     async function installSession(session, epoch) {
       const current = () => epoch === connectionEpoch.current;
-      const transport = new TalkTransport(session, {
+      const transport = makeTransport(session, {
         onStatus: (message) => { if (current()) setLive(message); },
         onTranscript: (role, text, final) => { if (current()) appendTranscript(role, text, final); },
         onError: (message) => { if (current()) setError(message); },
+        onClosed: () => { if (current()) { setPhase("idle"); setLive(""); setSending(false); } },
         onTaskState: (state) => { if (current()) setTaskState(state); },
         onTaskResult: (result) => {
           if (current()) setResults((prev) => Object.assign({}, prev, { [result.run_id]: result }));
@@ -1678,6 +1852,10 @@
         setError("Talk needs a browser with WebRTC and microphone access.");
         return;
       }
+      if (status && status.voiceMode === "live" && !selectedTask) {
+        setError("Choose an authorized task before starting GPT-Live.");
+        return;
+      }
       setPhase("starting");
       setLive("");
       setTranscript([]);
@@ -1695,12 +1873,12 @@
           method: "POST", body: JSON.stringify(body), signal: controller.signal,
         });
         if (epoch !== connectionEpoch.current || controller.signal.aborted) {
-          new TalkTransport(session, {}).stop();
+          makeTransport(session, {}).stop();
           return;
         }
         if (selectedTask && (!session.task || session.task.target_id !== selectedTask ||
             session.task.tab_id !== tabId.current)) {
-          new TalkTransport(session, {}).stop();
+          makeTransport(session, {}).stop();
           throw new Error("Bound task context did not match the selected task; join was refused.");
         }
         await installSession(session, epoch);
@@ -1768,7 +1946,7 @@
           method: "POST", body: JSON.stringify(body), signal: controller.signal,
         });
         if (operation !== switchEpoch.current || controller.signal.aborted || transportRef.current !== old) {
-          if (session && session.task) new TalkTransport(session, {}).stop();
+          if (session && session.task) makeTransport(session, {}).stop();
           return false;
         }
         if (session && session.ok === false && session.state === "ambiguous") {
@@ -1780,7 +1958,7 @@
             session.selection.target_id !== session.task.target_id ||
             session.task.tab_id !== tabId.current ||
             (body.target_id && session.task.target_id !== body.target_id)) {
-          if (session && session.task) new TalkTransport(session, {}).stop();
+          if (session && session.task) makeTransport(session, {}).stop();
           throw new Error("Target switch was not authorized and activated.");
         }
         installedEpoch = ++connectionEpoch.current;
@@ -1865,8 +2043,10 @@
         h("div", { className: "ht-actions" },
           active || starting
             ? h(C.Button, { onClick: stopTalk }, starting ? "Cancel connection" : "Stop")
-            : h(C.Button, { onClick: () => void startTalk(), disabled: !ready || loading },
-                selectedTask ? "Join / resume task" : "Start legacy Talk")
+            : h(C.Button, { onClick: () => void startTalk(), disabled: !ready || loading ||
+                (status.voiceMode === "live" && !selectedTask) },
+                selectedTask ? "Join / resume task" : status && status.voiceMode === "live"
+                  ? "Start GPT-Live" : "Start legacy Talk")
         )
       ),
 
@@ -1887,7 +2067,8 @@
         h("label", { className: "ht-field" }, "Task or Bot target",
           h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
             onChange: (e) => setSelectedTask(e.target.value) },
-            h("option", { value: "", disabled: active }, "Legacy unbound Talk (no task history)"),
+            h("option", { value: "", disabled: active }, status && status.voiceMode === "live"
+              ? "Choose a task for GPT-Live" : "Legacy unbound Talk (no task history)"),
             tasks.map((task) => {
               const id = task.target_id;
               return id && h("option", { key: id, value: id,
@@ -2087,7 +2268,8 @@
   }
 
   if (window.__HERMES_TALK_TEST_HOOK__) {
-    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, TalkPage: TalkPage,
+    window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, LiveTransport: LiveTransport,
+      makeTransport: makeTransport, TalkPage: TalkPage,
       controlLabel: controlLabel, steeringLabel: steeringLabel };
   }
   window.__HERMES_PLUGINS__.register("hermes-talk", TalkPage);

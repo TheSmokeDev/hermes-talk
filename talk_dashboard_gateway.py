@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 from urllib.parse import quote, urlsplit
 
@@ -26,6 +26,7 @@ class DashboardTaskError(Exception):
         "gateway_unavailable": "The gateway is unavailable; the original intent remains pending.",
         "gateway_response_invalid": "The gateway returned an unsupported response.",
         "gateway_refused": "The gateway refused this operation.",
+        "live_decision_invalid": "Hermes returned an invalid Live task decision.",
         "invalid_event": "This task event is incomplete or invalid.",
         "event_conflict": "An existing event identity has different content.",
         "connection_stale": "This connection is no longer current; reconnect to the original task.",
@@ -64,11 +65,19 @@ class DashboardTaskError(Exception):
 @dataclass(frozen=True, slots=True)
 class TaskGateway:
     transport: HistoryTransport
+    before_request: object = field(default=None, repr=False, compare=False)
+
+    def discord_context(self, operation, body):
+        if operation not in {"redeem", "verify", "rebind", "revoke"}:
+            raise DashboardTaskError("invalid_event", 400)
+        return self._request("POST", "/v1/task-context/discord/" + operation, body=body)
 
     def _request(
         self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024, not_found=None
     ):
         """Suffix is chosen only by the fixed methods below, never by a browser/model."""
+        if self.before_request is not None:
+            self.before_request()
         prefix = f"/p/{self.transport.profile}" if self.transport.named_profile else ""
         headers = {"Authorization": "Bearer " + self.transport.credential}
         if key is not None:

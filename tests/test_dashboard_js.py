@@ -1755,3 +1755,339 @@ t.task.close();
     result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
                  text=True, timeout=NODE_TIMEOUT_S)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+LIVE_HARNESS = TASK_HARNESS + r"""
+const captions = [], fullResults = [], peers = [], tracks = [], audioElements = [];
+let micRequests = 0, closedNotifications = 0, liveFetch;
+class FakePeer {
+  constructor() { this.listeners = {}; this.connectionState = 'new'; peers.push(this); }
+  addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
+  emit(name, event = {}) { for (const callback of this.listeners[name] || []) callback(event); }
+  addTrack() {}
+  createDataChannel(label) {
+    assert.equal(label, 'oai-events');
+    const channel = { readyState: 'connecting', listeners: {},
+      addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); },
+      emit(name, event = {}) {
+        for (const callback of this.listeners[name] || []) callback(event);
+      },
+      send(data) { sent.push(JSON.parse(data)); },
+      close() { this.readyState = 'closed'; this.emit('close'); },
+    };
+    return this.channel = channel;
+  }
+  async createOffer() { return { type: 'offer', sdp: 'browser-offer' }; }
+  async setLocalDescription(offer) { this.localDescription = offer; }
+  async setRemoteDescription(answer) {
+    this.remoteDescription = answer; this.connectionState = 'connected';
+    this.channel.readyState = 'open'; this.channel.emit('open');
+  }
+  close() { this.connectionState = 'closed'; this.emit('connectionstatechange'); }
+}
+const navigator = { mediaDevices: { async getUserMedia(options) {
+  assert.equal(options.audio, true); micRequests++;
+  const track = { stopped: false, stop() { this.stopped = true; } }; tracks.push(track);
+  return { getTracks: () => [track], getAudioTracks: () => [track] };
+} } };
+const document = { body: { appendChild() {} }, createElement(name) {
+  assert.equal(name, 'audio'); const audio = { style: {}, srcObject: null,
+    pause() { this.paused = true; }, remove() { this.removed = true; } };
+  audioElements.push(audio); return audio;
+} };
+fetchOverride = (url, body, opts) => {
+  if (liveFetch) { const result = liveFetch(url, body, opts);
+    if (result !== undefined) return result; }
+  if (url.endsWith('/live/session')) return { ok: true,
+    binding_id: 'opaque-live', sdp: 'server-answer' };
+  if (url.endsWith('/live/events')) return { ok: true, events: [], cursor: body.after };
+  if (url.endsWith('/live/input')) return { ok: true };
+};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), {
+  window, setTimeout, clearTimeout, AbortController, console, navigator, document,
+  RTCPeerConnection: FakePeer,
+  fetch() { throw new Error('Live must never send a credential or SDP directly to a provider'); },
+}, { filename: 'index.js' });
+const Live = window.__HERMES_TALK_TEST__.LiveTransport;
+const makeLive = (authSource = 'subscription') => window.__HERMES_TALK_TEST__.makeTransport({
+  voiceMode: 'live', authSource, live: { transport: 'webrtc' },
+  task: { connection_id: 'bound-live-task', generation: 9 },
+}, Object.assign({}, callbacks, {
+  onTranscript(role, text, final) { captions.push({ role, text, final }); },
+  onTaskResult(result) { fullResults.push(result); }, onClosed() { closedNotifications++; },
+}));
+const pollNow = async (t) => {
+  await waitFor(() => !t.livePolling); clearTimeout(t.liveTimer); t.liveTimer = null;
+  await t.pollEvents();
+};
+"""
+
+
+@pytest.mark.parametrize("auth_source", ["subscription", "api"])
+def test_live_browser_negotiates_server_sdp_and_never_relays_actions(auth_source):
+    script = LIVE_HARNESS + f"\n(async()=>{{const t=makeLive('{auth_source}');\n" + r"""
+assert(t instanceof Live); assert.equal(micRequests, 0, 'construction requested microphone');
+await t.start(); await waitFor(() => !t.livePolling);
+assert.equal(micRequests, 1);
+assert.equal(peers[0].remoteDescription.sdp, 'server-answer');
+const offer = requests.find(r => r.url.endsWith('/live/session'));
+assert.deepEqual(offer.body, { sdp: 'browser-offer',
+  connection_id: 'bound-live-task', generation: 9 });
+t.channel.emit('message', { data: JSON.stringify({ type: 'response.function_call_arguments.done',
+  call_id: 'evil-call', name: 'delegate_task', arguments: '{"goal":"Unexpected action"}' }) });
+t.channel.emit('message', { data: JSON.stringify({
+  type: 'delegation.created', delegation_id: 'evil' }) });
+assert.equal(t.send({ type: 'response.create' }), false);
+const original = '  Preserve this typed input\nexactly.\t ';
+assert.equal(await t.sendTyped(original), true);
+const input = requests.find(r => r.url.endsWith('/live/input')).body;
+assert.equal(input.text, original); assert(input.input_id.startsWith('live_input_'));
+assert.equal(input.binding_id, 'opaque-live'); assert.equal(input.generation, 9);
+assert.equal(captions.length, 0, 'typed input must be echoed by the authoritative event stream');
+liveFetch = (url) => url.endsWith('/state')
+  ? { task: {}, announcements: [{event_id:'summary'}] } : undefined;
+await t.task.refresh(); await drain();
+assert.equal(requests.filter(r => r.url.endsWith('/speech') || r.url.endsWith('/tool') ||
+  r.url.endsWith('/event')).length, 0);
+assert.equal(sent.length, 0);
+t.stop(); t.stop(); await drain();
+assert(tracks[0].stopped && audioElements[0].paused && audioElements[0].removed);
+assert.equal(peers[0].connectionState, 'closed'); assert.equal(t.liveTimer, null);
+assert.equal(t.task.controllers.size, 0); assert.equal(closedNotifications, 1);
+assert.equal(requests.filter(r => r.url.endsWith('/live/close')).length, 1);
+assert.equal(requests.filter(r => r.url === '/api/plugins/hermes-talk/close').length, 1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_server_events_deduplicate_without_promoting_partial_transcripts():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+let batch = [
+  {sequence:1,type:'transcript',role:'user',text:'Launch ',final:false},
+  {sequence:2,type:'transcript',role:'user',text:'Codex',final:false},
+  {sequence:3,type:'transcript',role:'assistant',text:'Starting ',final:false},
+];
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,events:batch,cursor:3} : undefined;
+await pollNow(t); await pollNow(t);
+assert.equal(captions.length,3); assert(captions.every(c=>c.final===false));
+batch=[{sequence:3,type:'transcript',role:'assistant',text:'Starting ',final:false},
+  {sequence:4,type:'transcript',role:'user',text:'Launch Codex.',final:true},
+  {sequence:5,type:'result',run_id:7,output:'Complete result',action:{state:'completed'}},
+];
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,events:batch,cursor:5} : undefined;
+await pollNow(t);
+assert.equal(captions.length,4); assert.equal(captions[3].text,'Launch Codex.');
+assert.equal(captions[3].final,true); assert.equal(fullResults.length,1);
+assert.equal(fullResults[0].output,'Complete result'); assert.equal(t.liveCursor,5);
+assert.equal(sent.length,0); assert.equal(events('input.final').length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", [
+    "throw new Error('403 stale task connection')",
+    "return {ok:false,events:[],cursor:0}",
+    "return {ok:true,events:[],cursor:-1}",
+    "return {ok:true,events:[{sequence:2,type:'transcript',role:'user',"
+    "text:'x',final:false}],cursor:1}",
+    "return {ok:true,events:[{sequence:1,type:'transcript',role:'user',"
+    "text:'x',final:'yes'}],cursor:1}",
+    "return {ok:true,events:[{sequence:1,type:'error',"
+    "message:'Live authentication expired'}],cursor:1}",
+])
+def test_live_event_failure_stops_microphone_without_rebilling_or_retry(failure):
+    script = LIVE_HARNESS + "\n(async()=>{\n" + r"""
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+liveFetch=(url)=>{if(url.endsWith('/live/events')) {
+""" + failure + r"""
+}};
+await pollNow(t); await drain();
+assert(t.closed && tracks[0].stopped); assert.equal(t.liveTimer,null);
+assert.equal(requests.filter(r=>r.url.endsWith('/live/session')).length,1);
+assert.equal(errors.length,1); assert.equal(sent.length,0);
+assert.equal(captions.length,0); assert.equal(closedNotifications,1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_cancelled_negotiation_and_stale_poll_cannot_reopen_audio_or_publish():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+let release;
+liveFetch=(url)=>url.endsWith('/live/session') ? new Promise(resolve=>{release=()=>resolve({
+  ok:true,binding_id:'late-binding',sdp:'late-answer'});}) : undefined;
+const first=makeLive(), pending=first.start(); await waitFor(()=>release);
+first.stop(); release(); await assert.rejects(pending,/cancelled/); await drain();
+assert(tracks[0].stopped && audioElements[0].paused); assert(!peers[0].remoteDescription);
+assert(requests.find(r=>r.url.endsWith('/live/session')).signal.aborted);
+assert(requests.some(r=>r.url.endsWith('/live/close') && r.body.binding_id==='late-binding'));
+liveFetch=null; const second=makeLive(); await second.start();
+await waitFor(()=>!second.livePolling);
+let finishPoll;
+liveFetch=(url)=>url.endsWith('/live/events') ? new Promise(resolve=>{finishPoll=()=>resolve({
+  ok:true,cursor:1,events:[{sequence:1,type:'transcript',role:'user',text:'stale',final:true}]
+});}) : undefined;
+const polling=pollNow(second); await waitFor(()=>finishPoll);
+second.stop(); finishPoll(); await polling;
+assert.equal(captions.length,0); assert.equal(second.liveTimer,null);
+assert(tracks[1].stopped); assert.equal(sent.length,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["disconnected", "channel-close", "typed-input"])
+def test_live_transport_and_input_failure_close_bound_audio(failure):
+    script = LIVE_HARNESS + "\n(async()=>{const t=makeLive();await t.start();\n" + {
+        "disconnected": "peers[0].connectionState='disconnected';"
+        "peers[0].emit('connectionstatechange');",
+        "channel-close": "t.channel.emit('close');",
+        "typed-input": r"""
+liveFetch=(url)=>{if(url.endsWith('/live/input'))throw new Error('401 expired authentication');};
+await assert.rejects(t.sendTyped('Original input'),/401/);
+""",
+    }[failure] + r"""
+await drain(); assert(t.closed && tracks[0].stopped); assert.equal(closedNotifications,1);
+assert.equal(requests.filter(r=>r.url.endsWith('/live/session')).length,1);
+assert.equal(sent.length,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_page_requires_operator_start_preserves_partials_and_switches_with_existing_flow():
+    script = TARGET_PAGE_HARNESS + r"""
+const liveBase=fetchOverride;
+fetchOverride=(url,body,opts)=>{
+  if(url.endsWith('/live/events')) return {ok:true,cursor:1,events:[
+    {sequence:1,type:'result',output:'Switch requested',selection:{target_id:'b'}}]};
+  const result=liveBase(url,body,opts);
+  if(url.endsWith('/status')) return Object.assign({},result,{voiceMode:'live'});
+  if(url.endsWith('/session') || url.endsWith('/switch')) return Object.assign({},result,{
+    voiceMode:'live',authSource:'subscription',live:{transport:'webrtc'}});
+  return result;
+};
+const liveClass=window.__HERMES_TALK_TEST__.LiveTransport;
+liveClass.prototype.start=async function(){
+  await window.__HERMES_TALK_TEST__.TalkTransport.prototype.start.call(this);
+  this.bindingId='binding-'+this.task.context.generation;
+};
+(async()=>{
+render(); let tree=await readyPage(); assert.equal(transports.length,0);
+assert(button(tree,'Start GPT-Live').props.disabled);
+assert(label(tree).includes('Choose a task for GPT-Live'));
+choose('Task or Bot target','a'); assert.equal(transports.length,0);
+click('Join / resume task'); tree=await readyPage(); const first=latestTransport;
+assert(first instanceof liveClass); assert.equal(transports.length,1);
+first.cb.onTranscript('user','Launch ',false); first.cb.onTranscript('user','Codex',false);
+tree=render(); assert(label(tree).includes('Launch Codex'));
+assert(nodes(tree).some(n=>n.props.className==='ht-role' && label(n)==='You …'));
+first.cb.onTranscript('user','Launch Codex.',true); tree=render();
+assert(!nodes(tree).some(n=>n.props.className==='ht-role' && label(n)==='You …'));
+startOverride=()=>{assert(first.closed,'replacement started before old audio was drained');};
+await first.pollEvents(); await readyPage();
+assert(first.closed); assert(latestTransport instanceof liveClass);
+assert.equal(latestTransport.session.task.target_id,'b');
+const request=requests.find(r=>r.url.endsWith('/switch'));
+assert.equal(request.body.target_id,'b');
+assert.equal(request.body.connection_id,first.task.context.connection_id);
+assert(requests.some(r=>r.url.endsWith('/live/close') && r.body.binding_id==='binding-1'));
+first.cb.onTranscript('assistant','Stale voice text',true);
+assert(!label(render()).includes('Stale voice text'));
+assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+listeners.pagehide(); process.exit(0);
+})().catch(e=>{console.error(e);process.exit(1);});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("response", [
+    "throw new Error('401 subscription login expired')",
+    "return {ok:true,binding_id:'bad-binding',sdp:''}",
+])
+def test_live_setup_failure_releases_capture_and_does_not_try_other_auth(response):
+    script = LIVE_HARNESS + "\n(async()=>{\n" + r"""
+liveFetch=(url)=>{if(url.endsWith('/live/session')) {
+""" + response + r"""
+}};
+const t=makeLive(); await assert.rejects(t.start());
+assert(t.closed && tracks[0].stopped && audioElements[0].paused);
+assert.equal(peers[0].connectionState,'closed'); assert.equal(t.liveTimer,null);
+assert.equal(requests.filter(r=>r.url.endsWith('/live/session')).length,1);
+assert.equal(requests.filter(r=>r.url.endsWith('/live/events')).length,0);
+assert.equal(sent.length,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_missing_task_is_rejected_before_microphone_request():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=new Live({voiceMode:'live',live:{transport:'webrtc'}},callbacks);
+await assert.rejects(t.start(),/authorized task/);
+assert.equal(micRequests,0); assert.equal(requests.length,0); assert.equal(peers.length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_live_spoken_updates_require_recent_input_and_output_measurement():
+    script = LIVE_HARNESS + r"""
+const t=makeLive(); let now=5000; t.task.timing.clock=()=>now;
+assert.equal(t.liveTiming(),null,'unmeasured audio must not be assumed quiet');
+t.task.timing.sample('input',false); assert.equal(t.liveTiming(),null);
+t.task.timing.sample('output',false);
+const quiet=t.liveTiming(); assert.equal(quiet.operator_speaking,false);
+assert.equal(quiet.playback_active,false);
+t.task.timing.sample('input',true); assert.equal(t.liveTiming().operator_speaking,true);
+now=7000; assert.equal(t.liveTiming(),null,'stale samples must not authorize speech');
+t.stop();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_live_large_result_uses_authorized_result_endpoint_without_speech_or_tools():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:1,events:[
+  {sequence:1,type:'result',run_id:'large-job',result_available:true}]} : undefined;
+await pollNow(t);
+assert.equal(fullResults.length,1);
+assert.equal(fullResults[0].output,'<script>full available result</script>');
+assert(requests.some(r=>r.url.includes('/result?connection_id=bound-live-task&generation=9')));
+assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr

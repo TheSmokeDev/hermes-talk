@@ -10,23 +10,33 @@ if "--version" in sys.argv:
     print("codex-cli " + os.environ.get("FAKE_CODEX_VERSION", "0.154.0"))
     raise SystemExit
 
-path = Path(sys.argv[1])
+base = Path(sys.argv[1])
 scenario = sys.argv[2]
-state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"requests": []}
+folder, prefix = base.parent, base.stem
+
+
+def snapshots():
+    return sorted(folder.glob(f"{prefix}-*.json"))
+
+
+def latest():
+    found = snapshots()
+    return found[-1] if found else None
+
+
+prior = latest()
+state = json.loads(prior.read_text(encoding="utf-8")) if prior else {"requests": []}
 state["processes"] = state.get("processes", 0) + 1
+sequence = (int(prior.stem.rsplit("-", 1)[1]) + 1) if prior else 1
 
 
 def save():
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state), encoding="utf-8")
-    for attempt in range(30):
-        try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            if attempt == 29:
-                raise
-            time.sleep(0.005)
+    # Fresh name per write: replacing one shared file raced the reader on Windows.
+    global sequence
+    staging = folder / f"{prefix}-{sequence:08d}.tmp"
+    staging.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(staging, folder / f"{prefix}-{sequence:08d}.json")
+    sequence += 1
 
 
 def send(message):
@@ -99,7 +109,29 @@ for line in sys.stdin:
             time.sleep(30)
     elif method == "thread/read":
         assert params["threadId"] == state["thread"]["id"]
-        result(message, {"thread": state["thread"]})
+        if not params.get("includeTurns", False):
+            if scenario in {
+                "unresponsive_read",
+                "unresponsive_approval",
+                "progress_on_steer",
+                "unresponsive_read_interrupt",
+                "approval_continue_unresponsive",
+            }:
+                continue
+            if scenario in {"metadata_unavailable", "approval_metadata_unavailable"}:
+                send(
+                    {
+                        "id": message["id"],
+                        "error": {"code": -32603, "message": "metadata unavailable"},
+                    }
+                )
+                continue
+            metadata = {**state["thread"], "turns": [], "status": {"type": "active"}}
+            if scenario == "foreign_metadata":
+                metadata["id"] = "foreign-thread"
+            result(message, {"thread": metadata})
+        else:
+            result(message, {"thread": state["thread"]})
     elif method == "thread/resume":
         assert params["threadId"] == state["thread"]["id"]
         result(message, policy())
@@ -136,7 +168,13 @@ for line in sys.stdin:
             )
         if scenario == "foreign":
             notify("turn/completed", {"threadId": "foreign-thread", "turn": turn})
-        if scenario in {"approval", "approval_replay"}:
+        if scenario in {
+            "approval",
+            "approval_replay",
+            "approval_metadata_unavailable",
+            "unresponsive_approval",
+            "approval_continue_unresponsive",
+        }:
             send(
                 {
                     "id": 901,
@@ -164,9 +202,22 @@ for line in sys.stdin:
         if scenario == "drop_steer":
             os._exit(3)
         result(message, {"turnId": "turn-owned"})
+        if scenario == "progress_on_steer":
+            notify(
+                "item/completed",
+                {
+                    "threadId": "thread-owned",
+                    "turnId": "turn-owned",
+                    "item": {
+                        "id": "progress",
+                        "type": "agentMessage",
+                        "text": params["clientUserMessageId"],
+                    },
+                },
+            )
     elif method == "turn/interrupt":
         assert params["threadId"] == "thread-owned" and params["turnId"] == "turn-owned"
-        if scenario == "ignore_interrupt":
+        if scenario in {"ignore_interrupt", "unresponsive_read_interrupt"}:
             continue
         result(message, {})
         if scenario != "ack_no_terminal":
@@ -188,7 +239,7 @@ for line in sys.stdin:
                     },
                 }
             )
-        else:
+        elif scenario != "approval_continue_unresponsive":
             finish()
     else:
         raise AssertionError("Unexpected protocol operation")
