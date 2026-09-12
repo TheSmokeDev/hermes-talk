@@ -26,6 +26,7 @@ class DashboardTaskError(Exception):
         "gateway_unavailable": "The gateway is unavailable; the original intent remains pending.",
         "gateway_response_invalid": "The gateway returned an unsupported response.",
         "gateway_refused": "The gateway refused this operation.",
+        "live_decision_invalid": "Hermes returned an invalid Live task decision.",
         "invalid_event": "This task event is incomplete or invalid.",
         "event_conflict": "An existing event identity has different content.",
         "connection_stale": "This connection is no longer current; reconnect to the original task.",

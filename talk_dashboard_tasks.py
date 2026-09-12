@@ -533,7 +533,7 @@ class DashboardTasks:
                 bound.attachment.snapshot.conversation_id,
                 bound.token.connection_id,
                 bound.token.generation,
-                (HistoryMessage("user", record["text"]),),
+                (HistoryMessage("user", record.get("canonical_text", record["text"])),),
                 "pending",
                 0,
                 "",
@@ -639,7 +639,7 @@ class DashboardTasks:
                     origin["receipt_id"] = record["receipt_id"]
                 action["goal"] = goal
                 action["request_body"] = {
-                    "input": record["text"],
+                    "input": record.get("canonical_text", record["text"]),
                     "session_id": bound.attachment.owner.session_id,
                     "origin": origin,
                     "child": {
@@ -660,7 +660,7 @@ class DashboardTasks:
                 if set(arguments) not in ({"run_id"}, {"api_run_id"}):
                     raise DashboardTaskError("invalid_event", 400)
                 record["mode"] = "control" if record["mode"] != "execution" else "execution"
-                action["control_input"] = record["text"]
+                action["control_input"] = record.get("canonical_text", record["text"])
                 action["control_origin"] = {
                     "event_id": record["event_id"],
                     "origin_turn_id": record["origin_turn_id"],
@@ -1005,6 +1005,7 @@ class DashboardTasks:
                     "event_id",
                     "canonical_state",
                     "canonical_message_ids",
+                    "source_window",
                 )
             }
             row["responses"] = [

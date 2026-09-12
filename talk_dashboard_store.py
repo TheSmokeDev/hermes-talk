@@ -9,10 +9,10 @@ from contextlib import contextmanager
 
 try:
     from .talk_dashboard_gateway import DashboardTaskError
-    from .talk_passive import identifier
+    from .talk_passive import digest, identifier
 except ImportError:  # pragma: no cover - flat plugin load
     from talk_dashboard_gateway import DashboardTaskError
-    from talk_passive import identifier
+    from talk_passive import digest, identifier
 
 INCOMPLETE_REASONS = frozenset(
     {
@@ -103,10 +103,24 @@ class DashboardStages:
         self._capacity(db)
 
     def stage(self, token, input_id, input_type, text):
-        identifier(input_id)
-        bounded_text(text)
         if input_type not in {"voice", "typed"}:
             raise DashboardTaskError("invalid_event", 400)
+        return self._stage(token, input_id, input_type, text)
+
+    def stage_live(self, token, source_window):
+        fragments = source_window["fragments"]
+        text = "".join(item["text"] for item in fragments)
+        input_id = "live-" + digest([source_window["provider_session_id"], fragments])
+        complete = len(fragments) == 1 and fragments[0]["final"]
+        return self._stage(
+            token, input_id, ("typed" if fragments[0].get("modality") == "typed"
+                             else "voice") if complete else "voice_window", text,
+            source_window=source_window,
+        )
+
+    def _stage(self, token, input_id, input_type, text, *, source_window=None):
+        identifier(input_id)
+        bounded_text(text, maximum=60000)
         with self._db(token) as db:
             existing = db.execute(
                 "SELECT record FROM dashboard_interactions "
@@ -135,6 +149,13 @@ class DashboardStages:
                 "attempt_generation": None,
                 "created_at": self.clock(),
             }
+            if source_window is not None:
+                record["source_window"] = source_window
+                record["canonical_text"] = (
+                    text if input_type in {"voice", "typed"} else
+                    "[Captured Live transcript fragments; this is not a finalized utterance.]\n"
+                    + text
+                )
             db.execute(
                 "INSERT INTO dashboard_interactions VALUES (?,?,?,?,?,?)",
                 (
@@ -259,6 +280,35 @@ class DashboardStages:
                 return
             raise DashboardTaskError("invalid_event", 400)
 
+        return self.update(token, interaction_id, change)
+
+    def claim_live_decision(self, token, interaction_id):
+        with self._db(token) as db:
+            record = self._load(db, token, interaction_id)
+            if "source_window" not in record:
+                raise DashboardTaskError("interaction_unlinked", 409)
+            if record.get("live_decision") is not None:
+                return record, False
+            record["live_decision"] = {"state": "reasoning"}
+            self._save(db, record)
+            return record, True
+
+    def complete_live_decision(self, token, interaction_id, decision):
+        def change(record):
+            current = record.get("live_decision")
+            if current is None or current["state"] != "reasoning":
+                raise DashboardTaskError("event_conflict", 409)
+            response_id = "hermes-decision-" + interaction_id
+            call_id = "hermes-action-" + interaction_id
+            record["live_decision"] = {"state": "completed", **decision}
+            record["responses"][response_id] = {
+                "response_id": response_id,
+                "source": "hermes_plugin_llm",
+                "previous_response_id": None,
+                "status": "completed",
+                "tool_call_ids": [call_id] if decision["name"] else [],
+                "finals": {},
+            }
         return self.update(token, interaction_id, change)
 
     def prepare_action(self, token, interaction_id, response_id, call_id, name, arguments, build):
