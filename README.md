@@ -1,6 +1,6 @@
 # hermes-talk
 
-**Realtime duplex voice for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
+**Realtime duplex voice for your own agent — talk to it, it runs real work in the background, it reports back out loud.**
 
 <p>
   <a href="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml/badge.svg"></a>
@@ -11,7 +11,9 @@
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
 
-Works today: a native mic session in the terminal (`hermes talk`), a Discord voice channel (`/talk join`), and a **Talk** tab in the Hermes dashboard — on OpenAI Realtime, xAI Grok Voice, or Gemini Live. The voice model calls Hermes's own tools, hands work to real background agents while you keep talking, and when a delegated run hits an approval gate it asks you out loud and your spoken answer resolves it. A ChatGPT or SuperGrok subscription is enough — no API key required.
+**It rides your ChatGPT or SuperGrok subscription. No API key required.**
+
+Works today: a native mic session in the terminal (`hermes talk`), a Discord voice channel (`/talk join`), and a **Talk** tab in the dashboard — on OpenAI Realtime, xAI Grok Voice, or Gemini Live. The voice model calls the host's own tools, hands work to real background agents while you keep talking, and when a delegated run hits an approval gate it asks you out loud and your spoken answer resolves it. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable && pip install "hermes-talk[audio]" && hermes talk
