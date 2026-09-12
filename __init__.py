@@ -301,15 +301,46 @@ def _canonical_discord_command(raw, invocation):
                 "anchor_session_id": context["anchor_session_id"],
             },
         }
-        return talk_discord.start_session(guild_id=identifiers["guild_id"], native_task=task)
-    return _canonical_discord_control(operation, arguments, identifiers)
+        with talk_discord._SESSION_LOCK:
+            previous = talk_discord._SESSION.get("task")
+        receipt = talk_discord.start_session(guild_id=identifiers["guild_id"], native_task=task)
+        with talk_discord._SESSION_LOCK:
+            running = talk_discord._SESSION.get("task")
+            if (running is not None and running is not previous and not running.done()
+                    and talk_discord._SESSION.get("mode") == "native-task"):
+                talk_discord._SESSION["native_start_control"] = (
+                    running, talk_discord._SESSION.get("generation"), dict(identifiers),
+                )
+        return receipt
+    with talk_discord._SESSION_LOCK:
+        expected_session = (
+            talk_discord._SESSION.get("task"), talk_discord._SESSION.get("generation"),
+        )
+    return _canonical_discord_control(operation, arguments, identifiers, expected_session)
 
 
-async def _canonical_discord_control(operation, arguments, identifiers):
+async def _canonical_discord_control(operation, arguments, identifiers, expected_session):
     try:
         if operation in {"leave", "stop"} and not arguments:
-            # The existing controller checks its immutable operator and live room before stop.
-            await talk_discord.native_command("/state", **identifiers)
+            with talk_discord._SESSION_LOCK:
+                running, generation = expected_session
+                if (running is None or running.done()
+                        or talk_discord._SESSION.get("task") is not running
+                        or talk_discord._SESSION.get("generation") != generation):
+                    raise ValueError("Voice session changed before leave")
+                starting = talk_discord._SESSION.get("controller") is None
+                if starting and talk_discord._SESSION.get("native_start_control") != (
+                    running, generation, identifiers,
+                ):
+                    raise ValueError("Startup caller does not match its immutable operator")
+            if not starting:
+                # Connected sessions retain their full operator and live audience checks.
+                await talk_discord.native_command("/state", **identifiers)
+            with talk_discord._SESSION_LOCK:
+                if (talk_discord._SESSION.get("task") is not running
+                        or talk_discord._SESSION.get("generation") != generation):
+                    raise ValueError("Voice session changed during leave")
+            # No await between the ownership fence and synchronous cancellation.
             return talk_discord.stop_session()
         aliases = {"mute": "pause", "unmute": "resume", "status": "state"}
         operation = aliases.get(operation, operation)

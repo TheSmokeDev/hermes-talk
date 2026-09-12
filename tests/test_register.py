@@ -673,3 +673,86 @@ def test_canonical_control_needs_trusted_room_and_withholds_private_results(plug
     assert "authorized Discord command" in refused
     assert "PRIVATE-TASK-RESULT" not in result and "private-proof" not in result
     assert received == [("/result 7", {"guild_id": 11, "channel_id": 22, "operator_user_id": 33})]
+
+
+@pytest.mark.parametrize("replacement", [None, "task", "generation"])
+def test_canonical_leave_cancels_only_authorized_current_startup(plugin, monkeypatch, replacement):
+    discord = plugin.talk_discord
+    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
+               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    authorized = True
+    stopped = []
+
+    def capture():
+        if not authorized:
+            raise PermissionError("Listener access revoked")
+        return dict(context)
+
+    monkeypatch.setattr(discord, "resolve_voice_bridge", lambda guild: {"guild_id": guild})
+    monkeypatch.setattr(
+        discord, "DiscordAudio",
+        lambda guild: types.SimpleNamespace(stop=lambda: stopped.append(guild)),
+    )
+    monkeypatch.setattr(
+        discord, "native_command", lambda *a, **kw: pytest.fail("Startup queried the task service")
+    )
+
+    async def run():
+        nonlocal authorized
+        started = asyncio.Event()
+
+        async def pending_connection(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(plugin.talk_cli, "run_talk_session", pending_connection)
+        invocation = types.SimpleNamespace(capture_discord_task_context_proof=capture)
+        assert "Starting canonical" in plugin._talk_command("join Anchor", invocation=invocation)
+        await started.wait()
+        with discord._SESSION_LOCK:
+            original = discord._SESSION["task"]
+            generation = discord._SESSION["generation"]
+            assert discord._SESSION.get("controller") is None
+        successor = None
+        try:
+            assert discord.native_session_active()
+            for key in ("operator_user_id", "channel_id", "guild_id"):
+                saved = context[key]
+                context[key] = "999"
+                assert "refused" in await plugin._talk_command("leave", invocation=invocation)
+                context[key] = saved
+                assert not original.done() and not original.cancelling()
+            authorized = False
+            assert "refused" in plugin._talk_command("leave", invocation=invocation)
+            assert not original.cancelling() and not stopped
+            authorized = True
+            leave = plugin._talk_command("leave", invocation=invocation)
+            if replacement == "task":
+                successor = asyncio.create_task(asyncio.Event().wait())
+                with discord._SESSION_LOCK:
+                    discord._SESSION["task"] = successor
+            elif replacement == "generation":
+                with discord._SESSION_LOCK:
+                    discord._SESSION["generation"] = generation + 1
+            receipt = await leave
+            if replacement:
+                assert "refused" in receipt
+                assert not original.cancelling() and not stopped
+                if successor is not None:
+                    assert not successor.cancelling()
+            else:
+                assert "Left the voice session" in receipt
+                with pytest.raises(asyncio.CancelledError):
+                    await original
+                assert original.cancelled() and stopped
+                assert not discord.native_session_active()
+        finally:
+            original.cancel()
+            if successor is not None:
+                successor.cancel()
+            await asyncio.gather(
+                original, *([successor] if successor else []), return_exceptions=True,
+            )
+            discord.reset_for_tests()
+
+    asyncio.run(run())
