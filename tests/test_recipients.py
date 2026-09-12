@@ -233,6 +233,9 @@ def test_selection_keeps_voice_owner_and_delivers_to_exact_recipient(bundle, tar
         ("worker", True, "codex_desktop", False),
         ("ui_bridge", True, "codex_worker", False),
         ("app_server", True, "claude_code", False),
+        ("peer_ipc", False, "claude_code", False),
+        ("peer_ipc", True, "claude_code", True),
+        ("peer_ipc", True, "codex_desktop", False),
     ],
 )
 def test_history_never_grants_app_server_control_or_cross_app_worker_substitution(

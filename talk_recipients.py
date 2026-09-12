@@ -116,6 +116,8 @@ def _can_send(record):
         return app in {"codex_desktop", "claude_code"}
     if control == "app_server":
         return app == "codex_desktop" and record.get("live_owner") is True
+    if control == "peer_ipc":
+        return app == "claude_code" and record.get("live_owner") is True
     if control == "worker":
         return app == "codex_worker"
     return control == "host_task" and app == "hermes_task"
@@ -210,6 +212,7 @@ class RecipientService:
                     "none",
                     "ui_bridge",
                     "app_server",
+                    "peer_ipc",
                     "worker",
                     "host_task",
                 }
