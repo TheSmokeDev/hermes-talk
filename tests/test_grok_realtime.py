@@ -835,3 +835,206 @@ def test_connect_turns_an_oauth_401_into_the_relogin_remediation():
     assert str(info.value) == "xAI OAuth token rejected — run `hermes auth add xai-oauth`"
     assert "oauth-canary" not in str(info.value)
     assert adapter.state is rt.SessionState.FAILED
+
+@pytest.mark.parametrize("automatic_response", [True, False])
+def test_native_task_mode_requires_explicit_responses_before_connect(automatic_response):
+    async def scenario():
+        socket = _Socket()
+        adapter, client = _adapter(socket)
+        setup = rt.SessionSetup(
+            model="grok-voice-test",
+            voice="ara",
+            instructions="Be brief.",
+            task_continuity=True,
+            automatic_response=automatic_response,
+        )
+        if automatic_response:
+            with pytest.raises(rt.RealtimeSessionError, match="explicit response"):
+                await adapter.connect(setup)
+            assert client.connect_args is None
+            assert socket.sent == []
+        else:
+            await adapter.connect(setup)
+            assert (
+                socket.sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"]
+                is False
+            )
+            await adapter.close()
+
+    asyncio.run(scenario())
+
+
+def test_native_input_and_isolated_summary_commands_preserve_scope():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(
+            rt.SessionSetup(
+                model="grok-voice-test",
+                voice="ara",
+                instructions="Be brief.",
+                task_continuity=True,
+                automatic_response=False,
+            )
+        )
+        await adapter.send(
+            (
+                rt.AddInputText(item_id="input-1", text="  original\n text  "),
+                rt.StartResponse(
+                    metadata={"talk_request_id": "req-1"},
+                    input=({"type": "item_reference", "id": "input-1"},),
+                ),
+                rt.StartResponse(
+                    metadata={"talk_presentation_id": "summary-1"},
+                    allow_tools=False,
+                    conversation="none",
+                    input=(),
+                    instructions="Summarize the authorized result.",
+                    max_output_tokens=200,
+                ),
+                rt.CancelResponse(response_id="response-old"),
+            )
+        )
+        await adapter.close()
+        return socket.sent[1:]
+
+    sent = asyncio.run(scenario())
+    assert sent[0] == {
+        "type": "conversation.item.create",
+        "item": {
+            "id": "input-1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "  original\n text  "}],
+        },
+    }
+    assert sent[1] == {
+        "type": "response.create",
+        "response": {
+            "metadata": {"talk_request_id": "req-1"},
+            "input": [{"type": "item_reference", "id": "input-1"}],
+        },
+    }
+    assert sent[2] == {
+        "type": "response.create",
+        "response": {
+            "metadata": {"talk_presentation_id": "summary-1"},
+            "tool_choice": "none",
+            "input": [],
+            "conversation": "none",
+            "tools": [],
+            "instructions": "Summarize the authorized result.",
+            "max_output_tokens": 200,
+        },
+    }
+    assert sent[3] == {"type": "response.cancel", "response_id": "response-old"}
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed", "incomplete"])
+def test_native_terminal_tool_declarations_preserve_provider_status(status):
+    output = [
+        {
+            "type": "function_call",
+            "id": "item-call",
+            "call_id": "call-1",
+            "name": "delegate_task",
+            "arguments": '{"goal":"Build"}',
+        }
+    ]
+    event = grok_rt.decode_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "response-1",
+                "status": status,
+                "output": output,
+            },
+        }
+    )
+    assert event == rt.ResponseFinished("response-1", status, output)
+    output[0]["call_id"] = "changed-after-decoding"
+    assert event.output[0]["call_id"] == "call-1"
+    missing = grok_rt.decode_event({"type": "response.done", "response": {"id": "response-2"}})
+    assert missing.status is None and missing.output is None
+
+
+def test_late_transcripts_keep_per_item_commit_and_dedupe_state():
+    async def scenario():
+        events = [
+            {"type": "input_audio_buffer.speech_started", "item_id": "a"},
+            {"type": "input_audio_buffer.committed", "item_id": "a"},
+            {"type": "input_audio_buffer.speech_started", "item_id": "b"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "a",
+                "transcript": "first",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "b",
+                "transcript": "second",
+            },
+            {"type": "input_audio_buffer.committed", "item_id": "b"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "b",
+                "transcript": "second",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "a",
+                "transcript": "first",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.updated",
+                "item_id": "a",
+                "transcript": "late partial",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "uncommitted",
+                "transcript": "cannot authorize",
+            },
+        ]
+        adapter, _client = _adapter(_Socket(events))
+        await adapter.connect(_setup())
+        decoded = [event async for event in adapter]
+        await adapter.close()
+        return [event for event in decoded if isinstance(event, rt.Transcript)]
+
+    assert [(event.item_id, event.text, event.final) for event in asyncio.run(scenario())] == [
+        ("a", "first", True),
+        ("b", "second", False),
+        ("b", "second", True),
+        ("uncommitted", "cannot authorize", False),
+    ]
+
+
+def test_native_truncate_refusal_never_sends_an_unscoped_cancel():
+    async def scenario():
+        socket = _Socket(
+            [
+                {"type": "error", "error": {"message": "conversation.item.truncate unsupported"}},
+                {
+                    "type": "response.done",
+                    "response": {"id": "old", "status": "cancelled", "output": []},
+                },
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(
+            rt.SessionSetup(
+                model="grok-voice-test",
+                voice="ara",
+                instructions="Be brief.",
+                task_continuity=True,
+                automatic_response=False,
+            )
+        )
+        event = await adapter.__anext__()
+        assert event == rt.ResponseFinished("old", "cancelled", [])
+        await adapter.send((rt.CancelResponse("old"), rt.TruncateOutput("old-item", 50)))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == [{"type": "response.cancel", "response_id": "old"}]

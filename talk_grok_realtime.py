@@ -144,37 +144,40 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(command.data).decode("ascii"),
         }
-    if isinstance(command, rt.AddContext):
+    if isinstance(command, (rt.AddContext, rt.AddInputText)):
         return {
             "type": "conversation.item.create",
             "item": {
                 "id": command.item_id,
                 "type": "message",
-                "role": command.role.value,
+                "role": "user" if isinstance(command, rt.AddInputText) else command.role.value,
                 "content": [{"type": "input_text", "text": command.text}],
             },
         }
     if isinstance(command, rt.RemoveContext):
         return {"type": "conversation.item.delete", "item_id": command.item_id}
     if isinstance(command, rt.StartResponse):
-        if command.input is not None or command.conversation is not None:
-            raise rt.RealtimeSessionError(
-                "Grok explicit task input/context isolation is unverified"
-            )
         response: dict[str, Any] = {}
         if command.metadata:
             response["metadata"] = dict(command.metadata)
         if command.allow_tools is False:
             response["tool_choice"] = "none"
+        if command.input is not None:
+            response["input"] = rt.wire_value(command.input)
+        if command.conversation is not None:
+            response["conversation"] = command.conversation
+        if command.conversation == "none":
+            response["tools"] = []
         if command.instructions is not None:
             response["instructions"] = command.instructions
         if command.max_output_tokens is not None:
             response["max_output_tokens"] = command.max_output_tokens
         return {"type": "response.create", **({"response": response} if response else {})}
     if isinstance(command, rt.CancelResponse):
-        if command.response_id is not None:
-            raise rt.RealtimeSessionError("Grok response-ID cancellation is unverified")
-        return {"type": "response.cancel"}
+        return {
+            "type": "response.cancel",
+            **({"response_id": command.response_id} if command.response_id else {}),
+        }
     if isinstance(command, rt.TruncateOutput):
         return {
             "type": "conversation.item.truncate",
@@ -362,7 +365,9 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
         if event_type == "response.done":
             response = _mapping(event.get("response"))
             return rt.ResponseFinished(
-                response_id=response.get("id"), status=response.get("status"), output=response.get("output")
+                response_id=response.get("id"),
+                status=response.get("status"),
+                output=response.get("output"),
             )
         if event_type == "error":
             return rt.ProviderFailure(
@@ -374,54 +379,42 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
 
 
 class _InputTranscriptDedupe:
-    """Per-utterance filter over xAI's cumulative input transcription stream.
+    """Keep cumulative ASR state per provider input item, including late finals."""
 
-    Live wire behavior (smoke, 2026-08-28): xAI repeats cumulative snapshots
-    verbatim and can send ``.completed`` several times per input item, so the
-    decoded stream stutters. This filter keeps the neutral contract — live
-    non-final partials plus exactly one final per utterance:
-
-    - a new input item (``speech_started``/``committed`` with a new id)
-      resets the utterance, so two identical turns both print;
-    - a pre-commit ``.completed`` is still a cumulative snapshot, so it is
-      downgraded to a non-final partial;
-    - an identical repeat of the last emitted snapshot is suppressed;
-    - the first post-commit completion is the one final; later copies are
-      dropped. A final is never snapshot-suppressed — the relay only prints
-      finals, so suppressing one would erase the turn entirely.
-    """
+    MAX_ITEMS = 256
 
     def __init__(self) -> None:
         self._item_id: str | None = None
-        self._committed = False
-        self._snapshot: str | None = None
-        self._final_emitted = False
+        self._items: dict[str | None, dict[str, Any]] = {}
 
-    def _reset(self) -> None:
-        self._committed = False
-        self._snapshot = None
-        self._final_emitted = False
+    def _item(self, item_id: str | None) -> dict[str, Any]:
+        if item_id not in self._items:
+            self._items[item_id] = {"committed": False, "snapshot": None, "final": False}
+            while len(self._items) > self.MAX_ITEMS:
+                self._items.pop(next(iter(self._items)))
+        return self._items[item_id]
 
     def begin_item(self, item_id: str | None) -> None:
-        if isinstance(item_id, str) and item_id and item_id != self._item_id:
+        if isinstance(item_id, str) and item_id:
             self._item_id = item_id
-            self._reset()
+            self._item(item_id)
 
     def mark_committed(self) -> None:
-        self._committed = True
+        self._item(self._item_id)["committed"] = True
 
     def admit(self, event: rt.Transcript) -> rt.Transcript | None:
-        final = event.final and self._committed
-        if final:
-            if self._final_emitted:
-                return None
-            self._final_emitted = True
-        elif event.text == self._snapshot:
+        # Missing IDs retain the legacy caption behavior but stay missing on
+        # the event: a task controller must never infer their execution owner.
+        item = self._item(event.item_id if event.item_id is not None else self._item_id)
+        if item["final"]:
             return None
-        self._snapshot = event.text
-        if final == event.final:
-            return event
-        return replace(event, final=False)
+        final = event.final and item["committed"]
+        if final:
+            item["final"] = True
+        elif event.text == item["snapshot"]:
+            return None
+        item["snapshot"] = event.text
+        return event if final == event.final else replace(event, final=False)
 
 
 class GrokWireError(RuntimeError):
@@ -661,14 +654,14 @@ class GrokRealtimeSession:
         self._truncate_supported = True
         self._truncate_degrade_logged = False
         self._input_dedupe = _InputTranscriptDedupe()
+        self._task_continuity = False
 
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
-        if setup.task_continuity:
-            raise rt.RealtimeSessionError(
-                "Grok canonical task context isolation needs protocol proof"
-            )
+        if setup.task_continuity and setup.automatic_response:
+            raise rt.RealtimeSessionError("Canonical task mode requires explicit response creation")
+        self._task_continuity = setup.task_continuity
         try:
             _validate_turn_detection(setup)
         except rt.RealtimeSessionError:
@@ -702,6 +695,11 @@ class GrokRealtimeSession:
             if isinstance(command, rt.TruncateOutput) and not self._truncate_supported
             else encode_command(command)
             for command in commands
+            if not (
+                self._task_continuity
+                and isinstance(command, rt.TruncateOutput)
+                and not self._truncate_supported
+            )
         )
         try:
             await self._wire.send_json(encoded)
@@ -724,9 +722,11 @@ class GrokRealtimeSession:
         if not self._truncate_degrade_logged:
             self._truncate_degrade_logged = True
             logger.warning(
-                "grok realtime: server refused conversation.item.truncate (%s); "
-                "barge-in degrades to cancel-only for the rest of this session",
+                "grok realtime: server refused conversation.item.truncate (%s); %s",
                 detail,
+                "barge-in uses local playback draining and explicit cancellation"
+                if self._task_continuity
+                else "barge-in degrades to cancel-only for the rest of this session",
             )
         return True
 

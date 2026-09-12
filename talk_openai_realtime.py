@@ -115,13 +115,13 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(command.data).decode("ascii"),
         }
-    if isinstance(command, rt.AddContext):
+    if isinstance(command, (rt.AddContext, rt.AddInputText)):
         return {
             "type": "conversation.item.create",
             "item": {
                 "id": command.item_id,
                 "type": "message",
-                "role": command.role.value,
+                "role": "user" if isinstance(command, rt.AddInputText) else command.role.value,
                 "content": [{"type": "input_text", "text": command.text}],
             },
         }
@@ -302,7 +302,9 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
         if event_type == "response.done":
             response = _mapping(event.get("response"))
             return rt.ResponseFinished(
-                response_id=response.get("id"), status=response.get("status"), output=response.get("output")
+                response_id=response.get("id"),
+                status=response.get("status"),
+                output=response.get("output"),
             )
         if event_type == "error":
             error = event.get("error")

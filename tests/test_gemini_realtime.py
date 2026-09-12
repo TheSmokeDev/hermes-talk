@@ -1351,3 +1351,292 @@ def test_gemini_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._gemini_auth()
     assert auth.token == "gemini-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+def test_typed_input_preserves_text_without_inventing_a_provider_item_id():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup())
+        await adapter.send((rt.AddInputText("local-input-1", "  Original\ntext  "),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == [
+        {
+            "clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": "  Original\ntext  "}]}],
+                "turnComplete": False,
+            }
+        }
+    ]
+
+
+def _task_setup():
+    return rt.SessionSetup(
+        model="gemini-test",
+        voice="Puck",
+        instructions="Use Hermes for actions.",
+        automatic_response=True,
+        task_continuity=True,
+        tools=(rt.ToolDefinition("delegate_task", "Delegate", {"type": "object"}),),
+    )
+
+
+def _batch(*ids):
+    return {
+        "toolCall": {
+            "functionCalls": [
+                {"id": call_id, "name": "delegate_task", "args": {"goal": "proposed work"}}
+                for call_id in ids
+            ]
+        }
+    }
+
+
+def test_task_mode_captures_partial_input_before_real_batch_and_keeps_wire_ids():
+    async def scenario():
+        packet = _batch("call-a", "call-b")
+        packet["serverContent"] = {"inputTranscription": {"text": "  start the job"}}
+        socket = _Socket(
+            [
+                {"setupComplete": {}},
+                packet,
+                _batch("call-a", "call-b"),
+                {
+                    "serverContent": {
+                        "inputTranscription": {"text": " after this."},
+                        "outputTranscription": {"text": "I am checking."},
+                        "generationComplete": True,
+                        "turnComplete": True,
+                    }
+                },
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        events = []
+        async for event in adapter:
+            events.append(event)
+            if isinstance(event, rt.DelegationRequested):
+                await adapter.send(
+                    (rt.SubmitDelegationResult(event.delegation_id, "Job 12 started."),)
+                )
+                await adapter.send(
+                    (rt.SubmitDelegationResult(event.delegation_id, "Job 12 started."),)
+                )
+        await adapter.close()
+        return socket, adapter, events
+
+    socket, adapter, events = asyncio.run(scenario())
+    assert adapter.uses_client_delegation is True
+    assert adapter.session_identity_origin == "adapter_connection"
+    assert adapter.supports_live_context is False
+    assert isinstance(events[0], rt.SessionReady)
+    assert events[1] == rt.Transcript(
+        rt.TranscriptRole.USER,
+        "  start the job",
+        False,
+        rt.TranscriptProvenance.INPUT_AUDIO,
+    )
+    delegation = events[2]
+    assert isinstance(delegation, rt.DelegationRequested)
+    assert delegation.delegation_id == "call-a"
+    assert [call["id"] for call in json.loads(delegation.prompt)["proposals"]] == [
+        "call-a",
+        "call-b",
+    ]
+    assert sum(isinstance(event, rt.DelegationRequested) for event in events) == 1
+    assert not any(
+        isinstance(event, (rt.ResponseStarted, rt.ResponseFinished, rt.FunctionCall))
+        for event in events
+    )
+    transcripts = [event for event in events if isinstance(event, rt.Transcript)]
+    assert all(
+        not event.final and event.item_id is None and event.response_id is None
+        for event in transcripts
+    )
+    assert [event.text for event in transcripts] == [
+        "  start the job",
+        " after this.",
+        "I am checking.",
+    ]
+    responses = socket.sent[1:]
+    assert len(responses) == 1
+    returned = responses[0]["toolResponse"]["functionResponses"]
+    assert [(call["id"], call["name"]) for call in returned] == [
+        ("call-a", "delegate_task"),
+        ("call-b", "delegate_task"),
+    ]
+    assert all(call["response"]["result"] == "Job 12 started." for call in returned)
+    assert all("whole proposed batch" in call["response"]["scope"] for call in returned)
+
+
+@pytest.mark.parametrize("cancel_first", [True, False])
+def test_cancelling_one_provider_call_retires_batch_and_suppresses_late_result(cancel_first):
+    async def scenario():
+        call = _batch("call-a", "call-b")
+        cancel = {"toolCallCancellation": {"ids": ["call-b"]}}
+        socket = _Socket([cancel, call] if cancel_first else [call, cancel])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        events = [event async for event in adapter]
+        await adapter.send((rt.SubmitDelegationResult("call-a", "Already complete."),))
+        await adapter.close()
+        return socket.sent[1:], events
+
+    sent, events = asyncio.run(scenario())
+    assert sent == []
+    assert rt.DelegationRetired("call-a") in events
+    assert sum(isinstance(event, rt.DelegationRequested) for event in events) == (
+        0 if cancel_first else 1
+    )
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"toolCall": {"functionCalls": [{"id": "c", "name": "delegate_task", "args": "wrong"}]}},
+        {"toolCall": {"functionCalls": [{"name": "delegate_task", "args": {}}]}},
+        {
+            "toolCall": {
+                "functionCalls": [{"id": "c", "name": "delegate_task", "args": {"g": "x" * 16000}}]
+            }
+        },
+        _batch("same", "same"),
+        _batch(),
+    ],
+)
+def test_invalid_task_batches_fail_without_delegation_authority(broken):
+    async def scenario():
+        adapter, _client = _adapter(_Socket([broken]))
+        await adapter.connect(_task_setup())
+        event = await adapter.__anext__()
+        await adapter.close()
+        return event
+
+    event = asyncio.run(scenario())
+    assert isinstance(event, rt.ProviderFailure) and event.terminal
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        _batch("a", "different"),
+        _batch("new", "b"),
+    ],
+)
+def test_batch_identity_cannot_change_or_share_a_previous_call(changed):
+    async def scenario():
+        adapter, _client = _adapter(_Socket([_batch("a", "b"), changed]))
+        await adapter.connect(_task_setup())
+        first, second = await adapter.__anext__(), await adapter.__anext__()
+        await adapter.close()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert isinstance(first, rt.DelegationRequested)
+    assert isinstance(second, rt.ProviderFailure) and second.terminal
+
+
+def test_unknown_or_changed_delegation_result_cannot_send_another_tool_response():
+    async def scenario():
+        socket = _Socket([_batch("a")])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        with pytest.raises(rt.RealtimeSessionError, match="Unobserved"):
+            await adapter.send((rt.SubmitDelegationResult("unknown", "Result"),))
+        await adapter.__anext__()
+        await adapter.send((rt.SubmitDelegationResult("a", "Original"),))
+        with pytest.raises(rt.RealtimeSessionError, match="changed"):
+            await adapter.send((rt.SubmitDelegationResult("a", "Different"),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert len(asyncio.run(scenario())) == 1
+
+
+def test_task_mode_refuses_unavailable_summary_isolation_before_any_wire_send():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        with pytest.raises(rt.RealtimeSessionError, match=r"render.*text"):
+            await adapter.send((rt.AppendLiveContext("Job complete.", kind="message"),))
+        with pytest.raises(rt.RealtimeSessionError, match="captured delegation mode"):
+            await adapter.send((rt.StartResponse(),))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_task_mode_interruption_drops_cancelled_audio_until_provider_turn_boundary():
+    def output(text):
+        return {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": _b64(text)}}
+                    ]
+                }
+            }
+        }
+
+    async def scenario():
+        socket = _Socket(
+            [output(b"old voice"), {"serverContent": {"turnComplete": True}}, output(b"new voice")]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        await adapter.send((rt.CancelResponse(),))
+        events = [event async for event in adapter]
+        await adapter.close()
+        return socket.sent[1:], events
+
+    sent, events = asyncio.run(scenario())
+    assert sent == []
+    assert [event.data for event in events if isinstance(event, rt.OutputAudio)] == [b"new voice"]
+
+
+
+def test_task_cancellation_capacity_fails_closed_instead_of_forgetting_old_retractions():
+    async def scenario():
+        ids = [f"cancel-{index}" for index in range(gemini_rt.MAX_CANCELLED_CALL_IDS + 1)]
+        adapter, _client = _adapter(_Socket([{"toolCallCancellation": {"ids": ids}}]))
+        await adapter.connect(_task_setup())
+        event = await adapter.__anext__()
+        await adapter.close()
+        return event, adapter
+
+    event, adapter = asyncio.run(scenario())
+    assert isinstance(event, rt.ProviderFailure) and event.terminal
+    assert "capacity" in event.detail
+    assert "cancel-0" in adapter._cancelled_call_ids
+
+
+
+def test_controller_cancel_after_bundled_provider_interrupt_does_not_mute_the_next_turn():
+    def output(data):
+        return {"modelTurn": {"parts": [{"inlineData": {
+            "mimeType": "audio/pcm;rate=24000", "data": _b64(data),
+        }}]}}
+
+    async def scenario():
+        socket = _Socket([
+            {"serverContent": output(b"before")},
+            {"serverContent": {
+                **output(b"discard tail"), "interrupted": True, "turnComplete": True,
+            }},
+            {"serverContent": output(b"after!")},
+        ])
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_task_setup())
+        before = await adapter.__anext__()
+        interruption = await adapter.__anext__()
+        assert isinstance(interruption, rt.SpeechStarted)
+        await adapter.send((rt.CancelResponse(),))
+        after = await adapter.__anext__()
+        await adapter.close()
+        return before, after
+
+    assert asyncio.run(scenario()) == (rt.OutputAudio(b"before"), rt.OutputAudio(b"after!"))
