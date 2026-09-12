@@ -127,7 +127,7 @@ def test_delegation_dedup_and_result_validation(mode):
     asyncio.run(run())
 
 
-def test_subscription_superseding_delegation_retires_old_result_authority():
+def test_subscription_later_delegation_preserves_original_result_identity():
     async def run():
         session, wire, setup = session_peer("subscription")
         await session.connect(setup)
@@ -135,13 +135,15 @@ def test_subscription_superseding_delegation_retires_old_result_authority():
         wire.emit(delegation("one", legacy=True))
         await anext(session)
         wire.emit(delegation("two", legacy=True))
-        assert await anext(session) == rt.DelegationRetired("one")
         assert (await anext(session)).delegation_id == "two"
-        with pytest.raises(rt.RealtimeSessionError, match="retired"):
-            await session.send([rt.SubmitDelegationResult("one", "late result")])
         await session.send([rt.SubmitDelegationResult("two", "current result")])
-        assert wire.sent[0]["delegation_item_id"] == "two"
+        await session.send([rt.SubmitDelegationResult("one", "late result")])
+        await session.send([rt.SubmitDelegationResult("one", "completed result")])
+        assert [event["delegation_item_id"] for event in wire.sent] == ["two", "one", "one"]
+        assert not session.finalized
         await session.close()
+        with pytest.raises(rt.RealtimeSessionError, match="not connected"):
+            await session.send([rt.SubmitDelegationResult("one", "after close")])
 
     asyncio.run(run())
 

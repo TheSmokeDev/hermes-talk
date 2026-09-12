@@ -86,6 +86,7 @@ def registry_for(environment, *, decision=None, clock=None, require_auth=None):
         manager, None, lambda _: [{"name": "delegate_task"}], decide=decision
     )
     browser = FakeBrowser()
+    manager.live_capabilities = lambda _bound: "computer_use, file_read (verified fixture host)"
     observed = []
 
     async def negotiate(sdp, setup, auth, config):
@@ -99,6 +100,7 @@ def registry_for(environment, *, decision=None, clock=None, require_auth=None):
         lambda _: [],
         require_auth or (lambda _: None),
         coordinator=coordinator,
+        catalog=lambda: SimpleNamespace(tools_resolved=True, tools=["computer_use", "file_read"]),
         negotiate=negotiate,
         env={"TALK_LIVE_AUTH": "api", "TALK_OPENAI_API_KEY": "fixture-live-api-key"},
         **({"clock": clock} if clock else {}),
@@ -128,6 +130,8 @@ def transcript(text="Inspect my project", *, final=False, item_id="audio-one"):
         final,
         rt.TranscriptProvenance.INPUT_AUDIO,
         item_id=item_id,
+        event_id="event-" + item_id,
+        finality="turn" if final else "delta",
         start_ms=0,
         end_ms=900,
     )
@@ -153,6 +157,9 @@ def test_answer_waits_for_sideband_and_descriptor_excludes_credentials(environme
         assert "fixture-live-api-key" not in json.dumps(response)
         assert "Earlier typed task" in fixture.observed[0][1].instructions
         assert binding.provider_session_id == fixture.browser.session_id
+        assert "computer_use" in fixture.observed[0][1].instructions
+        assert "call the talk_capabilities" not in fixture.observed[0][1].instructions
+        assert fixture.observed[0][1].tools == ()
         await fixture.registry.close_all()
         assert fixture.browser.closed and not binding.tasks
 
@@ -209,17 +216,26 @@ def test_delegation_does_not_block_transcript_pump_and_retirement_does_not_cance
             lambda: any(event.get("text") == "Still here" for event, _ in binding.events)
         )
         fixture.browser.session.queue.put_nowait(rt.DelegationRetired("pending"))
-        await wait_for(lambda: "pending" not in binding.pending)
+        await wait_for(lambda: "pending" in binding.retired)
+        assert "pending" in binding.pending and not fixture.host.jobs
         fixture.decision.release.set()
-        assert not fixture.host.jobs
+        await wait_for(lambda: "pending" not in binding.pending)
+        assert len(fixture.host.jobs) == 1
+        assert binding.deliveries and not fixture.browser.session.commands
         fixture.browser.session.queue.put_nowait(
             transcript("A fresh project request", item_id="new")
         )
         fixture.browser.session.queue.put_nowait(rt.DelegationRequested("accepted"))
-        await wait_for(lambda: bool(fixture.host.jobs))
+        await wait_for(lambda: len(fixture.host.jobs) == 2)
+        await binding.proactive({"sequence": 1, "operator_speaking": False,
+                                 "playback_active": False, "response_pending": False,
+                                 "input_pending": False, "tools_pending": False})
+        assert any(isinstance(command, rt.SubmitDelegationResult)
+                   and command.delegation_id == "pending"
+                   for command in fixture.browser.session.commands)
         fixture.browser.session.queue.put_nowait(rt.DelegationRetired("accepted"))
         await binding.close()
-        assert len(fixture.host.jobs) == 1
+        assert len(fixture.host.jobs) == 2
         assert not any(path.endswith("/stop") for _, path, _, _ in fixture.host.requests)
         await fixture.registry.close_all()
 
@@ -274,8 +290,10 @@ def test_browser_typed_input_has_one_receipt_and_context_append_per_input_id(env
     async def run():
         fixture = registry_for(environment)
         _, binding = await start(fixture)
-        assert await binding.typed("Inspect this exactly  ", "typed-one") == {"ok": True}
-        assert await binding.typed("Inspect this exactly  ", "typed-one") == {"ok": True}
+        receipt = await binding.typed("Inspect this exactly  ", "typed-one")
+        assert receipt["ok"] and receipt["pending"] and receipt["operation_id"]
+        assert await binding.typed("Inspect this exactly  ", "typed-one") == receipt
+        await wait_for(lambda: len(fixture.browser.session.commands) == 1)
         with pytest.raises(DashboardTaskError, match="different content"):
             await binding.typed("Different request", "typed-one")
         assert len(fixture.host.jobs) == len(fixture.decision.calls) == 1
@@ -401,10 +419,12 @@ def test_proactive_result_uses_quiet_timing_and_records_sent_not_heard(environme
         summaries = [
             command
             for command in fixture.browser.session.commands
-            if isinstance(command, rt.AppendLiveContext)
+            if isinstance(command, rt.SubmitDelegationResult)
+            and "completed" in command.content
         ]
         assert len(summaries) == 1 and "completed" in summaries[0].content
         assert "launch another task" not in summaries[0].content
+        assert summaries[0].delegation_id == "delegation-one"
         assert any(
             event.get("result", {}).get("output", "").startswith("Full result")
             for event in response["events"]
