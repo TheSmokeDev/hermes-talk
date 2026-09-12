@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -43,6 +44,10 @@ class NativeLiveTaskController(NativeTaskController):
         self.transcript_lock = asyncio.Lock()
         self.transcript_tasks = set()
         self.provider_response_active = False
+        self.pending_history = None
+        self.pending_messages = deque()
+        self.update_lock = asyncio.Lock()
+        self.no_input_proposals = 0
 
     async def _capture(self, fragment):
         async with self.transcript_lock:
@@ -108,10 +113,11 @@ class NativeLiveTaskController(NativeTaskController):
         selection = result.get("selection")
         if selection and self.on_selection is not None and await self.on_selection(selection):
             return result
-        self.synthetic_output = True
-        self.synthetic_cutoff_ms = None
         if getattr(self.session, "supports_live_context", True):
-            await self.send([rt.AppendLiveContext(result["output"], kind="message")])
+            if len(self.pending_messages) >= 16:
+                raise NativeTaskError("Voice update queue is full; the canonical result is saved")
+            self.pending_messages.append(rt.AppendLiveContext(result["output"], kind="message"))
+            await self._flush_updates()
         else:
             self.notice({"state": "text_only", "reason": "provider_context_append_unsupported"})
         return result
@@ -197,8 +203,24 @@ class NativeLiveTaskController(NativeTaskController):
             eligible.append((sequence, fragment))
         originals = [fragment for _, fragment in eligible if fragment["role"] == "user"]
         if not originals:
+            self.no_input_proposals += 1
+            if self.no_input_proposals > 3:
+                raise NativeTaskError("Provider repeated tool proposals without new operator input")
+            self.delegations[event.delegation_id] = _Delegation(event, {}, finished=True)
             self.notice({"state": "refused", "reason": "delegation_has_no_new_operator_input"})
+            await self._send_synthetic(
+                [
+                    rt.SubmitDelegationResult(
+                        event.delegation_id,
+                        "No new operator input was captured. No action or approval was authorized. "
+                        "Continue listening; do not propose another tool "
+                        "until the operator speaks.",
+                    )
+                ],
+                source_sequence=self.claimed_sequence,
+            )
             return
+        self.no_input_proposals = 0
         frozen = [dict(fragment) for _, fragment in eligible]
         body = {
             "provider_session_id": self.provider_session_id,
@@ -229,11 +251,7 @@ class NativeLiveTaskController(NativeTaskController):
         selection = result.get("selection")
         if selection and self.on_selection is not None and await self.on_selection(selection):
             return
-        commands = [
-            rt.SubmitDelegationResult(
-                call.event.delegation_id, result["output"], kind=result.get("kind", "commentary")
-            )
-        ]
+        commands = []
         if (
             getattr(self.session, "supports_live_context", True)
             and isinstance(result.get("context"), str)
@@ -244,9 +262,12 @@ class NativeLiveTaskController(NativeTaskController):
                     result["context"], kind="context", delegation_id=call.event.delegation_id
                 )
             )
-        self.synthetic_output = True
-        self.synthetic_cutoff_ms = None
-        await self.send(commands)
+        commands.append(
+            rt.SubmitDelegationResult(
+                call.event.delegation_id, result["output"], kind=result.get("kind", "commentary")
+            )
+        )
+        await self._send_synthetic(commands, source_sequence=self.claimed_sequence)
 
     async def handle(self, event):
         self.guard()
@@ -261,6 +282,12 @@ class NativeLiveTaskController(NativeTaskController):
         elif isinstance(event, rt.DelegationRetired):
             if event.delegation_id in self.delegations:
                 self.delegations[event.delegation_id].retired = True
+        elif isinstance(event, rt.OutputInterrupted):
+            self.audio.drain_playback()
+            self.provider_response_active = False
+            self.presentation = None
+        elif isinstance(event, rt.OutputTurnCompleted):
+            self.provider_response_active = False
         elif isinstance(event, rt.OutputAudio):
             self.spoken_item = event.item_id
             self.provider_response_active = True
@@ -290,7 +317,11 @@ class NativeLiveTaskController(NativeTaskController):
         self.sequence += 1
         return {
             "sequence": self.sequence,
-            "operator_speaking": self.operator_speaking,
+            "operator_speaking": self.operator_speaking
+            or (
+                self.last_input_activity is not None
+                and self.clock() - self.last_input_activity < 0.7
+            ),
             "playback_active": bool(getattr(self.audio, "playback_pending", True)),
             "response_pending": self.provider_response_active,
             "input_pending": bool(self.transcript_tasks)
@@ -306,12 +337,66 @@ class NativeLiveTaskController(NativeTaskController):
 
     async def tick(self):
         await super().tick()
-        if not getattr(self.audio, "playback_pending", True):
+        if not getattr(self.session, "emits_output_lifecycle", False) and not getattr(
+            self.audio, "playback_pending", True
+        ):
             self.provider_response_active = False
+        await self._flush_updates()
+
+    def _quiet(self):
+        return not any(value for key, value in self.timing().items() if key != "sequence")
+
+    async def _send_synthetic(self, commands, *, quiet=False, source_sequence=None):
+        async with self.send_lock:
+            self.guard()
+            if quiet and not self._quiet():
+                return False
+            self.synthetic_sequence = max(
+                self.synthetic_sequence,
+                self.fragment_sequence if source_sequence is None else source_sequence,
+            )
+            self.synthetic_output = True
+            self.synthetic_cutoff_ms = None
+            self._prune_fragments()
+            if getattr(self.session, "emits_output_lifecycle", False) and any(
+                isinstance(command, rt.SubmitDelegationResult)
+                or (
+                    isinstance(command, rt.AppendLiveContext)
+                    and (
+                        command.kind == "message"
+                        or not getattr(self.session, "supports_silent_live_context", True)
+                    )
+                )
+                for command in commands
+            ):
+                self.provider_response_active = True
+            await self.session.send(tuple(commands))
+            self.guard()
+            return True
+
+    async def _flush_updates(self):
+        async with self.update_lock:
+            self.guard()
+            if not self._quiet():
+                return
+            if self.pending_messages:
+                command = self.pending_messages.popleft()
+                if not await self._send_synthetic([command], quiet=True):
+                    self.pending_messages.appendleft(command)
+            elif self.pending_history is not None:
+                text, self.pending_history = self.pending_history, None
+                if (
+                    not await self._send_synthetic(
+                        [rt.AppendLiveContext(text, kind="context")], quiet=True
+                    )
+                    and self.pending_history is None
+                ):
+                    self.pending_history = text
 
     async def _send_history_context(self, text):
         if getattr(self.session, "supports_live_context", True):
-            await self.send([rt.AppendLiveContext(text, kind="context")])
+            self.pending_history = text
+            await self._flush_updates()
         else:
             self.notice({"state": "text_only", "reason": "provider_context_append_unsupported"})
 
@@ -335,13 +420,12 @@ class NativeLiveTaskController(NativeTaskController):
         if any(value for key, value in self.timing().items() if key != "sequence"):
             await self.request("/speech/receipt", {**receipt, "state": "deferred"})
             return
-        self.synthetic_sequence = self.fragment_sequence
-        self.synthetic_output = True
-        self.synthetic_cutoff_ms = None
         if speech.get("result") is not None and self.on_result is not None:
             self.on_result(speech["result"])
-        await self.send([rt.AppendLiveContext(commentary, kind="message")])
-        await self.request("/speech/receipt", {**receipt, "state": "sent"})
+        sent = await self._send_synthetic(
+            [rt.AppendLiveContext(commentary, kind="message")], quiet=True
+        )
+        await self.request("/speech/receipt", {**receipt, "state": "sent" if sent else "deferred"})
 
     async def close(self):
         with suppress(NativeTaskError):

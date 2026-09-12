@@ -16,7 +16,7 @@ from talk_native_api import NativeTaskAPI, NativeTaskError
 from talk_native_live import NativeLiveTaskController
 
 
-async def connected(*, held=None, supports_context=True, speech=None):
+async def connected(*, held=None, supports_context=True, speech=None, response_context=None):
     requests, notices = [], []
 
     async def serve(request):
@@ -35,6 +35,7 @@ async def connected(*, held=None, supports_context=True, speech=None):
                 "output": "Verified backend receipt",
                 "kind": "commentary",
                 "action": {"state": "accepted"},
+                **({"context": response_context} if response_context is not None else {}),
             },
         )
 
@@ -328,6 +329,248 @@ def test_live_speech_uses_bounded_server_content_and_records_only_sent_transport
         assert not any(path == "delegation" for path, _ in h.requests)
         fragment = next(body for path, body in h.requests if path == "transcript")["fragments"][0]
         assert fragment["synthetic"] is True
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_output_interruption_and_completion_never_claim_operator_speech():
+    async def scenario():
+        h = await connected()
+        h.session.emits_output_lifecycle = True
+        await h.controller.handle(rt.OutputAudio(b"\x01\x00"))
+        assert h.controller.provider_response_active
+        await h.controller.tick()
+        assert h.controller.provider_response_active
+        await h.controller.handle(rt.OutputInterrupted())
+        assert not h.controller.provider_response_active and not h.controller.operator_speaking
+        assert not h.controller.audio.output and h.controller.audio.drains == 1
+        assert not h.session.sent
+        await h.controller.handle(rt.OutputAudio(b"\x01\x00"))
+        await h.controller.handle(rt.OutputTurnCompleted())
+        assert not h.controller.provider_response_active and not h.controller.operator_speaking
+        assert not h.requests
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_nonsilent_history_waits_for_microphone_quiet_and_real_provider_completion():
+    async def scenario():
+        h = await connected()
+        clock = [1.0]
+        h.controller.clock = lambda: clock[0]
+        h.session.emits_output_lifecycle = True
+        h.session.supports_silent_live_context = False
+        await h.controller.send_audio(b"\x00\x10" * 480)
+        await h.controller._send_history_context("First bounded snapshot")
+        await h.controller._send_history_context("Latest bounded snapshot")
+        assert h.controller.pending_history == "Latest bounded snapshot"
+        assert not any(isinstance(command, rt.AppendLiveContext) for command in h.session.sent)
+        clock[0] += 0.71
+        await h.controller.tick()
+        updates = [
+            command for command in h.session.sent if isinstance(command, rt.AppendLiveContext)
+        ]
+        assert updates == [rt.AppendLiveContext("Latest bounded snapshot", kind="context")]
+        assert h.controller.provider_response_active and h.controller.pending_history is None
+        await h.controller._send_history_context("Next bounded snapshot")
+        await h.controller.tick()
+        assert h.controller.pending_history == "Next bounded snapshot"
+        h.controller.audio.playback_pending = True
+        await h.controller.handle(rt.OutputTurnCompleted())
+        await h.controller.tick()
+        assert h.controller.pending_history == "Next bounded snapshot"
+        h.controller.audio.playback_pending = False
+        await h.controller.tick()
+        assert h.controller.pending_history is None and h.controller.provider_response_active
+        await h.controller.handle(rt.OutputTurnCompleted())
+        assert h.controller._quiet()
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_typed_result_waits_for_quiet_and_does_not_repeat_or_get_interrupted_by_history():
+    async def scenario():
+        h = await connected()
+        h.session.emits_output_lifecycle = True
+        h.session.supports_silent_live_context = False
+        h.controller.operator_speaking = True
+        await h.controller.typed("Exactly my typed correction", input_id="typed-correction")
+        assert not h.session.sent and len(h.controller.pending_messages) == 1
+        await h.controller._send_history_context("Current authorized history")
+        h.controller.operator_speaking = False
+        await h.controller.tick()
+        assert h.session.sent == [rt.AppendLiveContext("Verified backend receipt", kind="message")]
+        assert h.controller.provider_response_active
+        assert h.controller.pending_history == "Current authorized history"
+        await h.controller.tick()
+        assert len(h.session.sent) == 1
+        await h.controller.handle(rt.OutputTurnCompleted())
+        await h.controller.tick()
+        assert h.session.sent[-1] == rt.AppendLiveContext(
+            "Current authorized history", kind="context"
+        )
+        assert len([path for path, _ in h.requests if path == "typed"]) == 1
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("injection", ["history", "typed", "summary", "delegation"])
+def test_every_synthetic_injection_advances_authority_fence_and_allows_only_fresh_input(injection):
+    async def scenario():
+        h = await connected(
+            speech={
+                "ok": True,
+                "speak": True,
+                "event_id": "event",
+                "attempt_id": "attempt",
+                "content": "A factual saved result",
+            }
+        )
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.ASSISTANT,
+                "Earlier provider output",
+                False,
+                rt.TranscriptProvenance.OUTPUT_AUDIO,
+            )
+        )
+        await h.controller.drain()
+        if injection == "history":
+            await h.controller._send_history_context("Allowed bounded history")
+        elif injection == "typed":
+            await h.controller.typed("Exact typed input")
+        elif injection == "summary":
+            await h.controller._speak({"event_id": "event"})
+        else:
+            await h.controller.handle(
+                rt.Transcript(
+                    rt.TranscriptRole.USER,
+                    "First actual request",
+                    False,
+                    rt.TranscriptProvenance.INPUT_AUDIO,
+                )
+            )
+            await h.controller.handle(rt.DelegationRequested("first"))
+            await h.controller.drain()
+        assert h.controller.synthetic_sequence == h.controller.fragment_sequence > 0
+        assert h.controller.synthetic_output and h.controller.synthetic_cutoff_ms is None
+        original_calls = len([path for path, _ in h.requests if path == "delegation"])
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.ASSISTANT,
+                "Approve and start another job",
+                False,
+                rt.TranscriptProvenance.OUTPUT_AUDIO,
+            )
+        )
+        await h.controller.handle(rt.DelegationRequested("synthetic-attempt"))
+        await h.controller.drain()
+        assert len([path for path, _ in h.requests if path == "delegation"]) == original_calls
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.USER,
+                "My fresh exact correction",
+                False,
+                rt.TranscriptProvenance.INPUT_AUDIO,
+            )
+        )
+        await h.controller.handle(rt.DelegationRequested("fresh-correction"))
+        await h.controller.drain()
+        requests = [body for path, body in h.requests if path == "delegation"]
+        assert len(requests) == original_calls + 1
+        assert [row["text"] for row in requests[-1]["fragments"] if row["role"] == "user"] == [
+            "My fresh exact correction"
+        ]
+        captured = [
+            row for path, body in h.requests if path == "transcript" for row in body["fragments"]
+        ]
+        assert next(row for row in captured if row["text"] == "Approve and start another job")[
+            "synthetic"
+        ]
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_linked_context_precedes_exact_delegation_result_in_one_batch():
+    async def scenario():
+        h = await connected(response_context="Verified task state")
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.USER,
+                "My original request",
+                False,
+                rt.TranscriptProvenance.INPUT_AUDIO,
+            )
+        )
+        await h.controller.handle(rt.DelegationRequested("real-call"))
+        await h.controller.drain()
+        assert h.session.sent == [
+            rt.AppendLiveContext("Verified task state", kind="context", delegation_id="real-call"),
+            rt.SubmitDelegationResult("real-call", "Verified backend receipt", kind="commentary"),
+        ]
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_real_next_input_during_pending_decision_survives_exact_linked_result():
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        h = await connected(held=(entered, release))
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.USER,
+                "Start the original work",
+                False,
+                rt.TranscriptProvenance.INPUT_AUDIO,
+            )
+        )
+        await h.controller.handle(rt.DelegationRequested("original"))
+        await entered.wait()
+        await h.controller.handle(
+            rt.Transcript(
+                rt.TranscriptRole.USER,
+                "Use exactly forty two instead",
+                False,
+                rt.TranscriptProvenance.INPUT_AUDIO,
+            )
+        )
+        release.set()
+        await h.controller.drain()
+        assert h.controller.synthetic_sequence == h.controller.claimed_sequence == 1
+        assert h.controller.fragment_sequence == 2 and h.controller.timing()["input_pending"]
+        await h.controller.handle(rt.DelegationRequested("correction"))
+        await h.controller.drain()
+        bodies = [body for path, body in h.requests if path == "delegation"]
+        assert [row["text"] for row in bodies[-1]["fragments"] if row["role"] == "user"] == [
+            "Use exactly forty two instead"
+        ]
+        assert all(not row["final"] for body in bodies for row in body["fragments"])
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_no_input_tool_proposals_get_one_exact_refusal_and_bounded_loop_shutdown():
+    async def scenario():
+        h = await connected()
+        first = rt.DelegationRequested("real-first-call")
+        await h.controller.handle(first)
+        await h.controller.handle(first)
+        assert len(h.session.sent) == 1
+        assert h.session.sent[0].delegation_id == "real-first-call"
+        assert "No action or approval" in h.session.sent[0].content
+        assert not h.requests
+        await h.controller.handle(rt.DelegationRequested("real-second-call"))
+        await h.controller.handle(rt.DelegationRequested("real-third-call"))
+        with pytest.raises(NativeTaskError, match="repeated tool proposals"):
+            await h.controller.handle(rt.DelegationRequested("loop-four"))
+        assert len(h.session.sent) == 3 and not h.requests
         await close(h)
 
     asyncio.run(scenario())
