@@ -591,3 +591,85 @@ def test_core_absent_process_keeps_legacy_imports_and_reports_optional():
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_live_join_uses_trusted_anchor_and_private_room_proof(plugin, monkeypatch):
+    monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "live")
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
+    monkeypatch.delenv("TALK_TASK_TARGET", raising=False)
+    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
+               "profile": "WorkProfile", "anchor_session_id": "OriginalTask",
+               "proof": "private-host-proof"}
+    invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
+    calls = []
+    monkeypatch.setattr(
+        plugin.talk_discord, "start_session", lambda **kw: calls.append(kw) or "Starting"
+    )
+
+    async def run():
+        return plugin._talk_command("join", invocation=invocation)
+
+    assert asyncio.run(run()) == "Starting"
+    task = calls[0]["native_task"]
+    assert task["target_id"] == "OriginalTask"
+    assert task["profile"] == "WorkProfile"
+    assert task["surface_context"]["surface_token"] == "private-host-proof"
+    assert calls[0]["guild_id"] == 11
+
+
+def test_explicit_discord_target_preserves_case_and_peer_scope(plugin, monkeypatch):
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
+    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
+               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    calls = []
+    monkeypatch.setattr(
+        plugin.talk_discord, "start_session", lambda **kw: calls.append(kw) or "Starting"
+    )
+
+    async def run():
+        invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
+        return plugin._talk_command('join "Mixed Case Task" PeerA Work', invocation=invocation)
+
+    assert asyncio.run(run()) == "Starting"
+    task = calls[0]["native_task"]
+    assert (task["target_id"], task["peer_id"], task["profile"]) == (
+        "Mixed Case Task", "PeerA", "Work",
+    )
+    assert task["surface_context"]["surface_profile"] == "issuer"
+
+
+def test_live_join_never_falls_back_without_room_proof(plugin, monkeypatch):
+    monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "live")
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
+    monkeypatch.setattr(
+        plugin.talk_discord, "start_session", lambda **kw: pytest.fail("unbound join")
+    )
+
+    async def run():
+        return plugin._talk_command("join", invocation=types.SimpleNamespace())
+
+    assert "authorized Discord command" in asyncio.run(run())
+
+
+def test_canonical_control_needs_trusted_room_and_withholds_private_results(plugin, monkeypatch):
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: True)
+    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
+               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    received = []
+
+    async def command(line, **ids):
+        received.append((line, ids))
+        return {"output": "PRIVATE-TASK-RESULT"}
+
+    monkeypatch.setattr(plugin.talk_discord, "native_command", command)
+
+    async def run():
+        refused = plugin._talk_command("pause")
+        invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
+        result = await plugin._talk_command("result 7", invocation=invocation)
+        return refused, result
+
+    refused, result = asyncio.run(run())
+    assert "authorized Discord command" in refused
+    assert "PRIVATE-TASK-RESULT" not in result and "private-proof" not in result
+    assert received == [("/result 7", {"guild_id": 11, "channel_id": 22, "operator_user_id": 33})]

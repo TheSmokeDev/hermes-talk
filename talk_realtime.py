@@ -249,7 +249,9 @@ class DelegationRequested(RealtimeEvent):
             raise ValueError("Delegation offset must be non-negative milliseconds")
         if self.target != "client":
             raise ValueError("Only client delegation can enter the Hermes coordinator")
-        if self.prompt is not None and (not isinstance(self.prompt, str) or len(self.prompt) > 16000):
+        if self.prompt is not None and (
+            not isinstance(self.prompt, str) or len(self.prompt) > 16000
+        ):
             raise ValueError("Delegation prompt must be bounded reference text")
 
 
@@ -512,8 +514,8 @@ __all__ = [
     "SpeechStarted",
     "SpeechStopped",
     "StartResponse",
-    "SubmitToolResult",
     "SubmitDelegationResult",
+    "SubmitToolResult",
     "ToolCallsCancelled",
     "ToolDefinition",
     "Transcript",

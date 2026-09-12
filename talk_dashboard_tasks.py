@@ -365,6 +365,9 @@ class DashboardTasks:
     @staticmethod
     def discard(bound):
         bound.closed = True
+        if bound.native_surface is not None:
+            with suppress(DashboardTaskError):
+                bound.native_surface.revoke()
         with suppress(HistoryError, DashboardTaskError):
             bound.attachment.close(bound.token)
 

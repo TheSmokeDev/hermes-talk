@@ -76,3 +76,45 @@ def test_rebind_preserves_issuer_anchor_and_disallows_cli_downgrade(environment)
         "session_id": "issuer-anchor", "binding_id": bound.connection_id,
         "next_session_id": "issuer-anchor", "next_binding_id": "new-connection"})
     assert candidate.native_surface.binding["proof"] == "replacement-private-proof"
+
+
+def test_abandoned_native_candidate_retires_room_access(environment):
+    manager, _, _, _ = environment
+    bound, _ = join(environment)
+    issuer = Issuer()
+    prepare_surface(bound, {"surface": "discord", "surface_token": "private-proof",
+        "anchor_session_id": "issuer-anchor"}, issuer_factory=lambda profile: issuer)
+    manager.discard(bound)
+    assert bound.closed is True
+    assert issuer.calls[-1][0] == "revoke"
+
+
+def test_cancelled_preparation_waits_for_worker_and_retires_candidate(monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from test_dashboard_api import api
+
+    entered, release = threading.Event(), threading.Event()
+    prepared, cancelled = object(), []
+
+    def prepare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return prepared
+
+    monkeypatch.setattr(api, "TARGETS", SimpleNamespace(prepare=prepare, cancel=cancelled.append))
+
+    async def run():
+        pending = asyncio.create_task(api._prepare_target(None, {}, initial=True))
+        assert await asyncio.to_thread(entered.wait, 5)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert cancelled == [prepared]
+
+    asyncio.run(run())

@@ -565,7 +565,9 @@ def test_every_route_is_gated():
 def test_route_handlers_covers_every_declared_route():
     """ROUTE_HANDLERS is the gate test's input — it must not drift from the file."""
 
-    source = (DASHBOARD_DIR / "plugin_api.py").read_text(encoding="utf-8")
+    source = "\n".join(path.read_text(encoding="utf-8") for path in (
+        DASHBOARD_DIR / "plugin_api.py", DASHBOARD_DIR.parent / "talk_live_routes.py",
+    ))
     decorated = re.findall(r"@router\.(?:get|post|put|patch|delete)\(", source)
 
     assert len(decorated) == len(api.ROUTE_HANDLERS)
