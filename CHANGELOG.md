@@ -11,12 +11,11 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
-## [Unreleased]
+## [0.18.0] — 2026-09-12
 
-The 0.18.0 candidate adds GPT-Live and task-bound Codex workers. Operator
-microphone acceptance for subscription and API billing on dashboard, terminal
-and Discord remains pending; merged code and provider-only probes do not
-establish installed-stack acceptance.
+GPT-Live connects voice conversation to Hermes tasks and Codex background
+workers on dashboard, terminal and Discord. Subscription is the default;
+API billing is selected explicitly.
 
 ### Added
 - GPT-Live with subscription authentication by default and explicit API billing,

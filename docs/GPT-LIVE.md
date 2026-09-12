@@ -1,6 +1,6 @@
 # GPT-Live and task workers
 
-The 0.18.0 candidate connects GPT-Live conversation to a selected Hermes task.
+Hermes Talk 0.18.0 connects GPT-Live conversation to a selected Hermes task.
 That task can delegate to Hermes or an explicitly configured Codex worker while
 you keep talking. Voice, typed input, worker receipts and results share task
 ownership. Closing or switching voice does not cancel accepted background work.
