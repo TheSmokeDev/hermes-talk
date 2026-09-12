@@ -29,7 +29,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -63,10 +63,11 @@ class TalkAuthError(RuntimeError):
 class TalkAuth:
     """A resolved OpenAI Platform bearer credential."""
 
-    token: str
+    token: str = field(repr=False)
     source: str  # one of SOURCE_CONFIGURED, SOURCE_ENV, SOURCE_CODEX_OAUTH
     detail: str
     expires_at: datetime | None = None
+    account_id: str | None = field(default=None, repr=False)
 
 
 def _read_env(env: Mapping[str, str] | None, key: str) -> str | None:
@@ -345,6 +346,7 @@ def _resolve_codex_oauth(codex_home: Path | None = None) -> TalkAuth | None:
         source=SOURCE_CODEX_OAUTH,
         detail="Codex CLI login (ChatGPT subscription)",
         expires_at=datetime.fromtimestamp(credential.expires_s, tz=UTC),
+        account_id=credential.account_id,
     )
 
 
