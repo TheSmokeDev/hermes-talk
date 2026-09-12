@@ -109,7 +109,29 @@ for line in sys.stdin:
             time.sleep(30)
     elif method == "thread/read":
         assert params["threadId"] == state["thread"]["id"]
-        result(message, {"thread": state["thread"]})
+        if not params.get("includeTurns", False):
+            if scenario in {
+                "unresponsive_read",
+                "unresponsive_approval",
+                "progress_on_steer",
+                "unresponsive_read_interrupt",
+                "approval_continue_unresponsive",
+            }:
+                continue
+            if scenario in {"metadata_unavailable", "approval_metadata_unavailable"}:
+                send(
+                    {
+                        "id": message["id"],
+                        "error": {"code": -32603, "message": "metadata unavailable"},
+                    }
+                )
+                continue
+            metadata = {**state["thread"], "turns": [], "status": {"type": "active"}}
+            if scenario == "foreign_metadata":
+                metadata["id"] = "foreign-thread"
+            result(message, {"thread": metadata})
+        else:
+            result(message, {"thread": state["thread"]})
     elif method == "thread/resume":
         assert params["threadId"] == state["thread"]["id"]
         result(message, policy())
@@ -146,7 +168,13 @@ for line in sys.stdin:
             )
         if scenario == "foreign":
             notify("turn/completed", {"threadId": "foreign-thread", "turn": turn})
-        if scenario in {"approval", "approval_replay"}:
+        if scenario in {
+            "approval",
+            "approval_replay",
+            "approval_metadata_unavailable",
+            "unresponsive_approval",
+            "approval_continue_unresponsive",
+        }:
             send(
                 {
                     "id": 901,
@@ -174,9 +202,22 @@ for line in sys.stdin:
         if scenario == "drop_steer":
             os._exit(3)
         result(message, {"turnId": "turn-owned"})
+        if scenario == "progress_on_steer":
+            notify(
+                "item/completed",
+                {
+                    "threadId": "thread-owned",
+                    "turnId": "turn-owned",
+                    "item": {
+                        "id": "progress",
+                        "type": "agentMessage",
+                        "text": params["clientUserMessageId"],
+                    },
+                },
+            )
     elif method == "turn/interrupt":
         assert params["threadId"] == "thread-owned" and params["turnId"] == "turn-owned"
-        if scenario == "ignore_interrupt":
+        if scenario in {"ignore_interrupt", "unresponsive_read_interrupt"}:
             continue
         result(message, {})
         if scenario != "ack_no_terminal":
@@ -198,7 +239,7 @@ for line in sys.stdin:
                     },
                 }
             )
-        else:
+        elif scenario != "approval_continue_unresponsive":
             finish()
     else:
         raise AssertionError("Unexpected protocol operation")

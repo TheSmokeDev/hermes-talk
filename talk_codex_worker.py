@@ -27,6 +27,8 @@ class CodexWorkerConfig:
     sandbox: str = "read-only"
     approval_policy: str = "untrusted"
     approvals_reviewer: str = "user"
+    liveness_interval_s: float = 300.0
+    liveness_timeout_s: float = 15.0
 
     def validate(self):
         if self.enabled is not True:
@@ -60,6 +62,13 @@ class CodexWorkerConfig:
         }:
             raise CodexWorkerError("unsupported_policy")
 
+        for value, maximum in (
+            (self.liveness_interval_s, 3600.0),
+            (self.liveness_timeout_s, 60.0),
+        ):
+            if type(value) not in (int, float) or not 0.05 <= value <= maximum:
+                raise CodexWorkerError("invalid_liveness_timeout")
+
     def thread_options(self):
         self.validate()
         return {
@@ -73,8 +82,6 @@ class CodexWorkerConfig:
 
 class CodexWorker:
     CANCEL_TIMEOUT_S = 10.0
-    #: A live peer keeps streaming; this much silence means it is wedged.
-    PROGRESS_TIMEOUT_S = 300.0
 
     def __init__(
         self,
@@ -420,8 +427,39 @@ class CodexWorker:
             self._update(controls=controls)
             return receipt
 
+    def _liveness_probe(self):
+        # Codex 0.154.0 thread/read supports metadata-only reads of loaded threads,
+        # including unmaterialized threads. It does not start or resume a turn.
+        # Keep its bounded RPC off the event loop so cancellation and approvals
+        # remain responsive while a peer is slow or its stdin is blocked.
+        result = {}
+        done = threading.Event()
+        thread_id = self.snapshot()["thread_id"]
+
+        def read():
+            try:
+                result["response"] = self.wire.request(
+                    "thread/read",
+                    {"threadId": thread_id, "includeTurns": False},
+                    authorize=self._work_authorized,
+                )
+            except CodexWorkerError as exc:
+                result["error"] = exc.code
+            except Exception:  # noqa: BLE001 - a failed local probe cannot expose peer output
+                result["error"] = "outcome_unknown"
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=read, daemon=True)
+        thread.start()
+        return done, result, thread
+
     def run(self):
         self.lease, record = self.jobs.claim(self.owner, self.job_id)
+        probe = None
+        probe_threads = []
+        probe_deadline = None
+        probe_started = None
         try:
             if record["state"] in TERMINAL:
                 return record
@@ -496,20 +534,65 @@ class CodexWorker:
             renewed = time.monotonic()
             progress = time.monotonic()
             cancel_sent = False
+            approval_waiting = False
             cancel_deadline = None
             while self.snapshot()["state"] not in TERMINAL:
                 message = self.wire.event()
                 if message is not None:
                     self._event(message)
                     progress = time.monotonic()
+                    if probe is not None:
+                        probe_deadline = progress + self.config.liveness_timeout_s
+                if self.snapshot()["state"] in TERMINAL:
+                    break
                 if self.cancel_event.is_set() and not cancel_sent:
                     cancel_deadline = time.monotonic() + self.CANCEL_TIMEOUT_S
                     self.control("cancel-" + self.job_id, cancel=True)
                     cancel_sent = True
                 if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
                     raise CodexWorkerError("cancellation_unconfirmed")
-                if time.monotonic() - progress >= self.PROGRESS_TIMEOUT_S:
-                    raise CodexWorkerError("outcome_unknown")
+                if not cancel_sent:
+                    pending_approval = bool(self.approvals())
+                    if approval_waiting and not pending_approval:
+                        # An answered approval begins a fresh quiet interval.
+                        progress = time.monotonic()
+                        if probe is not None:
+                            probe_deadline = (
+                                progress
+                                + self.config.liveness_interval_s
+                                + self.config.liveness_timeout_s
+                            )
+                    approval_waiting = pending_approval
+                    if probe is not None and probe[0].is_set():
+                        result = probe[1]
+                        error = result.get("error")
+                        # A rejected metadata read still proves the peer answered.
+                        # Approval waits also tolerate unavailable metadata: no
+                        # notification or history snapshot grants/denies approval.
+                        if error and error != "rpc_refused":
+                            if error != "outcome_unknown" or (
+                                not pending_approval and progress < probe_started
+                            ):
+                                raise CodexWorkerError(error)
+                        elif not error:
+                            self._thread(result.get("response", {}))
+                        probe = None
+                        progress = time.monotonic()
+                    if (
+                        probe is not None
+                        and time.monotonic() >= probe_deadline
+                        and not pending_approval
+                    ):
+                        raise CodexWorkerError("outcome_unknown")
+                    if (
+                        probe is None
+                        and time.monotonic() - progress >= self.config.liveness_interval_s
+                    ):
+                        probe_started = time.monotonic()
+                        probe = self._liveness_probe()
+                        probe_threads = [thread for thread in probe_threads if thread.is_alive()]
+                        probe_threads.append(probe[2])
+                        probe_deadline = time.monotonic() + self.config.liveness_timeout_s
                 if time.monotonic() - renewed >= 5:
                     self._update()
                     renewed = time.monotonic()
@@ -530,5 +613,7 @@ class CodexWorker:
                 self._pending_approvals.clear()
             if self.wire is not None:
                 self.wire.close()
+            for thread in probe_threads:
+                thread.join(timeout=0.1)
             with suppress(CodexWorkerError):
                 self.jobs.release(self.owner, self.job_id, self.lease)

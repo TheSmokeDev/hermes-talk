@@ -20,9 +20,20 @@ from talk_passive import HistoryOwner, digest
 SCRIPT = Path(__file__).parent / "fixtures" / "codex_app_server.py"
 
 
-def setup(tmp_path, scenario="complete", *, enabled=True, jobs=None, context="Reference context"):
+def setup(
+    tmp_path,
+    scenario="complete",
+    *,
+    enabled=True,
+    jobs=None,
+    context="Reference context",
+    wire_timeout=2,
+    **config_options,
+):
     owner = HistoryOwner(digest("host"), "default", digest("principal"), "parent")
-    config = CodexWorkerConfig(enabled, sys.executable, str(tmp_path), "explicit-model")
+    config = CodexWorkerConfig(
+        enabled, sys.executable, str(tmp_path), "explicit-model", **config_options
+    )
     request = {
         "parent_session_id": "parent",
         "child_session_id": "child",
@@ -37,7 +48,7 @@ def setup(tmp_path, scenario="complete", *, enabled=True, jobs=None, context="Re
         return CodexAppServer(
             (sys.executable, "-u", str(SCRIPT), str(tmp_path / "peer.json"), scenario),
             cwd=str(tmp_path),
-            timeout=2,
+            timeout=wire_timeout,
             version_command=(sys.executable, str(SCRIPT), "--version"),
         )
 
@@ -63,33 +74,33 @@ def wait_for(check):
 
 
 class _Run:
-    """A worker.run() in flight, joined with a deadline instead of forever."""
+    """A worker operation in flight, joined with a deadline instead of forever."""
 
-    def __init__(self, worker):
+    def __init__(self, call):
         self._done = threading.Event()
         self._value: Any = None
         self._error: BaseException | None = None
-        self.thread = threading.Thread(target=self._call, args=(worker,), daemon=True)
+        self.thread = threading.Thread(target=self._call, args=(call,), daemon=True)
         self.thread.start()
 
-    def _call(self, worker):
+    def _call(self, call):
         try:
-            self._value = worker.run()
+            self._value = call()
         except BaseException as exc:  # noqa: BLE001 - re-raised by result()
             self._error = exc
         finally:
             self._done.set()
 
-    def result(self, timeout=None) -> Any:
+    def result(self, timeout=10) -> Any:
         if not self._done.wait(timeout):
-            raise AssertionError("worker.run() never returned; the worker is wedged")
+            raise AssertionError("worker operation never returned; the worker is wedged")
         if self._error is not None:
             raise self._error
         return self._value
 
 
 @contextmanager
-def run_worker(worker):
+def run_worker(worker, *, cleanup_timeout=10):
     """Run the worker off-thread and bound the join.
 
     A plain executor context manager calls ``shutdown(wait=True)`` on exit, so
@@ -99,13 +110,16 @@ def run_worker(worker):
     loudly and cannot hold interpreter exit open.
     """
 
-    running = _Run(worker)
+    running = _Run(worker.run)
     try:
         yield running
     finally:
+        deadline = time.monotonic() + cleanup_timeout
         if worker.wire is not None:
-            worker.wire.close()
-        assert running._done.wait(10), "worker.run() never returned; the worker is wedged"
+            _Run(worker.wire.close).result(timeout=cleanup_timeout)
+        assert running._done.wait(max(0, deadline - time.monotonic())), (
+            "worker.run() never returned; the worker is wedged"
+        )
 
 
 def test_disabled_worker_starts_no_process_or_job(tmp_path):
