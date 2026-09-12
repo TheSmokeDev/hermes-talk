@@ -2724,6 +2724,9 @@ async def run_native_talk_session(
                 if on_controller is not None:
                     on_controller(current)
                 await current.refresh(announce=False)
+                reconcile = getattr(current, "reconcile_captures", None)
+                if reconcile is not None:
+                    await reconcile()
                 ready.set()
                 emit({"voice_state": "connected", "provider": pick.provider, "model": pick.model})
                 return True

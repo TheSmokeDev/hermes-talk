@@ -12,10 +12,12 @@ from dataclasses import dataclass
 try:
     from . import talk_realtime as rt
     from .talk_native_api import NativeTaskError
+    from .talk_native_capture_store import NativeCaptureStore
     from .talk_native_controller import NativeTaskController
 except ImportError:
     import talk_realtime as rt
     from talk_native_api import NativeTaskError
+    from talk_native_capture_store import NativeCaptureStore
     from talk_native_controller import NativeTaskController
 
 
@@ -32,8 +34,11 @@ class _Delegation:
 class NativeLiveTaskController(NativeTaskController):
     """Preserve Live's fragment evidence without inventing legacy response identity."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, capture_store=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.capture_store = capture_store
+        self.capture_store_lock = asyncio.Lock()
+        self.spooled_fragments = set()
         self.provider_session_id = getattr(self.session, "session_id", None)
         self.fragments = []
         self.captured_fragments = set()
@@ -68,6 +73,66 @@ class NativeLiveTaskController(NativeTaskController):
     CAPTURE_RETRIES = (0.1, 0.25)
     OPERATION_POLL_S = 0.25
     OPERATION_TIMEOUT_S = 75
+
+    def _capture_storage(self):
+        if self.capture_store is None:
+            self.capture_store = NativeCaptureStore.configured()
+        return self.capture_store
+
+    def _capture_owner(self):
+        return NativeCaptureStore.owner(self.api.origin, self.attachment)
+
+    async def _persist_capture_pending(self):
+        store = self._capture_storage()
+        owner = self._capture_owner() if store is not False else None
+        if store is not False:
+            async with self.capture_store_lock:
+                pending = [
+                    dict(row)
+                    for identity, row in self.capture_pending.items()
+                    if identity not in self.spooled_fragments
+                ]
+                if pending:
+                    await asyncio.to_thread(
+                        store.put, owner, self.context, self.provider_session_id, pending
+                    )
+                    self.spooled_fragments.update(row["event_id"] for row in pending)
+        return store, owner
+
+    async def reconcile_captures(self):
+        self.guard()
+        store = self._capture_storage()
+        if store is False:
+            return
+        owner = self._capture_owner()
+        while True:
+            session, batch = await asyncio.to_thread(store.pending, owner)
+            if not batch:
+                return
+            for attempt in range(len(self.CAPTURE_RETRIES) + 1):
+                try:
+                    result = await self.request(
+                        "/live/transcript",
+                        {"provider_session_id": session, "fragments": batch},
+                    )
+                    if result.get("ok") is not True:
+                        raise NativeTaskError("Transcript replay returned no acknowledgement")
+                    break
+                except NativeTaskError as exc:
+                    if not exc.retryable or attempt == len(self.CAPTURE_RETRIES):
+                        self.notice(
+                            {
+                                "state": "capture_recovery_pending",
+                                "receipt": store.receipt(owner),
+                                "category": exc.category,
+                            }
+                        )
+                        raise
+                    await asyncio.sleep(self.CAPTURE_RETRIES[attempt])
+            await asyncio.to_thread(store.acknowledge, owner, session, batch)
+            self.notice(
+                {"state": "capture_recovered", "count": len(batch), "receipt": store.receipt(owner)}
+            )
 
     def _queue_capture(self, fragment):
         if not self.capture_accepting:
@@ -115,9 +180,27 @@ class NativeLiveTaskController(NativeTaskController):
                     batch.append(dict(fragment))
                     size += amount
                 body = {"provider_session_id": self.provider_session_id, "fragments": batch}
+                try:
+                    store, owner = await self._persist_capture_pending()
+                except NativeTaskError as exc:
+                    self.capture_error = exc
+                    self.notice(
+                        {
+                            "state": "capture_unsaved",
+                            "category": exc.category,
+                            "count": len(self.capture_pending),
+                        }
+                    )
+                    return
                 for attempt in range(len(self.CAPTURE_RETRIES) + 1):
                     try:
-                        await self.request("/live/transcript", body)
+                        result = await self.request("/live/transcript", body)
+                        if result.get("ok") is not True:
+                            raise NativeTaskError("Transcript capture returned no acknowledgement")
+                        if store is not False:
+                            await asyncio.to_thread(
+                                store.acknowledge, owner, self.provider_session_id, batch
+                            )
                         break
                     except NativeTaskError as exc:
                         if not exc.retryable or attempt == len(self.CAPTURE_RETRIES):
@@ -134,6 +217,7 @@ class NativeLiveTaskController(NativeTaskController):
                         await asyncio.sleep(self.CAPTURE_RETRIES[attempt])
                 for fragment in batch:
                     self.capture_pending.pop(fragment["event_id"], None)
+                    self.spooled_fragments.discard(fragment["event_id"])
                     self.captured_fragments.add(fragment["event_id"])
                 self._prune_fragments()
                 if len(self.capture_pending) >= self.CAPTURE_COUNT:
@@ -621,9 +705,20 @@ class NativeLiveTaskController(NativeTaskController):
             return
         if self.current:
             try:
+                if self.capture_pending:
+                    await asyncio.wait_for(self._persist_capture_pending(), 2)
                 await asyncio.wait_for(self.flush_captures(retry=True), 2)
             except (NativeTaskError, TimeoutError):
-                self.notice({"state": "capture_incomplete", "count": len(self.capture_pending)})
+                receipt = None
+                if self.capture_store not in (None, False):
+                    receipt = self.capture_store.receipt(self._capture_owner())
+                self.notice(
+                    {
+                        "state": "capture_incomplete",
+                        "count": len(self.capture_pending),
+                        "receipt": receipt,
+                    }
+                )
         self.capture_accepting = False
         with suppress(NativeTaskError):
             if self.current:

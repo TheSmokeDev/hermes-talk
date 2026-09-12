@@ -115,6 +115,8 @@ class AttachmentAPI:
                 **self.context,
                 "target_id": target_id,
                 "session_id": target_id,
+                "profile": "default",
+                "peer_id": "local",
                 "history": {"session_id": target_id, "messages": []},
                 "return_depth": len(self.stack),
             },
@@ -142,11 +144,16 @@ class AttachmentAPI:
 
 @pytest.mark.parametrize("provider", ["openai", "grok", "gemini", "live"])
 def test_runner_select_return_reconnect_replaces_only_voice_and_replays_silently(
-    monkeypatch, provider
+    monkeypatch, provider, tmp_path
 ):
     from test_native_controller import Session
 
+    from talk_native_capture_store import NativeCaptureStore
     from talk_native_live import NativeLiveTaskController
+
+    monkeypatch.setattr(
+        NativeCaptureStore, "configured", lambda: NativeCaptureStore(tmp_path / "capture.sqlite3")
+    )
 
     async def scenario():
         monkeypatch.setattr(
@@ -161,6 +168,7 @@ def test_runner_select_return_reconnect_replaces_only_voice_and_replays_silently
         )
         created, selected = [], asyncio.Queue()
         api, audio = AttachmentAPI(), Audio()
+        api.origin = "http://127.0.0.1/api/plugins/hermes-talk"
 
         class Provider(Session):
             async def connect(self, setup):

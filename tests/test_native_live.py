@@ -45,7 +45,7 @@ async def connected(*, held=None, supports_context=True, speech=None, response_c
     session = Session()
     session.supports_live_context = supports_context
     controller = NativeLiveTaskController(
-        api, session, {"task": api.context}, Audio(), on_notice=notices.append
+        api, session, {"task": api.context}, Audio(), on_notice=notices.append, capture_store=False
     )
     await controller.handle(rt.SessionReady("real-provider-session"))
     return SimpleNamespace(

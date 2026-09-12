@@ -42,6 +42,7 @@ async def controller_for(handler):
         {"task": dict(api.context)},
         Audio(),
         on_notice=notices.append,
+        capture_store=False,
     )
     await controller.handle(rt.SessionReady("provider-session"))
     return SimpleNamespace(controller=controller, session=session, notices=notices, client=client)
