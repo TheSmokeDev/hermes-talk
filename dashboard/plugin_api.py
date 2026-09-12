@@ -65,6 +65,7 @@ import talk_live_config  # noqa: E402
 import talk_live_routes  # noqa: E402
 import talk_native_surface  # noqa: E402
 import talk_realtime  # noqa: E402
+import talk_recipients  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_target_selection  # noqa: E402
@@ -300,7 +301,8 @@ def _session_tools(bound=None):
     if bound is not None:
         tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
         tools += [
-            talk_dashboard_tasks.steering_tool(), talk_dashboard_tasks.update_preference_tool()
+            talk_dashboard_tasks.steering_tool(), talk_dashboard_tasks.update_preference_tool(),
+            *talk_recipients.recipient_tools(),
         ]
         if getattr(bound, "target_record", None) is not None:
             tools += talk_target_selection.selection_tools()
@@ -833,6 +835,11 @@ async def _task_call(function, request, body):
         raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
     except (HistoryError, TaskEventError) as exc:
         code = getattr(exc, "code", "")
+        status = (
+            403 if code in {"unauthorized", "denied", "owner_mismatch"}
+            else 503 if code in {"unavailable", "store_unavailable", "busy"}
+            else 409
+        )
         mapped = DashboardTaskError(
             {
                 "stale_generation": "connection_stale",
@@ -842,9 +849,10 @@ async def _task_call(function, request, body):
                 "unavailable": "target_offline",
                 "unsupported": "target_unsupported",
             }.get(code, "gateway_refused"),
-            409,
+            status,
+            retryable=status == 503,
         )
-        raise HTTPException(status_code=409, detail=mapped.detail()) from exc
+        raise HTTPException(status_code=status, detail=mapped.detail()) from exc
 
 
 async def _live_task_descriptor(bound, *, selection=None):
@@ -855,7 +863,8 @@ async def _live_task_descriptor(bound, *, selection=None):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"ok": True, "voiceMode": "live", "authSource": auth.source,
             "liveAuth": config.auth_mode, "model": config.model, "voice": config.voice,
-            "live": {"transport": "webrtc"}, "task": TASKS.descriptor(bound),
+            "live": {"transport": "webrtc", "delegation_admission": "async-v1"},
+            "task": TASKS.descriptor(bound),
             **({"selection": selection} if selection is not None else {})}
 
 
@@ -1004,13 +1013,23 @@ async def native_task_attach(request: Request):
             raise
         activated = True
         tools = _session_tools(bound)
-        instructions = talk_identity.build_instructions(
-            None, tools=tools, lane=surface_context["surface"], canonical_task=True,
-            capabilities="Canonical task tools and linked child work are available.",
-        ) + "\n\n" + TASKS.instructions(bound)
+        if _resolve_voice_mode() == "live":
+            instructions = talk_identity.build_live_instructions(
+                None, lane=surface_context["surface"],
+                capabilities=TASKS.live_capabilities(bound),
+                task_context=TASKS.live_instructions(bound),
+            )
+        else:
+            instructions = talk_identity.build_instructions(
+                None, tools=tools, lane=surface_context["surface"], canonical_task=True,
+                capabilities="Canonical task tools and linked child work are available.",
+            ) + "\n\n" + TASKS.instructions(bound)
         return {"ok": True, "task": TASKS.descriptor(bound), "instructions": instructions,
                 "tools": tools, "selection": selection, "voice_state": "not_connected",
-                "surface_context": surface_context}
+                "surface_context": surface_context,
+                "live_contract": {"delegation_admission": "async-v1",
+                                  "transcript_batch": {"flush_ms": 100, "fragments": 32,
+                                                       "bytes": 8192}}}
     finally:
         if not activated:
             await asyncio.to_thread(TARGETS.cancel, prepared)

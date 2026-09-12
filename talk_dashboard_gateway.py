@@ -47,6 +47,10 @@ class DashboardTaskError(Exception):
         "selection_store_unavailable": "The local selection state could not be read safely.",
         "selection_busy": "A target change is already being prepared for this tab.",
         "return_empty": "There is no previous authorized target to return to.",
+        "recipient_reconciliation_required": (
+            "An earlier delivery of this message is unconfirmed. Check its original result "
+            "before sending another message."
+        ),
         "steering_unsupported": "This host cannot steer that existing job with an origin receipt.",
         "steering_origin_pending": "The original correction is awaiting its canonical receipt.",
         "steering_target_denied": "That run does not belong to this canonical task.",
@@ -59,7 +63,8 @@ class DashboardTaskError(Exception):
         super().__init__(self.MESSAGES[self.code])
 
     def detail(self):
-        return {"code": self.code, "message": str(self)}
+        return {"code": self.code, "message": str(self),
+                **({"retryable": True} if self.retryable else {})}
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +78,8 @@ class TaskGateway:
         return self._request("POST", "/v1/task-context/discord/" + operation, body=body)
 
     def _request(
-        self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024, not_found=None
+        self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024,
+        not_found=None, timeout=3
     ):
         """Suffix is chosen only by the fixed methods below, never by a browser/model."""
         if self.before_request is not None:
@@ -85,7 +91,7 @@ class TaskGateway:
         try:
             with (
                 httpx.Client(
-                    timeout=3,
+                    timeout=timeout,
                     follow_redirects=False,
                     trust_env=False,
                     transport=self.transport._http_transport,
@@ -115,9 +121,10 @@ class TaskGateway:
                 if status in {401, 403}:
                     raise DashboardTaskError("context_denied", 403)
                 raise DashboardTaskError(
-                    "busy" if code == "busy" else "gateway_refused",
+                    code if code in DashboardTaskError.MESSAGES else "gateway_refused",
                     status,
-                    retryable=code in {"busy", "store_unavailable"},
+                    retryable=status in {429, 500, 502, 503, 504}
+                    or code in {"busy", "store_unavailable"},
                 )
             return data
         except (httpx.HTTPError, OSError):
@@ -263,3 +270,47 @@ class TaskGateway:
                 }
             )
         return {**data, "approvals": projected}
+
+
+class RecipientGateway:
+    """Existing-application controls on the voice owner's verified execution host."""
+
+    def __init__(self, bound):
+        self.bound = bound
+
+    def _call(self, operation, **fields):
+        if operation not in {"probe", "list", "select", "send", "reconcile", "inspect"}:
+            raise DashboardTaskError("invalid_event", 400)
+        owner, gateway = self.bound.attachment.owner, self.bound.gateway
+        body = {"session_id": owner.session_id, "actor_scope": owner.principal, **fields}
+        surface = self.bound.native_surface
+        if surface is not None:
+            issuer = surface.issuer.transport
+            target = gateway.transport
+            if (issuer.base_url, issuer.profile) == (target.base_url, target.profile):
+                body["discord_binding"] = dict(surface.binding)
+        result = gateway._request(
+            "POST", "/v1/recipient-bridge/" + operation, body=body,
+            timeout=20, max_bytes=4 * 1024 * 1024,
+        )
+        return {**result, "host_id": owner.host}
+
+    def list_recipients(self, app=None):
+        return self._call("list", **({"app": app} if app else {}))
+
+    def select(self, target):
+        return self._call("select", target_token=target["target_token"])
+
+    def send(self, operation_id, target, message, *, commit_token=None):
+        return self._call(
+            "send", operation_id=operation_id, target_token=target["target_token"],
+            message=message, **({"commit_token": commit_token} if commit_token else {}),
+        )
+
+    def reconcile(self, operation_id, target):
+        return self._call(
+            "reconcile", operation_id=operation_id, target_token=target["target_token"],
+        )
+
+    def inspect(self, target, *, capture=True):
+        return self._call("inspect", target_token=target["target_token"], capture=capture)

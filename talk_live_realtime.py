@@ -60,7 +60,6 @@ class LiveRealtimeSession:
         self._setup = None
         self._active_delegations = set()
         self._seen_delegations = set()
-        self._legacy_delegation = None
         self._instruction_updates = deque()
 
     async def connect(self, setup: rt.SessionSetup) -> None:
@@ -184,12 +183,6 @@ class LiveRealtimeSession:
                     if len(self._seen_delegations) >= MAX_DELEGATIONS:
                         raise rt.RealtimeSessionError("GPT-Live delegation limit exceeded")
                     self._seen_delegations.add(event.delegation_id)
-                    if wire.get("type") == "delegation.created":
-                        previous = self._legacy_delegation
-                        if previous:
-                            self._active_delegations.discard(previous)
-                            self._emit(rt.DelegationRetired(previous))
-                        self._legacy_delegation = event.delegation_id
                     self._active_delegations.add(event.delegation_id)
                 if isinstance(event, rt.SessionTerminated):
                     self.finalized = True

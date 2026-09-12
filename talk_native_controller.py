@@ -86,6 +86,7 @@ class NativeTaskController:
         self.authorize_surface = authorize_surface
         self.clock = clock
         self.closed = False
+        self.service_paused = False
         self.inputs, self.requests, self.responses = {}, {}, {}
         self.committed = set()
         self.completed = deque()
@@ -115,10 +116,14 @@ class NativeTaskController:
 
     def guard(self):
         if not self.current:
-            raise NativeTaskError("Native task connection is no longer current")
+            raise NativeTaskError(
+                "Native task connection is no longer current", category="stale", superseded=True
+            )
         if self.authorize_surface is not None and self.authorize_surface() is not True:
             self.audio.drain_playback()
-            raise NativeTaskError("Discord speaker or room audience authorization changed")
+            raise NativeTaskError(
+                "Discord speaker or room audience authorization changed", category="authorization"
+            )
 
     def notice(self, value):
         if self.current and self.on_notice is not None:
@@ -531,6 +536,8 @@ class NativeTaskController:
         elif isinstance(event, rt.ResponseFinished):
             await self._done(event)
         elif isinstance(event, rt.OutputAudio):
+            if self.service_paused:
+                return
             presentation = self._presentation_for(event.response_id)
             response = self.responses.get(event.response_id)
             if (presentation is not None and not presentation["retired"]) or (
@@ -581,6 +588,8 @@ class NativeTaskController:
 
     async def send_audio(self, pcm):
         self.guard()
+        if self.service_paused:
+            return
         if type(pcm) is not bytes or not pcm or len(pcm) % 2:
             raise NativeTaskError("Native microphone input must be PCM16 mono")
         self.last_input_sample = self.clock()
@@ -655,6 +664,7 @@ class NativeTaskController:
         async with self.refresh_lock:
             state = await self.request("/state")
             self.last_state = state
+            self.service_paused = False
             await self._refresh_history(state)
             if self.on_state is not None:
                 self.on_state(state)

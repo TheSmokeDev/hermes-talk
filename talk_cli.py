@@ -2590,6 +2590,14 @@ def start_native_keyboard_control(deliver, *, stdin=None, read_line=None):
     return stop.set
 
 
+async def _wait_for_native_selection(ready, selected):
+    while True:
+        await ready.wait()
+        active = selected()
+        if ready.is_set() and active is not None:
+            return active
+
+
 async def run_native_talk_session(
     *, audio=None, session_factory=None, lane="cli", keyboard_control=False,
     task=None, api=None, control_input=None, on_controller=None, on_refusal=None,
@@ -2653,16 +2661,37 @@ async def run_native_talk_session(
                     reference, peer_id=intent.get("peer_id"), profile=intent.get("profile")
                 )
                 fields = {"target_id": selected}
-            attached = await api.attach(
-                **fields, tab_id=task.get("tab_id", "terminal"),
-                surface_context=task.get("surface_context") or {"surface": lane},
-            )
-            if attached.get("ok") is not True:
-                emit(attached)
-                return False
+            previous, current = current, None
+            ready.clear()
+            if previous is not None:
+                previous.service_paused = True
+                flush = getattr(previous, "flush_captures", None)
+                if flush is not None:
+                    try:
+                        await asyncio.wait_for(flush(retry=True), 2)
+                    except (NativeTaskError, TimeoutError) as exc:
+                        current = previous
+                        previous.service_paused = False
+                        ready.set()
+                        if isinstance(exc, TimeoutError):
+                            raise NativeTaskError(
+                                "Transcript capture is still pending; "
+                                "the selected task is unchanged",
+                                category="transient",
+                            ) from None
+                        raise
             try:
-                ready.clear()
-                previous, current = current, None
+                attached = await api.attach(
+                    **fields, tab_id=task.get("tab_id", "terminal"),
+                    surface_context=task.get("surface_context") or {"surface": lane},
+                )
+                if attached.get("ok") is not True:
+                    current = previous
+                    if previous is not None:
+                        previous.service_paused = False
+                        ready.set()
+                    emit(attached)
+                    return False
                 if previous is not None:
                     await previous.close()
                 emit({"selected": attached.get("task"), "voice_state": "not_connected"})
@@ -2703,12 +2732,17 @@ async def run_native_talk_session(
                 if on_controller is not None:
                     on_controller(current)
                 await current.refresh(announce=False)
+                reconcile = getattr(current, "reconcile_captures", None)
+                if reconcile is not None:
+                    await reconcile()
                 ready.set()
                 emit({"voice_state": "connected", "provider": pick.provider, "model": pick.model})
                 return True
             except (NativeTaskError, talk_realtime.RealtimeSessionError,
                     talk_config.TalkConfigError, talk_auth.TalkAuthError,
                     talk_audio.TalkAudioError) as exc:
+                if previous is not None and not previous.closed:
+                    await previous.close()
                 activation_error = exc
                 activation_failed.set()
                 emit({"voice_state": "not_connected", "reason": str(exc)})
@@ -2764,8 +2798,7 @@ async def run_native_talk_session(
 
         async def receive():
             while True:
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 async for event in active.session:
                     if active is not current:
                         break
@@ -2781,8 +2814,7 @@ async def run_native_talk_session(
 
         async def microphone():
             while True:
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 read_packet = getattr(audio, "read_input_packet", None)
                 if lane == "discord":
                     packet = await asyncio.to_thread(read_packet)
@@ -2799,23 +2831,32 @@ async def run_native_talk_session(
                     await asyncio.sleep(IDLE_POLL_S)
 
         async def refresh():
+            failures = 0
             while True:
                 await asyncio.sleep(1)
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 try:
                     await active.tick()
                     await active.refresh()
-                except NativeTaskError:
-                    if active is current:
-                        raise
+                    failures = 0
+                    active.service_paused = False
+                except NativeTaskError as exc:
+                    if exc.superseded or active is not current:
+                        continue
+                    if exc.retryable and failures < 3:
+                        failures += 1
+                        active.service_paused = True
+                        active.audio.drain_playback()
+                        emit({"state": "reconnecting", "reason": str(exc), "attempt": failures})
+                        continue
+                    raise
 
         async def controls():
             while True:
                 line = await commands.get()
-                await ready.wait()
+                active = await _wait_for_native_selection(ready, lambda: current)
                 try:
-                    result = await current.command(line)
+                    result = await active.command(line)
                     if result is not None:
                         emit(result)
                 except NativeTaskError as exc:

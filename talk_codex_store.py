@@ -94,7 +94,7 @@ class CodexJobs:
             return record
 
     def read(self, owner, job_id):
-        with self.outbox._db() as db:
+        with self.outbox._db(write=False) as db:
             return self._read(db, owner, job_id)
 
     def claim(self, owner, job_id):

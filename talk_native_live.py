@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections import deque
 from contextlib import suppress
@@ -11,10 +12,12 @@ from dataclasses import dataclass
 try:
     from . import talk_realtime as rt
     from .talk_native_api import NativeTaskError
+    from .talk_native_capture_store import NativeCaptureStore
     from .talk_native_controller import NativeTaskController
 except ImportError:
     import talk_realtime as rt
     from talk_native_api import NativeTaskError
+    from talk_native_capture_store import NativeCaptureStore
     from talk_native_controller import NativeTaskController
 
 
@@ -24,16 +27,22 @@ class _Delegation:
     body: dict
     retired: bool = False
     finished: bool = False
+    admitted: bool = False
+    operation_id: str | None = None
 
 
 class NativeLiveTaskController(NativeTaskController):
     """Preserve Live's fragment evidence without inventing legacy response identity."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, capture_store=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.capture_store = capture_store
+        self.capture_store_lock = asyncio.Lock()
+        self.spooled_fragments = set()
         self.provider_session_id = getattr(self.session, "session_id", None)
         self.fragments = []
         self.captured_fragments = set()
+        self.claimed_fragments = set()
         self.final_fragments = {}
         self.delegations = {}
         self.fragment_sequence = 0
@@ -43,31 +52,202 @@ class NativeLiveTaskController(NativeTaskController):
         self.synthetic_cutoff_ms = None
         self.transcript_lock = asyncio.Lock()
         self.transcript_tasks = set()
+        self.capture_pending = {}
+        self.capture_task = None
+        self.capture_wake = asyncio.Event()
+        self.capture_error = None
+        self.capture_accepting = True
+        self.seen_fragments = {}
+        self.last_user_fragment_at = None
         self.provider_response_active = False
         self.pending_history = None
         self.pending_messages = deque()
         self.update_lock = asyncio.Lock()
         self.no_input_proposals = 0
 
-    async def _capture(self, fragment):
-        async with self.transcript_lock:
-            result = await self.request(
-                "/live/transcript",
-                {
-                    "provider_session_id": self.provider_session_id,
-                    "fragments": [fragment],
-                },
+    CAPTURE_DELAY = 0.1
+    CAPTURE_COUNT = 32
+    CAPTURE_BYTES = 8192
+    CAPTURE_PENDING_COUNT = 4096
+    CAPTURE_PENDING_BYTES = 256 * 1024
+    CAPTURE_RETRIES = (0.1, 0.25)
+    OPERATION_POLL_S = 0.25
+    OPERATION_TIMEOUT_S = 75
+
+    def _capture_storage(self):
+        if self.capture_store is None:
+            self.capture_store = NativeCaptureStore.configured()
+        return self.capture_store
+
+    def _capture_owner(self):
+        return NativeCaptureStore.owner(self.api.origin, self.attachment)
+
+    async def _persist_capture_pending(self):
+        store = self._capture_storage()
+        owner = self._capture_owner() if store is not False else None
+        if store is not False:
+            async with self.capture_store_lock:
+                pending = [
+                    dict(row)
+                    for identity, row in self.capture_pending.items()
+                    if identity not in self.spooled_fragments
+                ]
+                if pending:
+                    await asyncio.to_thread(
+                        store.put, owner, self.context, self.provider_session_id, pending
+                    )
+                    self.spooled_fragments.update(row["event_id"] for row in pending)
+        return store, owner
+
+    async def reconcile_captures(self):
+        self.guard()
+        store = self._capture_storage()
+        if store is False:
+            return
+        owner = self._capture_owner()
+        while True:
+            session, batch = await asyncio.to_thread(store.pending, owner)
+            if not batch:
+                return
+            for attempt in range(len(self.CAPTURE_RETRIES) + 1):
+                try:
+                    result = await self.request(
+                        "/live/transcript",
+                        {"provider_session_id": session, "fragments": batch},
+                    )
+                    if result.get("ok") is not True:
+                        raise NativeTaskError("Transcript replay returned no acknowledgement")
+                    break
+                except NativeTaskError as exc:
+                    if not exc.retryable or attempt == len(self.CAPTURE_RETRIES):
+                        self.notice(
+                            {
+                                "state": "capture_recovery_pending",
+                                "receipt": store.receipt(owner),
+                                "category": exc.category,
+                            }
+                        )
+                        raise
+                    await asyncio.sleep(self.CAPTURE_RETRIES[attempt])
+            await asyncio.to_thread(store.acknowledge, owner, session, batch)
+            self.notice(
+                {"state": "capture_recovered", "count": len(batch), "receipt": store.receipt(owner)}
             )
-            self.captured_fragments.add(fragment["event_id"])
-            self._prune_fragments()
-            return result
+
+    def _queue_capture(self, fragment):
+        if not self.capture_accepting:
+            raise NativeTaskError("Transcript capture is closing")
+        identity = fragment["event_id"]
+        if identity not in self.capture_pending:
+            if (
+                len(self.capture_pending) >= self.CAPTURE_PENDING_COUNT
+                or sum(len(json.dumps(row).encode()) for row in self.capture_pending.values())
+                + len(json.dumps(fragment).encode())
+                > self.CAPTURE_PENDING_BYTES
+            ):
+                raise NativeTaskError(
+                    "Live transcript queue is full; unsaved input remains pending"
+                )
+            self.capture_pending[identity] = dict(fragment)
+        if fragment.get("final") or len(self.capture_pending) >= self.CAPTURE_COUNT:
+            self.capture_wake.set()
+        self._start_capture()
+
+    def _start_capture(self):
+        if not self.capture_pending or self.capture_error is not None:
+            return
+        if self.capture_task is None or self.capture_task.done():
+            self.capture_task = asyncio.create_task(self._capture_writer())
+            self.tasks.add(self.capture_task)
+            self.transcript_tasks.add(self.capture_task)
+            self.capture_task.add_done_callback(self.tasks.discard)
+            self.capture_task.add_done_callback(self.transcript_tasks.discard)
+
+    async def _capture_writer(self):
+        async with self.transcript_lock:
+            while self.capture_pending and self.current:
+                if not self.capture_wake.is_set():
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self.capture_wake.wait(), self.CAPTURE_DELAY)
+                self.capture_wake.clear()
+                batch, size = [], 0
+                for fragment in self.capture_pending.values():
+                    amount = len(json.dumps(fragment, ensure_ascii=False).encode())
+                    if batch and (
+                        len(batch) >= self.CAPTURE_COUNT or size + amount > self.CAPTURE_BYTES
+                    ):
+                        break
+                    batch.append(dict(fragment))
+                    size += amount
+                body = {"provider_session_id": self.provider_session_id, "fragments": batch}
+                try:
+                    store, owner = await self._persist_capture_pending()
+                except NativeTaskError as exc:
+                    self.capture_error = exc
+                    self.notice(
+                        {
+                            "state": "capture_unsaved",
+                            "category": exc.category,
+                            "count": len(self.capture_pending),
+                        }
+                    )
+                    return
+                for attempt in range(len(self.CAPTURE_RETRIES) + 1):
+                    try:
+                        result = await self.request("/live/transcript", body)
+                        if result.get("ok") is not True:
+                            raise NativeTaskError("Transcript capture returned no acknowledgement")
+                        if store is not False:
+                            await asyncio.to_thread(
+                                store.acknowledge, owner, self.provider_session_id, batch
+                            )
+                        break
+                    except NativeTaskError as exc:
+                        if not exc.retryable or attempt == len(self.CAPTURE_RETRIES):
+                            self.capture_error = exc
+                            self.notice(
+                                {
+                                    "state": "capture_pending",
+                                    "reason": str(exc),
+                                    "category": exc.category,
+                                    "count": len(self.capture_pending),
+                                }
+                            )
+                            return
+                        await asyncio.sleep(self.CAPTURE_RETRIES[attempt])
+                for fragment in batch:
+                    self.capture_pending.pop(fragment["event_id"], None)
+                    self.spooled_fragments.discard(fragment["event_id"])
+                    self.captured_fragments.add(fragment["event_id"])
+                self._prune_fragments()
+                if len(self.capture_pending) >= self.CAPTURE_COUNT:
+                    self.capture_wake.set()
+
+    async def flush_captures(self, *, retry=False):
+        if retry and self.capture_error is not None and self.capture_error.retryable:
+            self.capture_error = None
+        self.capture_wake.set()
+        self._start_capture()
+        pending = self.capture_task
+        if pending is not None and pending is not asyncio.current_task():
+            await asyncio.shield(pending)
+        if self.capture_error is not None:
+            raise self.capture_error
+
+    async def _capture(self, fragment):
+        self._queue_capture(fragment)
+        await self.flush_captures()
+        return {"ok": True}
 
     def _prune_fragments(self):
-        cutoff = max(self.claimed_sequence, self.synthetic_sequence)
         retained = []
         for sequence, fragment in self.fragments:
-            if sequence <= cutoff and fragment["event_id"] in self.captured_fragments:
-                self.captured_fragments.discard(fragment["event_id"])
+            identity = fragment["event_id"]
+            if (
+                identity in self.claimed_fragments or fragment["role"] == "assistant"
+            ) and identity in self.captured_fragments:
+                self.captured_fragments.discard(identity)
+                self.claimed_fragments.discard(identity)
             else:
                 retained.append((sequence, fragment))
         self.fragments = retained
@@ -80,7 +260,7 @@ class NativeLiveTaskController(NativeTaskController):
             try:
                 await coroutine
             except NativeTaskError as exc:
-                self.notice({"state": "refused", "reason": str(exc)})
+                self.notice({"state": "refused", "reason": str(exc), "category": exc.category})
 
         task = asyncio.create_task(guarded())
         self.tasks.add(task)
@@ -103,8 +283,10 @@ class NativeLiveTaskController(NativeTaskController):
                 "provider_session_id": self.provider_session_id,
                 "input_id": input_id,
                 "text": text,
+                "admission": "async",
             },
         )
+        result = await self._operation_result(result)
         if not isinstance(result.get("output"), str):
             raise NativeTaskError("Typed input returned no canonical decision receipt")
         self.notice(
@@ -126,8 +308,15 @@ class NativeLiveTaskController(NativeTaskController):
         if self.provider_session_id is None:
             raise NativeTaskError("Live provider has not supplied its session identity")
         self._prune_fragments()
-        if len(self.fragments) >= 256:
-            raise NativeTaskError("Live transcript capacity reached; reconnect the selected task")
+        if (
+            len(self.fragments) >= 4096
+            or sum(len(row["text"].encode()) for _, row in self.fragments)
+            + len(fragment["text"].encode())
+            > 60000
+        ):
+            raise NativeTaskError(
+                "Live input window is full; captured input remains in task history"
+            )
         self.fragment_sequence += 1
         self.fragments.append((self.fragment_sequence, fragment))
 
@@ -157,26 +346,53 @@ class NativeLiveTaskController(NativeTaskController):
                 event.end_ms,
             ):
                 raise NativeTaskError("Final Live transcript changed for its provider item")
-            self._background(self._capture(prior), transcript=True)
+            self._queue_capture(prior)
             return
+        event_identity = getattr(event, "event_id", None)
         fragment = {
-            "event_id": "fragment_" + uuid.uuid4().hex,
+            "event_id": (
+                "fragment_"
+                + uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    self.provider_session_id + ":" + event_identity,
+                ).hex
+            )
+            if event_identity
+            else "fragment_" + uuid.uuid4().hex,
             "role": role,
             "text": event.text,
             "final": event.final,
         }
+        item_id = getattr(event, "item_id", None)
+        finality = getattr(event, "finality", None)
+        if item_id is not None:
+            fragment["item_id"] = item_id
+        if finality is not None:
+            fragment["finality"] = finality
         if synthetic:
             fragment["synthetic"] = True
         for name in ("start_ms", "end_ms"):
             value = getattr(event, name)
             if value is not None:
                 fragment[name] = value
+        previous = self.seen_fragments.get(fragment["event_id"])
+        if previous is not None:
+            if previous != fragment:
+                raise NativeTaskError(
+                    "Live transcript identity changed during retry", category="validation"
+                )
+            return
+        self.seen_fragments[fragment["event_id"]] = dict(fragment)
+        if len(self.seen_fragments) > 8192:
+            self.seen_fragments.pop(next(iter(self.seen_fragments)))
         self._remember_fragment(fragment)
+        if role == "user":
+            self.last_user_fragment_at = self.clock()
         if final_key is not None:
             self.final_fragments[final_key] = fragment
         if role == "user" and self.synthetic_output and event.end_ms is not None:
             self.synthetic_cutoff_ms = event.end_ms
-        self._background(self._capture(fragment), transcript=True)
+        self._queue_capture(fragment)
         if self.on_caption is not None:
             self.on_caption(event)
 
@@ -188,10 +404,9 @@ class NativeLiveTaskController(NativeTaskController):
             if prior.event != event:
                 raise NativeTaskError("Live delegation identity changed during retry")
             return
-        cutoff = max(self.claimed_sequence, self.synthetic_sequence)
         eligible = []
         for sequence, fragment in self.fragments:
-            if sequence <= cutoff:
+            if fragment["event_id"] in self.claimed_fragments:
                 continue
             if (
                 event.offset_ms is not None
@@ -199,7 +414,7 @@ class NativeLiveTaskController(NativeTaskController):
                 and fragment.get("end_ms") is not None
                 and fragment["end_ms"] > event.offset_ms
             ):
-                break
+                continue
             eligible.append((sequence, fragment))
         originals = [fragment for _, fragment in eligible if fragment["role"] == "user"]
         if not originals:
@@ -227,16 +442,63 @@ class NativeLiveTaskController(NativeTaskController):
             "delegation_id": event.delegation_id,
             "offset_ms": event.offset_ms,
             "fragments": frozen,
+            "admission": "async",
         }
         if event.prompt is not None:
             body["prompt"] = event.prompt
         call = _Delegation(event, body)
         self.delegations[event.delegation_id] = call
-        self.claimed_sequence = eligible[-1][0]
+        self.claimed_sequence = max(self.claimed_sequence, eligible[-1][0])
+        self.claimed_fragments.update(fragment["event_id"] for _, fragment in eligible)
         self._background(self._dispatch_live(call))
 
+    async def _operation_result(self, result, call=None):
+        operation_id = result.get("operation_id")
+        if operation_id is None:
+            return result
+        if not isinstance(operation_id, str) or not operation_id:
+            raise NativeTaskError("Live operation receipt has no identity")
+        if call is not None:
+            call.operation_id, call.admitted = operation_id, True
+        self.notice({"state": "operation_accepted", "operation_id": operation_id})
+        deadline = asyncio.get_running_loop().time() + self.OPERATION_TIMEOUT_S
+        failures = 0
+        while result.get("pending") is True:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise NativeTaskError(
+                    "Live operation remains pending; inspect its existing receipt"
+                )
+            await asyncio.sleep(self.OPERATION_POLL_S)
+            try:
+                self.guard()
+                result = await self.api.request(
+                    "/live/operation",
+                    method="GET",
+                    params={"operation_id": operation_id},
+                    expected_context=self.context,
+                )
+                self.guard()
+                failures = 0
+            except NativeTaskError as exc:
+                failures += 1
+                if not exc.retryable or failures >= 3:
+                    raise
+                continue
+            if result.get("operation_id") != operation_id:
+                raise NativeTaskError("Live operation response belongs to another request")
+        value = result.get("result")
+        if not isinstance(value, dict):
+            raise NativeTaskError("Live operation has no decision receipt")
+        return value
+
     async def _dispatch_live(self, call):
-        result = await self.request("/live/delegation", call.body)
+        try:
+            await self.flush_captures()
+            result = await self.request("/live/delegation", call.body)
+            result = await self._operation_result(result, call)
+        except NativeTaskError:
+            call.finished = True
+            raise
         if not isinstance(result.get("output"), str):
             raise NativeTaskError("Live delegation returned no canonical decision receipt")
         self.notice(
@@ -289,6 +551,8 @@ class NativeLiveTaskController(NativeTaskController):
         elif isinstance(event, rt.OutputTurnCompleted):
             self.provider_response_active = False
         elif isinstance(event, rt.OutputAudio):
+            if self.service_paused:
+                return
             self.spoken_item = event.item_id
             self.provider_response_active = True
             self.audio.queue_playback(event.data)
@@ -324,18 +588,21 @@ class NativeLiveTaskController(NativeTaskController):
             ),
             "playback_active": bool(getattr(self.audio, "playback_pending", True)),
             "response_pending": self.provider_response_active,
-            "input_pending": bool(self.transcript_tasks)
-            or any(
-                sequence > max(self.claimed_sequence, self.synthetic_sequence)
-                and fragment["role"] == "user"
-                for sequence, fragment in self.fragments
+            "input_pending": self.last_user_fragment_at is not None
+            and self.clock() - self.last_user_fragment_at < 0.7
+            and any(
+                fragment["event_id"] not in self.claimed_fragments and fragment["role"] == "user"
+                for _, fragment in self.fragments
             ),
             "tools_pending": any(
-                not value.finished and not value.retired for value in self.delegations.values()
+                not value.finished and not value.retired and not value.admitted
+                for value in self.delegations.values()
             ),
         }
 
     async def tick(self):
+        if self.capture_error is not None and not self.capture_error.retryable:
+            raise self.capture_error
         await super().tick()
         if not getattr(self.session, "emits_output_lifecycle", False) and not getattr(
             self.audio, "playback_pending", True
@@ -344,7 +611,9 @@ class NativeLiveTaskController(NativeTaskController):
         await self._flush_updates()
 
     def _quiet(self):
-        return not any(value for key, value in self.timing().items() if key != "sequence")
+        return not self.service_paused and not any(
+            value for key, value in self.timing().items() if key != "sequence"
+        )
 
     async def _send_synthetic(self, commands, *, quiet=False, source_sequence=None):
         async with self.send_lock:
@@ -427,7 +696,30 @@ class NativeLiveTaskController(NativeTaskController):
         )
         await self.request("/speech/receipt", {**receipt, "state": "sent" if sent else "deferred"})
 
+    async def drain(self):
+        await self.flush_captures()
+        await super().drain()
+
     async def close(self):
+        if self.closed:
+            return
+        if self.current:
+            try:
+                if self.capture_pending:
+                    await asyncio.wait_for(self._persist_capture_pending(), 2)
+                await asyncio.wait_for(self.flush_captures(retry=True), 2)
+            except (NativeTaskError, TimeoutError):
+                receipt = None
+                if self.capture_store not in (None, False):
+                    receipt = self.capture_store.receipt(self._capture_owner())
+                self.notice(
+                    {
+                        "state": "capture_incomplete",
+                        "count": len(self.capture_pending),
+                        "receipt": receipt,
+                    }
+                )
+        self.capture_accepting = False
         with suppress(NativeTaskError):
             if self.current:
                 await self.interrupt()

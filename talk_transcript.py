@@ -456,8 +456,9 @@ def _sweep_transcripts(
             if lease is None:
                 continue
             transcript_fd = _open_verified_regular(source)
+            original_name = source.name.split(".claimed-", 1)[0]
             claimed = source.with_name(
-                f"{source.name}.claimed-{os.getpid()}-{uuid.uuid4().hex}"
+                f"{original_name}.claimed-{os.getpid()}-{uuid.uuid4().hex}"
             )
             # Only one lease holder may claim this identity. The post-rename
             # lstat comparison catches a path swap injected after validation.

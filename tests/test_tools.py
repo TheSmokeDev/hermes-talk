@@ -653,3 +653,17 @@ def test_nothing_found_is_a_different_sentence_from_a_failure(monkeypatch):
     assert "nothing in the notes" in empty
     assert "failed" in broken
     assert empty != broken
+
+
+@pytest.mark.parametrize("manifest", ["version: 4.5.6\n", None, "version: \n"])
+def test_plugin_version_uses_loaded_source_before_stale_editable_metadata(
+    tmp_path, monkeypatch, manifest,
+):
+    import importlib.metadata
+
+    monkeypatch.setattr(talk_tools, "__file__", str(tmp_path / "talk_tools.py"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "1.2.3")
+    if manifest is not None:
+        (tmp_path / "plugin.yaml").write_text(manifest, encoding="utf-8")
+    expected = "4.5.6" if manifest and "4.5.6" in manifest else "1.2.3"
+    assert talk_tools.plugin_version() == expected

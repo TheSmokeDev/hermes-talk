@@ -42,7 +42,8 @@ def bounded_text(value, *, maximum=65536):
 class DashboardStages:
     def __init__(self, outbox, token, *, clock=time.time):
         self.outbox, self.owner, self.clock = outbox, token.owner, clock
-        with self._db(token, prune=False) as db:
+
+        def initialize(db):
             db.execute("""CREATE TABLE IF NOT EXISTS dashboard_interactions (
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL
                 REFERENCES task_event_owners(owner) ON DELETE CASCADE,
@@ -54,19 +55,37 @@ class DashboardStages:
                 REFERENCES dashboard_interactions(id) ON DELETE CASCADE,
                 owner TEXT NOT NULL, call_id TEXT NOT NULL, record TEXT NOT NULL,
                 UNIQUE(owner,interaction_id,call_id))""")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS dashboard_interactions_expiry "
+                "ON dashboard_interactions(expires)"
+            )
+
+        outbox.ensure_schema("dashboard_stages_v1", initialize)
+        self._last_prune = float("-inf")
 
     @contextmanager
-    def _db(self, token, *, prune=True):
+    def _db(self, token, *, prune=False, write=True):
         if token.owner != self.owner:
             raise DashboardTaskError("context_denied", 403)
-        with self.outbox.fenced(self.owner, token.connection_id, token.generation) as db:
-            if prune:
-                db.execute("DELETE FROM dashboard_interactions WHERE expires<=?", (self.clock(),))
+        with self.outbox.fenced(
+            self.owner, token.connection_id, token.generation, write=write
+        ) as db:
+            if (prune or write) and self.clock() - self._last_prune >= 60:
+                # Keep unresolved decisions/actions for reconciliation, even across long calls.
+                db.execute(
+                    "DELETE FROM dashboard_interactions WHERE expires<=? "
+                    "AND json_extract(record,'$.live_decision.state') IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM dashboard_actions a "
+                    "WHERE a.interaction_id=dashboard_interactions.id "
+                    "AND json_extract(a.record,'$.state') NOT IN ('returned','failed'))",
+                    (self.clock(),),
+                )
+                self._last_prune = self.clock()
             yield db
 
     def _encode(self, value):
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        if len(encoded.encode("utf-8")) > 256 * 1024:
+        if len(encoded.encode("utf-8")) > 1024 * 1024:
             raise DashboardTaskError("capacity", 413)
         return encoded
 
@@ -78,7 +97,7 @@ class DashboardStages:
         actions, action_bytes = db.execute(
             "SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM dashboard_actions"
         ).fetchone()
-        if count > 128 or actions > 512 or size + action_bytes > 4 * 1024 * 1024:
+        if count > 4096 or actions > 16384 or size + action_bytes > 64 * 1024 * 1024:
             raise DashboardTaskError("capacity", 409)
 
     def _load(self, db, token, interaction_id):
@@ -107,71 +126,118 @@ class DashboardStages:
             raise DashboardTaskError("invalid_event", 400)
         return self._stage(token, input_id, input_type, text)
 
-    def stage_live(self, token, source_window):
+    @staticmethod
+    def live_input_id(source_window):
+        fragments = [
+            {
+                key: value
+                for key, value in row.items()
+                if not (key == "finality" and value == ("turn" if row["final"] else "delta"))
+            }
+            for row in source_window["fragments"]
+        ]
+        return "live-" + digest([source_window["provider_session_id"], fragments])
+
+    def stage_live(self, token, source_window, *, db=None):
         fragments = source_window["fragments"]
         text = "".join(item["text"] for item in fragments)
-        input_id = "live-" + digest([source_window["provider_session_id"], fragments])
-        complete = len(fragments) == 1 and fragments[0]["final"]
+        input_id = self.live_input_id(source_window)
+        complete = (
+            len(fragments) == 1
+            and fragments[0].get("finality", "turn" if fragments[0]["final"] else "delta") == "turn"
+        )
         return self._stage(
-            token, input_id, ("typed" if fragments[0].get("modality") == "typed"
-                             else "voice") if complete else "voice_window", text,
+            token,
+            input_id,
+            ("typed" if fragments[0].get("modality") == "typed" else "voice")
+            if complete
+            else "voice_window",
+            text,
             source_window=source_window,
+            db=db,
         )
 
-    def _stage(self, token, input_id, input_type, text, *, source_window=None):
+    def _stage(self, token, input_id, input_type, text, *, source_window=None, db=None):
         identifier(input_id)
         bounded_text(text, maximum=60000)
+        if db is not None:
+            return self._stage_record(db, token, input_id, input_type, text, source_window)
         with self._db(token) as db:
-            existing = db.execute(
-                "SELECT record FROM dashboard_interactions "
-                "WHERE owner=? AND tab_id=? AND input_id=?",
-                (self.owner.key, token.connection_id, input_id),
-            ).fetchone()
-            if existing:
-                record = json.loads(existing[0])
-                if (record["text"], record["input_type"]) != (text, input_type):
-                    raise DashboardTaskError("event_conflict", 409)
-                return record
-            record = {
-                "id": uuid.uuid4().hex,
-                "input_id": input_id,
-                "input_type": input_type,
-                "text": text,
-                "state": "staged",
-                "mode": "undecided",
-                "origin_turn_id": uuid.uuid4().hex,
-                "event_id": uuid.uuid4().hex,
-                "canonical_state": "pending",
-                "canonical_message_ids": [],
-                "receipt_id": None,
-                "responses": {},
-                "settled_response": None,
-                "attempt_generation": None,
-                "created_at": self.clock(),
-            }
-            if source_window is not None:
-                record["source_window"] = source_window
-                record["canonical_text"] = (
-                    text if input_type in {"voice", "typed"} else
-                    "[Captured Live transcript fragments; this is not a finalized utterance.]\n"
-                    + text
-                )
-            db.execute(
-                "INSERT INTO dashboard_interactions VALUES (?,?,?,?,?,?)",
-                (
-                    record["id"],
-                    self.owner.key,
-                    token.connection_id,
-                    input_id,
-                    self._encode(record),
-                    self.clock() + 86400,
-                ),
-            )
-            self._save(db, record)
+            return self._stage_record(db, token, input_id, input_type, text, source_window)
+
+    def _stage_record(self, db, token, input_id, input_type, text, source_window):
+        existing = db.execute(
+            "SELECT record FROM dashboard_interactions WHERE owner=? AND tab_id=? AND input_id=?",
+            (self.owner.key, token.connection_id, input_id),
+        ).fetchone()
+        if existing:
+            record = json.loads(existing[0])
+            if (record["text"], record["input_type"]) != (text, input_type):
+                raise DashboardTaskError("event_conflict", 409)
             return record
+        record = {
+            "id": uuid.uuid4().hex,
+            "input_id": input_id,
+            "input_type": input_type,
+            "text": text,
+            "state": "staged",
+            "mode": "undecided",
+            "origin_turn_id": uuid.uuid4().hex,
+            "event_id": uuid.uuid4().hex,
+            "canonical_state": "pending",
+            "canonical_message_ids": [],
+            "receipt_id": None,
+            "responses": {},
+            "settled_response": None,
+            "attempt_generation": None,
+            "created_at": self.clock(),
+        }
+        if source_window is not None:
+            # Capture identity survives a new audio connection. Only canonical input receipts
+            # are reusable; decisions, response chains, and action authority stay tab-owned.
+            previous = db.execute(
+                "SELECT record FROM dashboard_interactions WHERE owner=? AND input_id=? "
+                "ORDER BY rowid LIMIT 1",
+                (self.owner.key, input_id),
+            ).fetchone()
+            if previous:
+                original = json.loads(previous[0])
+                if (original["text"], original["input_type"]) != (text, input_type):
+                    raise DashboardTaskError("event_conflict", 409)
+                for key in (
+                    "origin_turn_id",
+                    "event_id",
+                    "canonical_state",
+                    "canonical_message_ids",
+                    "receipt_id",
+                ):
+                    record[key] = original[key]
+            else:
+                record["origin_turn_id"] = digest([self.owner.key, input_id, "live-origin"])
+                record["event_id"] = digest([self.owner.key, input_id, "live-event"])
+            record["source_window"] = source_window
+            record["canonical_text"] = (
+                text
+                if input_type in {"voice", "typed"}
+                else "[Captured Live transcript fragments; this is not a finalized utterance.]\n"
+                + text
+            )
+        db.execute(
+            "INSERT INTO dashboard_interactions VALUES (?,?,?,?,?,?)",
+            (
+                record["id"],
+                self.owner.key,
+                token.connection_id,
+                input_id,
+                self._encode(record),
+                self.clock() + 86400,
+            ),
+        )
+        self._save(db, record)
+        return record
 
     def get(self, token, interaction_id):
-        with self._db(token) as db:
+        with self._db(token, write=False) as db:
             return self._load(db, token, interaction_id)
 
     def update(self, token, interaction_id, change):
@@ -282,16 +348,28 @@ class DashboardStages:
 
         return self.update(token, interaction_id, change)
 
-    def claim_live_decision(self, token, interaction_id):
-        with self._db(token) as db:
-            record = self._load(db, token, interaction_id)
-            if "source_window" not in record:
-                raise DashboardTaskError("interaction_unlinked", 409)
-            if record.get("live_decision") is not None:
-                return record, False
-            record["live_decision"] = {"state": "reasoning"}
-            self._save(db, record)
-            return record, True
+    def claim_live_decision(self, token, interaction_id, *, db=None):
+        if db is None:
+            with self._db(token) as db:
+                return self.claim_live_decision(token, interaction_id, db=db)
+        record = self._load(db, token, interaction_id)
+        if "source_window" not in record:
+            raise DashboardTaskError("interaction_unlinked", 409)
+        if record.get("live_decision") is not None:
+            return record, False
+        record["live_decision"] = {"state": "reasoning"}
+        self._save(db, record)
+        return record, True
+
+    def live_action(self, token, interaction_id):
+        with self._db(token, write=False) as db:
+            self._load(db, token, interaction_id)
+            row = db.execute(
+                "SELECT record FROM dashboard_actions WHERE owner=? AND interaction_id=? "
+                "AND call_id=?",
+                (self.owner.key, interaction_id, "hermes-action-" + interaction_id),
+            ).fetchone()
+            return json.loads(row[0]) if row else None
 
     def complete_live_decision(self, token, interaction_id, decision):
         def change(record):
@@ -309,6 +387,7 @@ class DashboardStages:
                 "tool_call_ids": [call_id] if decision["name"] else [],
                 "finals": {},
             }
+
         return self.update(token, interaction_id, change)
 
     def prepare_action(self, token, interaction_id, response_id, call_id, name, arguments, build):
@@ -547,7 +626,7 @@ class DashboardStages:
             return action
 
     def records(self, token):
-        with self._db(token) as db:
+        with self._db(token, write=False) as db:
             interactions = [
                 json.loads(row[0])
                 for row in db.execute(

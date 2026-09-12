@@ -166,13 +166,15 @@ def test_public_fragments_preserve_interval_and_never_become_final(role):
             "type": f"session.{role}_transcript.delta",
             "delta": "hello",
             "event_id": "fragment-7",
+            "item_id": "utterance-2",
             "start_ms": 100,
             "end_ms": 160,
         }
     )
     assert isinstance(event, rt.Transcript)
     assert event.final is False
-    assert (event.start_ms, event.end_ms, event.item_id) == (100, 160, "fragment-7")
+    assert (event.start_ms, event.end_ms, event.item_id) == (100, 160, "utterance-2")
+    assert event.event_id == "fragment-7" and event.finality == "delta"
     assert event.role is (
         rt.TranscriptRole.USER if role == "input" else rt.TranscriptRole.ASSISTANT
     )
@@ -183,8 +185,8 @@ def test_subscription_fragment_is_partial_and_explicit_turn_done_is_final():
     final = protocol.decode_event(
         {"type": "turn.done", "turn": {"role": "user", "transcript": "hello"}}
     )
-    assert delta.final is False
-    assert final.final is True
+    assert delta.final is False and delta.finality == "item"
+    assert final.final is True and final.finality == "turn"
     assert final.text == "hello"
 
 
@@ -314,3 +316,29 @@ def test_separate_billing_settings_survive_auth_switch():
     assert subscription.auth_mode == "subscription" and subscription.voice == "cove"
     assert api.auth_mode == "api" and api.voice == "marin"
     assert resolve_live_config(env) == subscription
+
+
+@pytest.mark.parametrize("kind,role", [
+    ("session.input_transcript.delta", rt.TranscriptRole.USER),
+    ("session.output_transcript.delta", rt.TranscriptRole.ASSISTANT),
+])
+def test_live_fragment_identity_and_whitespace_are_independent_of_text(kind, role):
+    events = [protocol.decode_event({"type": kind, "event_id": identity, "delta": text})
+              for identity, text in [("a", "go"), ("b", " "), ("c", "go")]]
+    assert "".join(event.text for event in events) == "go go"
+    assert [event.event_id for event in events] == ["a", "b", "c"]
+    assert all(event.role is role and event.item_id is None and not event.final for event in events)
+
+
+def test_live_added_item_and_turn_have_separate_event_identity():
+    item = protocol.decode_event({"type": "input_transcript.added", "event_id": "added-event",
+                                  "item": {"id": "utterance", "text": " yes "}})
+    turn = protocol.decode_event({"type": "turn.done", "event_id": "turn-event",
+                                  "turn": {"id": "utterance", "role": "user",
+                                           "transcript": " yes "}})
+    assert item.item_id == turn.item_id == "utterance"
+    assert item.event_id == "added-event" and turn.event_id == "turn-event"
+    assert item.text == turn.text == " yes "
+    assert item.finality == "item" and turn.finality == "turn"
+    with pytest.raises(ValueError, match="finality"):
+        replace(item, finality="maybe")

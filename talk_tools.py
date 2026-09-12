@@ -423,19 +423,18 @@ def plugin_version() -> str:
     """The shipped plugin version, whichever way this plugin was loaded."""
 
     try:
-        from importlib.metadata import version
-
-        return version("hermes-talk")
-    except Exception:  # noqa: BLE001 - file-path load has no installed metadata
-        pass
-    try:
         manifest = Path(__file__).resolve().parent / "plugin.yaml"
         for line in manifest.read_text(encoding="utf-8").splitlines():
-            if line.startswith("version:"):
+            if line.startswith("version:") and line.split(":", 1)[1].strip():
                 return line.split(":", 1)[1].strip()
     except OSError:
         pass
-    return "unknown"
+    try:
+        from importlib.metadata import version
+
+        return version("hermes-talk")
+    except Exception:  # noqa: BLE001 - a wheel may have no adjacent plugin manifest
+        return "unknown"
 
 
 def default_talk_tools(*, pausable: bool = False) -> list[dict]:

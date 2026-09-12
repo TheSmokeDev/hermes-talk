@@ -45,7 +45,7 @@ async def connected(*, held=None, supports_context=True, speech=None, response_c
     session = Session()
     session.supports_live_context = supports_context
     controller = NativeLiveTaskController(
-        api, session, {"task": api.context}, Audio(), on_notice=notices.append
+        api, session, {"task": api.context}, Audio(), on_notice=notices.append, capture_store=False
     )
     await controller.handle(rt.SessionReady("real-provider-session"))
     return SimpleNamespace(
@@ -171,6 +171,7 @@ def test_typed_live_input_uses_direct_canonical_route_without_fake_delegation(su
             "provider_session_id": "real-provider-session",
             "input_id": "typed-one",
             "text": "Exactly my typed words",
+            "admission": "async",
         }
         assert not any(
             isinstance(command, (rt.AddInputText, rt.SubmitDelegationResult))

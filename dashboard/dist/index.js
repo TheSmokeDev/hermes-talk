@@ -31,7 +31,7 @@
   const TOOL_TIMEOUT_MS = 6500;
   const RUN_POLL_MS = 5000;
   const IDLE_POLL_MS = 20000;
-  const LIVE_POLL_MS = 750;
+  const LIVE_POLL_MS = 250;
   /** How long to watch each run kind before letting go. The work continues. */
   const RUN_POLL_CAPS_MS = { agent: 2700000, skill: 600000 };
   const DEFAULT_RUN_CAP_MS = 600000;
@@ -384,7 +384,10 @@
     refresh() {
       if (this.closed) return Promise.resolve();
       if (this.stateTail) return this.stateTail;
-      this.stateTail = this.request("/state", {}).then((state) => {
+      const pending = this.transport.live
+        ? this.transport.flushCapture().then(() => this.request("/state", {}))
+        : this.request("/state", {});
+      this.stateTail = pending.then((state) => {
         if (!this.closed && this.transport.cb.onTaskState) this.transport.cb.onTaskState(state);
         if (!this.closed && !this.transport.live) this.presentation.offer(state);
       }).catch((err) => this.report(errorText(err))).finally(() => { this.stateTail = null; });
@@ -640,7 +643,7 @@
       }).catch((err) => this.report(errorText(err)));
     }
 
-    close() {
+    close(beforeRevoke) {
       if (this.closed) return;
       this.presentation.interrupt();
       this.presentation.pending = [];
@@ -649,7 +652,10 @@
       this.controllers.clear();
       this.requests.clear();
       // Revocation is best effort; all local continuations are already fenced.
-      void apiCall("/close", { method: "POST", body: JSON.stringify(this.context), keepalive: true }).catch(() => {});
+      const revoke = () => apiCall("/close", {
+        method: "POST", body: JSON.stringify(this.context), keepalive: true }).catch(() => {});
+      if (beforeRevoke) void beforeRevoke.then(revoke, revoke);
+      else void revoke();
     }
   }
 
@@ -873,9 +879,9 @@
       }
     }
 
-    stop() {
+    stop(beforeTaskClose) {
       this.closed = true;
-      if (this.task) this.task.close();
+      if (this.task) this.task.close(beforeTaskClose);
       // Teardown is idempotent and each step is guarded so a throw in one can
       // never skip the rest. (A throw in abortCascade() used to leave the
       // channel/peer open, so the server kept listening even though the UI
@@ -1447,6 +1453,53 @@
     }
   }
 
+  function appendTranscriptRows(rows, event, id) {
+    const role = event.role, text = event.text, final = event.final;
+    const scope = event.finality, item = event.item_id;
+    const rich = scope !== undefined || item !== undefined || event.event_id !== undefined;
+    if (event.event_id && rows.some((row) => (row.event_ids || []).includes(event.event_id))) return rows;
+    const contains = (outer, inner) => Number.isFinite(outer.start_ms) &&
+      Number.isFinite(outer.end_ms) && Number.isFinite(inner.start_ms) &&
+      Number.isFinite(inner.end_ms) && outer.start_ms <= inner.start_ms && outer.end_ms >= inner.end_ms;
+    let indexes = [];
+    if (rich) {
+      indexes = rows.flatMap((row, index) => {
+        if (row.role !== role) return [];
+        const sameItem = typeof item === "string" && row.item_id === item;
+        const coveredTurn = scope === "turn" && (row.fragments || []).length &&
+          row.fragments.every((fragment) => contains(event, fragment));
+        const lateObservation = scope !== "turn" && row.finality === "turn" && contains(row, event);
+        return sameItem || coveredTurn || lateObservation ? [index] : [];
+      });
+    }
+    if (!indexes.length && (!rich || !item)) {
+      const last = rows[rows.length - 1];
+      if (last && last.role === role && !last.final &&
+          (!rich || (!last.item_id && last.finality !== "item"))) indexes = [rows.length - 1];
+    }
+    const previous = indexes.length ? rows[indexes[0]] : null;
+    const observations = indexes.flatMap((index) => rows[index].fragments || []);
+    const ids = indexes.flatMap((index) => rows[index].event_ids || []);
+    const late = previous && previous.finality === "turn" && scope !== "turn" &&
+      ((typeof item === "string" && previous.item_id === item) || contains(previous, event));
+    const delta = rich ? scope === "delta" || (!scope && !final) : !final;
+    const row = Object.assign({}, previous || { id, role, text: "" });
+    if (!late) {
+      row.text = delta && previous ? previous.text + text : text;
+      row.final = rich ? scope === "turn" || (!scope && final) : final;
+      if (rich) Object.assign(row, { item_id: item, finality: scope,
+        start_ms: event.start_ms, end_ms: event.end_ms });
+    }
+    if (rich) {
+      row.event_ids = ids.concat(event.event_id || []);
+      row.fragments = observations.concat([{ event_id: event.event_id, text,
+        item_id: item, finality: scope, start_ms: event.start_ms, end_ms: event.end_ms }]);
+    }
+    if (!indexes.length) return rows.concat([row]);
+    return rows.flatMap((value, index) => index === indexes[0] ? [row] :
+      indexes.includes(index) ? [] : [value]);
+  }
+
   /** Live audio is browser WebRTC; every task action remains on the server. */
   class LiveTransport extends TalkTransport {
     constructor(session, callbacks) {
@@ -1456,6 +1509,7 @@
       this.liveCursor = 0;
       this.liveTimer = null;
       this.livePolling = false;
+      this.operations = new Map();
     }
 
     async start() {
@@ -1528,13 +1582,20 @@
       if (this.closed || !this.bindingId || typeof text !== "string" || !text.trim()) return false;
       try {
         const result = await this.task.request("/live/input", {
-          binding_id: this.bindingId, input_id: clientId("live_input_"), text: text });
+          binding_id: this.bindingId, input_id: clientId("live_input_"), text: text,
+          admission: "async" });
         if (!result || result.ok !== true) throw new Error("Live typed input was not accepted.");
         return true;
       } catch (err) {
         if (!this.closed) this.fail(errorText(err));
         throw err;
       }
+    }
+
+    async flushCapture() {
+      if (this.closed || !this.bindingId) return;
+      const reply = await this.task.request("/live/flush", { binding_id: this.bindingId });
+      if (!reply || reply.ok !== true) throw new Error("Live transcript capture was not confirmed.");
     }
 
     async pollEvents() {
@@ -1555,7 +1616,20 @@
           if (event.type === "transcript") {
             if (!["user", "assistant"].includes(event.role) || typeof event.text !== "string" ||
                 typeof event.final !== "boolean") throw new Error("Invalid Live transcript event.");
-            if (event.text) this.cb.onTranscript(event.role, event.text, event.final);
+            if ((event.finality !== undefined && !["delta", "item", "turn"].includes(event.finality)) ||
+                (event.item_id !== undefined && typeof event.item_id !== "string") ||
+                (event.event_id !== undefined && typeof event.event_id !== "string")) {
+              throw new Error("Invalid Live transcript identity.");
+            }
+            this.cb.onTranscript(event.role, event.text, event.final, event);
+          } else if (event.type === "operation") {
+            if (typeof event.operation_id !== "string" || typeof event.pending !== "boolean" ||
+                !["admitted", "deciding", "dispatching", "completed", "uncertain", "failed"].includes(event.state)) {
+              throw new Error("Invalid Live operation receipt.");
+            }
+            this.operations.set(event.operation_id, { state: event.state, pending: event.pending });
+            if (this.cb.onStatus) this.cb.onStatus(event.pending ? "Hermes is checking the request." :
+              "Hermes returned a task decision; job status is shown separately.");
           } else if (event.type === "result") {
             const result = event.result || event;
             if (result.run_id !== undefined && this.cb.onTaskResult) {
@@ -1593,22 +1667,23 @@
     }
 
     closeBinding(bindingId) {
-      void apiCall("/live/close", { method: "POST", keepalive: true,
+      return apiCall("/live/close", { method: "POST", keepalive: true,
         body: JSON.stringify(Object.assign({ binding_id: bindingId }, this.task.context)) }).catch(() => {});
     }
 
     stop() {
       const wasClosed = this.closed;
+      let beforeTaskClose;
       window.clearTimeout(this.liveTimer);
       this.liveTimer = null;
       if (this.bindingId) {
-        this.closeBinding(this.bindingId);
+        beforeTaskClose = this.closeBinding(this.bindingId);
         this.bindingId = null;
       }
       if (this.audio) {
         try { this.audio.pause(); this.audio.srcObject = null; } catch (e) { /* already stopped */ }
       }
-      super.stop();
+      super.stop(beforeTaskClose);
       if (!wasClosed && this.cb.onClosed) this.cb.onClosed();
     }
   }
@@ -1793,29 +1868,18 @@
       };
     }, [refreshRuns]);
 
-    const appendTranscript = useCallback((role, text, final) => {
-      setTranscript((prev) => {
-        const last = prev[prev.length - 1];
-        if (!final) {
-          if (last && last.role === role && !last.final) {
-            const merged = Object.assign({}, last, { text: last.text + text });
-            return prev.slice(0, -1).concat([merged]);
-          }
-          return prev.concat([{ id: rowId.current++, role: role, text: text, final: false }]);
-        }
-        if (last && last.role === role && !last.final) {
-          const done = Object.assign({}, last, { text: text, final: true });
-          return prev.slice(0, -1).concat([done]);
-        }
-        return prev.concat([{ id: rowId.current++, role: role, text: text, final: true }]);
-      });
+    const appendTranscript = useCallback((role, text, final, metadata) => {
+      setTranscript((prev) => appendTranscriptRows(prev,
+        Object.assign({}, metadata || {}, { role, text, final }), rowId.current++));
     }, []);
 
     async function installSession(session, epoch) {
       const current = () => epoch === connectionEpoch.current;
       const transport = makeTransport(session, {
         onStatus: (message) => { if (current()) setLive(message); },
-        onTranscript: (role, text, final) => { if (current()) appendTranscript(role, text, final); },
+        onTranscript: (role, text, final, metadata) => {
+          if (current()) appendTranscript(role, text, final, metadata);
+        },
         onError: (message) => { if (current()) setError(message); },
         onClosed: () => { if (current()) { setPhase("idle"); setLive(""); setSending(false); } },
         onTaskState: (state) => { if (current()) setTaskState(state); },
@@ -1942,6 +2006,10 @@
       setError("");
       let installedEpoch = null;
       try {
+        if (old && old.live) await old.flushCapture();
+        if (operation !== switchEpoch.current || controller.signal.aborted || transportRef.current !== old) {
+          return false;
+        }
         const session = await apiCall("/switch", {
           method: "POST", body: JSON.stringify(body), signal: controller.signal,
         });
@@ -2269,7 +2337,7 @@
 
   if (window.__HERMES_TALK_TEST_HOOK__) {
     window.__HERMES_TALK_TEST__ = { TalkTransport: TalkTransport, LiveTransport: LiveTransport,
-      makeTransport: makeTransport, TalkPage: TalkPage,
+      makeTransport: makeTransport, TalkPage: TalkPage, appendTranscriptRows: appendTranscriptRows,
       controlLabel: controlLabel, steeringLabel: steeringLabel };
   }
   window.__HERMES_PLUGINS__.register("hermes-talk", TalkPage);

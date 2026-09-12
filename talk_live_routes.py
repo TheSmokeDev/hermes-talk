@@ -93,6 +93,18 @@ def mount_live_routes(
 
         return await invoke(typed(), request, body)
 
+    @router.post("/live/flush")
+    async def live_flush(request: Request):
+        require_auth(request)
+        body = await read_body(request)
+
+        async def flush():
+            binding = await registry.binding(request, body, refresh=True)
+            await binding.flush_capture()
+            return {"ok": True}
+
+        return await invoke(flush(), request, body)
+
     @router.post("/live/close")
     async def live_close(request: Request):
         require_auth(request)
@@ -124,6 +136,22 @@ def mount_live_routes(
         body = await read_body(request)
         return await invoke(registry.coordinator.typed(request, body), request, body)
 
+    @router.get("/live/operation")
+    async def live_operation(request: Request):
+        require_auth(request)
+        query = request.query_params
+        try:
+            body = {
+                "connection_id": query.get("connection_id"),
+                "generation": int(query.get("generation", "")),
+                "operation_id": query.get("operation_id"),
+            }
+        except (TypeError, ValueError):
+            raise http_exception(
+                status_code=400, detail=DashboardTaskError("invalid_event", 400).detail(),
+            ) from None
+        return await task_call(registry.coordinator.operation, request, body)
+
     @router.post("/live/speech")
     async def live_speech(request: Request):
         require_auth(request)
@@ -136,9 +164,11 @@ def mount_live_routes(
         live_events,
         live_input,
         live_close,
+        live_flush,
         live_transcript,
         live_delegation,
         live_typed,
+        live_operation,
         live_speech,
     )
     if hasattr(router, "add_event_handler"):

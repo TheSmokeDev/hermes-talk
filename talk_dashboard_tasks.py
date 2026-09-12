@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 try:
     from .talk_attachment import HistoryDelivery, TalkAttachment
-    from .talk_dashboard_gateway import DashboardTaskError, TaskGateway
+    from .talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from .talk_dashboard_store import DashboardStages, bounded_text
     from .talk_outbox import HistoryOutbox, PendingHistory
     from .talk_passive import (
@@ -30,6 +30,7 @@ try:
         identifier,
         session_id,
     )
+    from .talk_recipients import RECIPIENT_TOOLS, RecipientService
     from .talk_run_control import (
         control_output,
         require_steering,
@@ -42,9 +43,10 @@ try:
     from .talk_speech_timing import SpeechTiming
     from .talk_task_events import SpeechAttempt, TaskEvents
     from .talk_task_sources import TaskEventError
+    from .talk_worker_recipients import TalkWorkerRecipients, WorkerRecipientBackend
 except ImportError:  # pragma: no cover - flat plugin load
     from talk_attachment import HistoryDelivery, TalkAttachment
-    from talk_dashboard_gateway import DashboardTaskError, TaskGateway
+    from talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from talk_dashboard_store import DashboardStages, bounded_text
     from talk_outbox import HistoryOutbox, PendingHistory
     from talk_passive import (
@@ -56,6 +58,7 @@ except ImportError:  # pragma: no cover - flat plugin load
         identifier,
         session_id,
     )
+    from talk_recipients import RECIPIENT_TOOLS, RecipientService
     from talk_run_control import (
         control_output,
         require_steering,
@@ -68,6 +71,7 @@ except ImportError:  # pragma: no cover - flat plugin load
     from talk_speech_timing import SpeechTiming
     from talk_task_events import SpeechAttempt, TaskEvents
     from talk_task_sources import TaskEventError
+    from talk_worker_recipients import TalkWorkerRecipients, WorkerRecipientBackend
 
 BOUND_TOOLS = frozenset(
     {
@@ -83,7 +87,7 @@ BOUND_TOOLS = frozenset(
         "talk_capabilities",
         "set_update_preference",
     }
-)
+) | RECIPIENT_TOOLS
 CHILD_TOOLS = frozenset({"delegate_task", "search_memory", "search_vault"})
 
 
@@ -189,6 +193,7 @@ class BoundDashboard:
     job_observations: dict = field(default_factory=dict)
     speech_timing: SpeechTiming | None = None
     native_surface: object = field(default=None, repr=False)
+    capabilities_checked_at: float = field(default_factory=time.monotonic)
 
     @property
     def token(self):
@@ -199,13 +204,31 @@ class BoundDashboard:
 
 
 class DashboardTasks:
-    def __init__(self, *, context_resolver=resolve_context, transport_factory=configured_transport):
+    def __init__(self, *, context_resolver=resolve_context, transport_factory=configured_transport,
+                 recipient_backend=RecipientGateway):
         self.resolve_context = context_resolver
         self.transport_factory = transport_factory
         self._bindings: dict[str, BoundDashboard] = {}
         self._lock = threading.RLock()
         self.target_resolver = None
         self.selection_guard = None
+        self.recipients = RecipientService(
+            self, backend_factory=lambda bound: WorkerRecipientBackend(
+                bound, recipient_backend(bound),
+            ),
+        )
+
+    def capabilities(self, bound, *, refresh=False):
+        # Only feature descriptions are cached. binding() and gateway guards always run.
+        now = time.monotonic()
+        with self._lock:
+            if not refresh and now - bound.capabilities_checked_at < 5:
+                return bound.capabilities
+        value = bound.gateway.capabilities()
+        with self._lock:
+            bound.capabilities = value
+            bound.capabilities_checked_at = now
+        return value
 
     def _store_proof(self, gateway, context, target=None):
         if not target or target["peer_id"] == "local":
@@ -447,6 +470,38 @@ class DashboardTasks:
             + ". Use set_update_preference when the operator asks to change update frequency."
         )
 
+    def live_capabilities(self, bound):
+        features = self.capabilities(bound).get("features", {})
+        return json.dumps({
+            "delegation": "Hermes owns actions and their canonical receipts",
+            "workers": ["hermes", "codex"] if codex_worker_available(bound.capabilities)
+            else ["hermes"],
+            "existing_app_recipients": features.get("recipient_bridge", {"state": "unknown"}),
+            "computer_use": features.get("computer_use", {"state": "unknown"}),
+            "unknown_capability": "Ask Hermes to verify on the selected execution host",
+        }, ensure_ascii=False)
+
+    def live_instructions(self, bound):
+        history = self._history(bound)
+        messages, remaining = [], 12000
+        for row in reversed(history.get("messages", [])[-12:]):
+            if row.get("role") not in {"user", "assistant"}:
+                continue
+            content = str(row.get("content", ""))
+            if len(content) > remaining:
+                content = content[-remaining:] if remaining else ""
+            if not content:
+                break
+            messages.append({"role": row["role"], "content": content})
+            remaining -= len(content)
+        return json.dumps({
+            "task": bound.selected_context,
+            "history": list(reversed(messages)),
+            "update_preference": bound.events.preferences(bound.token)["update_mode"],
+            "reference_only": True,
+            "recipients": self.recipients.snapshot(bound),
+        }, ensure_ascii=False)
+
     def event(self, request, body):
         bound = self.binding(request, body, write=True)
         record = bound.stages.event(bound.token, body)
@@ -529,7 +584,7 @@ class DashboardTasks:
         if record.get("original_attempt_generation") == bound.token.generation and not recover:
             return record
         self._store_proof(bound.gateway, bound.context, bound.target_record)
-        bound.capabilities = bound.gateway.capabilities()
+        bound.capabilities = self.capabilities(bound, refresh=True)
         bound.gateway.require_child(bound.capabilities)
         bound.outbox.add(
             PendingHistory(
@@ -619,6 +674,11 @@ class DashboardTasks:
         name, arguments = body.get("name"), body.get("arguments")
         if name not in BOUND_TOOLS or not isinstance(arguments, dict):
             raise DashboardTaskError("unsupported_tool", 400)
+        if name == "send_agent_message":
+            target = self.recipients._store(bound).snapshot()["selected"]
+            if target and target["app"] == "codex_worker":
+                body = TalkWorkerRecipients(bound).steering_body(target, body)
+                name, arguments = body["name"], body["arguments"]
         child_context = self.instructions(bound)[:32000] if name in CHILD_TOOLS else ""
 
         def build(record, action):
@@ -674,7 +734,7 @@ class DashboardTasks:
                 action["control_target_run_id"] = arguments.get("run_id")
                 action["control_api_run_id"] = control_api_run_id
                 action["control_phase"] = "prepared"
-            elif name in {"stop_work", "resolve_approval"}:
+            elif name in {"stop_work", "resolve_approval"} | RECIPIENT_TOOLS:
                 record["mode"] = "control" if record["mode"] != "execution" else "execution"
             action["request_body"] = action.get("request_body")
 
@@ -698,7 +758,14 @@ class DashboardTasks:
             arguments,
             build,
         )
-        if name in CHILD_TOOLS:
+        if name in RECIPIENT_TOOLS:
+            receipt = self.recipients.tool(request, body, action=action, bound=bound)
+            output = receipt.get("output") or json.dumps(receipt, ensure_ascii=False)
+            action = bound.stages.update_action(
+                bound.token, action["run_id"], state="returned", output=output,
+                recipient_receipt=receipt,
+            )
+        elif name in CHILD_TOOLS:
             action = self._dispatch(bound, action)
             output = (
                 f"WORK_STARTED #{action['run_id']} kind=agent — linked child work is running."
@@ -718,7 +785,7 @@ class DashboardTasks:
             )
             output = action["output"]
         else:
-            output = self._read_or_control(bound, name, arguments)
+            output = self._read_or_control(bound, name, arguments, request=request, body=body)
             action = bound.stages.update_action(bound.token, action["run_id"], state="returned")
         self.binding(request, body)
         return {"ok": True, "output": output[:4000], "action": self._action_view(action)}
@@ -780,7 +847,7 @@ class DashboardTasks:
         if action["state"] not in {"prepared", "uncertain"}:
             raise DashboardTaskError("interaction_incomplete", 409)
         self._store_proof(bound.gateway, bound.context, bound.target_record)
-        bound.capabilities = bound.gateway.capabilities()
+        bound.capabilities = self.capabilities(bound, refresh=True)
         bound.gateway.require_child(bound.capabilities)
         action = bound.stages.update_action(bound.token, action["run_id"], state="submitting")
         try:
@@ -807,7 +874,7 @@ class DashboardTasks:
                 raise
             return saved
 
-    def _read_or_control(self, bound, name, arguments):
+    def _read_or_control(self, bound, name, arguments, *, request=None, body=None):
         if name == "talk_capabilities":
             return json.dumps(
                 {
@@ -823,6 +890,8 @@ class DashboardTasks:
                     "linked_children": True,
                     "steering": self._steering_capability(bound),
                     "resource_admission": "unsupported",
+                    "recipients": self.recipients.snapshot(bound),
+                    "execution_host": self.recipients.capabilities(bound),
                 }
             )
         if name == "talk_status":
@@ -831,9 +900,12 @@ class DashboardTasks:
         if name in {"check_work", "list_agents"} and run_id is None:
             _, actions = bound.stages.records(bound.token)
             return json.dumps(
-                [self._action_view(action) for action in actions if action.get("api_run_id")]
+                [self._action_view(action) for action in actions
+                 if action.get("api_run_id") or action["name"] in RECIPIENT_TOOLS]
             )
         action = bound.stages.action(bound.token, run_id)
+        if action["name"] in RECIPIENT_TOOLS and name in {"check_work", "list_agents"}:
+            return json.dumps(self._recipient_result(request, body, bound, action))
         if not action.get("api_run_id"):
             raise DashboardTaskError("result_unavailable", 409)
         if name == "stop_work":
@@ -859,6 +931,8 @@ class DashboardTasks:
             key: action.get(key)
             for key in ("action_id", "run_id", "name", "state", "canonical_message_ids", "error")
         }
+        if action["name"] in RECIPIENT_TOOLS and action.get("recipient_receipt"):
+            view["recipient_receipt"] = action["recipient_receipt"]
         if action["name"] == "steer_work":
             view["control"] = action.get("control_receipt") or {
                 "status": "unknown",
@@ -905,7 +979,7 @@ class DashboardTasks:
         bound = self.binding(request, body)
         self._store_proof(bound.gateway, bound.context, bound.target_record)
         bound.attachment.refresh_snapshot(bound.token)
-        bound.capabilities = bound.gateway.capabilities()
+        bound.capabilities = self.capabilities(bound)
         interactions, actions = bound.stages.records(bound.token)
         for action in actions:
             if action["name"] == "steer_work":
@@ -1041,6 +1115,12 @@ class DashboardTasks:
             "history": self._history(bound),
             "interactions": visible,
             "jobs": jobs,
+            "recipients": {
+                **self.recipients.snapshot(bound),
+                "deliveries": [self._action_view(action) for action in actions
+                               if action["name"] in RECIPIENT_TOOLS][-12:],
+            },
+            "capabilities": self.recipients.capabilities(bound),
             "events": bound.events.page(bound.token, after=body.get("after", 0)),
             "preferences": bound.events.preferences(bound.token),
             "announcements": [
@@ -1098,10 +1178,30 @@ class DashboardTasks:
             )
             bound.job_observations[action["run_id"]] = signature
 
+    def _recipient_result(self, request, body, bound, action):
+        receipt = self.recipients.reconcile(request, body, action=action, bound=bound)
+        if not isinstance(receipt, dict):
+            raise DashboardTaskError("result_unavailable", 409)
+        output = receipt.get("output") or json.dumps(receipt, ensure_ascii=False)
+        bound.stages.update_action(
+            bound.token, action["run_id"], recipient_receipt=receipt, output=output,
+        )
+        self.binding(request, body)
+        capture = receipt.get("capture")
+        return {
+            "ok": True, "run_id": action["run_id"],
+            "status": receipt.get("status", receipt.get("state", "returned")),
+            "output": output, "receipt": receipt,
+            "artifacts": [capture] if isinstance(capture, dict) else [],
+            "error": receipt.get("reason"), "truncated": False,
+        }
+
     def result(self, request, body):
         bound = self.binding(request, body)
         self._store_proof(bound.gateway, bound.context, bound.target_record)
         action = bound.stages.action(bound.token, body.get("run_id"))
+        if action["name"] in RECIPIENT_TOOLS:
+            return self._recipient_result(request, body, bound, action)
         if not action.get("api_run_id"):
             raise DashboardTaskError("result_unavailable", 404)
         result = bound.gateway.run(action["api_run_id"])

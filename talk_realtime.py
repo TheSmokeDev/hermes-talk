@@ -229,6 +229,8 @@ class Transcript(RealtimeEvent):
     item_id: str | None = None
     start_ms: int | None = None
     end_ms: int | None = None
+    event_id: str | None = None
+    finality: str | None = None
 
     def __post_init__(self) -> None:
         expected_role = {
@@ -239,6 +241,9 @@ class Transcript(RealtimeEvent):
             raise ValueError("Transcript role must match its audio provenance")
         _identifier(self.response_id, "response_id", optional=True)
         _identifier(self.item_id, "item_id", optional=True)
+        _identifier(self.event_id, "event_id", optional=True)
+        if self.finality not in {None, "delta", "item", "turn"}:
+            raise ValueError("Invalid transcript finality scope")
         for value in (self.start_ms, self.end_ms):
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError("Transcript offsets must be non-negative milliseconds")

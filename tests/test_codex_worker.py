@@ -200,10 +200,30 @@ def test_exact_steering_and_cancellation_keep_original_thread_and_turn(tmp_path)
     assert len(peer(tmp_path)["thread"]["turns"]) == 1
 
 
+def test_approval_snapshot_does_not_reserve_the_outbox_writer(tmp_path):
+    worker = setup(tmp_path)
+    # Another writer may be recording a worker event; a committed snapshot is
+    # still readable and must not try to become a competing SQLite writer.
+    with worker.jobs.outbox._db():
+        assert worker.snapshot()["state"] == "prepared"
+        assert worker.approvals() == []
+
+
 def test_current_approval_once_and_replay_cannot_authorize_a_new_request(tmp_path):
     worker = setup(tmp_path, "approval_replay")
+    approval_ready, interrupted = threading.Event(), threading.Event()
+
+    def observed(record):
+        if worker.approvals():
+            approval_ready.set()
+        if record["state"] == "interrupted":
+            interrupted.set()
+
+    worker.on_change = observed
     with run_worker(worker) as running:
-        wait_for(lambda: bool(worker.approvals()))
+        # Startup includes a separately bounded version process and three RPCs.
+        # Await their actual notification; disk/process scheduling is not approval latency.
+        assert approval_ready.wait(20), worker.snapshot()
         current = worker.approvals()[0]
         with pytest.raises(CodexWorkerError, match="approval_unavailable"):
             worker.approve("foreign", "once")
@@ -213,7 +233,9 @@ def test_current_approval_once_and_replay_cannot_authorize_a_new_request(tmp_pat
             worker.approve(current["request_id"], "once")
         assert worker.approvals() == []
         worker.control("stop-approved-job", cancel=True)
-        assert running.result(timeout=5)["state"] == "interrupted"
+        assert interrupted.wait(20), worker.snapshot()
+        # Terminal proof precedes process cleanup, which itself can take six seconds.
+        assert running.result()["state"] == "interrupted"
     assert peer(tmp_path)["approval_replies"] == 1
 
 
@@ -270,8 +292,12 @@ def test_malformed_configuration_is_a_fixed_refusal(tmp_path, field, value):
 def test_unconfirmed_cancellation_exits_with_partial_result_and_no_replacement(tmp_path, scenario):
     worker = setup(tmp_path, scenario)
     worker.CANCEL_TIMEOUT_S = 0.25
+    partial_ready = threading.Event()
+    worker.on_change = lambda record: (
+        partial_ready.set() if record["output"] == "Partial work before stop" else None
+    )
     with run_worker(worker) as running:
-        wait_for(lambda: worker.snapshot()["output"] == "Partial work before stop")
+        assert partial_ready.wait(20), worker.snapshot()
         worker.cancel_event.set()
         result = running.result(timeout=8)
     assert result["state"] == "unknown" and result["error"] == "cancellation_unconfirmed"
