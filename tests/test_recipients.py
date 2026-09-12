@@ -432,6 +432,25 @@ def test_inspect_only_selection_captures_once_on_explicit_tool(bundle):
     assert send(bundle)["status"] == "failed"
 
 
+@pytest.mark.parametrize("mime_type", ["image/png", "image/jpeg", "text/html"])
+def test_capture_preserves_supported_backend_mime_type(bundle, monkeypatch, mime_type):
+    select(bundle)
+    inspect = bundle[1].inspect
+
+    def capture(target, *, capture=False):
+        receipt = inspect(target, capture=capture)
+        receipt["artifact"]["mime_type"] = mime_type
+        return receipt
+
+    monkeypatch.setattr(bundle[1], "inspect", capture)
+    if mime_type == "text/html":
+        with pytest.raises(RecipientError):
+            call(bundle, "inspect_screen", operation_id="capture-mime")
+    else:
+        result = call(bundle, "inspect_screen", operation_id="capture-mime")
+        assert result["capture"]["mime_type"] == mime_type
+
+
 def test_capture_receipt_is_hidden_after_authority_revoked(bundle):
     select(bundle)
     bundle[1].after_inspect = lambda: setattr(bundle[4].state, "principal", "other-actor")

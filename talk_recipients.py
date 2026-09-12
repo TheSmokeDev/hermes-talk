@@ -582,14 +582,14 @@ class RecipientService:
                 or artifact.get("captured_at") != captured_at
                 or artifact.get("recipient_id") != target["recipient_id"]
                 or artifact.get("task_id") != target["task_id"]
-                or artifact.get("mime_type") != "image/png"
+                or artifact.get("mime_type") not in {"image/png", "image/jpeg"}
             ):
                 raise RecipientError("recipient_response_invalid", 502)
             capture = {
                 "artifact_id": artifact_id,
                 "captured_at": captured_at,
                 "path": _text(artifact.get("path"), 4096),
-                "mime_type": "image/png",
+                "mime_type": artifact["mime_type"],
                 "sha256": _text(artifact.get("sha256"), 64),
             }
             result = {
