@@ -32,7 +32,8 @@ class Socket:
 
     async def send_json(self, event):
         if self.fail_send:
-            raise RuntimeError("test-subscription-token test-account")
+            auth = fake_auth()
+            raise RuntimeError(f"{auth.token} {auth.account_id}")
         self.sent.append(event)
         if event["type"] == "session.start" and self.auto_start:
             self.emit({"type": "session.started", "session": {"id": "live_test"}})
@@ -120,7 +121,7 @@ def test_browser_negotiation_uses_only_mode_specific_endpoint_and_private_creden
             assert str(request.url) == transport.SUBSCRIPTION_CALL_URL
             assert payload["sdp"] == SDP
             assert "transport" not in payload
-            assert request.headers["chatgpt-account-id"] == "test-account"
+            assert request.headers["chatgpt-account-id"] == auth.account_id
             assert request.headers["openai-alpha"] == "quicksilver=v2"
             assert broker.sideband_url == "wss://api.openai.com/v1/live/rtc_test"
         else:
@@ -133,7 +134,8 @@ def test_browser_negotiation_uses_only_mode_specific_endpoint_and_private_creden
         public = broker.public_response("talk_binding")
         assert public == {"binding_id": "talk_binding", "sdp": SDP}
         assert auth.token not in json.dumps(public)
-        assert "test-account" not in json.dumps(public)
+        if auth.account_id:
+            assert auth.account_id not in json.dumps(public)
         assert broker.session_id not in json.dumps(public)
 
     asyncio.run(run())
@@ -190,24 +192,25 @@ def test_subscription_rejects_untrusted_or_ambiguous_call_identity(headers):
 @pytest.mark.parametrize("status", [302, 400, 401, 403, 429, 500])
 def test_http_failure_does_not_fallback_or_echo_provider_body(status):
     async def run():
+        auth = fake_auth()
         calls = []
 
         def respond(request):
             calls.append(request)
             return httpx.Response(
                 status,
-                text="test-subscription-token test-account",
+                text=f"{auth.token} {auth.account_id}",
                 headers={"location": "https://untrusted.example/"},
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             with pytest.raises(rt.RealtimeSessionError) as exc:
                 await transport.negotiate_live_browser(
-                    SDP, setup_for(), fake_auth(), LiveConfig(), http_client=client
+                    SDP, setup_for(), auth, LiveConfig(), http_client=client
                 )
         assert len(calls) == 1
-        assert "test-subscription-token" not in str(exc.value)
-        assert "test-account" not in str(exc.value)
+        assert auth.token not in str(exc.value)
+        assert auth.account_id not in str(exc.value)
         assert "No auth fallback" in str(exc.value)
 
     asyncio.run(run())
@@ -273,13 +276,14 @@ def test_api_rejects_legacy_shape_instead_of_endpoint_aliasing():
 
 def test_native_api_ws_starts_without_query_or_ephemeral_token_and_waits_for_ack():
     async def run():
+        auth = fake_auth("api")
         module, client, socket = aiohttp_peer()
         wire = transport.LiveWebSocketTransport(
-            auth=fake_auth("api"), config=LiveConfig("api"), aiohttp_module=module
+            auth=auth, config=LiveConfig("api"), aiohttp_module=module
         )
         await wire.connect({"model": "gpt-live-1"})
         assert client.calls[0][0] == transport.API_WEBSOCKET_URL
-        assert client.calls[0][1]["headers"] == {"Authorization": "Bearer test-api-key"}
+        assert client.calls[0][1]["headers"] == {"Authorization": f"Bearer {auth.token}"}
         assert socket.sent == [{"type": "session.start", "session": {"model": "gpt-live-1"}}]
         assert (await anext(wire))["type"] == "session.started"
         socket.emit({"type": "session.output_transcript.delta", "delta": "x"}, "binary")
@@ -294,15 +298,17 @@ def test_native_api_ws_starts_without_query_or_ephemeral_token_and_waits_for_ack
 
 def test_ws_startup_failure_closes_contexts_and_redacts_exception():
     async def run():
-        module, client, _ = aiohttp_peer(failure=RuntimeError("test-api-key test-account"))
+        auth = fake_auth("api")
+        account_id = fake_auth().account_id
+        module, client, _ = aiohttp_peer(failure=RuntimeError(f"{auth.token} {account_id}"))
         wire = transport.LiveWebSocketTransport(
-            auth=fake_auth("api"), config=LiveConfig("api"), aiohttp_module=module
+            auth=auth, config=LiveConfig("api"), aiohttp_module=module
         )
         with pytest.raises(rt.RealtimeSessionError) as exc:
             await wire.connect({})
         assert client.closed
-        assert "test-api-key" not in str(exc.value)
-        assert "test-account" not in str(exc.value)
+        assert auth.token not in str(exc.value)
+        assert account_id not in str(exc.value)
 
     asyncio.run(run())
 
@@ -336,13 +342,16 @@ def test_ws_start_timeout_closes_its_socket(monkeypatch):
     asyncio.run(run())
 
 
-def test_successful_negotiation_cannot_reflect_private_credentials_in_browser_sdp():
+@pytest.mark.parametrize("private_field", ["token", "account_id"])
+def test_successful_negotiation_cannot_reflect_private_credentials_in_browser_sdp(private_field):
     async def run():
+        auth = fake_auth()
+        private_value = getattr(auth, private_field)
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
                     201,
-                    text=SDP + "a=bad:test-subscription-token\r\n",
+                    text=SDP + f"a=bad:{private_value}\r\n",
                     headers={"openai-session-id": "rtc_test"},
                 )
             )
@@ -351,8 +360,8 @@ def test_successful_negotiation_cannot_reflect_private_credentials_in_browser_sd
                 rt.RealtimeSessionError, match="reflected private credentials"
             ) as exc:
                 await transport.negotiate_live_browser(
-                    SDP, setup_for(), fake_auth(), LiveConfig(), http_client=client
+                    SDP, setup_for(), auth, LiveConfig(), http_client=client
                 )
-            assert "test-subscription-token" not in str(exc.value)
+            assert private_value not in str(exc.value)
 
     asyncio.run(run())
