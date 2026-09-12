@@ -1515,8 +1515,14 @@
     // Provider events cannot acquire execution authority through the browser.
     handleEvent() {}
     send() { return false; }
-    meter() {}
     clearPlayback() {}
+
+    liveTiming() {
+      const timing = this.task.timing, now = timing.clock();
+      if (!["input", "output"].every((kind) => timing.samples[kind] &&
+          now - timing.samples[kind].at <= 1000)) return null;
+      return timing.snapshot();
+    }
 
     async sendTyped(text) {
       if (this.closed || !this.bindingId || typeof text !== "string" || !text.trim()) return false;
@@ -1536,7 +1542,7 @@
       this.livePolling = true;
       try {
         const reply = await this.task.request("/live/events", {
-          binding_id: this.bindingId, after: this.liveCursor });
+          binding_id: this.bindingId, after: this.liveCursor, timing: this.liveTiming() });
         if (!reply || reply.ok !== true || !Array.isArray(reply.events) ||
             !Number.isSafeInteger(reply.cursor) || reply.cursor < this.liveCursor) {
           throw new Error("Live event stream could not be reconciled. Rejoin the task.");
@@ -1552,7 +1558,12 @@
             if (event.text) this.cb.onTranscript(event.role, event.text, event.final);
           } else if (event.type === "result") {
             const result = event.result || event;
-            if (result.run_id !== undefined && this.cb.onTaskResult) this.cb.onTaskResult(result);
+            if (result.run_id !== undefined && this.cb.onTaskResult) {
+              const full = event.result_available === true && result.output === undefined
+                ? await this.task.result(result.run_id) : result;
+              if (this.closed) return;
+              this.cb.onTaskResult(full);
+            }
             if (event.selection && this.cb.onSelectionIntent) {
               await this.cb.onSelectionIntent(event.selection, this);
               if (this.closed) return;

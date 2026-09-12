@@ -2053,3 +2053,41 @@ t.stop();
     result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
                  text=True, timeout=NODE_TIMEOUT_S)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_live_spoken_updates_require_recent_input_and_output_measurement():
+    script = LIVE_HARNESS + r"""
+const t=makeLive(); let now=5000; t.task.timing.clock=()=>now;
+assert.equal(t.liveTiming(),null,'unmeasured audio must not be assumed quiet');
+t.task.timing.sample('input',false); assert.equal(t.liveTiming(),null);
+t.task.timing.sample('output',false);
+const quiet=t.liveTiming(); assert.equal(quiet.operator_speaking,false);
+assert.equal(quiet.playback_active,false);
+t.task.timing.sample('input',true); assert.equal(t.liveTiming().operator_speaking,true);
+now=7000; assert.equal(t.liveTiming(),null,'stale samples must not authorize speech');
+t.stop();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_live_large_result_uses_authorized_result_endpoint_without_speech_or_tools():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:1,events:[
+  {sequence:1,type:'result',run_id:'large-job',result_available:true}]} : undefined;
+await pollNow(t);
+assert.equal(fullResults.length,1);
+assert.equal(fullResults[0].output,'<script>full available result</script>');
+assert(requests.some(r=>r.url.includes('/result?connection_id=bound-live-task&generation=9')));
+assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
