@@ -163,14 +163,33 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
 
 
 def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result(
-    environment, record_property,
+    environment, record_property, monkeypatch,
 ):
     async def run():
-        fixture = registry_for(environment)
+        fixture = registry_for(environment, clock=lambda: 100.0)
         _, binding = await start(fixture)
         await delegate(fixture, identity="original-delegation")
         await wait_for(lambda: not binding.pending)
         await binding.poll(0, quiet())
+        fixture.host.jobs["remote-1"].update(
+            status="completed", updated_at=200.0, last_event="run.completed",
+            output="Verified worker result")
+        manager = fixture.registry.manager
+        # Keep the real host/SQLite projection, but measure it separately from
+        # presentation scheduling while capture is blocked.
+        projected_at = time.perf_counter()
+        state = await asyncio.to_thread(manager.state, binding.lease, binding.context)
+        result = await asyncio.to_thread(
+            manager.result, binding.lease,
+            {**binding.context, "run_id": state["jobs"][0]["run_id"]})
+        prepared = await asyncio.to_thread(
+            manager.speech, binding.lease,
+            {**binding.context, "event_id": state["announcements"][0]["event_id"],
+             "timing": quiet(2)})
+        assert prepared["speak"]
+        record_property("completion_host_sqlite_projection_ms",
+                        round((time.perf_counter() - projected_at) * 1000, 2))
+        receipts = []
         entered, release = threading.Event(), threading.Event()
         original = fixture.registry.coordinator.transcript
 
@@ -184,14 +203,17 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
         binding.capture_full.set()
         await wait_for(entered.is_set)
         try:
-            fixture.host.jobs["remote-1"].update(
-                status="completed", updated_at=200.0, last_event="run.completed",
-                output="Verified worker result")
             binding.last_state = 0
-            recorded = time.monotonic()
-            response = await asyncio.wait_for(binding.poll(binding.sequence, quiet(2)), 1)
-            eligible_ms = (time.monotonic() - recorded) * 1000
-            record_property("completion_eligibility_ms", round(eligible_ms, 2))
+            with monkeypatch.context() as projected:
+                projected.setattr(manager, "state", lambda *_: state)
+                projected.setattr(manager, "result", lambda *_: result)
+                projected.setattr(manager, "speech", lambda *_: prepared)
+                projected.setattr(
+                    manager, "speech_receipt", lambda request, body: receipts.append(body))
+                recorded = time.perf_counter()
+                response = await asyncio.wait_for(binding.poll(binding.sequence, quiet(2)), 1)
+                eligible_ms = (time.perf_counter() - recorded) * 1000
+            record_property("completion_capture_isolation_ms", round(eligible_ms, 2))
             record_property("audio_played_confirmed", False)
             summaries = [command for command in fixture.browser.session.commands
                          if isinstance(command, rt.SubmitDelegationResult)
@@ -202,6 +224,14 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
             assert any(event.get("result", {}).get("output") == "Verified worker result"
                        for event in response["events"])
             assert not binding.active_jobs
+            assert len(receipts) == 1 and receipts[0]["state"] == "sent"
+            assert receipts[0]["event_id"] == prepared["event_id"]
+            release.set()
+            receipt_at = time.perf_counter()
+            for receipt in receipts:
+                await asyncio.to_thread(manager.speech_receipt, binding.lease, receipt)
+            record_property("completion_sqlite_receipt_ms",
+                            round((time.perf_counter() - receipt_at) * 1000, 2))
             with fixture.bound.events._db(fixture.bound.token) as db:
                 states = db.execute(
                     "SELECT state,playback_supported FROM task_event_speech").fetchall()
@@ -221,7 +251,7 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
 
 def test_sync_coordinator_reply_remains_compatible_and_duplicate_delivery_is_inert(environment):
     async def run():
-        fixture = registry_for(environment)
+        fixture = registry_for(environment, clock=lambda: 100.0)
         original = fixture.registry.coordinator.typed
 
         async def legacy(request, body):

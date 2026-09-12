@@ -200,6 +200,15 @@ def test_exact_steering_and_cancellation_keep_original_thread_and_turn(tmp_path)
     assert len(peer(tmp_path)["thread"]["turns"]) == 1
 
 
+def test_approval_snapshot_does_not_reserve_the_outbox_writer(tmp_path):
+    worker = setup(tmp_path)
+    # Another writer may be recording a worker event; a committed snapshot is
+    # still readable and must not try to become a competing SQLite writer.
+    with worker.jobs.outbox._db():
+        assert worker.snapshot()["state"] == "prepared"
+        assert worker.approvals() == []
+
+
 def test_current_approval_once_and_replay_cannot_authorize_a_new_request(tmp_path):
     worker = setup(tmp_path, "approval_replay")
     with run_worker(worker) as running:
