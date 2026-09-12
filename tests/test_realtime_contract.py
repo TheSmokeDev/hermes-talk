@@ -329,3 +329,13 @@ def test_output_events_carry_optional_response_identity():
     # The operator's own speech belongs to no response.
     assert user_speech.response_id is None
     assert answer.response_id == "response-1"
+
+
+def test_unidentified_output_lifecycle_does_not_claim_input_or_transcript_finality():
+    from dataclasses import fields
+
+    for event in (rt.OutputInterrupted(), rt.OutputTurnCompleted()):
+        assert isinstance(event, rt.RealtimeEvent)
+        assert fields(event) == ()
+        assert not isinstance(event, (rt.SpeechStarted, rt.SpeechStopped, rt.Transcript))
+        assert type(event).__name__ in rt.__all__

@@ -195,6 +195,16 @@ class ResponseStarted(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class OutputInterrupted(RealtimeEvent):
+    """The provider interrupted output; this does not assert operator speech."""
+
+
+@dataclass(frozen=True, slots=True)
+class OutputTurnCompleted(RealtimeEvent):
+    """The provider ended its output turn; transcripts may remain partial."""
+
+
+@dataclass(frozen=True, slots=True)
 class OutputAudio(RealtimeEvent):
     data: bytes
     item_id: str | None = None
@@ -496,6 +506,8 @@ __all__ = [
     "FunctionCall",
     "InputAudioCommitted",
     "OutputAudio",
+    "OutputInterrupted",
+    "OutputTurnCompleted",
     "ProviderFailure",
     "RealtimeCommand",
     "RealtimeEvent",
