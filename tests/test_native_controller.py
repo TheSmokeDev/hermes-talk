@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import fixture_data
 import httpx
 import pytest
 from starlette.applications import Starlette
@@ -98,7 +99,7 @@ def native(fleet, monkeypatch):
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "TASKS", fleet.manager)
     monkeypatch.setattr(module, "TARGETS", fleet.selection)
-    monkeypatch.setenv("TALK_DASHBOARD_TOKEN", "fixture-native-token")
+    monkeypatch.setenv("TALK_DASHBOARD_TOKEN", "fake-native-token")
     routes = {
         "/native/attach": module.native_task_attach,
         "/targets": module.task_targets,
@@ -135,7 +136,7 @@ def native(fleet, monkeypatch):
 
     async def connect(*, tab="native-test", target="task-a", session=None):
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app))
-        api = NativeTaskAPI("http://127.0.0.1", talk_token="fixture-native-token", client=client)
+        api = NativeTaskAPI("http://127.0.0.1", talk_token="fake-native-token", client=client)
         catalog = await api.catalog()
         selected = next(
             row["target_id"] for row in catalog["targets"] if row["session_id"] == target
@@ -580,7 +581,8 @@ def test_shared_history_allowlist_excludes_hidden_non_dialogue_and_credentials(n
                 {"id": 70, "role": "system", "content": "Hidden system"},
                 {"id": 71, "role": "tool", "content": "Hidden tool"},
                 {"id": 72, "role": "user", "content": "Hidden flag", "hidden": True},
-                {"id": 73, "role": "user", "content": "Key sk-fixtureSecretMustNotLeave"},
+                {"id": 73, "role": "user",
+                 "content": "Key " + fixture_data.fake_credential("doctor-api")},
                 {"id": 74, "role": "assistant", "content": "Bearer fixture-secret-value"},
                 {"id": 75, "role": "user", "content": "Visible saved dialogue"},
             ]
@@ -635,7 +637,7 @@ def test_terminal_runner_actual_http_selects_peer_returns_and_reconnects_silentl
 
     async def scenario():
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=native.app))
-        api = NativeTaskAPI("http://127.0.0.1", talk_token="fixture-native-token", client=client)
+        api = NativeTaskAPI("http://127.0.0.1", talk_token="fake-native-token", client=client)
         selected, sessions = asyncio.Queue(), []
         monkeypatch.setattr(
             talk_cli,

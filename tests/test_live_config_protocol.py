@@ -15,7 +15,7 @@ import talk_realtime as rt
 
 def fake_auth(mode="subscription"):
     return talk_auth.TalkAuth(
-        token="test-subscription-token" if mode == "subscription" else "test-api-key",
+        token="fake-sub-token" if mode == "subscription" else "fake-api-key",
         source=talk_auth.SOURCE_CODEX_OAUTH if mode == "subscription" else talk_auth.SOURCE_ENV,
         detail="test credential",
         account_id="test-account" if mode == "subscription" else None,
@@ -248,12 +248,12 @@ def test_error_text_cannot_leak_credentials_or_account_ids():
             "type": "error",
             "error": {
                 "code": "invalid_token",
-                "message": "test-subscription-token test-account",
+                "message": "fake-sub-token test-account",
             },
         }
     )
     assert event.terminal
-    assert "test-subscription-token" not in event.detail
+    assert "fake-sub-token" not in event.detail
     assert "test-account" not in event.detail
 
 
