@@ -1,6 +1,6 @@
 # hermes-talk
 
-**Realtime duplex voice for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — talk to it, it runs agents, it reports back out loud.**
+**Realtime duplex voice for your own agent — talk to it, it runs real work in the background, it reports back out loud.**
 
 <p>
   <a href="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheSmokeDev/hermes-talk/actions/workflows/ci.yml/badge.svg"></a>
@@ -11,9 +11,11 @@
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
 
-Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It can delegate background work while you keep talking, report results, and handle current approval requests. Provider support differs by surface; see the tables below. OpenAI and Grok offer subscription authentication as well as API keys.
+**It rides your ChatGPT or SuperGrok subscription. No API key required.**
 
-**New in the 0.18.0 candidate:** GPT-Live with explicit subscription or API billing, and Codex workers attached to a selected Hermes task. These require the compatible task-worker host. Operator microphone acceptance for both billing options on all three surfaces is still pending. Setup, controls, verification and rollback: [GPT-Live and task workers](docs/GPT-LIVE.md).
+Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+
+**New in 0.18.0:** GPT-Live with separate subscription and API billing, plus Codex workers attached to a selected Hermes task. Subscription is the default, with no automatic paid fallback. These features require the compatible task-worker host. Setup, controls and verification: [GPT-Live and task workers](docs/GPT-LIVE.md).
 
 ```bash
 hermes plugins install TheSmokeDev/hermes-talk --enable && pip install "hermes-talk[audio]" && hermes talk

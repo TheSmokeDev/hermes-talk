@@ -10,3 +10,5 @@ provides_hooks:
   - on_session_end
   - subagent_start
   - subagent_stop
+  - post_tool_call
+  - pre_approval_request
