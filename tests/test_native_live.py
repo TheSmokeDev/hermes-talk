@@ -171,6 +171,7 @@ def test_typed_live_input_uses_direct_canonical_route_without_fake_delegation(su
             "provider_session_id": "real-provider-session",
             "input_id": "typed-one",
             "text": "Exactly my typed words",
+            "admission": "async",
         }
         assert not any(
             isinstance(command, (rt.AddInputText, rt.SubmitDelegationResult))

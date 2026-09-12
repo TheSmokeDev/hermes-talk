@@ -10,9 +10,22 @@ import httpx
 
 
 class NativeTaskError(RuntimeError):
-    def __init__(self, message, *, status=None):
+    def __init__(self, message, *, status=None, category=None, superseded=False):
         super().__init__(message)
         self.status = status
+        self.category = category or (
+            "authorization"
+            if status in {401, 403}
+            else "stale"
+            if status == 409
+            else "transient"
+            if status in {408, 429, 500, 502, 503, 504}
+            else "validation"
+            if status in {400, 413, 422}
+            else "protocol"
+        )
+        self.retryable = self.category == "transient"
+        self.superseded = superseded
 
 
 class NativeTaskAPI:
@@ -42,6 +55,11 @@ class NativeTaskAPI:
         self.context = None
         self.closed = False
         self._attach_lock = asyncio.Lock()
+        self._admission_lock = asyncio.Lock()
+        self._attached = asyncio.Event()
+        self._attached.set()
+        self._binding_epoch = 0
+        self._requests = asyncio.Semaphore(4)
 
     @classmethod
     def configured(cls, origin=None, *, client=None):
@@ -62,26 +80,60 @@ class NativeTaskAPI:
     ):
         if not bound:
             return await self._request(
-                path, body, bound=False, method=method, params=params,
+                path,
+                body,
+                bound=False,
+                method=method,
+                params=params,
                 expected_context=expected_context,
             )
-        # Preserve the caller's attachment before waiting. A switch retires the
-        # server binding before its receipt reaches us; old polls/actions must
-        # neither enter that gap nor move onto the newly accepted attachment.
         expected_context = (
-            dict(self.context or {}) if expected_context is None else expected_context
+            dict(self.context or {}) if expected_context is None else dict(expected_context)
         )
-        async with self._attach_lock:
+        async with self._requests:
+            # Admission is short. Network I/O never holds the generation mutex.
+            while True:
+                await self._attached.wait()
+                async with self._admission_lock:
+                    if not self._attached.is_set():
+                        continue
+                    context, epoch = dict(self.context or {}), self._binding_epoch
+                    if context != expected_context:
+                        raise NativeTaskError(
+                            "Task request belongs to an older connection",
+                            category="stale",
+                            superseded=True,
+                        )
+                    break
             return await self._request(
-                path, body, method=method, params=params, expected_context=expected_context,
+                path,
+                body,
+                method=method,
+                params=params,
+                expected_context=expected_context,
+                request_context=context,
+                epoch=epoch,
             )
 
     async def _request(
-        self, path, body=None, *, bound=True, method="POST", params=None, expected_context=None
+        self,
+        path,
+        body=None,
+        *,
+        bound=True,
+        method="POST",
+        params=None,
+        expected_context=None,
+        request_context=None,
+        epoch=None,
     ):
         if self.closed:
             raise NativeTaskError("Task connection is closed")
-        context = dict(self.context or {}) if bound else {}
+        context = (
+            (dict(self.context or {}) if request_context is None else request_context)
+            if bound
+            else {}
+        )
         if bound and not context:
             raise NativeTaskError("Task is not attached")
         if expected_context is not None and context != expected_context:
@@ -96,10 +148,23 @@ class NativeTaskAPI:
             )
         except httpx.HTTPError:
             raise NativeTaskError(
-                "Task service is unavailable; original work remains owned"
+                "Task service is unavailable; original work remains owned", category="transient"
             ) from None
-        if self.closed or (bound and self.context != context):
-            raise NativeTaskError("Task response belongs to an older connection")
+        if response.status_code in {401, 403}:
+            raise NativeTaskError(
+                f"Task service refused the request (HTTP {response.status_code})",
+                status=response.status_code,
+            )
+        if (
+            self.closed
+            or (bound and self.context != context)
+            or (epoch is not None and epoch != self._binding_epoch)
+        ):
+            raise NativeTaskError(
+                "Task response belongs to an older connection",
+                category="stale",
+                superseded=True,
+            )
         if not response.is_success:
             raise NativeTaskError(
                 f"Task service refused the request (HTTP {response.status_code})",
@@ -130,15 +195,21 @@ class NativeTaskAPI:
         surface_context=None,
     ):
         async with self._attach_lock:
-            return await self._attach(
-                target_id=target_id,
-                tab_id=tab_id,
-                back=back,
-                reference=reference,
-                peer_id=peer_id,
-                profile=profile,
-                surface_context=surface_context,
-            )
+            async with self._admission_lock:
+                self._attached.clear()
+                self._binding_epoch += 1
+            try:
+                return await self._attach(
+                    target_id=target_id,
+                    tab_id=tab_id,
+                    back=back,
+                    reference=reference,
+                    peer_id=peer_id,
+                    profile=profile,
+                    surface_context=surface_context,
+                )
+            finally:
+                self._attached.set()
 
     async def _attach(
         self, *, target_id, tab_id, back, reference, peer_id, profile, surface_context

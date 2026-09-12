@@ -2653,16 +2653,37 @@ async def run_native_talk_session(
                     reference, peer_id=intent.get("peer_id"), profile=intent.get("profile")
                 )
                 fields = {"target_id": selected}
-            attached = await api.attach(
-                **fields, tab_id=task.get("tab_id", "terminal"),
-                surface_context=task.get("surface_context") or {"surface": lane},
-            )
-            if attached.get("ok") is not True:
-                emit(attached)
-                return False
+            previous, current = current, None
+            ready.clear()
+            if previous is not None:
+                previous.service_paused = True
+                flush = getattr(previous, "flush_captures", None)
+                if flush is not None:
+                    try:
+                        await asyncio.wait_for(flush(retry=True), 2)
+                    except (NativeTaskError, TimeoutError) as exc:
+                        current = previous
+                        previous.service_paused = False
+                        ready.set()
+                        if isinstance(exc, TimeoutError):
+                            raise NativeTaskError(
+                                "Transcript capture is still pending; "
+                                "the selected task is unchanged",
+                                category="transient",
+                            ) from None
+                        raise
             try:
-                ready.clear()
-                previous, current = current, None
+                attached = await api.attach(
+                    **fields, tab_id=task.get("tab_id", "terminal"),
+                    surface_context=task.get("surface_context") or {"surface": lane},
+                )
+                if attached.get("ok") is not True:
+                    current = previous
+                    if previous is not None:
+                        previous.service_paused = False
+                        ready.set()
+                    emit(attached)
+                    return False
                 if previous is not None:
                     await previous.close()
                 emit({"selected": attached.get("task"), "voice_state": "not_connected"})
@@ -2709,6 +2730,8 @@ async def run_native_talk_session(
             except (NativeTaskError, talk_realtime.RealtimeSessionError,
                     talk_config.TalkConfigError, talk_auth.TalkAuthError,
                     talk_audio.TalkAudioError) as exc:
+                if previous is not None and not previous.closed:
+                    await previous.close()
                 activation_error = exc
                 activation_failed.set()
                 emit({"voice_state": "not_connected", "reason": str(exc)})
@@ -2799,6 +2822,7 @@ async def run_native_talk_session(
                     await asyncio.sleep(IDLE_POLL_S)
 
         async def refresh():
+            failures = 0
             while True:
                 await asyncio.sleep(1)
                 await ready.wait()
@@ -2806,9 +2830,18 @@ async def run_native_talk_session(
                 try:
                     await active.tick()
                     await active.refresh()
-                except NativeTaskError:
-                    if active is current:
-                        raise
+                    failures = 0
+                    active.service_paused = False
+                except NativeTaskError as exc:
+                    if exc.superseded or active is not current:
+                        continue
+                    if exc.retryable and failures < 3:
+                        failures += 1
+                        active.service_paused = True
+                        active.audio.drain_playback()
+                        emit({"state": "reconnecting", "reason": str(exc), "attempt": failures})
+                        continue
+                    raise
 
         async def controls():
             while True:
