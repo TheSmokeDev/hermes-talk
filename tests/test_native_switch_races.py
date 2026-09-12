@@ -308,3 +308,25 @@ def test_selection_flushes_old_capture_before_attachment_and_pauses_media(native
                 await asyncio.gather(running, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+
+def test_selection_wait_rechecks_a_wake_from_an_already_retired_generation():
+    async def scenario():
+        ready = asyncio.Event()
+        selected = [None]
+        waiting = asyncio.create_task(
+            talk_cli._wait_for_native_selection(ready, lambda: selected[0])
+        )
+        await asyncio.sleep(0)
+        selected[0] = object()
+        ready.set()
+        # A second switch clears selection before the first wake runs.
+        ready.clear()
+        selected[0] = None
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        fresh = selected[0] = object()
+        ready.set()
+        assert await asyncio.wait_for(waiting, 0.1) is fresh
+    asyncio.run(scenario())

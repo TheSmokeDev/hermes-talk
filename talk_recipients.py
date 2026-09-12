@@ -108,6 +108,8 @@ def _target(record):
 
 def _can_send(record):
     control, app = record["proven_control"], record["app"]
+    if app == "codex_worker" and control == "worker" and "steer_work" in record["operations"]:
+        return True
     if not {"send", "send_agent_message", "turn/steer"}.intersection(record["operations"]):
         return False
     if control == "ui_bridge":
@@ -507,6 +509,29 @@ class RecipientService:
             record = store.operation(operation_id, "send_agent_message", arguments)
         except (OSError, TimeoutError):
             record = store.finish(record, self._delivery_result(record, "unknown"))
+        return self._return(request, body, bound, record)
+
+    def reconcile(self, request, body, *, action, bound=None):
+        """Observe a prior delivery using its frozen identity; never submit or commit input."""
+        bound = self._binding(request, body, bound)
+        store = self._store(bound)
+        record = store.operation(action["action_id"], action["name"], action["arguments"])
+        if record is None:
+            return action.get("recipient_receipt")
+        if (action["name"] != "send_agent_message" or not record["target"]
+                or not record["attempted"] or record["status"] in {"failed", "completed"}):
+            return self._return(request, body, bound, record)
+        self._binding(request, body, bound)
+        try:
+            receipt = self._backend(bound).reconcile(
+                record["operation_id"], _target(record["target"]),
+            )
+            record = self._send_receipt(store, record, receipt)
+        except DashboardTaskError as exc:
+            if not exc.retryable:
+                raise
+        except (OSError, TimeoutError):
+            pass
         return self._return(request, body, bound, record)
 
     def inspect_screen(self, request, body, *, operation_id, bound=None):

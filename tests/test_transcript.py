@@ -457,8 +457,12 @@ def test_force_killed_sweeper_claim_is_recovered_by_next_process(tmp_path):
             f"talk_transcript.sweep_transcripts(Path({str(tmp_path)!r}), block)",
         ]
     )
+    # Windows venv python.exe is a redirector; terminate the process holding the lease.
+    executable = (
+        getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
+    )
     child = subprocess.Popen(
-        [sys.executable, "-c", code],
+        [executable, "-c", code],
         cwd=Path(__file__).parents[1],
         stdout=subprocess.PIPE,
         text=True,

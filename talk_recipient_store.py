@@ -104,6 +104,23 @@ class RecipientStore:
             selection = self._selection(db)
             if name in {"send_agent_message", "inspect_screen"}:
                 target = selection["selected"]
+            if name == "send_agent_message" and target:
+                prior_rows = db.execute(
+                    "SELECT record FROM talk_recipient_operations WHERE owner=?",
+                    (self.owner.key,),
+                ).fetchall()
+                for row in prior_rows:
+                    prior = json.loads(row[0])
+                    same_message = (
+                        prior.get("message_fingerprint") == digest(arguments.get("message"))
+                        or prior["fingerprint"] == digest([name, arguments])
+                    )
+                    prior_target = prior.get("target") or {}
+                    same_task = all(prior_target.get(key) == target.get(key)
+                                    for key in ("app", "task_id", "recipient_id"))
+                    if (prior["name"] == name and prior["status"] in {"queued", "unknown"}
+                            and same_message and same_task and prior["attempted"]):
+                        raise DashboardTaskError("recipient_reconciliation_required", 409)
             revision = None
             if name == "select_recipient":
                 revision = selection["revision"] + 1
@@ -113,6 +130,8 @@ class RecipientStore:
                 "operation_id": operation_id,
                 "name": name,
                 "fingerprint": digest([name, arguments]),
+                "message_fingerprint": digest(arguments.get("message"))
+                if name == "send_agent_message" else None,
                 "host_id": self.owner.host,
                 "target": target,
                 "tab": self.tab,

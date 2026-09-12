@@ -28,11 +28,17 @@ class Router:
         self.routes = []
 
     def post(self, path):
+        return self.route(path, "POST")
+
+    def get(self, path):
+        return self.route(path, "GET")
+
+    def route(self, path, method):
         def decorate(handler):
             async def endpoint(request):
                 return JSONResponse(await handler(request))
 
-            self.routes.append(Route(path, endpoint, methods=["POST"]))
+            self.routes.append(Route(path, endpoint, methods=[method]))
             return handler
 
         return decorate
@@ -80,7 +86,7 @@ async def application(environment, **options):
         http_exception=HTTPException,
         registry=fixture.registry,
     )
-    assert len(handlers) == 8 and registry is fixture.registry
+    assert len(handlers) == 10 and registry is fixture.registry
     app = Starlette(routes=router.routes, exception_handlers={HTTPException: domain_error})
     try:
         async with httpx.AsyncClient(
@@ -107,6 +113,7 @@ async def create(client, fixture):
         "/live/events",
         "/live/input",
         "/live/close",
+        "/live/flush",
         "/live/transcript",
         "/live/delegation",
         "/live/typed",
@@ -204,6 +211,9 @@ def test_http_typed_retry_is_idempotent_and_stale_generation_is_refused(environm
             first = await client.post("/live/input", json=typed)
             repeat = await client.post("/live/input", json=typed)
             assert first.status_code == repeat.status_code == 200
+            assert first.json() == repeat.json()
+            assert first.json()["operation_id"] and first.json()["pending"] is True
+            await wait_for(lambda: len(fixture.browser.session.commands) == 1)
             assert len(fixture.host.jobs) == len(fixture.browser.session.commands) == 1
             response = await client.post(
                 "/live/events", json={**body, "after": 0, "generation": body["generation"] + 1}
@@ -271,4 +281,16 @@ def test_http_speech_returns_trusted_status_and_original_receipt_ids(environment
             assert "completed" in speech["content"] and "Ignore" not in speech["content"]
             assert len(fixture.host.jobs) == 1
 
+    asyncio.run(run())
+
+
+def test_operation_lookup_requires_auth_before_query_validation(environment):
+    async def run():
+        async with application(environment) as (client, fixture):
+            result = await client.get("/live/operation?generation=invalid",
+                                      headers={"x-dashboard-token": "wrong"})
+            assert result.status_code == 401
+            result = await client.get("/live/operation?generation=invalid")
+            assert result.status_code == 400
+            assert not fixture.host.jobs
     asyncio.run(run())

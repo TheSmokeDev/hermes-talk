@@ -2590,6 +2590,14 @@ def start_native_keyboard_control(deliver, *, stdin=None, read_line=None):
     return stop.set
 
 
+async def _wait_for_native_selection(ready, selected):
+    while True:
+        await ready.wait()
+        active = selected()
+        if ready.is_set() and active is not None:
+            return active
+
+
 async def run_native_talk_session(
     *, audio=None, session_factory=None, lane="cli", keyboard_control=False,
     task=None, api=None, control_input=None, on_controller=None, on_refusal=None,
@@ -2790,8 +2798,7 @@ async def run_native_talk_session(
 
         async def receive():
             while True:
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 async for event in active.session:
                     if active is not current:
                         break
@@ -2807,8 +2814,7 @@ async def run_native_talk_session(
 
         async def microphone():
             while True:
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 read_packet = getattr(audio, "read_input_packet", None)
                 if lane == "discord":
                     packet = await asyncio.to_thread(read_packet)
@@ -2828,8 +2834,7 @@ async def run_native_talk_session(
             failures = 0
             while True:
                 await asyncio.sleep(1)
-                await ready.wait()
-                active = current
+                active = await _wait_for_native_selection(ready, lambda: current)
                 try:
                     await active.tick()
                     await active.refresh()
@@ -2849,9 +2854,9 @@ async def run_native_talk_session(
         async def controls():
             while True:
                 line = await commands.get()
-                await ready.wait()
+                active = await _wait_for_native_selection(ready, lambda: current)
                 try:
-                    result = await current.command(line)
+                    result = await active.command(line)
                     if result is not None:
                         emit(result)
                 except NativeTaskError as exc:

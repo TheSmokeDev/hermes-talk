@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.18.0"
+version = "0.19.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,6 +48,10 @@ py-modules = [
   "talk_native_api",
   "talk_native_controller",
   "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_worker_recipients",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",
@@ -150,6 +154,10 @@ known-first-party = [
   "talk_native_api",
   "talk_native_controller",
   "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_worker_recipients",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",

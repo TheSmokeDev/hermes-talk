@@ -1823,9 +1823,10 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
         "talk_live_coordinator", reason="shared coordinator integration worktree"
     )
     import httpx
-    from test_dashboard_tasks import environment, join
+    from test_target_switching import activate, fleet, target
 
     from talk_native_api import NativeTaskAPI
+    from talk_native_capture_store import NativeCaptureStore
 
     class Audio:
         playback_pending = False
@@ -1845,9 +1846,9 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
             pass
 
     async def scenario():
-        env = environment.__wrapped__(tmp_path)
-        manager, request, host, _ = env
-        _bound, context = join(env)
+        fixture = fleet.__wrapped__(tmp_path)
+        manager, request, host = fixture.manager, fixture.request, fixture.hosts["local"]
+        bound, context, _ = activate(fixture, target(fixture))
         decisions, requests, notices = [], [], []
 
         async def decide(**kwargs):
@@ -1863,7 +1864,11 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
         )
 
         async def serve(req):
-            body = json.loads(req.content)
+            if req.method == "GET":
+                body = dict(req.url.params)
+                body["generation"] = int(body["generation"])
+            else:
+                body = json.loads(req.content)
             path = req.url.path.rsplit("/", 1)[-1]
             requests.append((path, body))
             if path == "transcript":
@@ -1872,6 +1877,9 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
                 result = await coordinator.delegation(request, body)
             elif path == "typed":
                 result = await coordinator.typed(request, body)
+            elif path == "operation":
+                assert req.method == "GET"
+                result = await asyncio.to_thread(coordinator.operation, request, body)
             else:
                 raise AssertionError(path)
             return httpx.Response(200, json=result)
@@ -1883,9 +1891,13 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
         session, _ = _adapter(socket)
         await session.connect(_task_setup(model))
         audio = Audio()
+        attachment = {"task": manager.descriptor(bound),
+                      "live_contract": {"delegation_admission": "async-v1"}}
+        capture_store = NativeCaptureStore(tmp_path / "native-captures.sqlite3")
         controller = native_module.NativeLiveTaskController(
-            api, session, {"task": context}, audio, on_notice=notices.append,
+            api, session, attachment, audio, on_notice=notices.append, capture_store=capture_store,
         )
+        capture_owner = capture_store.owner(api.origin, attachment)
 
         async def deliver(packets):
             socket.events = iter(packets)
@@ -1907,6 +1919,10 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
             repeated = await coordinator.delegation(request, body)
             assert len(host.jobs) == len(decisions) == 1
             assert body["delegation_id"] == "actual-gemini-call"
+            assert body["admission"] == "async"
+            assert repeated["pending"] is False and repeated["state"] == "completed"
+            assert any(path == "operation" and query["operation_id"] == repeated["operation_id"]
+                       for path, query in requests)
             assert body["fragments"][0]["final"] is False
             assert body["fragments"][0]["text"] == "Inspect my requested project"
             assert "proposed work" in body["prompt"]
@@ -1918,7 +1934,7 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
                 "[Captured Live transcript fragments; this is not a finalized utterance.]"
             )
             state = manager.state(request, context)
-            assert repeated["action"]["run_id"] == state["jobs"][0]["run_id"]
+            assert repeated["result"]["action"]["run_id"] == state["jobs"][0]["run_id"]
 
             await controller._send_history_context("Verified selected-task history")
             assert ("clientContent" if "2.5" in model else "realtimeInput") in socket.sent[-1]
@@ -1968,6 +1984,9 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
             assert decisions[-1]["source"]["fragments"][0]["text"] == "Inspect my second project"
             assert decisions[-1]["source"]["fragments"][0]["final"] is False
             assert sum(path == "delegation" for path, _ in requests) == 2
+            assert all(body["admission"] == "async" for path, body in requests
+                       if path in {"delegation", "typed"})
+            assert capture_store.pending(capture_owner) == (None, [])
         finally:
             await controller.close()
             await http.aclose()

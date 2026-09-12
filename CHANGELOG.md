@@ -11,6 +11,20 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.19.0] — 2026-09-12
+
+### Changed
+- Address existing Codex Desktop and Claude Code recipients by verified task
+  identity, separately from starting a Codex worker. Delivery receipts preserve
+  the original recipient through reconnect and uncertain-send reconciliation.
+- Admit Live delegation asynchronously while transcript capture, status and
+  controls continue. Capture batches preserve event identities, whitespace,
+  provider-item finality and late arrivals; native pending batches survive a
+  matching-owner reconnect.
+- Give GPT-Live a dedicated delegation prompt and deliver completion updates
+  independently of transcript persistence. Host-verified screen inspection stays
+  on demand, and Discord output still requires current audience authorization.
+
 ## [0.18.0] — 2026-09-12
 
 GPT-Live connects voice conversation to Hermes tasks and Codex background
