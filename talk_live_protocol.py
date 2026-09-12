@@ -86,7 +86,9 @@ def decode_event(event: Mapping) -> rt.RealtimeEvent | None:
                     if user
                     else rt.TranscriptProvenance.OUTPUT_AUDIO
                 ),
-                item_id=event.get("event_id"),
+                item_id=event.get("item_id"),
+                event_id=event.get("event_id"),
+                finality="delta",
                 start_ms=_offset(event.get("start_ms")),
                 end_ms=_offset(event.get("end_ms")),
             )
@@ -110,6 +112,8 @@ def decode_event(event: Mapping) -> rt.RealtimeEvent | None:
                     else rt.TranscriptProvenance.OUTPUT_AUDIO
                 ),
                 item_id=item.get("id"),
+                event_id=event.get("event_id"),
+                finality="turn" if kind == "turn.done" else "item",
                 start_ms=_offset(item.get("start_ms")),
                 end_ms=_offset(item.get("end_ms")),
             )
