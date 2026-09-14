@@ -17,7 +17,7 @@ live = ["aiortc>=1.14,<2"]
 # the real class in CI that branch is untestable, which is exactly how the
 # relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
 # stub when starlette is absent, so the plugin installs without it.
-dev = ["pytest>=8", "ruff==0.16.6", "starlette>=0.40"]
+dev = ["pytest>=8", "ruff==0.16.7", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
