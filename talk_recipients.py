@@ -466,7 +466,9 @@ class RecipientService:
         arguments = body.get("arguments", {})
         self._arguments("catalog_recipients", arguments)
         backend = self._backend(bound)
-        live, live_truncated = self._catalog(request, body, bound, backend, app=arguments.get("app"))
+        live, live_truncated = self._catalog(
+            request, body, bound, backend, app=arguments.get("app")
+        )
         self._binding(request, body, bound)
         try:
             envelope = backend.catalog(**arguments)
