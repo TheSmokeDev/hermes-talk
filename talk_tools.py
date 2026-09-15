@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Talk tool surface — Realtime function-tool schemas and the executor.
 
 The Realtime session advertises these tools; when the model emits a function

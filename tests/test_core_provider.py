@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """talk_core_provider — hermes-talk's lanes on the Hermes core contract.
 
 These tests run against the REAL ``agent/realtime_voice_provider.py``, never a

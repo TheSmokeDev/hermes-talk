@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The microphone pause (hermes-talk#100).
 
 What is being proved: a paused capture surface feeds the session nothing

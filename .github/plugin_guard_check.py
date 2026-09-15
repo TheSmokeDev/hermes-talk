@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Run the upstream Hermes plugin_guard scanner against this repository.
 
 The plugin-guard workflow downloads ``tools/plugin_guard.py`` and

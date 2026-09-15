@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded durable staging of original dashboard inputs and exact action intents."""
 
 from __future__ import annotations

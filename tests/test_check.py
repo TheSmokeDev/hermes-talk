@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Native ``hermes talk check`` — the end-to-end proof and its refusals."""
 
 from __future__ import annotations

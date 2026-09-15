@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Native CLI mode routing refuses ambiguous or unbound execution before capture."""
 
 import argparse

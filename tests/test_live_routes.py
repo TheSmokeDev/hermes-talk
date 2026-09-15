@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Real ASGI HTTP routes and durable task receipts, with provider audio faked."""
 
 from __future__ import annotations

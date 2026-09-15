@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Discord voice as an audio device — the same eleven methods, a different room.
 
 :class:`DiscordAudio` implements exactly the surface

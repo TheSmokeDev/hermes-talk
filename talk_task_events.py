@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Owner-bound derived task observations and delivery receipts, never execution authority.
 
 All I/O is worker-only. Sources are supplied by authenticated host integration code;

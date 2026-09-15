@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Voice-input pause — mute the microphone without ending the call (hermes-talk#100).
 
 One live capture surface per process. :func:`talk_cli.run_talk_session`

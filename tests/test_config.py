@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Config — fail-closed key resolution, voice validation, host paths."""
 
 from __future__ import annotations

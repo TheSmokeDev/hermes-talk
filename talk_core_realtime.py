@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Defensive Hermes core API-v2 OpenAI Realtime adapter.
 
 The optional core boundary is deliberately contained in this module.  Legacy

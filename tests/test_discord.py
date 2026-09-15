@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Discord voice as an audio device.
 
 What is being proved: the bridge wears :class:`talk_audio.DuplexAudio`'s

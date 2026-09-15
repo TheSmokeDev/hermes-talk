@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Executable dashboard transport protocol regressions (Node, no browser)."""
 
 from __future__ import annotations

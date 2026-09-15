@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Optional aiortc media transport for GPT-Live subscription sessions.
 
 aiortc owns RTP, Opus, jitter handling and its outbound PyAV resampling.

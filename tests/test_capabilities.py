@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The capability catalog — source preference, honest absence, and bounding.
 
 Zero network. ``talk_capabilities`` keeps its own REST switch off under pytest

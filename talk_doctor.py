@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Read-only diagnostics for the native ``hermes talk doctor`` command.
 
 The design borrows TaskChad's useful operational loop without importing its

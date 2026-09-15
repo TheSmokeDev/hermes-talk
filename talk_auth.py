@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """OpenAI Platform auth resolution with Codex OAuth fallback.
 
 Port of the proven Talk Mode auth ordering (itself a port of OpenClaw

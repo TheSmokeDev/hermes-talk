@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """OpenAI adapter mapping tests with a scripted socket and no network."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded waits against a scripted local peer; no models or credentials."""
 
 import json

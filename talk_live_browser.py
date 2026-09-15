@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Server-owned Live browser sessions and bounded task delegation pumps."""
 
 from __future__ import annotations

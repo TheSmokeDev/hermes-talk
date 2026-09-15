@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Shared canonical Talk attachment lifecycle, independent of voice providers.
 
 Use from a worker. Nothing here dispatches tools, starts inference or wires a

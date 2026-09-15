@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Gemini Live adapter tests with a scripted socket and no network.
 
 Mirrors the Grok adapter tests against the same neutral contract, plus the

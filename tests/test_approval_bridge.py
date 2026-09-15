@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The spoken approval bridge — scripted SSE in, correct resolve POSTs out.
 
 Zero network: ``talk_apiserver.respond_to_approval`` and

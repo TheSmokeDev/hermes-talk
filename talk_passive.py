@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Passive history v1 wire contract. Trusted host code configures this transport.
 
 Calls are synchronous and belong in a worker, never the realtime audio loop.

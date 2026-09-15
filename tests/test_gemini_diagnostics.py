@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Gemini diagnostics must agree with the session lane, without inspecting other auth."""
 
 from __future__ import annotations

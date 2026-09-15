@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Audio — the queue and barge-in logic, with no device and no sounddevice.
 
 Only the pure half is exercised here: everything below is what runs between

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """``hermes talk diagnostics`` — a redacted support bundle for issue reports.
 
 Most "it doesn't work" reports cannot be reproduced from what the reporter

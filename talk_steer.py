@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Steer receipts — what we can PROVE about a note sent to running work.
 
 The substrate fact this module exists for: ``AIAgent.steer()`` is a queue

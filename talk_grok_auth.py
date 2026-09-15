@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Grok (xAI) credential resolution for Talk sessions.
 
 Mirrors ``talk_auth`` for the xAI realtime surface. Two lanes:

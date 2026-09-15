@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Tier-2 agent lane — a real Hermes agent reached over the api_server platform.
 
 Hermes's api_server gateway platform (``gateway/platforms/api_server.py``)

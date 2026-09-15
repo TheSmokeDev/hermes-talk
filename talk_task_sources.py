@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded observations from existing host contracts; no transport or authority creation."""
 
 from __future__ import annotations

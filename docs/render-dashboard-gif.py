@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Regenerate the README demo GIF from the published source recording.
 
     python docs/render-dashboard-gif.py [path/to/hermes-talk-dashboard-cut.mp4]

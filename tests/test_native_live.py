@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Native Live adaptation preserves fragments and never invents provider function authority."""
 
 from __future__ import annotations

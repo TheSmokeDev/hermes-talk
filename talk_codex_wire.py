@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded local stdio client for the pinned Codex app-server protocol."""
 
 from __future__ import annotations

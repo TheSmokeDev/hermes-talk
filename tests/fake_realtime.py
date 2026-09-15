@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Scripted Realtime transcripts — the offline stand-in for a live call.
 
 Feed :func:`run_transcript` a list of server events exactly as OpenAI Realtime

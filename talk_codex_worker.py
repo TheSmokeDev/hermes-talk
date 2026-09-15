@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Opt-in Codex worker: one immutable Hermes job owns one recorded Codex thread/turn."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Private, bounded storage of unacknowledged native transcript fragments."""
 
 from __future__ import annotations

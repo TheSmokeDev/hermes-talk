@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Recipient projection for already accepted canonical Talk Codex worker jobs.
 
 Listing derives identity from Talk dispatch/origin receipts, never Codex history.

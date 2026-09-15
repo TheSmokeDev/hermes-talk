@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Transport-neutral admission primitives for canonical Talk sessions."""
 
 from __future__ import annotations

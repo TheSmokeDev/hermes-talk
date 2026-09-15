@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """hermes-talk configuration — TALK_* env namespace and host paths.
 
 Every knob is resolved at CALL time, never bound at import time, so a test

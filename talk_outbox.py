@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded, profile-resolved derived history queue. Never opens a host database."""
 
 from __future__ import annotations

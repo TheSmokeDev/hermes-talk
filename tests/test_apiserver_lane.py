@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The api_server lane — probe honesty, tier selection, and announced fallbacks.
 
 Zero network. ``talk_apiserver`` is inert under pytest by design (same guard as

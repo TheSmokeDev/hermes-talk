@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live capability catalog — what this Hermes session can ACTUALLY do.
 
 Talk could always describe itself; it could never check. Asked "what can you

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """``hermes talk check`` — prove the whole voice path end to end, right now.
 
 Doctor (:mod:`talk_doctor`) is read-only by design: it inspects config,

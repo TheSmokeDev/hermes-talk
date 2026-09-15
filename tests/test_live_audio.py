@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Local media acceptance: real aiortc/PyAV codecs, fake negotiation and media peers."""
 
 from __future__ import annotations

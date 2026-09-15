@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Auth resolution — the fail-closed dual lane (API key / Codex OAuth)."""
 
 from __future__ import annotations

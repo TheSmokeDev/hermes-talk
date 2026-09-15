@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Shared replay/observation behavior over real durable P2a storage, with no providers."""
 
 from __future__ import annotations

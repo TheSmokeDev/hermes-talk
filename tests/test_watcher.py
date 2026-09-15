@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The result watcher — sentinel detection and the spoken-result injection.
 
 The sentinel is a WIRE contract: ``talk_runs`` writes it into a tool's return

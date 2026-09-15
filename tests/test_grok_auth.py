@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The Grok auth lane: preference knob, metered keys, and the host's xAI OAuth login.
 
 Every token here is a short fake. The host (``hermes_cli.auth``) is never

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """HostAdapter — the five host interfaces hermes-talk needs from Hermes.
 
 Everything the voice surface asks of the host comes through here: identity,

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live provider events use captured fragments and the same canonical native task API."""
 
 from __future__ import annotations

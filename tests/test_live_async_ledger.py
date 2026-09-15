@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Async admission and exact transcript identity over the real SQLite stores."""
 
 from __future__ import annotations

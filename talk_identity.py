@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Realtime session instructions — the voice preamble and identity assembly.
 
 A Realtime session prompt is re-read on EVERY turn, so the per-section caps

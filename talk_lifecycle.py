@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Subagent lifecycle — push-based, from the host's own hook bus.
 
 v0.5 learned that a child was gone by PULLING: ``degrade_gone_children()``

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """``hermes talk`` — the terminal duplex voice session.
 
 The glue layer, and the only place the three halves meet: microphone and

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Gemini Live implementation of the provider-neutral Realtime session contract.
 
 The Live API speaks its own BidiGenerateContent vocabulary over an API-key

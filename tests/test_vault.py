@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Vault recall — the lookup a voice session can actually make.
 
 Hermetic like the identity suite: ``plugins.memory`` is injected as a fake, so

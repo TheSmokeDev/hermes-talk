@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Real durable coordinator paths with controlled Hermes reasoning and gateway I/O."""
 
 from __future__ import annotations

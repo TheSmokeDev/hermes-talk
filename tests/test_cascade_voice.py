@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Custom-voice cascade — chunker, stream lifecycle, barge-in, fail-closed config.
 
 No network, no real keys: the ElevenLabs leg is a scripted fake WebSocket and

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """steer_agent / list_agents / stop_work — the run-control surface.
 
 The contract under test: a steer is QUEUED, never claimed delivered; every

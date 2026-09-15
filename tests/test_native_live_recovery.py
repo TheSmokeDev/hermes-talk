@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Offline transport latency, transcript batching, and exact operation recovery."""
 
 from __future__ import annotations

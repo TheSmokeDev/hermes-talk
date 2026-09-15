@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Wire layer — session payload shape and ephemeral-secret handling."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Dashboard cascade relay — the browser lane's custom voice, server-side only.
 
 The tab holds the provider socket (WebRTC) and relays the model's TEXT deltas

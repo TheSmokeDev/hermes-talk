@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Cross-repository proof for installed Talk canonical Discord attachment.
 
 This test is intentionally skipped in Talk-only environments.  Point

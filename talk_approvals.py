@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The spoken approval bridge — voice resolves run approvals out loud.
 
 A delegated run on the api-server lane parks in ``waiting_for_approval`` when

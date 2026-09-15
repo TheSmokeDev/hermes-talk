@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Real subprocess/SQLite integration with a scripted app-server, no model or tool execution."""
 
 import json

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Dashboard plugin backend — the mint's secrecy, the tool contract, the gate.
 
 The module is loaded THE WAY THE DASHBOARD LOADS IT (by path, no parent

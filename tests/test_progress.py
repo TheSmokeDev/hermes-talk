@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bounded progress phases for background work (hermes-talk#33).
 
 What is being proved: host events map to the bounded phase vocabulary and

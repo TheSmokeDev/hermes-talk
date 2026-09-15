@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Host-tool classification and the steering deny receipts (capability bridge).
 
 The classification table routes canonical Hermes tool names arriving at the

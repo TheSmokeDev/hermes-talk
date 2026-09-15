@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Repo self-check against the upstream plugin_guard scanner.
 
 Offline mirror of ``.github/workflows/plugin-guard.yml``: when the scanner

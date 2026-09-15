@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """OpenAI implementation of the provider-neutral Realtime session contract."""
 
 from __future__ import annotations

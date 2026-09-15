@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Native ``hermes talk diagnostics`` — the redacted, default-deny support bundle."""
 
 from __future__ import annotations

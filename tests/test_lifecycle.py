@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """subagent_start/stop hooks — the roster, the ledger, and the loop marshal.
 
 What is being proved: the roster is keyed by ``child_session_id`` (the only

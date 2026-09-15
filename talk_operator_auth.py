@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Fail-closed Discord authorization for state-changing Talk tools.
 
 The model never supplies authorization data. This module binds Discord's

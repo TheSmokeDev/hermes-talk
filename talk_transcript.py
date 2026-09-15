@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Durable Talk transcript capture and crash-safe memory handoff.
 
 The handoff is maintenance, not user-visible work: it runs at session

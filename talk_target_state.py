@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Actor-scoped target catalog and bounded return stack. No credentials or history."""
 
 from __future__ import annotations

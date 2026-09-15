@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Recipient result recovery crosses the real canonical action boundary."""
 
 import pytest

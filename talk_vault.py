@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Vault recall — the durable-notes lookup a voice session can actually make.
 
 Hermes's memory PROVIDERS publish a system-prompt block that tells the model

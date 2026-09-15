@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Relay — the event loop, against scripted transcripts. No network."""
 
 from __future__ import annotations

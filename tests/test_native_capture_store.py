@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Private transcript spooling survives disposal and cannot cross canonical owners."""
 
 from __future__ import annotations

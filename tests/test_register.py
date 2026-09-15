@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """register(ctx) — against a stub host, loaded the way Hermes loads it.
 
 The plugin is loaded here by file path with ``submodule_search_locations``,

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Repository-only source hygiene contracts."""
 
 from __future__ import annotations

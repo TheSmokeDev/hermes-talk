@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Bound dashboard vertical contract over real shared stores and controlled host/provider I/O."""
 
 from __future__ import annotations

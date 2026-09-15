@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live configuration, credential isolation, and protocol schemas; no real credentials."""
 
 from __future__ import annotations

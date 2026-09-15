@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Origin-linked control of existing API runs, independent of voice providers."""
 
 from __future__ import annotations

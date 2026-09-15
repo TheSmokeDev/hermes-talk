@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Trusted Discord room proof, independent of the selected task's configured peer."""
 
 from __future__ import annotations

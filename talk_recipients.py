@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Existing recipients addressed from an independently owned Hermes voice task.
 
 Only the authenticated host backend enumerates targets and proves control.

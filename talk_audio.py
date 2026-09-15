@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Duplex terminal audio — pcm16 mono 24 kHz in and out.
 
 sounddevice is imported lazily and never at module scope: the plugin has to

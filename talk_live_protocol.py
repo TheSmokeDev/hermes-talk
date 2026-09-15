@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live wire vocabulary, separate from the Realtime function-call protocol.
 
 Subscription compatibility derives from OpenClaw 76378ddb (MIT),

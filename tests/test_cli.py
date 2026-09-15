@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """CLI — session.update shaping and the fail-closed startup paths."""
 
 from __future__ import annotations

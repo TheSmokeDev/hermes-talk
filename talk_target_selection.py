@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Prepare/mint/activate target switching; model tools propose, never activate."""
 
 from __future__ import annotations

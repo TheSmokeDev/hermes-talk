@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Provider-neutral GPT-Live session with explicit client delegation."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Run admission control — execution_mode + resource_keys (hermes-talk#101).
 
 What is being proved: two live runs that share a resource key never

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """hermes-talk — OpenAI Realtime speech-to-speech voice for Hermes Agent.
 
 ``register(ctx)`` wires five surfaces: the ``hermes talk`` CLI command, the

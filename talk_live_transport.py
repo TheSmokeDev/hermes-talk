@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Server-owned Live negotiation and JSON transports.
 
 Subscription call/header/location handling is adapted from OpenClaw

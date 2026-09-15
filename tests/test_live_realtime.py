@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live semantic session and lifecycle tests using fake transports."""
 
 from __future__ import annotations

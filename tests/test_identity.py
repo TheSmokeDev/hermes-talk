@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Identity — the voice preamble and host-section assembly."""
 
 from __future__ import annotations

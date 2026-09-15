@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """The run_agent backend chain — host agent loop, detached Hermes, refusal.
 
 The live failure this closes: in a standalone ``hermes talk`` the plugin

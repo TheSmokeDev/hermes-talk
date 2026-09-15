@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Grok (xAI) implementation of the provider-neutral Realtime session contract.
 
 xAI's Grok Voice Agent API speaks the OpenAI Realtime GA vocabulary over a

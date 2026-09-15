@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Live browser ownership over real SQLite receipts and controlled provider I/O."""
 
 from __future__ import annotations

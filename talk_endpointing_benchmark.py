@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Deterministic, content-free metrics for endpointing trace fixtures.
 
 Times are monotonic integer milliseconds chosen by the caller.  This module has

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Same-job controls over the real coordinator/outbox and bounded fixture gateway."""
 
 from __future__ import annotations

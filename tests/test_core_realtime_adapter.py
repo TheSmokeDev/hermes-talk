@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Hermes core API-v2 input-only adapter tests (no network)."""
 
 from __future__ import annotations

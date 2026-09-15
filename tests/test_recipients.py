@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Recipient routing uses actual owner fences and durable stores; UI I/O is controlled."""
 
 from __future__ import annotations

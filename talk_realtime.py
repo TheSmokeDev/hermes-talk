@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Typed, provider-neutral contract for one duplex Realtime session.
 
 Hermes policy consumes these events and emits these commands.  A provider

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Target switching over real attachment/events/staging and the frozen HTTP envelopes."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 SmokeDev
-# SPDX-License-Identifier: MIT
 """Canonical worker recipients use the existing exact-origin steering path."""
 
 from __future__ import annotations
