@@ -17,7 +17,7 @@ live = ["aiortc>=1.14,<2"]
 # the real class in CI that branch is untestable, which is exactly how the
 # relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
 # stub when starlette is absent, so the plugin installs without it.
-dev = ["pytest>=8", "ruff==0.16.7", "starlette>=0.40"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "ruff==0.16.7", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -109,6 +109,12 @@ py-modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# A wedged coordinator test used to sit until the CI job's 15-minute ceiling
+# and come back as "cancelled" with no stack. Now it fails on its own, with one,
+# well inside that ceiling. Thread method so a stuck worker thread cannot block
+# the interrupt.
+timeout = 180
+timeout_method = "thread"
 
 [tool.ruff]
 line-length = 100
