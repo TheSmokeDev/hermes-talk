@@ -44,6 +44,7 @@ _REFRESH_MARGIN_S = 60
 SOURCE_CONFIGURED = "configured"
 SOURCE_ENV = "env"
 SOURCE_CODEX_OAUTH = "codex-oauth"
+_OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
@@ -142,6 +143,25 @@ def _decode_jwt_expiry_s(token: str) -> int | None:
     return exp if isinstance(exp, (int, float)) else None
 
 
+def _decode_jwt_chatgpt_account_id(token: str) -> str | None:
+    """Read the ChatGPT account id a Codex access token carries under its nested auth claim.
+
+    Codex tokens name the account at ``https://api.openai.com/auth`` -> ``chatgpt_account_id``;
+    Hermes reads the same claim when it builds its own ``ChatGPT-Account-Id`` header.
+    """
+
+    data, _malformed = _decode_jwt_payload(token)
+    if data is None:
+        return None
+    claims = data.get(_OPENAI_AUTH_CLAIM)
+    if not isinstance(claims, dict):
+        return None
+    account_id = claims.get("chatgpt_account_id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return account_id.strip()
+
+
 def _auth_json_uses_chatgpt_tokens(data: dict) -> bool:
     """Mirror OpenClaw ``codexAuthJsonUsesChatGptTokens``."""
 
@@ -181,12 +201,14 @@ def _parse_codex_oauth_credential(
     if expires_s is None:
         expires_s = fallback_expiry_s
     account_id = tokens.get("account_id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        account_id = _decode_jwt_chatgpt_account_id(access)
     id_token = tokens.get("id_token")
     return _CodexOauthCredential(
         access=access,
         refresh=refresh,
         expires_s=expires_s,
-        account_id=account_id if isinstance(account_id, str) else None,
+        account_id=account_id,
         id_token=id_token if isinstance(id_token, str) else None,
     )
 
@@ -231,12 +253,18 @@ def _resolve_hermes_codex_oauth() -> TalkAuth | None:
     token = creds.get("api_key") if isinstance(creds, dict) else None
     if not isinstance(token, str) or not token:
         return None
+    _payload, malformed_jwt = _decode_jwt_payload(token)
+    if malformed_jwt:
+        return None
+    expires_s = _decode_jwt_expiry_s(token)
+    # Hermes hands back only the bearer token; the ChatGPT account the subscription
+    # lane must name lives inside it, so read it there (#149).
     return TalkAuth(
         token=token,
         source=SOURCE_CODEX_OAUTH,
         detail="Hermes Codex login (ChatGPT subscription)",
-        expires_at=None,
-        account_id=None,
+        expires_at=datetime.fromtimestamp(expires_s, tz=UTC) if expires_s is not None else None,
+        account_id=_decode_jwt_chatgpt_account_id(token),
     )
 
 

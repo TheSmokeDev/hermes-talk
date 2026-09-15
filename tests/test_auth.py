@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 import time
+import types
 
 import pytest
 
 import talk_auth
+import talk_live_config
 
 
 def _jwt_with_exp(exp: float) -> str:
@@ -27,21 +30,34 @@ def _write_codex_auth(
     access: str,
     refresh: str = "refresh-1",
     auth_mode: str = "chatgpt",
+    account_id: str | None = "acct-1",
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
+    tokens = {"access_token": access, "refresh_token": refresh}
+    if account_id is not None:
+        tokens["account_id"] = account_id
     (home / "auth.json").write_text(
-        json.dumps(
-            {
-                "auth_mode": auth_mode,
-                "tokens": {
-                    "access_token": access,
-                    "refresh_token": refresh,
-                    "account_id": "acct-1",
-                },
-            }
-        ),
+        json.dumps({"auth_mode": auth_mode, "tokens": tokens}),
         encoding="utf-8",
     )
+
+
+_ACCOUNT_CLAIM = {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-hermes"}}
+
+
+def _install_fake_hermes_login(monkeypatch, api_key: str) -> None:
+    """Stand in for ``hermes_cli.auth_codex`` so the real borrow path runs, not a stub."""
+
+    package = types.ModuleType("hermes_cli")
+    module = types.ModuleType("hermes_cli.auth_codex")
+    module.resolve_codex_runtime_credentials = lambda **_kwargs: {
+        "provider": "openai-codex",
+        "api_key": api_key,
+        "auth_mode": "chatgpt",
+    }
+    package.auth_codex = module
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +162,57 @@ def test_hermes_codex_login_wins_over_the_cli_store(monkeypatch, tmp_path):
     auth = talk_auth.resolve_auth()
     assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
     assert auth.token == "hermes-access"
+
+
+def test_hermes_codex_login_carries_the_account_id_from_the_token(monkeypatch, tmp_path):
+    """#149: Hermes hands back only the bearer; the account id is a claim inside it."""
+    exp = int(time.time()) + 3600
+    token = _jwt_with_payload({"exp": exp, **_ACCOUNT_CLAIM})
+    _install_fake_hermes_login(monkeypatch, token)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.token == token
+    assert auth.account_id == "acct-hermes"
+    assert auth.expires_at is not None and int(auth.expires_at.timestamp()) == exp
+    assert "acct-hermes" not in repr(auth)
+    # The whole point: the subscription gate accepts the borrowed login as-is.
+    talk_live_config.validate_live_auth(auth, talk_live_config.LiveConfig(auth_mode="subscription"))
+
+
+def test_hermes_codex_login_without_the_claim_still_fails_closed(monkeypatch, tmp_path):
+    """A borrowed token naming no account cannot open subscription mode; no key fallback."""
+    token = _jwt_with_payload({"exp": int(time.time()) + 3600})
+    _install_fake_hermes_login(monkeypatch, token)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.account_id is None
+    with pytest.raises(talk_auth.TalkAuthError, match="account ID"):
+        talk_live_config.validate_live_auth(
+            auth, talk_live_config.LiveConfig(auth_mode="subscription")
+        )
+
+
+def test_hermes_codex_login_with_a_malformed_token_yields_to_the_cli_store(monkeypatch, tmp_path):
+    _install_fake_hermes_login(monkeypatch, "header.!!!.sig")
+    _write_codex_auth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.account_id == "acct-1"
+    assert auth.detail.startswith("Codex CLI login")
+
+
+def test_cli_store_without_account_id_reads_it_from_the_token_claim(monkeypatch, tmp_path):
+    token = _jwt_with_payload({"exp": int(time.time()) + 3600, **_ACCOUNT_CLAIM})
+    _write_codex_auth(tmp_path / "codex", access=token, account_id=None)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.account_id == "acct-hermes"
 
 
 def test_status_reports_lane_without_tokens(monkeypatch, tmp_path):
