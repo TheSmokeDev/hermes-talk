@@ -10,6 +10,7 @@ from pathlib import Path
 
 import fixture_data
 import pytest
+import wallclock
 
 import talk_transcript
 
@@ -435,7 +436,7 @@ def test_detached_handoff_lease_blocks_another_process_until_done(tmp_path, monk
     assert result.stdout == ""
     release.set()
     root = tmp_path / "state" / "talk-transcripts"
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + wallclock.stretch(2)
     while any(root.glob("*.claimed-*")) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not list(root.glob("*.claimed-*"))
@@ -605,7 +606,7 @@ def test_dead_claim_is_recovered_when_pid_now_belongs_to_unrelated_live_process(
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> bool:
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + wallclock.stretch(timeout)
     while time.monotonic() < deadline:
         if predicate():
             return True

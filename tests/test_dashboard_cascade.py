@@ -18,6 +18,7 @@ import types
 
 import aiohttp
 import pytest
+import wallclock
 from test_dashboard_api import api, serialized
 
 import talk_cascade_voice
@@ -172,7 +173,7 @@ def tts(monkeypatch):
 
 
 async def _wait_for(condition, timeout: float = 2.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + wallclock.stretch(timeout)
     while not condition():
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("condition never became true")

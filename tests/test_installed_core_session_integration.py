@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import wallclock
 
 TALK_REPO = Path(__file__).resolve().parent.parent
 AGENT_REPO = Path(os.environ.get("HERMES_AGENT_REPO", "")).resolve()
@@ -51,7 +52,7 @@ def _copy_installed_plugin(home: Path) -> Path:
 
 
 async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + wallclock.stretch(timeout)
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("timed out waiting for installed cross-repo state")

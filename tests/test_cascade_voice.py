@@ -14,6 +14,7 @@ import json
 
 import aiohttp
 import pytest
+import wallclock
 
 import talk_cascade_voice as cascade
 import talk_cli
@@ -204,7 +205,7 @@ class _Harness:
 async def _wait_for(condition, timeout: float = 2.0) -> None:
     """Poll the loop until ``condition`` holds; fail the test if it never does."""
 
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + wallclock.stretch(timeout)
     while not condition():
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("condition never became true")

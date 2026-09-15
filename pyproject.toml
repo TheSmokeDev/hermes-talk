@@ -111,8 +111,10 @@ testpaths = ["tests"]
 pythonpath = ["."]
 # A wedged coordinator test used to sit until the CI job's 15-minute ceiling
 # and come back as "cancelled" with no stack. Now it fails on its own, with one,
-# well inside that ceiling. Thread method so a stuck worker thread cannot block
-# the interrupt.
+# well inside that ceiling. Thread method because Windows has no SIGALRM; note
+# it ends the whole pytest process (os._exit) at the first wedge, so you get one
+# stack and no summary for the tests after it, which is still strictly better
+# than a cancelled job.
 timeout = 180
 timeout_method = "thread"
 markers = [

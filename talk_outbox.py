@@ -85,11 +85,16 @@ class HistoryOutbox:
         # journal a steady stream of commits (a liveness probe, a lease renewal) starves
         # every concurrent read on a slow disk until the busy timeout turns that starvation
         # into "storage broken". Must run outside a transaction, hence its own connection.
+        # Best effort with a short lock wait: this constructor runs per dashboard attach
+        # and per Codex delegation, so it must not sit behind a held writer; a filesystem
+        # that refuses WAL keeps rollback mode and the busy bound below still applies.
         db = None
         try:
-            db = sqlite3.connect(self._path, timeout=_BUSY_TIMEOUT_S)
+            db = sqlite3.connect(self._path, timeout=2)
             db.execute("PRAGMA journal_mode=WAL")
-        except (sqlite3.Error, OSError):
+        except sqlite3.Error:
+            pass
+        except OSError:
             raise HistoryError("outbox_unavailable") from None
         finally:
             if db is not None:

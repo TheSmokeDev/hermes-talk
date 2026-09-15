@@ -17,7 +17,11 @@ def test_outbox_uses_write_ahead_logging(tmp_path):
 
 def test_readers_survive_a_writer_committing_in_a_tight_loop(tmp_path):
     """A liveness probe or lease renewal committing every few milliseconds must not
-    starve a concurrent snapshot read into ``outbox_unavailable``."""
+    starve a concurrent snapshot read into ``outbox_unavailable``.
+
+    On a fast disk this also passes in rollback-journal mode, so the WAL assertion
+    above is the load-bearing one; this case guards the behavior the mode exists for.
+    """
 
     outbox = HistoryOutbox(tmp_path, profile="default")
     stop = threading.Event()

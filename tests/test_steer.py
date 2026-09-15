@@ -18,6 +18,7 @@ import time
 import types
 
 import pytest
+import wallclock
 
 import talk_apiserver
 import talk_host
@@ -324,7 +325,7 @@ def test_stop_subagent_interrupts_and_supersedes_its_notes(monkeypatch):
 
 
 def _poll_stop_receipt(run_id: int, expected_fragment: str, timeout: float = 3.0) -> str:
-    deadline = time.time() + timeout
+    deadline = time.time() + wallclock.stretch(timeout)
     while time.time() < deadline:
         run = talk_runs.get_run(run_id)
         meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import wallclock
 
 from talk_codex_store import CodexJobs
 from talk_codex_wire import CodexAppServer, CodexWorkerError
@@ -65,7 +66,7 @@ def peer_wrote_nothing(tmp_path):
 
 
 def wait_for(check):
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + wallclock.stretch(5)
     while time.monotonic() < deadline:
         if check():
             return

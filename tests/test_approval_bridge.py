@@ -13,6 +13,7 @@ import threading
 import time
 
 import pytest
+import wallclock
 
 import talk_apiserver
 import talk_approvals
@@ -506,7 +507,7 @@ def test_resolve_routes_the_exact_request_when_the_event_carried_one(monkeypatch
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> bool:
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + wallclock.stretch(timeout)
     while time.monotonic() < deadline:
         if predicate():
             return True
@@ -729,7 +730,7 @@ def test_the_api_server_worker_starts_the_approval_sidecar(monkeypatch):
         talk_host._api_server_worker("check the screen", session_id=None),
     )
 
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + wallclock.stretch(3)
     while time.monotonic() < deadline:
         run = talk_runs.get_run(run_id)
         if run and run["status"] in talk_runs.TERMINAL_STATUSES:
