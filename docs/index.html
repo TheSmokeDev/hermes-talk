@@ -187,11 +187,17 @@ configured memory provider contributes.</li>
 
 <h2>Providers</h2>
 <table>
-<tr><th>Provider</th><th>Auth</th></tr>
-<tr><td>OpenAI Realtime (default)</td><td>a ChatGPT subscription through <code>codex login</code>, or an API key</td></tr>
-<tr><td>xAI Grok Voice</td><td>an X Premium or SuperGrok login, or an API key</td></tr>
-<tr><td>Gemini Live</td><td>a Gemini API key; free-tier AI Studio keys work</td></tr>
+<tr><th>Provider</th><th>Model</th><th>Auth</th></tr>
+<tr><td>OpenAI Realtime (default)</td><td><code>gpt-realtime-2.1</code></td><td>a ChatGPT subscription through <code>codex login</code>, or an API key</td></tr>
+<tr><td>xAI Grok Voice</td><td><code>grok-voice-latest</code></td><td>an X Premium or SuperGrok login, no key; or an API key</td></tr>
+<tr><td>Gemini Live</td><td><code>gemini-3.1-flash-live-preview</code></td><td>a Gemini API key; free-tier AI Studio keys work</td></tr>
+<tr><td>GPT-Live</td><td><code>gpt-live-1-codex</code> / <code>gpt-live-1</code></td><td>the Codex subscription, or explicitly chosen API billing</td></tr>
 </table>
+<p>So OpenAI Realtime and xAI Grok Voice ride a subscription today, and Gemini Live
+needs a key. <strong>GPT-Live</strong> is not a row in the provider knob — it is
+selected separately by <code>TALK_VOICE_MODE=live</code>, runs
+<code>gpt-live-1-codex</code> on the subscription and <code>gpt-live-1</code> on API
+billing, and never falls back from one to the other.</p>
 <p>A cascade lane can route speech through ElevenLabs for a custom voice. Provider
 support differs by surface, and the provider knob is fail-closed — it is never inferred
 from which keys happen to exist. <code>hermes talk doctor</code> names which lane came

@@ -15,6 +15,8 @@ Hermes Talk is a realtime voice plugin for [Hermes Agent](https://github.com/Nou
 
 **It rides your ChatGPT or SuperGrok subscription. No API key required.**
 
+The realtime lanes are **OpenAI Realtime** (`gpt-realtime-2.1`, on your ChatGPT subscription through `codex login`), **xAI Grok Voice** (on an X Premium or SuperGrok login, no key), and **Gemini Live** (which does need a `GEMINI_API_KEY` — free-tier AI Studio keys work); **GPT-Live** is selected separately by `TALK_VOICE_MODE=live` and runs `gpt-live-1-codex` on the Codex subscription or `gpt-live-1` on explicitly chosen API billing.
+
 Talk calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below.
 
 **What it is:** a plug-in that adds interruptible, duplex speech-to-speech voice to an
