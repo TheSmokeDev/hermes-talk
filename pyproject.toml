@@ -115,6 +115,9 @@ pythonpath = ["."]
 # the interrupt.
 timeout = 180
 timeout_method = "thread"
+markers = [
+  "wall_clock: asserts ordering under real wall-clock deadlines; skipped on Windows CI (see tests/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 100

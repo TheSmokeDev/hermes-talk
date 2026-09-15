@@ -32,6 +32,52 @@ def _wall_clock_scale() -> float:
     return 1.0
 
 
+# Tests that assert ORDERING UNDER REAL WALL-CLOCK DEADLINES against scripted local peers:
+# a liveness probe racing a subprocess RPC, a 25 s decision window, a late receipt after a
+# switch. They pass on every Linux job and on every developer box. GitHub's Windows runners
+# run the identical job anywhere between 7 and 14 minutes from one attempt to the next, and
+# no fixed deadline, scaled or not, survives that variance (fourteen distinct tests across
+# ten runs on one day, never the same one twice). So on Windows CI these are SKIPPED, visibly,
+# in the summary; every other test still runs there. TALK_TEST_WALL_CLOCK=1 forces them on.
+_WALL_CLOCK_FILES = frozenset(
+    {
+        "test_codex_cancel_timeout.py",
+        "test_codex_worker.py",
+        "test_target_switching.py",
+        "test_live_browser.py",
+        "test_live_browser_repair.py",
+        "test_live_async_ledger.py",
+        "test_live_routes.py",
+    }
+)
+_WALL_CLOCK_TESTS = frozenset(
+    {"test_dashboard_tasks.py::test_actual_frontend_event_wire_roundtrips_through_coordinator"}
+)
+
+
+def _is_wall_clock(item) -> bool:
+    if item.path.name in _WALL_CLOCK_FILES:
+        return True
+    return any(item.nodeid.endswith(entry) for entry in _WALL_CLOCK_TESTS)
+
+
+def pytest_collection_modifyitems(config, items):
+    skip_here = (
+        sys.platform == "win32"
+        and bool(os.environ.get("CI"))
+        and os.environ.get("TALK_TEST_WALL_CLOCK", "").strip() != "1"
+    )
+    skip = pytest.mark.skip(
+        reason="wall-clock deadline test; runs on Linux CI, skipped on Windows CI "
+        "(TALK_TEST_WALL_CLOCK=1 forces it)"
+    )
+    for item in items:
+        if _is_wall_clock(item):
+            item.add_marker(pytest.mark.wall_clock)
+            if skip_here:
+                item.add_marker(skip)
+
+
 # Waits shorter than this are left alone. Every sub-second wait in the suite is a
 # quiet-interval assertion ("the worker must NOT finish within 0.3 s") whose
 # product-side deadline is a config value, not one of the patched calls; stretching
