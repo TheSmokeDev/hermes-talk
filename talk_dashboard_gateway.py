@@ -54,6 +54,9 @@ class DashboardTaskError(Exception):
         "steering_unsupported": "This host cannot steer that existing job with an origin receipt.",
         "steering_origin_pending": "The original correction is awaiting its canonical receipt.",
         "steering_target_denied": "That run does not belong to this canonical task.",
+        "recipient_history_unsupported": "This host does not support recipient history reads.",
+        "recipient_history_stale": "This history snapshot expired or changed; refresh the catalog.",
+        "recipient_history_unavailable": "The recipient's native history is unavailable.",
     }
 
     def __init__(self, code: str, status: int = 409, *, retryable=False):
@@ -120,6 +123,17 @@ class TaskGateway:
                     code = code.get("code")
                 if status in {401, 403}:
                     raise DashboardTaskError("context_denied", 403)
+                if suffix.startswith("/v1/recipient-bridge/"):
+                    if code in {
+                        "history_target_expired", "history_cursor_expired",
+                        "history_cursor_mismatch", "history_snapshot_changed",
+                        "history_source_changed", "history_task_identity_unverified",
+                    }:
+                        code = "recipient_history_stale"
+                    elif status == 503:
+                        code = "recipient_history_unavailable"
+                    elif status == 404:
+                        code = "target_missing"
                 raise DashboardTaskError(
                     code if code in DashboardTaskError.MESSAGES else "gateway_refused",
                     status,
@@ -278,8 +292,11 @@ class RecipientGateway:
     def __init__(self, bound):
         self.bound = bound
 
-    def _call(self, operation, **fields):
-        if operation not in {"probe", "list", "select", "send", "reconcile", "inspect"}:
+    def _call(self, operation, *, native_host_id=None, **fields):
+        if operation not in {
+            "probe", "list", "select", "send", "reconcile", "inspect",
+            "catalog", "history", "status",
+        }:
             raise DashboardTaskError("invalid_event", 400)
         owner, gateway = self.bound.attachment.owner, self.bound.gateway
         body = {"session_id": owner.session_id, "actor_scope": owner.principal, **fields}
@@ -293,13 +310,63 @@ class RecipientGateway:
             "POST", "/v1/recipient-bridge/" + operation, body=body,
             timeout=20, max_bytes=4 * 1024 * 1024,
         )
+        if native_host_id is not None and result.get("host_id") != native_host_id:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        if operation == "catalog":
+            rows = result.get("recipients")
+            if not isinstance(rows, list) or len(rows) > 50:
+                raise DashboardTaskError("gateway_response_invalid", 502)
+            normalized = []
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("host_id"), str):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                normalized.append({**row, "native_host_id": row["host_id"], "host_id": owner.host})
+            result = {**result, "recipients": normalized}
         return {**result, "host_id": owner.host}
+
+    def _require_history(self, operation):
+        descriptor = self._call("probe").get("recipient_bridge")
+        if (
+            not isinstance(descriptor, dict)
+            or type(descriptor.get("version")) is not int
+            or descriptor["version"] != 1
+            or not isinstance(descriptor.get("operations"), list)
+            or operation not in descriptor["operations"]
+            or not isinstance(descriptor.get("history"), dict)
+            or descriptor["history"].get("read_only") is not True
+        ):
+            raise DashboardTaskError("recipient_history_unsupported", 503)
+
+    def catalog(self, *, app=None, limit=20, cursor=None):
+        self._require_history("catalog")
+        return self._call(
+            "catalog", limit=limit, **({"app": app} if app else {}),
+            **({"cursor": cursor} if cursor is not None else {}),
+        )
+
+    def history(self, target, *, limit=20, cursor=None):
+        self._require_history("history")
+        return self._call(
+            "history", target_token=target["target_token"], limit=limit,
+            native_host_id=target.get("native_host_id"),
+            **({"cursor": cursor} if cursor is not None else {}),
+        )
+
+    def status(self, target):
+        self._require_history("status")
+        return self._call(
+            "status", target_token=target["target_token"],
+            native_host_id=target.get("native_host_id"),
+        )
 
     def list_recipients(self, app=None):
         return self._call("list", **({"app": app} if app else {}))
 
     def select(self, target):
-        return self._call("select", target_token=target["target_token"])
+        return self._call(
+            "select", target_token=target["target_token"],
+            native_host_id=target.get("native_host_id"),
+        )
 
     def send(self, operation_id, target, message, *, commit_token=None):
         return self._call(

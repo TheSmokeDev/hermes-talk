@@ -1149,6 +1149,11 @@ LIVE_ROUTE_HANDLERS, LIVE_SESSIONS = talk_live_routes.mount_live_routes(
     http_exception=HTTPException,
 )
 
+RECIPIENT_ROUTE_HANDLERS = talk_recipients.mount_recipient_routes(
+    router, require_auth=require_dashboard_auth, read_body=_json_body,
+    task_call=_task_call, service=TASKS.recipients,
+)
+
 
 ROUTE_HANDLERS = (
     talk_status,
@@ -1167,6 +1172,7 @@ ROUTE_HANDLERS = (
     native_task_attach,
     task_switch,
     *LIVE_ROUTE_HANDLERS,
+    *RECIPIENT_ROUTE_HANDLERS,
 )
 
 

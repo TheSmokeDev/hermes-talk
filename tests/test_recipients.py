@@ -500,6 +500,9 @@ def test_tool_schemas_never_offer_worker_creation_or_model_supplied_operation_id
         "select_recipient",
         "send_agent_message",
         "inspect_screen",
+        "catalog_recipients",
+        "read_recipient_history",
+        "recipient_status",
     }
     assert all("operation_id" not in tool["parameters"]["properties"] for tool in schemas)
     assert all("worker" not in tool["parameters"]["properties"] for tool in schemas)

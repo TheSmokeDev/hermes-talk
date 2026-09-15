@@ -224,8 +224,16 @@ class WorkerRecipientBackend:
     def select(self, target):
         return (self.workers if target.get("app") == APP else self.fallback).select(target)
 
+    def catalog(self, *, app=None, limit=20, cursor=None):
+        return self.fallback.catalog(app=app, limit=limit, cursor=cursor)
+
+    def history(self, target, *, limit=20, cursor=None):
+        if target.get("app") == APP:
+            raise DashboardTaskError("recipient_history_unsupported", 503)
+        return self.fallback.history(target, limit=limit, cursor=cursor)
+
     def status(self, target):
-        return self.workers.status(target)
+        return (self.workers if target.get("app") == APP else self.fallback).status(target)
 
     def steering_body(self, target, body):
         return self.workers.steering_body(target, body)

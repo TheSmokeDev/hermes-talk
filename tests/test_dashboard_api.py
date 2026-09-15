@@ -586,6 +586,7 @@ def test_route_handlers_covers_every_declared_route():
 
     source = "\n".join(path.read_text(encoding="utf-8") for path in (
         DASHBOARD_DIR / "plugin_api.py", DASHBOARD_DIR.parent / "talk_live_routes.py",
+        DASHBOARD_DIR.parent / "talk_recipients.py",
     ))
     decorated = re.findall(r"@router\.(?:get|post|put|patch|delete)\(", source)
 
