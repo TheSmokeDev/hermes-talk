@@ -54,15 +54,16 @@ class NativeSurface:
         return self.issuer.discord_context("revoke", self.binding)
 
 
-def prepare_surface(bound, body, *, previous=None, issuer_factory=None):
+def prepare_surface(bound, body, *, previous=None, issuer_factory=None, typed=False):
     prior = previous.native_surface if previous is not None else None
     surface = body.get("surface", "discord" if prior else "cli")
-    if surface not in {"cli", "discord"} or (prior is not None and surface != "discord"):
+    allowed = ("cli", "discord", "desktop", "dashboard") if typed else ("cli", "discord")
+    if surface not in allowed or (prior is not None and surface != "discord"):
         raise DashboardTaskError("context_denied", 403)
-    if surface == "cli":
+    if surface != "discord":
         if any(key in body for key in FIELDS - {"surface"}):
             raise DashboardTaskError("context_denied", 403)
-        return {"surface": "cli"}
+        return {"surface": surface}
     if prior is not None:
         prior.verify()
         current = prior.issuer.discord_context("rebind", {

@@ -1008,13 +1008,18 @@ async def _target_session(request, body, *, initial=False):
 
 @router.post("/native/attach")
 async def native_task_attach(request: Request):
-    """Bind a native client through real dashboard authentication; mint no voice credentials."""
+    """Bind native voice or typed input through authenticated target activation."""
     require_dashboard_auth(request)
     body = await _json_body(request)
+    input_mode = body.get("input_mode", "voice")
+    if input_mode not in ("voice", "typed"):
+        raise HTTPException(
+            status_code=400, detail=DashboardTaskError("invalid_event", 400).detail()
+        )
     previous = (await _task_call(TASKS.binding, request, body)
                 if "connection_id" in body else None)
     selection_body = {key: value for key, value in body.items()
-                      if key not in talk_native_surface.FIELDS}
+                      if key not in talk_native_surface.FIELDS and key != "input_mode"}
     prepared = await _prepare_target(
         request, selection_body, initial="connection_id" not in selection_body, reconnect=True,
     )
@@ -1025,7 +1030,7 @@ async def native_task_attach(request: Request):
         bound = prepared.bound
         surface = asyncio.create_task(_task_call(
             lambda _request, data: talk_native_surface.prepare_surface(
-                bound, data, previous=previous), request, body,
+                bound, data, previous=previous, typed=input_mode == "typed"), request, body,
         ))
         try:
             surface_context = await asyncio.shield(surface)
@@ -1033,6 +1038,10 @@ async def native_task_attach(request: Request):
             with suppress(Exception):
                 await surface
             raise
+        if hasattr(request, "is_disconnected") and await request.is_disconnected():
+            raise HTTPException(
+                status_code=409, detail=DashboardTaskError("connection_stale", 409).detail()
+            )
         activation = asyncio.create_task(_task_call(TARGETS.activate, request, prepared))
         try:
             selection = await asyncio.shield(activation)
@@ -1041,6 +1050,16 @@ async def native_task_attach(request: Request):
             activated = True
             raise
         activated = True
+        await _task_call(TASKS.binding, request, {
+            "connection_id": bound.connection_id, "generation": bound.generation,
+        })
+        result = {"ok": True, "task": TASKS.descriptor(bound), "selection": selection,
+                  "voice_state": "not_connected", "surface_context": surface_context,
+                  "live_contract": {"delegation_admission": "async-v1",
+                                    "transcript_batch": {"flush_ms": 100, "fragments": 32,
+                                                         "bytes": 8192}}}
+        if input_mode == "typed":
+            return {**result, "input_mode": "typed"}
         tools = _session_tools(bound)
         if _resolve_voice_mode() == "live":
             instructions = talk_identity.build_live_instructions(
@@ -1053,12 +1072,7 @@ async def native_task_attach(request: Request):
                 None, tools=tools, lane=surface_context["surface"], canonical_task=True,
                 capabilities="Canonical task tools and linked child work are available.",
             ) + "\n\n" + TASKS.instructions(bound)
-        return {"ok": True, "task": TASKS.descriptor(bound), "instructions": instructions,
-                "tools": tools, "selection": selection, "voice_state": "not_connected",
-                "surface_context": surface_context,
-                "live_contract": {"delegation_admission": "async-v1",
-                                  "transcript_batch": {"flush_ms": 100, "fragments": 32,
-                                                       "bytes": 8192}}}
+        return {**result, "instructions": instructions, "tools": tools}
     finally:
         if not activated:
             await asyncio.to_thread(TARGETS.cancel, prepared)
