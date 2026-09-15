@@ -17,6 +17,10 @@ try:
 except ImportError:  # pragma: no cover - flat Hermes plugin load
     from talk_passive import HistoryError, HistoryMessage, HistoryOwner, dialogue_messages, digest
 
+# How long a connection waits for a lock before the outbox reports itself unavailable.
+# A bound on contention, not a deadline for work: no transaction spans a network request.
+_BUSY_TIMEOUT_S = 10.0
+
 
 @dataclass(frozen=True, slots=True)
 class PendingHistory:
@@ -76,6 +80,20 @@ class HistoryOutbox:
             self._path.chmod(0o600)
         except OSError:
             raise HistoryError("outbox_unavailable") from None
+        # Write-ahead logging, set once and persisted in the file: readers never wait on a
+        # committing writer and a writer never waits on readers. In the default rollback
+        # journal a steady stream of commits (a liveness probe, a lease renewal) starves
+        # every concurrent read on a slow disk until the busy timeout turns that starvation
+        # into "storage broken". Must run outside a transaction, hence its own connection.
+        db = None
+        try:
+            db = sqlite3.connect(self._path, timeout=_BUSY_TIMEOUT_S)
+            db.execute("PRAGMA journal_mode=WAL")
+        except (sqlite3.Error, OSError):
+            raise HistoryError("outbox_unavailable") from None
+        finally:
+            if db is not None:
+                db.close()
         with self._db(prune=False) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS metadata "
@@ -101,7 +119,7 @@ class HistoryOutbox:
     def _db(self, *, prune: bool = False, write: bool = True) -> Iterator[sqlite3.Connection]:
         db = None
         try:
-            db = sqlite3.connect(self._path, timeout=2)
+            db = sqlite3.connect(self._path, timeout=_BUSY_TIMEOUT_S)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA secure_delete=ON")
             db.execute("PRAGMA foreign_keys=ON")
