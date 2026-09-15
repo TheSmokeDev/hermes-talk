@@ -20,6 +20,8 @@ except ImportError:  # pragma: no cover - flat Hermes plugin load
 # How long a connection waits for a lock before the outbox reports itself unavailable.
 # A bound on contention, not a deadline for work: no transaction spans a network request.
 _BUSY_TIMEOUT_S = 10.0
+# The constructor keeps the historical short wait; it runs on hot paths (attach, delegate).
+_CONSTRUCTOR_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +87,14 @@ class HistoryOutbox:
         # journal a steady stream of commits (a liveness probe, a lease renewal) starves
         # every concurrent read on a slow disk until the busy timeout turns that starvation
         # into "storage broken". Must run outside a transaction, hence its own connection.
-        # Best effort with a short lock wait: this constructor runs per dashboard attach
-        # and per Codex delegation, so it must not sit behind a held writer; a filesystem
-        # that refuses WAL keeps rollback mode and the busy bound below still applies.
+        # Best effort with a short lock wait, and the schema transaction below keeps the
+        # same short wait: this constructor runs per dashboard attach and per Codex
+        # delegation, so it fails in 2 s behind a held writer as it always did, while
+        # ordinary reads and writes get the longer busy bound. A filesystem that refuses
+        # WAL keeps rollback mode and that bound still applies.
         db = None
         try:
-            db = sqlite3.connect(self._path, timeout=2)
+            db = sqlite3.connect(self._path, timeout=_CONSTRUCTOR_TIMEOUT_S)
             db.execute("PRAGMA journal_mode=WAL")
         except sqlite3.Error:
             pass
@@ -99,7 +103,7 @@ class HistoryOutbox:
         finally:
             if db is not None:
                 db.close()
-        with self._db(prune=False) as db:
+        with self._db(prune=False, timeout=_CONSTRUCTOR_TIMEOUT_S) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS metadata "
                 "(profile TEXT NOT NULL, next_generation INTEGER NOT NULL)"
@@ -121,10 +125,12 @@ class HistoryOutbox:
                 code TEXT NOT NULL DEFAULT '')""")
 
     @contextmanager
-    def _db(self, *, prune: bool = False, write: bool = True) -> Iterator[sqlite3.Connection]:
+    def _db(
+        self, *, prune: bool = False, write: bool = True, timeout: float = _BUSY_TIMEOUT_S
+    ) -> Iterator[sqlite3.Connection]:
         db = None
         try:
-            db = sqlite3.connect(self._path, timeout=_BUSY_TIMEOUT_S)
+            db = sqlite3.connect(self._path, timeout=timeout)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA secure_delete=ON")
             db.execute("PRAGMA foreign_keys=ON")
