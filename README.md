@@ -1,4 +1,4 @@
-# hermes-talk
+# Hermes Talk
 
 **Realtime duplex voice for your own agent — talk to it, it runs real work in the background, it reports back out loud.**
 
@@ -11,9 +11,20 @@
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
 
+Hermes Talk is a realtime voice plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): you speak, it answers out loud, and it calls the agent's own tools without leaving the conversation. It runs in the terminal (`hermes talk`), in a Discord voice channel (`/talk join`), and in the Hermes dashboard **Talk** tab.
+
 **It rides your ChatGPT or SuperGrok subscription. No API key required.**
 
-Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Talk calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below.
+
+**What it is:** a plug-in that adds interruptible, duplex speech-to-speech voice to an
+existing Hermes Agent install — one bidirectional audio session in which the agent uses
+its real tools, hands work to background agents, and speaks the results when they land.
+
+**Who it is for:** people already running Hermes Agent who would rather talk to it than
+type at it, and who want to keep talking while it works. It is not a standalone
+assistant, and it does not replace Hermes's built-in turn-based voice mode — that is a
+different shape, and a good one.
 
 **Desktop integration:** open a conversation → **Talk** → **Connect**.
 Talk appears in the top bar and beside the composer, selects the current conversation
