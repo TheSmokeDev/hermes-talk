@@ -21,10 +21,14 @@ jobs:
     # No secrets, no network: the suite runs against scripted Realtime
     # transcripts and a stub plugin context, and never opens an audio device.
     #
-    # A healthy job finishes in ~3 minutes (Windows), so 15 is ~5x headroom.
-    # Without a ceiling a wedged test holds the runner for GitHub's 6-hour
-    # default, which reads as "still running" long after it has failed.
-    timeout-minutes: 15
+    # A healthy Linux job finishes in ~3 minutes. Windows runs the same suite in
+    # 6 to 14 minutes from one attempt to the next, and the 3x wall-clock scale
+    # tests/wallclock.py applies there stretches every wait that legitimately
+    # expires, so a slow Windows attempt needs ~15. Without a ceiling a wedged
+    # test holds the runner for GitHub's 6-hour default, which reads as "still
+    # running" long after it has failed; pytest-timeout (180 s per test) is the
+    # first line, this is the backstop.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
