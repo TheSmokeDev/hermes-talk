@@ -51,6 +51,7 @@ class NativeHost:
         self.failure = None
         self.after = None
         self.mutate = None
+        self.list_truncated = False
 
     def __call__(self, request):
         if "/v1/recipient-bridge/" not in request.url.path:
@@ -70,7 +71,10 @@ class NativeHost:
         if operation == "probe":
             result = {"recipient_bridge": descriptor}
         elif operation == "list":
-            result = {"recipients": [self.live], "capabilities": {}}
+            result = {
+                "recipients": [self.live], "capabilities": {},
+                "truncated": self.list_truncated,
+            }
         elif operation == "catalog":
             rows = [row for row in self.rows if body.get("app") in {None, row["app"]}]
             offset = 1 if body.get("cursor") == "catalog-page-two" else 0
@@ -322,6 +326,15 @@ def test_response_and_request_page_bounds_are_enforced(bundle):
     bundle.native.messages = [{**row, "text": "short"} for row in bundle.native.messages] * 11
     with pytest.raises(RecipientError):
         route(bundle, "history", **identity(row), limit=50)
+
+
+def test_catalog_truncated_is_true_when_the_live_list_was_cut(bundle):
+    """The one flag the UI reads must say incomplete if EITHER side cut the set."""
+    bundle.native.list_truncated = True
+    reply = route(bundle, "catalog")
+    assert reply["live_truncated"] is True
+    assert reply["truncated"] is True
+    assert reply["next_cursor"] is None  # the stored side was complete
 
 
 def test_catalog_pagination_preserves_cached_identity_and_opaque_cursor(bundle):

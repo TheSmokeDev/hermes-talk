@@ -546,6 +546,8 @@ class RecipientService:
             "ok": True, "state": "listed", "host_id": bound.token.owner.host,
             "recipients": [_public(row) for row in live + stored],
             "sources": projected_sources, **pagination,
+            # The one flag the UI reads: the set is incomplete if EITHER side cut it.
+            "truncated": bool(pagination.get("truncated")) or bool(live_truncated),
             "live_truncated": live_truncated,
             "selected": self.snapshot(bound)["selected"],
             "output": "Existing recipients: " + self._choices_text(live + stored),
