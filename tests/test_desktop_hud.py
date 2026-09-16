@@ -241,6 +241,7 @@ assert(!find(tree,node=>node.type==='textarea'));
 const toggle=button(tree,'Talk');
 assert.equal(toggle.props['aria-expanded'],false);
 assert.equal(toggle.props.type,'button','native button supports keyboard and touch activation');
+assert.equal(toggle.props['data-hud-drag'],'move','the host drags the window from this button');
 assert(toggle.props['aria-describedby']);
 assert(text(tree).includes('Microphone off'));
 assert(!find(tree,node=>node.props.className==='ht-desktop-view'),

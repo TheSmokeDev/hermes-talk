@@ -3838,6 +3838,8 @@ function TalkHudPresentation(props) {
     h('style', null, TALK_HUD_CSS),
     h('div', { className: 'ht-hud-compact' },
       h('button', { type: 'button', className: 'ht-hud-toggle', ref: toggleRef,
+        // The host moves the window as soon as a press on this button travels; a still tap toggles.
+        'data-hud-drag': 'move',
         'aria-label': (expanded ? 'Collapse Talk' : 'Expand Talk') + ' · ' + status,
         'aria-expanded': expanded, 'aria-controls': 'hermes-talk-hud-panel',
         'aria-describedby': 'hermes-talk-hud-status', onClick: toggle }, 'Talk'),
