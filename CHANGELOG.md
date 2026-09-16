@@ -11,6 +11,36 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.20.2] — 2026-09-16
+
+The floating Talk window gets out of the way, and the subscription lane's
+self-check tells the truth.
+
+### Changed
+- The floating window shrinks to the round Talk button once the session
+  connects; hovering the button opens the panel and leaving it closes the
+  panel again unless a click pinned it or a control inside has focus. Both
+  behaviors are toggles under Advanced and persist with the other appearance
+  settings; saved settings without them keep the defaults. A reconnect never
+  closes a panel the operator pinned. (#163, #164)
+- The round button, the hover status line and the expanded panel paint their
+  own theme background, so a collapsed control is just the button over
+  whatever is underneath. With a Hermes Desktop host that makes the window
+  transparent and click-through, nothing around the button blocks the app,
+  and a press on the button drags the window as soon as the pointer travels;
+  a still tap toggles the panel. (#165)
+
+### Fixed
+- `hermes talk check` on the GPT-Live lane (`TALK_VOICE_MODE=live`). The
+  provider step refused the resolved `live` lane as "not a live realtime
+  provider" before opening a session; behind that, the probe sent
+  `StartResponse`, which the Live client-delegation protocol has no encoding
+  for, and then waited for a response boundary that lane never reports. The
+  step now admits the lane, sends one speakable message and passes on the
+  first audio back, under the same wall-clock budget. Doctor's model check
+  names the live model and voice under live mode instead of `TALK_MODEL`.
+  Nothing here touches a live conversation. (#161, #166)
+
 ## [0.20.1] — 2026-09-16
 
 ### Added
