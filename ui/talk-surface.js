@@ -1960,7 +1960,8 @@ function createTalkSurface(SDK) {
     const [muted, updateMuted] = useState(false);
     const [sleeping, updateSleeping] = useState(false);
     const [audioActivity, setAudioActivity] = useState({ input: false, output: false });
-    const [appearance, updateAppearance] = useState({ skin: "system", animate: false });
+    const [appearance, updateAppearance] = useState({ skin: "system", animate: false,
+      collapseOnConnect: true, hoverExpand: true });
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
@@ -2034,17 +2035,22 @@ function createTalkSurface(SDK) {
       updateAttachments(next);
     }
 
+    // The floating-window behaviors default on; a saved object without them keeps the default.
+    const appearanceRecord = (value) => ({ skin: value.skin, animate: value.animate,
+      collapseOnConnect: value.collapseOnConnect !== false, hoverExpand: value.hoverExpand !== false });
+
     function setAppearance(next) {
       if (!["system", "quiet", "contrast"].includes(next?.skin) || typeof next.animate !== "boolean") return;
-      updateAppearance({ skin: next.skin, animate: next.animate });
-      try { window.localStorage.setItem(preferenceKey, JSON.stringify(next)); } catch (e) { /* storage unavailable */ }
+      const record = appearanceRecord(next);
+      updateAppearance(record);
+      try { window.localStorage.setItem(preferenceKey, JSON.stringify(record)); } catch (e) { /* storage unavailable */ }
     }
 
     useEffect(() => {
       try {
         const saved = JSON.parse(window.localStorage.getItem(preferenceKey));
         if (["system", "quiet", "contrast"].includes(saved?.skin) && typeof saved.animate === "boolean") {
-          updateAppearance({ skin: saved.skin, animate: saved.animate });
+          updateAppearance(appearanceRecord(saved));
         }
       } catch (e) { /* appearance is optional */ }
     }, [preferenceKey]);

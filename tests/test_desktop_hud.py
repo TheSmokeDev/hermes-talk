@@ -324,6 +324,11 @@ assert.equal(button(tree,'Connect').props.disabled,false);
 button(tree,'Connect').props.onClick();
 await waitFor(()=>offers===1); await tick();
 tree=render(runtime,'hud'); flushEffects();
+tree=render(runtime,'hud');
+assert.equal(button(tree,'Talk').props['aria-expanded'],false,
+  'connecting shrinks the window to the Talk button');
+button(tree,'Talk').props.onClick();
+tree=render(runtime,'hud'); flushEffects();
 assert(button(tree,'Stop talking'));
 assert.equal(captures,1); assert.equal(acquires,1);
 button(tree,'Mute microphone').props.onClick();
@@ -410,4 +415,84 @@ tree=render(registered[0].render(),'composer');
 assert(text(tree).includes('Composer mode'));
 assert(text(tree).includes('update Hermes Desktop'));
 assert.equal(acquires,0); assert.equal(captures,0);
+""")
+
+
+def test_hud_shrinks_to_the_button_when_the_session_connects(desktop_source):
+    run_hud(desktop_source, r"""
+context.plugin.register(host);
+const expands=[];
+const props={active:false, expanded:false, setExpanded:value=>expands.push(value),
+  appearance:{skin:'system',animate:false}, recipients:[], taskState:{jobs:[]}};
+const show=extra=>{
+  render(React.createElement(context.TalkHudPresentation,{...props,...extra}),'hud');
+  flushEffects();
+};
+show({});
+assert.deepEqual(expands,[],'mounting collapsed does not touch the panel');
+show({active:true});
+assert.deepEqual(expands,[false],'connecting shrinks the window to the Talk button');
+show({active:true});
+assert.deepEqual(expands,[false],'staying connected does not collapse again');
+""")
+
+
+def test_hud_keeps_the_panel_open_on_connect_when_the_preference_is_off(desktop_source):
+    run_hud(desktop_source, r"""
+context.plugin.register(host);
+const expands=[];
+const props={active:false, expanded:false, setExpanded:value=>expands.push(value),
+  appearance:{skin:'system',animate:false,collapseOnConnect:false},
+  recipients:[], taskState:{jobs:[]}};
+const show=extra=>{
+  render(React.createElement(context.TalkHudPresentation,{...props,...extra}),'hud');
+  flushEffects();
+};
+show({});
+show({active:true});
+assert.deepEqual(expands,[]);
+""")
+
+
+def test_hud_expands_while_hovered_and_a_click_pins_it(desktop_source):
+    run_hud(desktop_source, r"""
+context.plugin.register(host);
+const expands=[];
+const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
+  appearance:{skin:'system',animate:false}, recipients:[], taskState:{jobs:[]}};
+let tree=render(React.createElement(context.TalkHudPresentation, props),'hud'); flushEffects();
+const section=find(tree,node=>node.type==='section');
+section.props.onPointerEnter();
+assert.deepEqual(expands,[true],'hovering the button opens the panel');
+section.props.onPointerLeave({currentTarget:{contains:()=>false}});
+assert.deepEqual(expands,[true,false],'leaving closes a hover-opened panel');
+section.props.onPointerEnter();
+context.document.activeElement={};
+section.props.onPointerLeave({currentTarget:{contains:()=>true}});
+assert.deepEqual(expands,[true,false,true],'a focused control keeps the panel open');
+context.document.activeElement=null;
+tree=render(React.createElement(context.TalkHudPresentation,{...props,expanded:true}),'hud');
+flushEffects();
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true,false,true],'clicking a hover-opened panel pins it');
+find(tree,node=>node.type==='section').props.onPointerLeave({currentTarget:{contains:()=>false}});
+assert.deepEqual(expands,[true,false,true],'a pinned panel survives the pointer leaving');
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true,false,true,false],'a second click collapses a pinned panel');
+""")
+
+
+def test_hud_ignores_hover_when_the_preference_is_off(desktop_source):
+    run_hud(desktop_source, r"""
+context.plugin.register(host);
+const expands=[];
+const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
+  appearance:{skin:'system',animate:false,hoverExpand:false}, recipients:[], taskState:{jobs:[]}};
+const tree=render(React.createElement(context.TalkHudPresentation, props),'hud'); flushEffects();
+const section=find(tree,node=>node.type==='section');
+section.props.onPointerEnter();
+section.props.onPointerLeave({currentTarget:{contains:()=>false}});
+assert.deepEqual(expands,[]);
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true],'the button still opens the panel');
 """)

@@ -1961,7 +1961,8 @@ function createTalkSurface(SDK) {
     const [muted, updateMuted] = useState(false);
     const [sleeping, updateSleeping] = useState(false);
     const [audioActivity, setAudioActivity] = useState({ input: false, output: false });
-    const [appearance, updateAppearance] = useState({ skin: "system", animate: false });
+    const [appearance, updateAppearance] = useState({ skin: "system", animate: false,
+      collapseOnConnect: true, hoverExpand: true });
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
@@ -2035,17 +2036,22 @@ function createTalkSurface(SDK) {
       updateAttachments(next);
     }
 
+    // The floating-window behaviors default on; a saved object without them keeps the default.
+    const appearanceRecord = (value) => ({ skin: value.skin, animate: value.animate,
+      collapseOnConnect: value.collapseOnConnect !== false, hoverExpand: value.hoverExpand !== false });
+
     function setAppearance(next) {
       if (!["system", "quiet", "contrast"].includes(next?.skin) || typeof next.animate !== "boolean") return;
-      updateAppearance({ skin: next.skin, animate: next.animate });
-      try { window.localStorage.setItem(preferenceKey, JSON.stringify(next)); } catch (e) { /* storage unavailable */ }
+      const record = appearanceRecord(next);
+      updateAppearance(record);
+      try { window.localStorage.setItem(preferenceKey, JSON.stringify(record)); } catch (e) { /* storage unavailable */ }
     }
 
     useEffect(() => {
       try {
         const saved = JSON.parse(window.localStorage.getItem(preferenceKey));
         if (["system", "quiet", "contrast"].includes(saved?.skin) && typeof saved.animate === "boolean") {
-          updateAppearance({ skin: saved.skin, animate: saved.animate });
+          updateAppearance(appearanceRecord(saved));
         }
       } catch (e) { /* appearance is optional */ }
     }, [preferenceKey]);
@@ -3542,6 +3548,14 @@ export function DesktopTalkView(props) {
           h('input', { type: 'checkbox', checked: appearance.animate === true,
             onChange: event => setAppearance({ ...appearance, animate: event.target.checked }) }),
           'Animate active audio state'),
+        setAppearance && collapse && h('label', { className: 'htd-row' },
+          h('input', { type: 'checkbox', checked: appearance.collapseOnConnect !== false,
+            onChange: event => setAppearance({ ...appearance, collapseOnConnect: event.target.checked }) }),
+          'Shrink to the Talk button after connecting'),
+        setAppearance && collapse && h('label', { className: 'htd-row' },
+          h('input', { type: 'checkbox', checked: appearance.hoverExpand !== false,
+            onChange: event => setAppearance({ ...appearance, hoverExpand: event.target.checked }) }),
+          'Expand while the pointer is over the Talk button'),
         voices.length > 0 && h('label', null, 'Voice',
           h('select', { value: voice, disabled: !ready || active || busy,
             onChange: event => setVoice(event.target.value) },
@@ -3769,6 +3783,32 @@ function TalkHudPresentation(props) {
   const { active, starting, muted, sleeping, taskState, selectedRecipient, recipients = [],
     expanded, setExpanded, appearance = {} } = props;
   const toggleRef = React.useRef(null);
+  // hoverOpen: the panel is showing only because the pointer is over it; a click pins it.
+  const hoverOpen = React.useRef(false);
+  const wasActive = React.useRef(active);
+  const collapseOnConnect = appearance.collapseOnConnect !== false;
+  const hoverExpand = appearance.hoverExpand !== false;
+  React.useEffect(() => {
+    const connected = active && !wasActive.current;
+    wasActive.current = active;
+    if (connected && collapseOnConnect) { hoverOpen.current = false; setExpanded(false); }
+  }, [active, collapseOnConnect, setExpanded]);
+  const toggle = () => {
+    if (!expanded) { hoverOpen.current = false; setExpanded(true); return; }
+    if (hoverOpen.current) { hoverOpen.current = false; return; }
+    setExpanded(false);
+  };
+  const enter = () => {
+    if (hoverExpand && !expanded) { hoverOpen.current = true; setExpanded(true); }
+  };
+  const leave = event => {
+    if (!hoverOpen.current) return;
+    const focusInside = typeof document !== 'undefined' && document.activeElement &&
+      event?.currentTarget?.contains?.(document.activeElement);
+    if (focusInside) return;
+    hoverOpen.current = false;
+    setExpanded(false);
+  };
   const recipient = recipients.find(row => row.recipient_id === selectedRecipient);
   const addressed = recipient ? desktopTalkRecipientLabel(recipient)
     : selectedRecipient ? 'Unavailable recipient · ' + selectedRecipient : 'Hermes · voice owner';
@@ -3781,10 +3821,12 @@ function TalkHudPresentation(props) {
     : active && props.audioActivity?.input ? 'Microphone audio detected'
     : active ? 'Connected · microphone on' : 'Microphone off';
   const status = state + ' · Addressed: ' + addressed + ' · Active work: ' + activeWork;
-  const collapse = () => { setExpanded(false); toggleRef.current?.focus(); };
+  const collapse = () => { hoverOpen.current = false; setExpanded(false); toggleRef.current?.focus(); };
   return h('section', { className: 'ht-hud', 'aria-label': 'Hermes Talk floating control',
     'data-skin': appearance.skin || 'system', 'data-animate': String(appearance.animate === true),
     'data-active': String(Boolean(active && !muted && !sleeping)),
+    'data-hover-open': String(expanded && hoverOpen.current),
+    onPointerEnter: enter, onPointerLeave: leave,
     onKeyDown: event => {
       if (event.key === 'Escape' && expanded) { event.preventDefault(); collapse(); }
     } },
@@ -3793,7 +3835,7 @@ function TalkHudPresentation(props) {
       h('button', { type: 'button', className: 'ht-hud-toggle', ref: toggleRef,
         'aria-label': (expanded ? 'Collapse Talk' : 'Expand Talk') + ' · ' + status,
         'aria-expanded': expanded, 'aria-controls': 'hermes-talk-hud-panel',
-        'aria-describedby': 'hermes-talk-hud-status', onClick: () => setExpanded(!expanded) }, 'Talk'),
+        'aria-describedby': 'hermes-talk-hud-status', onClick: toggle }, 'Talk'),
       h('p', { id: 'hermes-talk-hud-status', className: 'ht-hud-preview', role: 'status' }, status)),
     expanded && h('div', { id: 'hermes-talk-hud-panel', className: 'ht-hud-panel',
       onSubmit: event => event.stopPropagation() }, h(DesktopTalkView, { ...props, collapse })));
