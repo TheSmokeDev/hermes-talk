@@ -522,7 +522,55 @@ def _auth_check() -> dict[str, Any]:
     return _check("auth", "pass", summary, details)
 
 
+def _live_model_check() -> dict[str, Any] | None:
+    """The GPT-Live lane's model, when that lane is selected; ``None`` otherwise.
+
+    Under ``TALK_VOICE_MODE=live`` the session never uses ``TALK_MODEL``; it
+    runs the live model and voice :mod:`talk_live_config` resolves, so that is
+    what the receipt must name.
+    """
+
+    try:
+        if talk_config.voice_mode() != "live":
+            return None
+    except talk_config.TalkConfigError:
+        return None
+    try:
+        from .talk_live_config import LiveConfigError, resolve_live_config
+    except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
+        from talk_live_config import LiveConfigError, resolve_live_config
+    try:
+        live = resolve_live_config()
+    except LiveConfigError as exc:
+        return _check(
+            "model",
+            "fail",
+            f"GPT-Live configuration refused: {exc}",
+            {"provider": "live", "validation_scope": "configuration-only"},
+            ("Fix TALK_LIVE_AUTH, TALK_LIVE_MODEL or TALK_LIVE_VOICE, then re-run.",),
+        )
+    return _check(
+        "model",
+        "pass",
+        f"GPT-Live model {live.model} with voice {live.voice} is configured for "
+        f"{live.auth_mode} auth; live availability was not checked",
+        {
+            "provider": "live",
+            "auth_mode": live.auth_mode,
+            "model": live.model,
+            "voice": live.voice,
+            "source": (
+                "TALK_LIVE_MODEL" if (os.environ.get("TALK_LIVE_MODEL") or "").strip() else "default"
+            ),
+            "validation_scope": "configuration-only",
+        },
+    )
+
+
 def _model_check() -> dict[str, Any]:
+    live = _live_model_check()
+    if live is not None:
+        return live
     if _selected_provider() == "gemini":
         model = talk_config.talk_gemini_model()
         known_default = model == talk_config.DEFAULT_GEMINI_MODEL

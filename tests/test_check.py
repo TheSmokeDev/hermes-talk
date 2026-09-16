@@ -17,6 +17,7 @@ import talk_check
 import talk_cli
 import talk_doctor
 import talk_host
+import talk_live_protocol
 import talk_realtime as rt
 import talk_runs
 import talk_tools
@@ -758,3 +759,63 @@ def test_scrub_text_covers_secrets_and_path_shapes_but_not_urls():
         "wss://api.openai.com/v1/realtime failed for <redacted-secret> at "
         "<path> and <path> and <path>"
     )
+
+
+# -- the GPT-Live lane ---------------------------------------------------------------
+
+
+def _live_lane(source="codex-oauth"):
+    return talk_cli.ProviderLane(
+        provider=talk_check.LIVE_LANE,
+        auth=types.SimpleNamespace(token="sk-never-print", source=source),
+        model="gpt-live-1-codex",
+        voice="cove",
+    )
+
+
+def test_the_live_lane_reaches_the_session_and_passes_on_the_first_audio(live):
+    # Live never reports a response boundary: no ResponseFinished, ever.
+    session = FakeProviderSession(
+        [
+            rt.SessionReady(session_id="s"),
+            rt.OutputAudio(data=b"\x00\x01" * 50, item_id="item_1", response_id="resp_1"),
+        ],
+        hang=True,
+    )
+
+    report = _run(
+        lane_resolver=_live_lane, session_factory=lambda _auth: session, provider_timeout_s=2.0
+    )
+    step = _steps(report)["provider_session"]
+
+    assert step["status"] == "pass", step
+    assert "spoke one message" in step["summary"]
+    assert step["details"]["audio_bytes"] == 100
+    assert step["details"]["provider"] == "live"
+    assert session.sent == [(rt.AppendLiveContext(talk_check.CHECK_TURN_TEXT, kind="message"),)]
+    assert session.closed
+    assert _steps(report)["hermes_run"]["status"] == "pass"
+    assert report["ok"] is True
+
+
+def test_the_live_lane_times_out_without_audio_instead_of_hanging(live):
+    session = FakeProviderSession([rt.SessionReady(session_id="s")], hang=True)
+
+    report = _run(
+        lane_resolver=_live_lane, session_factory=lambda _auth: session, provider_timeout_s=0.5
+    )
+    step = _steps(report)["provider_session"]
+
+    assert step["status"] == "fail"
+    assert "timed out" in step["summary"]
+    assert session.closed
+
+
+def test_the_live_probe_turn_is_a_command_the_live_protocol_encodes():
+    turn = rt.AppendLiveContext(talk_check.CHECK_TURN_TEXT, kind="message")
+
+    for subscription in (False, True):
+        assert talk_live_protocol.encode_command(turn, subscription=subscription)
+    # The pre-fix probe's second command, which the Live protocol refuses.
+    with pytest.raises(rt.RealtimeSessionError):
+        talk_live_protocol.encode_command(rt.StartResponse())

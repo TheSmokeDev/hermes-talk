@@ -11,7 +11,10 @@ is broken. This command is the other half. Three steps, in order:
    the same adapter, credential resolution, and neutral contract the voice
    session uses (:mod:`talk_realtime`): connect, wait for ``SessionReady``,
    send one text turn (``AddContext`` + ``StartResponse``), wait for
-   ``ResponseFinished``.
+   ``ResponseFinished``. The GPT-Live lane (:data:`LIVE_LANE`) has no
+   response boundary and no ``StartResponse``: the turn is one speakable
+   message (``AppendLiveContext(kind="message")``) and the first audio
+   back is the answer.
 3. **hermes_run** — ONE bounded Hermes run through the existing delegation
    path (``HostAdapter.run_agent`` -> :mod:`talk_runs`) whose output must
    contain :data:`MAGIC_WORD`. The run rides a check-owned ticket with no
@@ -66,6 +69,9 @@ STATUS_SKIP = "skip"
 #: the config layer enforces; restated here so the report's own gate cannot
 #: drift from it.
 LIVE_PROVIDERS = talk_config.TALK_PROVIDERS
+#: The lane :func:`talk_cli.resolve_provider_lane` returns under ``TALK_VOICE_MODE=live``.
+#: It is not a provider name; the configured provider stays in :data:`LIVE_PROVIDERS`.
+LIVE_LANE = "live"
 
 #: What the Hermes run must echo. A fixed literal, not a nonce: the point is
 #: that a REAL agent read the prompt and answered, and a stub that cannot
@@ -243,8 +249,13 @@ async def run_provider_turn(
     setup: talk_realtime.SessionSetup,
     *,
     timeout_s: float | None = None,
+    live: bool = False,
 ) -> dict[str, Any]:
     """Connect, wait for ``SessionReady``, send one text turn, wait for the finish.
+
+    ``live`` is the GPT-Live lane: its client-delegation protocol has no
+    ``StartResponse`` and never reports a response boundary, so the turn is
+    one speakable message and the first output audio ends the wait.
 
     One wall-clock budget covers the whole turn — connect included — so a
     provider that accepts the socket and then says nothing cannot hold this
@@ -284,18 +295,18 @@ async def run_provider_turn(
             if isinstance(event, talk_realtime.SessionReady):
                 facts["session_ready"] = True
         phase = "send turn"
-        await asyncio.wait_for(
-            session.send(
-                (
-                    talk_realtime.AddContext(
-                        item_id=f"talk-check-{uuid.uuid4().hex[:12]}",
-                        text=CHECK_TURN_TEXT,
-                    ),
-                    talk_realtime.StartResponse(),
-                )
-            ),
-            remaining(),
-        )
+        turn: tuple[talk_realtime.RealtimeCommand, ...]
+        if live:
+            turn = (talk_realtime.AppendLiveContext(CHECK_TURN_TEXT, kind="message"),)
+        else:
+            turn = (
+                talk_realtime.AddContext(
+                    item_id=f"talk-check-{uuid.uuid4().hex[:12]}",
+                    text=CHECK_TURN_TEXT,
+                ),
+                talk_realtime.StartResponse(),
+            )
+        await asyncio.wait_for(session.send(turn), remaining())
         phase = "response"
         while not facts["response_finished"]:
             event = await asyncio.wait_for(iterator.__anext__(), remaining())
@@ -308,6 +319,10 @@ async def run_provider_turn(
                 facts["response_started"] = True
             elif isinstance(event, talk_realtime.OutputAudio):
                 facts["audio_bytes"] += len(event.data)
+                if live and facts["audio_bytes"] > 0:
+                    # Live speaks continuously; the first audio is the proof.
+                    facts["response_started"] = True
+                    facts["response_finished"] = True
             elif isinstance(event, talk_realtime.Transcript):
                 if event.final:
                     facts["transcript_chars"] += len(event.text)
@@ -362,7 +377,8 @@ def run_provider_step(
         "auth_source": lane.auth.source,
         "timeout_s": float(timeout_s if timeout_s is not None else PROVIDER_STEP_TIMEOUT_S),
     }
-    if lane.provider not in LIVE_PROVIDERS:
+    live = lane.provider == LIVE_LANE
+    if not live and lane.provider not in LIVE_PROVIDERS:
         details["refused"] = "not a live provider"
         return (
             _step(
@@ -396,7 +412,7 @@ def run_provider_step(
             ),
             lane,
         )
-    facts = asyncio.run(run_provider_turn(session, setup, timeout_s=timeout_s))
+    facts = asyncio.run(run_provider_turn(session, setup, timeout_s=timeout_s, live=live))
     error = facts.pop("error")
     details.update(facts)
     if error is not None:
@@ -418,8 +434,13 @@ def run_provider_step(
         _step(
             "provider_session",
             STATUS_PASS,
-            f"{lane.provider} {lane.model} answered one text turn "
-            f"({facts['audio_bytes']} audio bytes)",
+            (
+                f"{lane.provider} {lane.model} spoke one message "
+                f"({facts['audio_bytes']} audio bytes)"
+                if live
+                else f"{lane.provider} {lane.model} answered one text turn "
+                f"({facts['audio_bytes']} audio bytes)"
+            ),
             details,
             duration_ms=_elapsed_ms(started),
         ),
@@ -775,6 +796,7 @@ def cli_entry(
 
 __all__ = [
     "COMMAND",
+    "LIVE_LANE",
     "LIVE_PROVIDERS",
     "MAGIC_WORD",
     "PROVIDER_STEP_TIMEOUT_S",

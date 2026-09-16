@@ -1096,3 +1096,29 @@ def test_cli_parser_passes_the_probe_flag(monkeypatch):
 
     assert talk_cli.cli_entry(parser.parse_args(["doctor", "--probe"])) == 0
     assert seen == [{"json_output": False, "probe": True}]
+
+
+def test_live_mode_reports_the_live_model_not_talk_model(monkeypatch):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_MODEL", "gpt-realtime-2.1")
+    monkeypatch.delenv("TALK_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("TALK_LIVE_AUTH", raising=False)
+
+    check = _checks(talk_doctor.collect_report())["model"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["provider"] == "live"
+    assert check["details"]["model"] == "gpt-live-1-codex"
+    assert check["details"]["voice"] == "cove"
+    assert "gpt-realtime-2.1" not in json.dumps(check)
+
+
+def test_live_mode_reports_a_refused_live_configuration(monkeypatch):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_LIVE_MODEL", "gpt-live-nope")
+
+    check = _checks(talk_doctor.collect_report())["model"]
+
+    assert check["status"] == "fail"
+    assert check["details"]["provider"] == "live"
+    assert "TALK_LIVE_MODEL" in check["summary"]
