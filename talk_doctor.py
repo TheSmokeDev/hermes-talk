@@ -560,7 +560,9 @@ def _live_model_check() -> dict[str, Any] | None:
             "model": live.model,
             "voice": live.voice,
             "source": (
-                "TALK_LIVE_MODEL" if (os.environ.get("TALK_LIVE_MODEL") or "").strip() else "default"
+                "TALK_LIVE_MODEL"
+                if (os.environ.get("TALK_LIVE_MODEL") or "").strip()
+                else "default"
             ),
             "validation_scope": "configuration-only",
         },
