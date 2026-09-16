@@ -3784,18 +3784,21 @@ function TalkHudPresentation(props) {
     expanded, setExpanded, appearance = {} } = props;
   const toggleRef = React.useRef(null);
   // hoverOpen: the panel is showing only because the pointer is over it; a click pins it.
+  // pinned: the operator opened or pinned the panel themselves; a reconnect must not take it away.
   const hoverOpen = React.useRef(false);
+  const pinned = React.useRef(false);
   const wasActive = React.useRef(active);
   const collapseOnConnect = appearance.collapseOnConnect !== false;
   const hoverExpand = appearance.hoverExpand !== false;
   React.useEffect(() => {
     const connected = active && !wasActive.current;
     wasActive.current = active;
-    if (connected && collapseOnConnect) { hoverOpen.current = false; setExpanded(false); }
+    if (connected && collapseOnConnect && !pinned.current) { hoverOpen.current = false; setExpanded(false); }
   }, [active, collapseOnConnect, setExpanded]);
   const toggle = () => {
-    if (!expanded) { hoverOpen.current = false; setExpanded(true); return; }
-    if (hoverOpen.current) { hoverOpen.current = false; return; }
+    if (!expanded) { hoverOpen.current = false; pinned.current = true; setExpanded(true); return; }
+    if (hoverOpen.current) { hoverOpen.current = false; pinned.current = true; return; }
+    pinned.current = false;
     setExpanded(false);
   };
   const enter = () => {
@@ -3821,7 +3824,9 @@ function TalkHudPresentation(props) {
     : active && props.audioActivity?.input ? 'Microphone audio detected'
     : active ? 'Connected · microphone on' : 'Microphone off';
   const status = state + ' · Addressed: ' + addressed + ' · Active work: ' + activeWork;
-  const collapse = () => { hoverOpen.current = false; setExpanded(false); toggleRef.current?.focus(); };
+  const collapse = () => {
+    hoverOpen.current = false; pinned.current = false; setExpanded(false); toggleRef.current?.focus();
+  };
   return h('section', { className: 'ht-hud', 'aria-label': 'Hermes Talk floating control',
     'data-skin': appearance.skin || 'system', 'data-animate': String(appearance.animate === true),
     'data-active': String(Boolean(active && !muted && !sleeping)),

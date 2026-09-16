@@ -450,7 +450,10 @@ const show=extra=>{
 };
 show({});
 show({active:true});
-assert.deepEqual(expands,[]);
+assert.deepEqual(expands,[],'connecting leaves the panel alone');
+const tree=render(React.createElement(context.TalkHudPresentation,{...props,active:true}),'hud');
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true],'the button still opens the panel afterwards');
 """)
 
 
@@ -495,4 +498,33 @@ section.props.onPointerLeave({currentTarget:{contains:()=>false}});
 assert.deepEqual(expands,[]);
 button(tree,'Talk').props.onClick();
 assert.deepEqual(expands,[true],'the button still opens the panel');
+""")
+
+
+def test_a_reconnect_keeps_a_pinned_panel_but_closes_a_hover_opened_one(desktop_source):
+    run_hud(desktop_source, r"""
+context.plugin.register(host);
+const expands=[];
+const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
+  appearance:{skin:'system',animate:false}, recipients:[], taskState:{jobs:[]}};
+const show=extra=>{
+  const tree=render(React.createElement(context.TalkHudPresentation,{...props,...extra}),'hud');
+  flushEffects();
+  return tree;
+};
+let tree=show({});
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true],'the operator pins the panel open');
+show({expanded:true, active:false});
+show({expanded:true, active:true});
+assert.deepEqual(expands,[true],'a reconnect leaves a pinned panel alone');
+tree=show({expanded:true});
+button(tree,'Talk').props.onClick();
+assert.deepEqual(expands,[true,false],'a second click collapses and unpins');
+tree=show({expanded:false});
+find(tree,node=>node.type==='section').props.onPointerEnter();
+assert.deepEqual(expands,[true,false,true],'hover opens without pinning');
+show({expanded:true, active:false});
+show({expanded:true, active:true});
+assert.deepEqual(expands,[true,false,true,false],'a reconnect closes a hover-opened panel');
 """)
