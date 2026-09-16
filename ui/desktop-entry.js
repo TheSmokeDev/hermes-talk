@@ -176,14 +176,14 @@ function DesktopTalkPresentation(props) {
 }
 
 const TALK_HUD_CSS = `
-.ht-hud { display:grid; gap:.5rem; color:inherit; font:inherit; }
+.ht-hud { display:grid; gap:.5rem; color:inherit; font:inherit; --ht-hud-surface:var(--background, Canvas); }
 .ht-hud-compact { position:relative; display:flex; align-items:center; gap:.5rem; }
-.ht-hud-toggle { min-width:3rem; min-height:3rem; border-radius:50%; font:inherit; color:inherit; background:inherit; border:1px solid currentColor; cursor:pointer; }
+.ht-hud-toggle { min-width:3rem; min-height:3rem; border-radius:50%; font:inherit; color:inherit; background:var(--ht-hud-surface); border:1px solid currentColor; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.35); }
 .ht-hud-toggle:focus-visible { outline:2px solid currentColor; outline-offset:3px; }
-.ht-hud-preview { display:none; margin:0; font-size:.75rem; overflow-wrap:anywhere; }
+.ht-hud-preview { display:none; margin:0; padding:.375rem .625rem; border-radius:.5rem; background:var(--ht-hud-surface); font-size:.75rem; overflow-wrap:anywhere; }
 .ht-hud-compact:hover .ht-hud-preview, .ht-hud-compact:focus-within .ht-hud-preview { display:block; }
-.ht-hud-panel { width:min(380px,calc(100vw - 24px)); max-height:calc(100vh - 5rem); overflow:auto; padding:.75rem; }
-.ht-hud[data-skin="contrast"] { color:CanvasText; background:Canvas; }
+.ht-hud-panel { width:min(380px,calc(100vw - 24px)); max-height:calc(100vh - 5rem); overflow:auto; padding:.75rem; border-radius:.75rem; background:var(--ht-hud-surface); }
+.ht-hud[data-skin="contrast"] { color:CanvasText; --ht-hud-surface:Canvas; }
 .ht-hud[data-animate="true"][data-active="true"] .ht-hud-toggle { animation:ht-hud-connected 2s ease-in-out infinite; }
 @keyframes ht-hud-connected { 50% { border-color:transparent; } }
 @media (prefers-reduced-motion:reduce) { .ht-hud-toggle { animation:none !important; } }
