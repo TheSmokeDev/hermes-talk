@@ -541,6 +541,6 @@ host.rest=async()=>{throw new Error(
   "Error invoking remote method 'hermes:api': Error: 401: {\"detail\":\"token required\"}");};
 await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: 401:/);
 assert.equal(stock.signal.aborted,false,
-  'a stock host cannot present the token, so the refusal stays a notice and the panel keeps rendering');
+  'a stock host cannot present the token: the refusal stays a notice and the panel renders');
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
