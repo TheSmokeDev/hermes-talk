@@ -542,5 +542,42 @@ host.rest=async()=>{throw new Error(
 await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: 401:/);
 assert.equal(stock.signal.aborted,false,
   'a stock host cannot present the token: the refusal stays a notice and the panel renders');
+host.rest=async(path,options)=>{calls.push({path,options}); return {ok:true};};
+await sdk.fetchJSON('/api/plugins/hermes-talk/status');
+assert.equal(calls.length,1,'the panel still reaches the host after a token refusal');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_a_conversation_with_no_profile():
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.focusedSessionOwner.set({connectionId:'connection-a'});
+hostState.focusedSessionProfile.set(null);
+hostState.profile.set(null);
+const stock=context.useStockVoiceController();
+assert.equal(stock.owner.connectionId,'connection-a');
+assert.equal(stock.owner.profile,null,'an absent profile is never invented');
+assert.throws(()=>context.createDesktopTalkSDK(host,()=>stock),
+  /Open a connected Hermes conversation before starting Talk/);
+assert.equal(requests.length,0,'no host request carries a fabricated profile');
+assert.equal(calls.length,0,'no plugin request carries a fabricated profile');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_does_not_read_an_absent_profile_as_a_profile_named_local():
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.focusedSessionOwner.set({connectionId:'connection-a',profile:'local'});
+hostState.profile.set(null);
+const stock=context.useStockVoiceController();
+assert.equal(stock.owner.profile,'local','a conversation may genuinely use this name');
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/follows the active profile/);
+assert.equal(requests.length,0,'an unreported active profile is not that conversation');
+assert.equal(calls.length,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)

@@ -46,8 +46,9 @@ A host whose `useComposerVoiceController()` reports `microphoneLease: 1`,
 That contract builds on the composer ownership controller proposed in
 [Hermes PR #100666](https://github.com/NousResearch/hermes-agent/pull/100666);
 the proposal by itself does not supply all of it. A host that reports only part
-of the contract is refused rather than half driven, and the panel says which
-build the floating window needs.
+of the contract gets the stock lane in the composer instead of a half driven
+controller; the four additions above arrive together or not at all, and the panel
+says which build the floating window needs.
 
 ## Open Talk
 

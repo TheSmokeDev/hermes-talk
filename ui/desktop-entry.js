@@ -20,15 +20,25 @@ function ownerKey(owner) {
 const STOCK_STATE_ATOMS = ['focusedSessionOwner', 'focusedSessionId', 'focusedStoredSessionId',
   'focusedSessionProfile', 'connectionId', 'profile'];
 
-function stockScopeValue(value) {
+// A local Hermes reports no connection id; 'local' is its documented name. A
+// profile has no such default, so an absent one stays absent.
+function stockConnectionValue(value) {
   return typeof value === 'string' && value ? value : 'local';
+}
+
+function stockProfileValue(value) {
+  return typeof value === 'string' && value ? value : null;
+}
+
+function sameStockProfile(left, right) {
+  return (left ?? null) === (right ?? null);
 }
 
 function readHostScope() {
   const state = HermesSDK.host?.state;
   return {
-    connectionId: stockScopeValue(state?.connectionId?.get?.()),
-    profile: stockScopeValue(state?.profile?.get?.()),
+    connectionId: stockConnectionValue(state?.connectionId?.get?.()),
+    profile: stockProfileValue(state?.profile?.get?.()),
   };
 }
 
@@ -36,8 +46,8 @@ function readFocusedSnapshot() {
   const state = HermesSDK.host?.state;
   const focused = state?.focusedSessionOwner?.get?.() || null;
   return {
-    connectionId: stockScopeValue(focused?.connectionId),
-    profile: stockScopeValue(focused?.profile ?? state?.focusedSessionProfile?.get?.()),
+    connectionId: stockConnectionValue(focused?.connectionId),
+    profile: stockProfileValue(focused?.profile || state?.focusedSessionProfile?.get?.()),
     sessionId: state?.focusedSessionId?.get?.() || null,
     storedSessionId: state?.focusedStoredSessionId?.get?.() || null,
   };
@@ -56,7 +66,8 @@ async function prepareStockSession(snapshot) {
       'Hermes Desktop saves a conversation on its first message.');
   }
   const ambient = readHostScope();
-  if (ambient.connectionId !== snapshot.connectionId || ambient.profile !== snapshot.profile) {
+  if (ambient.connectionId !== snapshot.connectionId ||
+      !sameStockProfile(ambient.profile, snapshot.profile)) {
     throw new Error(STOCK_SCOPE_MOVED);
   }
   // Read-only: a title request without a title returns the durable session key.
@@ -91,7 +102,7 @@ function readStockSnapshot() {
 
 function stockSnapshotKey(snapshot) {
   return ownerKey(snapshot.owner) + '|' +
-    snapshot.ambient.connectionId + '|' + snapshot.ambient.profile;
+    JSON.stringify([snapshot.ambient.connectionId, snapshot.ambient.profile]);
 }
 
 function subscribeStockState(handler) {
@@ -127,7 +138,12 @@ function useStockVoiceController() {
     active.current = { key, controller: createStockTalkController(current.owner) };
   }
   const entry = active.current;
-  React.useEffect(() => () => entry.controller.stop(), [entry.controller]);
+  React.useEffect(() => () => {
+    entry.controller.stop();
+    // Drop the cache too, so a remount rebuilds instead of handing back a
+    // controller whose lifetime this cleanup just aborted.
+    if (active.current === entry) active.current = null;
+  }, [entry.controller]);
   return entry.controller;
 }
 
@@ -242,7 +258,8 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         // Stock plugin REST follows the ambient connection and profile, so a moved
         // scope would silently address another gateway.
         const ambient = readHostScope();
-        if (ambient.connectionId !== scope.connectionId || ambient.profile !== scope.profile) {
+        if (ambient.connectionId !== scope.connectionId ||
+            !sameStockProfile(ambient.profile, scope.profile)) {
           throw new Error(STOCK_SCOPE_MOVED);
         }
       }
@@ -479,15 +496,15 @@ function DesktopTalkPanel({ context, controller, onPreparing, presentationProps 
 }
 
 export function openFocusedTalk() {
-  const state = HermesSDK.host?.state;
-  const focused = state?.focusedSessionOwner?.get();
-  const stored = state?.focusedStoredSessionId?.get() || null;
-  const runtime = state?.focusedSessionId?.get() || null;
-  const matches = [...desktopOpeners].filter(entry => {
+  // One reader for both sides, so the title bar matches on the same normalised
+  // owner the stock lane hands its panel.
+  const focused = readFocusedSnapshot();
+  const matches = !focused.sessionId ? [] : [...desktopOpeners].filter(entry => {
     const candidate = entry.owner();
-    return focused && candidate?.connectionId === focused.connectionId &&
-      candidate?.profile === focused.profile && (candidate?.storedSessionId || null) === stored &&
-      (candidate?.sessionId || null) === runtime;
+    return candidate?.connectionId === focused.connectionId &&
+      sameStockProfile(candidate?.profile, focused.profile) &&
+      (candidate?.storedSessionId || null) === focused.storedSessionId &&
+      (candidate?.sessionId || null) === focused.sessionId;
   });
   // Stock composer actions all report the same focused conversation, so several
   // matches name one conversation rather than an ambiguous choice.

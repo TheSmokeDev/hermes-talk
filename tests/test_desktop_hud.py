@@ -613,3 +613,76 @@ assert.equal(second.signal.aborted,true,'unmounting ends the stock lifetime');
 assert.equal(stops,0,'the stock lane never stops a host controller');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
 """)
+
+
+def test_stock_lane_rebuilds_after_a_teardown_with_the_same_owner(desktop_source):
+    run_hud(desktop_source, r"""
+const seen=[];
+const Probe=()=>{seen.push(context.useStockVoiceController()); return null;};
+render(React.createElement(Probe),'probe'); flushEffects();
+const first=seen.at(-1);
+assert.equal(first.signal.aborted,false);
+// React tears effects down and mounts them again on the same instance under
+// StrictMode, so the cached controller outlives its own cleanup.
+instances.get('probe').slots.forEach(slot=>slot?.cleanup?.());
+assert.equal(first.signal.aborted,true,'the torn down lifetime is aborted');
+render(React.createElement(Probe),'probe'); flushEffects();
+const second=seen.at(-1);
+assert.notEqual(second,first,'a remount rebuilds rather than reuse an aborted controller');
+assert.equal(second.owner.storedSessionId,first.owner.storedSessionId,
+  'the owner key did not change');
+assert.equal(second.owner.profile,first.owner.profile);
+assert.equal(second.signal.aborted,false,'the remounted stock lane can still talk');
+render(null,'probe');
+assert.equal(second.signal.aborted,true);
+render(React.createElement(Probe),'probe'); flushEffects();
+assert.equal(seen.at(-1).signal.aborted,false,'a full unmount and remount also rebuilds');
+render(null,'probe');
+assert.equal(stops,0,'the stock lane never stops a host controller');
+assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
+""")
+
+
+def test_topbar_matches_a_profile_reported_beside_the_focused_owner(desktop_source):
+    run_hud(desktop_source, r"""
+delete host.voice;
+delete HermesSDK.useComposerVoiceController;
+hostState.focusedSessionOwner.set({connectionId:'connection-a'});
+hostState.focusedSessionProfile.set('profile-a');
+let notified=0;
+HermesSDK.host.notify=()=>{notified++;};
+context.plugin.register(host);
+render(registered[0].render(),'composer'); flushEffects();
+registered[1].data.onSelect();
+const tree=render(registered[0].render(),'composer'); flushEffects(); await tick();
+assert.equal(notified,0,'the title bar matches the normalised focused owner');
+assert(find(tree,node=>node.type==='popover-content'),'choosing Talk opened the panel');
+assert.equal(acquires,0); assert.equal(captures,0);
+render(null,'composer'); await tick();
+""")
+
+
+def test_stock_composer_shows_the_token_notice_instead_of_a_dead_panel(desktop_source):
+    run_hud(desktop_source, r"""
+delete host.voice;
+delete HermesSDK.useComposerVoiceController;
+host.rest=async(path,options)=>{
+  calls.push({path,options});
+  throw new Error(
+    "Error invoking remote method 'hermes:api': Error: 401: {\"detail\":\"token required\"}");
+};
+context.plugin.register(host);
+let tree=render(registered[0].render(),'composer'); flushEffects();
+find(tree,node=>node.type==='popover').props.onOpenChange(true);
+tree=render(registered[0].render(),'composer'); flushEffects(); await tick();
+tree=render(registered[0].render(),'composer'); flushEffects();
+assert(calls.some(row=>row.path==='/status'),'the panel asked the host');
+assert(text(tree).includes('This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN'),
+  'the panel names the token this lane cannot present');
+assert(text(tree).includes('Unset it for local Desktop use'));
+assert(!text(tree).includes('Checking connection'),
+  'a refused token leaves a readable panel, not one stuck checking the connection');
+assert(find(tree,node=>node.props.role==='alert'),'the notice is announced');
+assert.equal(acquires,0); assert.equal(captures,0); assert.equal(stops,0);
+render(null,'composer'); await tick();
+""")
