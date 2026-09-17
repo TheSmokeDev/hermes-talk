@@ -3858,7 +3858,10 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         const prefix = "Error invoking remote method 'hermes:api': Error: ";
         const normalized = typeof error?.message === 'string' && error.message.startsWith(prefix)
           ? new Error(error.message.slice(prefix.length)) : error;
-        if (/^(?:401|403)\b/.test(normalized?.message || '')) sdk.stopHost();
+        // A stock host cannot present TALK_DASHBOARD_TOKEN, so a refusal there is a
+        // notice to show, not a lost host session to stop.
+        if (/^(?:401|403)\b/.test(normalized?.message || '') &&
+            currentController()?.capabilities?.lane !== 'stock') sdk.stopHost();
         throw normalized;
       }
     },

@@ -531,7 +531,7 @@ assert.equal(calls.length,0);assert.equal(acquires,0);
         .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
 
 
-def test_stock_lane_authorization_loss_ends_the_stock_lifetime():
+def test_stock_lane_token_refusal_keeps_the_stock_lifetime():
     run_node(r"""
 (async()=>{
 stockHooks();
@@ -540,6 +540,7 @@ const sdk=context.createDesktopTalkSDK(host,()=>stock);
 host.rest=async()=>{throw new Error(
   "Error invoking remote method 'hermes:api': Error: 401: {\"detail\":\"token required\"}");};
 await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: 401:/);
-assert.equal(stock.signal.aborted,true,'a refused token ends the stock session');
+assert.equal(stock.signal.aborted,false,
+  'a stock host cannot present the token, so the refusal stays a notice and the panel keeps rendering');
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
