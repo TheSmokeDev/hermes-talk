@@ -420,7 +420,7 @@ assert.equal(calls.length,1,'no request leaves for the moved connection');
 
 @pytest.mark.parametrize(("atom_name", "expected"), [
     ("focusedStoredSessionId", "Send one message in this conversation first"),
-    ("focusedSessionId", "Open a connected Hermes conversation"),
+    ("focusedSessionId", "Send one message in this conversation first"),
 ])
 def test_stock_lane_asks_for_a_first_message_when_the_conversation_is_unsaved(atom_name, expected):
     run_node(r"""

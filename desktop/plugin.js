@@ -3648,10 +3648,8 @@ export function hasTalkHostCapabilities(controller) {
 }
 
 async function prepareStockSession(snapshot) {
-  if (!snapshot?.sessionId) {
-    throw new Error('Open a connected Hermes conversation before starting Talk.');
-  }
-  if (!snapshot.storedSessionId) {
+  // A stock draft carries no runtime or stored id until its first prompt.
+  if (!snapshot?.sessionId || !snapshot.storedSessionId) {
     throw new Error('Send one message in this conversation first, then Connect. ' +
       'Hermes Desktop saves a conversation on its first message.');
   }
