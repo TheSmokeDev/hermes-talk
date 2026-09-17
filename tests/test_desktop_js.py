@@ -11,7 +11,29 @@ HARNESS = r"""
 const fs = require('fs'), vm = require('vm'), assert = require('assert/strict');
 const calls = [], registered = [], disposers = [];
 const React = {createElement(type, props, ...children) {return {type, props, children};}};
-const HermesSDK = {Button:'button',Input:'input'};
+const atom = value => {
+  const listeners = new Set();
+  return {get() {return value;}, set(next) {value = next; listeners.forEach(fn=>fn(next));},
+    subscribe(fn) {listeners.add(fn); return ()=>listeners.delete(fn);}};
+};
+const hostState = {
+  focusedSessionOwner:atom({connectionId:'connection-a',profile:'profile-a'}),
+  focusedSessionId:atom('pane-a'), focusedStoredSessionId:atom('stored-a'),
+  focusedSessionProfile:atom('profile-a'),
+  connectionId:atom('connection-a'), profile:atom('profile-a')};
+const requests = [];
+const HermesSDK = {Button:'button',Input:'input',
+  host:{state:hostState, notify(){},
+    request(method, params) {
+      requests.push({method, params});
+      return Promise.resolve({title:'Fixture conversation',
+        session_key:hostState.focusedStoredSessionId.get()});
+    }}};
+const stockHooks = () => {
+  React.useState = initial => [typeof initial === 'function' ? initial() : initial, ()=>{}];
+  React.useEffect = () => {};
+  React.useRef = value => ({current:value});
+};
 const context = vm.createContext({React,HermesSDK,Headers,DOMException,AbortController,
   console, window:{setTimeout,clearTimeout,sessionStorage:{getItem(){return '';}}}});
 const source = fs.readFileSync(process.argv[1],'utf8')
@@ -73,7 +95,7 @@ assert.equal(acquires,0);
 @pytest.mark.parametrize("scenario", [
     r"""
 controller.capabilities={microphoneLease:1};
-assert.throws(createSDK,/Update Hermes Desktop/);
+assert.throws(createSDK,/incomplete Talk contract/);
 """,
     r"""
 controller.owner=null; assert.throws(createSDK,/connected Hermes conversation/);
@@ -314,3 +336,210 @@ assert.equal(calls.length,0);assert.equal(acquires,0);
 """.replace("__MESSAGE__", json.dumps(message))
         .replace("__EXPECTED__", json.dumps(expected))
         .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+
+
+def test_stock_lane_prepares_the_focused_conversation_before_the_catalog():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+assert.equal(stock.capabilities.lane,'stock');
+assert.equal(stock.capabilities.microphoneLease,0);
+assert.equal(stock.capabilities.pinnedRest,0);
+assert.deepEqual(JSON.parse(JSON.stringify(stock.owner)),{connectionId:'connection-a',
+  profile:'profile-a',sessionId:'pane-a',storedSessionId:'stored-a'});
+host.rest=async(path,options)=>{
+  assert.equal(requests.length,1,'the stored conversation is confirmed before the catalog');
+  calls.push({path,options});
+  return {ok:true,targets:[{target_id:'target-a',peer_id:'local',profile:'profile-a',
+    session_id:'stored-a'}]};
+};
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const target=await sdk.prepareTask({tabId:'tab-a'});
+assert.equal(target.target_id,'target-a');
+assert.equal(requests[0].method,'session.title');
+assert.equal(requests[0].params.session_id,'pane-a');
+assert.equal(requests[0].params.title,undefined,'a title read must not rename the conversation');
+assert.equal(calls.length,1);assert.equal(calls[0].path,'/targets');
+assert.equal(calls[0].options.body.session_id,'stored-a');
+assert.equal(calls[0].options.body.profile,'profile-a');
+assert.equal(sdk.desktopOwner.storedSessionId,'stored-a');
+assert.equal(acquires,0,'preparing does not open the microphone');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_a_stored_session_mismatch():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+HermesSDK.host.request=async(method,params)=>{
+  requests.push({method,params});
+  return {title:'Fixture conversation',session_key:'stored-elsewhere'};
+};
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/conversation changed/);
+assert.equal(requests.length,1);
+assert.equal(calls.length,0,'a mismatched conversation never reaches the catalog');
+assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_when_the_active_profile_moved():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+hostState.profile.set('profile-b');
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/follows the active profile/);
+assert.equal(requests.length,0,'a moved profile is refused before the host is asked');
+assert.equal(calls.length,0);assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_rest_refuses_after_the_active_profile_moves():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await sdk.fetchJSON('/api/plugins/hermes-talk/status');
+assert.equal(calls.length,1);
+assert.equal(calls[0].options.scope.profile,'profile-a');
+hostState.connectionId.set('connection-b');
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/session',
+  {method:'POST',body:JSON.stringify({taskId:'task-a'})}),/follows the active profile/);
+assert.equal(calls.length,1,'no request leaves for the moved connection');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize(("atom_name", "expected"), [
+    ("focusedStoredSessionId", "Send one message in this conversation first"),
+    ("focusedSessionId", "Open a connected Hermes conversation"),
+])
+def test_stock_lane_asks_for_a_first_message_when_the_conversation_is_unsaved(atom_name, expected):
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.__ATOM__.set(null);
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/__EXPECTED__/);
+assert.equal(requests.length,0);
+assert.equal(calls.length,0);assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""".replace("__ATOM__", atom_name).replace("__EXPECTED__", expected))
+
+
+def test_stock_lane_grants_a_release_only_microphone_lease():
+    run_node(r"""
+(async()=>{
+stockHooks();
+let prompts=0;
+context.window.hermesDesktop={requestMicrophoneAccess(){
+  prompts++;return Promise.reject(new Error('Hermes has no microphone bridge'));}};
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const lease=await sdk.acquireMicrophone();
+assert.equal(prompts,1,'a stock host is still asked for system microphone access');
+assert.equal(lease.signal,stock.signal);
+lease.release();
+assert.equal(stock.signal.aborted,false,'releasing a stock lease cannot end the session');
+sdk.stopHost();
+assert.equal(stock.signal.aborted,true);
+await assert.rejects(sdk.acquireMicrophone(),{name:'AbortError'});
+assert.equal(prompts,1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize(("message", "lane", "expected", "retry"), [
+    (
+        '404: {"detail":"target_missing"}',
+        "stock",
+        "Send one message in this conversation first, then Connect.",
+        True,
+    ),
+    (
+        '404: {"detail":"target_missing"}',
+        None,
+        "Send one message in this conversation first, then Connect.",
+        True,
+    ),
+    (
+        '404: {"detail":"unknown_route"}',
+        "stock",
+        "Talk could not complete this request. Try again.",
+        True,
+    ),
+    (
+        '401: {"detail":"fixture-private-token"}',
+        "stock",
+        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+        False,
+    ),
+    (
+        '403: {"detail":"fixture-private-token"}',
+        "stock",
+        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+        False,
+    ),
+    (
+        '401: {"detail":"fixture-private-token"}',
+        None,
+        "Reconnect to this Hermes connection and try again.",
+        False,
+    ),
+])
+def test_stock_lane_notice_explains_the_first_message_and_token_rules(
+    message, lane, expected, retry
+):
+    run_node(r"""
+const message = __MESSAGE__, expected = __EXPECTED__, retry = __RETRY__;
+let starts = 0, refreshes = 0;
+const tree = context.DesktopTalkView({
+  status:{configured:true,source:'subscription'},ready:true,error:new Error(message),
+  lane:__LANE__,tasks:[],transcript:[],results:{},
+  startTalk(){starts++;},refresh(){refreshes++;},
+});
+function nodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [node,...(node.children||[]).flat(Infinity).flatMap(nodes)];
+}
+function text(node) {
+  if (typeof node === 'string') return node;
+  return (node?.children||[]).flat(Infinity).map(text).join(' ');
+}
+const alert = nodes(tree).find(node=>node.props?.role==='alert');
+assert(alert,'the failure must produce an actionable notice');
+assert(text(alert).includes(expected));
+const action = nodes(alert).find(node=>node.type==='button');
+assert.equal(text(action),retry?'Try again':'Check connection');
+action.props.onClick();
+assert.equal(starts,retry?1:0);assert.equal(refreshes,retry?0:1);
+assert(!text(tree).includes('fixture-private-token'),
+  'raw server error details must stay out of the view');
+assert.equal(calls.length,0);assert.equal(acquires,0);
+""".replace("__MESSAGE__", json.dumps(message))
+        .replace("__EXPECTED__", json.dumps(expected))
+        .replace("__LANE__", json.dumps(lane))
+        .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+
+
+def test_stock_lane_authorization_loss_ends_the_stock_lifetime():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+host.rest=async()=>{throw new Error(
+  "Error invoking remote method 'hermes:api': Error: 401: {\"detail\":\"token required\"}");};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: 401:/);
+assert.equal(stock.signal.aborted,true,'a refused token ends the stock session');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")

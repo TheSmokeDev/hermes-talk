@@ -34,9 +34,17 @@ const DESKTOP_TALK_VIEW_CSS = `
 @media (prefers-reduced-motion:reduce) { .ht-desktop-view .htd-status { animation:none !important; } }
 `;
 
-function desktopTalkNotice(value, needsToken) {
+function desktopTalkNotice(value, needsToken, lane) {
   if (!value && !needsToken) return null;
   const message = String(value?.message || value || '');
+  if (/^404\b/.test(message) && /target_missing/.test(message)) {
+    return { text: 'Send one message in this conversation first, then Connect. ' +
+      'Hermes Desktop saves a conversation on its first message.', retry: true };
+  }
+  if (lane === 'stock' && (needsToken || /^(?:401|403)\b/.test(message))) {
+    return { text: 'This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN. ' +
+      'Unset it for local Desktop use, or use the dashboard Talk tab.', retry: false };
+  }
   if (needsToken || /^(?:401|403)\b/.test(message)) {
     return { text: 'Reconnect to this Hermes connection and try again.' };
   }
@@ -106,7 +114,7 @@ export function DesktopTalkView(props) {
     setRecipientOperation, readRecipient, recipientHistory, recipientLoading,
     attachments = [], addAttachments, removeAttachment, canSendTyped = active,
     muted, sleeping, setMuted, setSleeping, collapse, appearance = {}, setAppearance,
-    cancelJob, steerJob, answerApproval, replayResult, pendingActions = {} } = props;
+    cancelJob, steerJob, answerApproval, replayResult, pendingActions = {}, lane } = props;
   const tasks = (props.tasks || []).filter(task => typeof task?.target_id === 'string' && task.target_id);
   const selected = tasks.find(task => task.target_id === selectedTask);
   const conversation = selected?.label || taskState?.task?.label || 'This conversation';
@@ -119,8 +127,8 @@ export function DesktopTalkView(props) {
     Number(!visibleJobIds.has(left)) - Number(!visibleJobIds.has(right))).slice(0, 8);
   const captions = (props.transcript || []).filter(row => typeof row?.text === 'string' && row.text.length);
   const voices = (status?.voices || []).filter(name => typeof name === 'string');
-  const notice = desktopTalkNotice(error, needsToken);
-  const catalogNotice = desktopTalkNotice(catalogError, false);
+  const notice = desktopTalkNotice(error, needsToken, lane);
+  const catalogNotice = desktopTalkNotice(catalogError, false, lane);
   const button = (label, onClick, options = {}) => h(HermesSDK.Button,
     { ...options, type: 'button', onClick }, label);
   const busy = starting || switching;

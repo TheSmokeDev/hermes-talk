@@ -11,6 +11,30 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.21.0] — 2026-09-16
+
+Talk works on a stock Hermes Desktop, and the refusal text stops asking for an
+update that does not exist.
+
+### Added
+- The Desktop composer **Talk** button now runs on a stock Hermes Desktop build.
+  Talk reads the focused conversation from the host state, confirms its stored
+  identity with a read-only title request, and attaches through the composer
+  popover. Connect once the conversation has one message, because Desktop saves a
+  conversation on its first message. Requests on this lane follow whichever
+  profile Desktop has active, and Talk refuses a request rather than address
+  another gateway once that profile moves. There is no microphone lease to share
+  with Desktop dictation, and `TALK_DASHBOARD_TOKEN` is unsupported here; the
+  panel names both when they matter. The Talk-enabled build is unchanged and
+  keeps the floating window, the lease, pinned requests and empty conversations.
+  (#168)
+
+### Changed
+- A host that reports only part of the Talk contract now says that, instead of
+  asking for an update that no release carries. The composer popover names the
+  Talk-enabled Hermes Desktop build as what the floating window needs, and
+  `docs/DESKTOP.md` describes the two lanes side by side. (#168)
+
 ## [0.20.2] — 2026-09-16
 
 The floating Talk window gets out of the way, and the subscription lane's

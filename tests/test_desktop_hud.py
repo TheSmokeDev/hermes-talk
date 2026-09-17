@@ -124,9 +124,27 @@ let controller = {capabilities:{microphoneLease:1,pinnedRest:1,prepareSession:1}
   async acquire() { acquires++; return {signal:leaseLifetime.signal, release(){releases++;}}; },
   stop() { stops++; lifetime.abort(); },
 };
+const atom = value => {
+  const listeners = new Set();
+  return {get() {return value;}, set(next) {value = next; listeners.forEach(fn=>fn(next));},
+    subscribe(fn) {listeners.add(fn); return ()=>listeners.delete(fn);}};
+};
+const hostState = {
+  focusedSessionOwner:atom({connectionId:'connection-a', profile:'profile-a'}),
+  focusedSessionId:atom('runtime-a'), focusedStoredSessionId:atom('stored-a'),
+  focusedSessionProfile:atom('profile-a'),
+  connectionId:atom('connection-a'), profile:atom('profile-a')};
+let titles = 0;
 const HermesSDK = {Button:'button',Input:'input',Popover:'popover',
   PopoverTrigger:'popover-trigger',PopoverContent:'popover-content',
-  useComposerVoiceController:()=>controller};
+  useComposerVoiceController:()=>controller,
+  host:{state:hostState, notify(){},
+    async request(method, params) {
+      titles++;
+      assert.equal(method, 'session.title');
+      assert.equal(params.session_id, hostState.focusedSessionId.get());
+      return {title:'Fixture conversation', session_key:hostState.focusedStoredSessionId.get()};
+    }}};
 const storage = new Map();
 const host = {
   voice: {available:true, register(render){voiceRenders.push(render);},
@@ -414,7 +432,8 @@ assert(popover); assert.equal(popover.props.modal,false);
 popover.props.onOpenChange(true);
 tree=render(registered[0].render(),'composer');
 assert(text(tree).includes('Composer mode'));
-assert(text(tree).includes('update Hermes Desktop'));
+assert(text(tree).includes('The floating Talk window needs the Talk-enabled Hermes Desktop build'));
+assert(!text(tree).includes('update Hermes Desktop'));
 assert.equal(acquires,0); assert.equal(captures,0);
 """)
 
@@ -528,4 +547,69 @@ assert.deepEqual(expands,[true,false,true],'hover opens without pinning');
 show({expanded:true, active:false});
 show({expanded:true, active:true});
 assert.deepEqual(expands,[true,false,true,false],'a reconnect closes a hover-opened panel');
+""")
+
+
+def test_stock_host_registers_the_same_two_contributions(desktop_source):
+    run_hud(desktop_source, r"""
+delete host.voice;
+delete HermesSDK.useComposerVoiceController;
+hostState.focusedStoredSessionId.set('stored-stock');
+context.plugin.register(host);
+assert.equal(voiceRenders.length,0,'a stock host offers no floating window');
+assert.equal(registered.length,2);
+assert.equal(registered[0].area,'composer.actions');
+assert.equal(registered[1].area,'titleBar.tools.right');
+let tree=render(registered[0].render(),'composer'); flushEffects();
+find(tree,node=>node.type==='popover').props.onOpenChange(true);
+tree=render(registered[0].render(),'composer'); flushEffects(); await tick();
+assert(text(tree).includes('Composer mode'));
+const catalog=calls.find(row=>row.path==='/targets');
+assert(catalog,'the stock lane drives the shared catalog');
+assert.equal(catalog.options.body.session_id,'stored-stock');
+assert.equal(catalog.options.scope.profile,'profile-a');
+assert.equal(acquires,0); assert.equal(captures,0); assert.equal(titles,0);
+render(null,'composer'); await tick();
+""")
+
+
+def test_full_host_controller_is_preferred_over_the_stock_lane(desktop_source):
+    run_hud(desktop_source, r"""
+delete host.voice;
+hostState.focusedStoredSessionId.set('stored-stock');
+context.plugin.register(host);
+let tree=render(registered[0].render(),'composer'); flushEffects();
+find(tree,node=>node.type==='popover').props.onOpenChange(true);
+tree=render(registered[0].render(),'composer'); flushEffects(); await tick();
+const catalog=calls.find(row=>row.path==='/targets');
+assert(catalog);
+assert.equal(catalog.options.body.session_id,'stored-a',
+  'the Talk-enabled host controller owns the conversation, not the focused atoms');
+assert.equal(acquires,0); assert.equal(captures,0); assert.equal(stops,0);
+render(null,'composer'); await tick();
+""")
+
+
+def test_stock_lane_stops_when_the_focused_conversation_changes(desktop_source):
+    run_hud(desktop_source, r"""
+const seen=[];
+const Probe=()=>{seen.push(context.useStockVoiceController()); return null;};
+render(React.createElement(Probe),'probe'); flushEffects();
+const first=seen.at(-1);
+assert.equal(first.capabilities.lane,'stock');
+assert.equal(first.owner.storedSessionId,'stored-a');
+render(React.createElement(Probe),'probe'); flushEffects();
+assert.equal(seen.at(-1),first,'a quiet conversation keeps one lifetime');
+hostState.focusedSessionId.set('runtime-b');
+hostState.focusedStoredSessionId.set('stored-b');
+render(React.createElement(Probe),'probe'); flushEffects();
+const second=seen.at(-1);
+assert.notEqual(second,first,'a new conversation gets its own controller');
+assert.equal(second.owner.storedSessionId,'stored-b');
+assert.equal(first.signal.aborted,true,'the previous conversation lifetime is aborted');
+assert.equal(second.signal.aborted,false);
+render(null,'probe');
+assert.equal(second.signal.aborted,true,'unmounting ends the stock lifetime');
+assert.equal(stops,0,'the stock lane never stops a host controller');
+assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
 """)

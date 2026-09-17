@@ -8,21 +8,46 @@ composer. Reopen Talk whenever you want captions, results or settings.
 The generated entrypoint is `desktop/plugin.js`; it does not embed a second
 provider implementation or an external browser page.
 
-## Required host support
+## Two host lanes
 
-This candidate requires a Hermes Desktop host with:
+Talk chooses its lane from what the running Hermes Desktop offers. Both lanes use
+the same composer button and the same panel.
 
-- `useComposerVoiceController()` reporting `microphoneLease: 1` and
-  `pinnedRest: 1` and `prepareSession: 1`, granting an abortable microphone lease
-  and preparing the exact current conversation without sending a prompt;
-- plugin REST accepting an explicit `{connectionId, profile}` scope;
-- the native Talk authentication bridge for Desktop-owned local backends.
+### Stock Hermes Desktop
 
-The companion host change builds on the composer ownership controller proposed
-in [Hermes PR #100666](https://github.com/NousResearch/hermes-agent/pull/100666).
-That proposal by itself does not supply the complete contract above. On an older
-host, Talk displays an update-required message before requesting credentials or
-microphone access. This page does not imply those changes are in stock Desktop.
+Talk runs in the composer popover. It reads the focused conversation from the
+host state atoms, confirms the stored conversation with a read-only
+`session.title` request, and attaches. Its boundaries:
+
+- **Connect once the conversation has one message.** Desktop writes a
+  conversation row on the first message, so an empty conversation has nothing to
+  attach to. Talk says so rather than saving a placeholder for you.
+- **Talk follows the active profile.** Plugin REST on this lane routes through
+  whichever connection and profile Desktop currently has active. If that moves
+  away from the conversation Talk attached to, Talk refuses the request instead
+  of addressing another gateway.
+- **No microphone coordination.** There is no lease to share with Desktop
+  dictation or a wake word. Stop those before you Connect.
+- **`TALK_DASHBOARD_TOKEN` is unsupported.** This lane cannot present the token,
+  so a backend that sets it answers 401. Unset it for local Desktop use, or use
+  the dashboard Talk tab.
+
+### Talk-enabled Hermes Desktop build
+
+A host whose `useComposerVoiceController()` reports `microphoneLease: 1`,
+`pinnedRest: 1` and `prepareSession: 1` adds:
+
+- the floating Talk window, which stays up while you use the rest of the app;
+- an abortable microphone lease, coordinated with the rest of Desktop;
+- plugin REST pinned to an explicit `{connectionId, profile}` scope rather than
+  the ambient one;
+- attaching an empty conversation, prepared without sending a prompt.
+
+That contract builds on the composer ownership controller proposed in
+[Hermes PR #100666](https://github.com/NousResearch/hermes-agent/pull/100666);
+the proposal by itself does not supply all of it. A host that reports only part
+of the contract is refused rather than half driven, and the panel says which
+build the floating window needs.
 
 ## Open Talk
 
@@ -33,8 +58,9 @@ microphone access. This page does not imply those changes are in stock Desktop.
    contribution is disabled. Installed agent packages are opt-in on Desktop.
 4. Open a connected Hermes conversation, then click **Talk** in the top bar or
    beside its composer. The top-bar button follows the focused conversation.
-5. Click **Connect**. A new conversation is saved automatically, without a
-   synthetic message. Existing conversations are resumed by their exact identity.
+5. Click **Connect**. Existing conversations are resumed by their exact identity.
+   On the Talk-enabled build a new conversation is saved automatically, without a
+   synthetic message; on stock Desktop, send one message first.
 6. Allow the requested microphone access. The popover disappears once connected.
    Clicking away or closing the popover keeps audio running. Click **Stop** beside
    the composer, or reopen Talk and choose **Stop talking**, to end audio. Accepted

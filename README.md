@@ -110,7 +110,7 @@ Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
 | Inside a Hermes session | `/talk` — the one surface with an **attached** agent loop, so lookups and delegation answer inline |
 | Discord voice channel | `/voice join`, then `/talk join [TARGET]` |
 | Dashboard **Talk** tab | `hermes dashboard`, select a task, **Start** |
-| Desktop **Talk** composer action | open a conversation → **Talk** → **Connect** ([host requirements](docs/DESKTOP.md)) |
+| Desktop **Talk** composer action | open a conversation → **Talk** → **Connect**; works on stock Desktop, with a floating window on the Talk-enabled build ([host lanes](docs/DESKTOP.md)) |
 
 ## Is it working?
 
@@ -149,7 +149,7 @@ Everything Hermes Talk does, in depth:
 - [BACKGROUND-WORK.md](docs/BACKGROUND-WORK.md) — delegation, admission control, steering a running agent, and the capability bridge.
 - [CASCADE.md](docs/CASCADE.md) — the cascade lane: your own ElevenLabs voice over a realtime provider.
 - [GPT-LIVE.md](docs/GPT-LIVE.md) — GPT-Live billing and voice, task attachment, Codex workers, operator acceptance.
-- [DESKTOP.md](docs/DESKTOP.md) — Talk in the Hermes desktop app and the host support it requires.
+- [DESKTOP.md](docs/DESKTOP.md) — Talk in the Hermes desktop app: the stock lane, and what the Talk-enabled build adds.
 - [VOICE-COMMANDS.md](docs/VOICE-COMMANDS.md) — say this, hear this, and what each spoken receipt commits to.
 - [REALTIME-ORCHESTRATOR.md](docs/REALTIME-ORCHESTRATOR.md) — architecture map of the tool-calling realtime lane.
 - [dashboard-task-continuity.md](docs/dashboard-task-continuity.md) — joining, continuing and reconnecting to a canonical Hermes task.
