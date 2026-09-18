@@ -1963,6 +1963,35 @@ function createTalkSurface(SDK) {
     const [audioActivity, setAudioActivity] = useState({ input: false, output: false });
     const [appearance, updateAppearance] = useState({ skin: "system", animate: false,
       collapseOnConnect: true, hoverExpand: true });
+    // hermes-jarvis presence-bus BEGIN
+    // Optional presence bus: other surfaces can mirror the live call without reading
+    // Talk's DOM. Inert when nothing listens; commands call Talk's own functions.
+    const presenceBusRef = useRef(null);
+    useEffect(() => { presenceBusRef.current = { startTalk, stopTalk, setMuted, setSleeping }; },
+      [startTalk, stopTalk, setMuted, setSleeping]);
+    useEffect(() => {
+      if (typeof window === "undefined") return;
+      try {
+        window.dispatchEvent(new CustomEvent("hermes-talk:presence", { detail: { phase, live,
+          audioActivity, transcript: transcript.slice(-6), muted, sleeping, at: Date.now() } }));
+      } catch (e) { /* the bus is optional */ }
+    }, [phase, live, audioActivity, transcript, muted, sleeping]);
+    useEffect(() => {
+      if (typeof window === "undefined") return undefined;
+      const onCommand = (event) => {
+        const api = presenceBusRef.current || {}, action = event?.detail?.action;
+        const call = (fn, value) => { if (typeof fn === "function") fn(value); };
+        try {
+          if (action === "start") call(api.startTalk);
+          else if (action === "stop") call(api.stopTalk);
+          else if (action === "mute" || action === "unmute") call(api.setMuted, action === "mute");
+          else if (action === "sleep" || action === "wake") call(api.setSleeping, action === "sleep");
+        } catch (e) { /* a command never breaks the call */ }
+      };
+      window.addEventListener("hermes-talk:command", onCommand);
+      return () => window.removeEventListener("hermes-talk:command", onCommand);
+    }, []);
+    // hermes-jarvis presence-bus END
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
