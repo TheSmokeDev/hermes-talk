@@ -315,6 +315,12 @@ function DesktopTalkPresentation(props) {
     }, starting ? 'Cancel' : 'Stop')),
     popoverOpen && h(HermesSDK.PopoverContent, {
       side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+      // The host keeps keyboard ownership with the composer: crossing the chat
+      // area with the pointer re-focuses the composer input, and Radix dismisses
+      // a popover on focus-outside by default. That closed this panel while the
+      // pointer was still on its way in, leaving no way to reach the controls.
+      // Dismissal stays on outside click and Escape (docs/DESKTOP.md).
+      onFocusOutside: event => event.preventDefault(),
       style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
         overflowY: 'auto', padding: '1rem' },
       onSubmit: event => event.stopPropagation(),
@@ -574,6 +580,9 @@ function DesktopTalkAction() {
     attachedHere && (unavailable || !desktopContext
       ? popoverOpen && h(HermesSDK.PopoverContent, {
         side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+        // Same reason as the panel above: a host focus change must not dismiss
+        // this popover. Outside click and Escape still do.
+        onFocusOutside: event => event.preventDefault(),
         style: { width: 'min(360px, calc(100vw - 24px))' },
       }, h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.'))
       : h(DesktopTalkPanel, {

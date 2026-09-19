@@ -2276,6 +2276,13 @@ function createTalkSurface(SDK) {
       }
     }
 
+    // Bound (task-catalog) mode is a host capability, and /status is the plugin's
+    // own verdict on it: without `hermes_cli.dashboard_task_context` on the host
+    // the catalog answers 503, so a surface that binds anyway fails before audio
+    // ever starts. Ask for a target only when the host can authorize one; the
+    // legacy unbound lane stays the documented fallback.
+    const taskBinding = Boolean(SDK.prepareTask) && status?.taskContinuity?.supported !== false;
+
     async function startTalk() {
       if (!["idle", "text"].includes(phaseRef.current) || textSessionRef.current || sendingRef.current) return;
       setError("");
@@ -2283,7 +2290,7 @@ function createTalkSurface(SDK) {
         setError("Talk needs a browser with WebRTC and microphone access.");
         return;
       }
-      if (status && status.voiceMode === "live" && !selectedTask && !SDK.prepareTask) {
+      if (status && status.voiceMode === "live" && !selectedTask && taskBinding) {
         setError("Choose an authorized task before starting GPT-Live.");
         return;
       }
@@ -2301,7 +2308,7 @@ function createTalkSurface(SDK) {
       sessionAbort.current = controller;
       try {
         let targetId = selectedTask;
-        if (SDK.prepareTask) {
+        if (taskBinding) {
           const target = await SDK.prepareTask({ tabId: tabId.current, signal: controller.signal });
           if (epoch !== connectionEpoch.current || controller.signal.aborted) return;
           if (!target?.target_id) throw new Error("The current conversation could not be prepared.");
@@ -2466,7 +2473,7 @@ function createTalkSurface(SDK) {
       sessionAbort.current = controller;
       const pending = (async () => {
         let targetId = selectedTask;
-        if (SDK.prepareTask) {
+        if (taskBinding) {
           const target = await SDK.prepareTask({ tabId: tabId.current, signal: controller.signal });
           if (controller.signal.aborted || epoch !== connectionEpoch.current) throw new Error("Connection cancelled.");
           targetId = target?.target_id;
@@ -2632,7 +2639,7 @@ function createTalkSurface(SDK) {
     const legacyText = !selectedRecipient && recipientOperation === "message" &&
       transportRef.current && !transportRef.current.textOnly && phase === "active";
     const ownerText = !selectedRecipient && recipientOperation === "message" &&
-      Boolean(SDK.prepareTask || selectedTask);
+      Boolean(taskBinding || selectedTask);
     const canSendTyped = !switching && !recipientLoading && !sending &&
       (attachments.length === 0 || attachmentsSendable) &&
       (legacyText || ownerText || operationSupported && (recipientOperation === "start_worker" ||
@@ -3913,6 +3920,12 @@ function DesktopTalkPresentation(props) {
     }, starting ? 'Cancel' : 'Stop')),
     popoverOpen && h(HermesSDK.PopoverContent, {
       side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+      // The host keeps keyboard ownership with the composer: crossing the chat
+      // area with the pointer re-focuses the composer input, and Radix dismisses
+      // a popover on focus-outside by default. That closed this panel while the
+      // pointer was still on its way in, leaving no way to reach the controls.
+      // Dismissal stays on outside click and Escape (docs/DESKTOP.md).
+      onFocusOutside: event => event.preventDefault(),
       style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
         overflowY: 'auto', padding: '1rem' },
       onSubmit: event => event.stopPropagation(),
@@ -4172,6 +4185,9 @@ function DesktopTalkAction() {
     attachedHere && (unavailable || !desktopContext
       ? popoverOpen && h(HermesSDK.PopoverContent, {
         side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+        // Same reason as the panel above: a host focus change must not dismiss
+        // this popover. Outside click and Escape still do.
+        onFocusOutside: event => event.preventDefault(),
         style: { width: 'min(360px, calc(100vw - 24px))' },
       }, h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.'))
       : h(DesktopTalkPanel, {
