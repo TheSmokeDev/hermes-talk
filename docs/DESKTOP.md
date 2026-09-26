@@ -50,6 +50,27 @@ of the contract gets the stock lane in the composer instead of a half driven
 controller; the four additions above arrive together or not at all, and the panel
 says which build the floating window needs.
 
+### Hosts without task context
+
+Attaching Talk to the conversation also needs support from the Hermes backend:
+the `hermes_cli.dashboard_task_context` helper described under
+[required host support](dashboard-task-continuity.md#required-host-support). No
+released Hermes core ships it yet. When `/status` reports
+`taskContinuity.supported: false`, Talk connects without attaching, the way the
+dashboard's legacy Talk does, on either Desktop lane:
+
+- **OpenAI Realtime works** (`TALK_VOICE_MODE=native`). Talk runs as its own
+  session rather than inside this conversation's history.
+- **GPT-Live does not.** It always runs on an attached task, so the panel refuses
+  it before connecting and names the missing host support.
+- **Other recipients are unavailable.** The panel says so instead of reporting a
+  failed request, and the conversation list under Advanced stays empty.
+
+Desktop plugin requests travel over IPC, so they never appear in the devtools
+Network tab. A refused request shows its status and error code in the panel and
+in the devtools console, for example
+`[hermes-talk] POST /targets failed: 503 context_unavailable`.
+
 ## Open Talk
 
 1. Install the matching host build and this plugin candidate in the Hermes home
@@ -88,16 +109,28 @@ Cascade streaming is not carried by this host's JSON plugin bridge; use the
 dashboard for cascade. Unsupported modes produce an explanation before session
 creation. Opening Talk does not alter your provider or billing settings.
 
-The host keeps long-lived provider credentials. Electron main grants each local
-backend a temporary Talk credential and attaches it only to that owned backend's
-Talk routes. The renderer never receives or stores it. Both normal host
-authentication and exact task authorization still apply. External dashboard
-requests retain their existing `TALK_DASHBOARD_TOKEN` gate.
+The host keeps long-lived provider credentials. On the Talk-enabled build,
+Electron main grants each local backend a temporary Talk credential and attaches
+it only to that owned backend's Talk routes. The renderer never receives or
+stores it. Both normal host authentication and exact task authorization still
+apply. External dashboard requests retain their existing `TALK_DASHBOARD_TOKEN`
+gate. That bridge applies only to backends Desktop starts locally.
 
-This automatic bridge applies to backends started locally by Desktop. It is not
-forwarded to SSH, cloud or remote connections. A separately hosted gateway retains
-its configured access requirements; use its authenticated dashboard until that
-connection supplies native Talk authentication.
+Stock Desktop has no Talk credential. Its plugin requests carry the Desktop
+session token only, so Talk admits them through its loopback rule.
+
+### Remote connections
+
+- **SSH connections reach Talk the way a local backend does.** Desktop starts
+  `hermes serve` on the remote bound to `127.0.0.1` and reaches it through an
+  `ssh -L` tunnel, so Talk's requests arrive on the remote's loopback. Install
+  and enable hermes-talk on the remote host, since its routes are served from
+  there, and leave `TALK_DASHBOARD_TOKEN` unset on that host. The Desktop half
+  loads from the local Hermes home. The same task-context rule applies: without
+  it, OpenAI Realtime connects and GPT-Live does not.
+- **URL connections** (a separately hosted gateway) reach Talk from a non-loopback
+  address, and stock Desktop cannot present `TALK_DASHBOARD_TOKEN`, so Talk
+  refuses them. Use that gateway's authenticated dashboard Talk tab.
 
 ## Ownership and recovery
 

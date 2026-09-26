@@ -277,6 +277,14 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         const prefix = "Error invoking remote method 'hermes:api': Error: ";
         const normalized = typeof error?.message === 'string' && error.message.startsWith(prefix)
           ? new Error(error.message.slice(prefix.length)) : error;
+        // Plugin REST rides the host's IPC, so the Network tab never shows it.
+        // Name the route and the refusal code, never the refusal's free text.
+        if (normalized?.name !== 'AbortError') {
+          const reason = desktopTalkErrorCode(normalized?.message) ||
+            /^\d{3}\b/.exec(normalized?.message || '')?.[0] || normalized?.name || 'Error';
+          globalThis.console?.warn?.('[hermes-talk] ' + (options.method || 'GET') + ' ' +
+            suffix + ' failed: ' + reason);
+        }
         // A stock host cannot present TALK_DASHBOARD_TOKEN, so a refusal there is a
         // notice to show, not a lost host session to stop.
         if (/^(?:401|403)\b/.test(normalized?.message || '') &&
@@ -315,6 +323,12 @@ function DesktopTalkPresentation(props) {
     }, starting ? 'Cancel' : 'Stop')),
     popoverOpen && h(HermesSDK.PopoverContent, {
       side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+      // The host keeps keyboard ownership with the composer: crossing the chat
+      // area with the pointer re-focuses the composer input, and Radix dismisses
+      // a popover on focus-outside by default. That closed this panel while the
+      // pointer was still on its way in, leaving no way to reach the controls.
+      // Dismissal stays on outside click and Escape (docs/DESKTOP.md).
+      onFocusOutside: event => event.preventDefault(),
       style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
         overflowY: 'auto', padding: '1rem' },
       onSubmit: event => event.stopPropagation(),
@@ -574,6 +588,9 @@ function DesktopTalkAction() {
     attachedHere && (unavailable || !desktopContext
       ? popoverOpen && h(HermesSDK.PopoverContent, {
         side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+        // Same reason as the panel above: a host focus change must not dismiss
+        // this popover. Outside click and Escape still do.
+        onFocusOutside: event => event.preventDefault(),
         style: { width: 'min(360px, calc(100vw - 24px))' },
       }, h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.'))
       : h(DesktopTalkPanel, {

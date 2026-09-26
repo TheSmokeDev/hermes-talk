@@ -1,7 +1,8 @@
 """Run the upstream Hermes plugin_guard scanner against this repository.
 
-The plugin-guard workflow downloads ``tools/plugin_guard.py`` and
-``tools/skills_guard.py`` from NousResearch/hermes-agent, pinned to the
+The plugin-guard workflow downloads ``tools/plugin_guard.py``,
+``tools/plugin_guard_context.py`` and ``tools/skills_guard.py`` from
+NousResearch/hermes-agent, pinned to the
 commit it resolved from upstream main, into a directory OUTSIDE this
 checkout (the scanner's own pattern table would otherwise be scanned as
 repo content). This script then runs that scanner over the checkout and
