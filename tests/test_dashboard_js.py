@@ -2272,3 +2272,110 @@ t.stop();
     result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
                  text=True, timeout=NODE_TIMEOUT_S)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_task_continuity_false_skips_prepare_task_on_start():
+    """With taskContinuity.supported:false, startTalk must not call prepareTask.
+
+    The documented legacy unbound lane is the fallback: the session is minted
+    without a task catalog binding, so hosts that lack
+    hermes_cli.dashboard_task_context never hit the 503 context_unavailable
+    path that blocked the desktop start lane before the fix.
+    """
+
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const prepareCalls = [];
+const sessionRequests = [];
+let sequence = 0;
+const slots = [], effects = [];
+let cursor = 0;
+const hooks = {
+  useState(initial) {
+    const index = cursor++;
+    if (!(index in slots)) slots[index] = initial;
+    return [slots[index], (value) => { slots[index] = typeof value === "function" ? value(slots[index]) : value; }];
+  },
+  useRef(initial) { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index]; },
+  useCallback(cb) { cursor++; return cb; },
+  useEffect(effect, deps) {
+    const index = cursor++, previous = slots[index];
+    if (!previous || deps.some((dep, at) => dep !== previous.deps[at])) {
+      effects.push(() => { if (previous && previous.cleanup) previous.cleanup();
+        slots[index] = { deps, cleanup: effect() }; });
+    }
+  },
+};
+const window = {
+  __HERMES_TALK_TEST_HOOK__: true,
+  __HERMES_PLUGINS__: { register() {} },
+  __HERMES_PLUGIN_SDK__: {
+    React: { createElement(tag, props, ...children) { return { tag, props: props || {}, children }; } },
+    hooks,
+    components: { Button: "button" },
+    async prepareTask(opts) {
+      prepareCalls.push(opts);
+      return { target_id: "bound-task", label: "Bound task" };
+    },
+    async fetchJSON(url, opts) {
+      const body = opts && opts.body ? JSON.parse(opts.body) : null;
+      if (url.endsWith("/status")) return {
+        configured: true, voices: ["marin"], voice: "marin",
+        voiceMode: "cascade", taskContinuity: { supported: false },
+      };
+      if (url.endsWith("/session")) {
+        sessionRequests.push(body);
+        return { task: { connection_id: "page-conn", generation: 1,
+          context: { workspace: "unavailable" } } };
+      }
+      return { ok: true };
+    },
+  },
+  sessionStorage: { getItem() { return ""; } },
+  crypto: { randomUUID() { return "uuid-" + (++sequence); } },
+  location: { href: "https://dashboard.example/plugins/hermes-talk" },
+  addEventListener() {}, removeEventListener() {},
+  setTimeout, clearTimeout,
+};
+const context = {
+  window, setTimeout, clearTimeout, AbortController, console,
+  document: { title: "Dashboard" },
+  navigator: { mediaDevices: {} },
+  RTCPeerConnection: function () {},
+};
+vm.runInNewContext(source, context, { filename: "index.js" });
+const Page = window.__HERMES_TALK_TEST__.TalkPage;
+const render = () => { cursor = 0; effects.length = 0; const tree = Page(); effects.forEach((f) => f()); return tree; };
+const nodes = (tree) => !tree || typeof tree !== "object" ? []
+  : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.children)];
+const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
+  : Array.isArray(tree) ? tree.map(label).join(" ") : label(tree.children);
+const button = (tree, text) => nodes(tree).find((n) => n.tag === "button" && label(n) === text);
+const drain = () => new Promise((resolve) => setTimeout(resolve, 20));
+(async () => {
+  render(); await drain(); let tree = render();
+  const startBtn = button(tree, "Start legacy Talk");
+  assert(startBtn, "start button must be present when status is ready");
+  assert(!startBtn.props.disabled, "start button must be enabled for cascade mode");
+  startBtn.props.onClick();
+  await drain();
+  assert.equal(prepareCalls.length, 0,
+    "prepareTask must not be called when taskContinuity.supported is false");
+  const sessionBody = sessionRequests.find((r) => r !== null);
+  assert(sessionBody, "a /session request must have been sent");
+  assert(!Object.hasOwn(sessionBody, "task"),
+    "the legacy unbound lane must not include a task binding");
+  process.exit(0);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

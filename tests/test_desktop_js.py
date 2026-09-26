@@ -581,3 +581,37 @@ assert.equal(requests.length,0,'an unreported active profile is not that convers
 assert.equal(calls.length,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
+
+
+def test_popover_content_receives_focus_outside_guard():
+    """PopoverContent must receive onFocusOutside; outside-click and Escape still dismiss."""
+    run_node(r"""
+React.useState=()=>[null,()=>{}];React.useEffect=()=>{};
+React.useRef=value=>({current:value});
+HermesSDK.Popover='popover';HermesSDK.PopoverTrigger='popover-trigger';
+HermesSDK.PopoverContent='popover-content';
+const popoverClosed = [];
+const onPopoverOpenChange = (open) => { if (!open) popoverClosed.push(true); };
+const tree = context.DesktopTalkPresentation({
+  popoverOpen: true, onPopoverOpenChange, stopTalk() {},
+});
+const popoverContent = (tree.children || []).filter(Boolean)
+  .find(c => c.type === 'popover-content');
+assert(popoverContent, 'PopoverContent must be rendered when popoverOpen is true');
+assert.equal(typeof popoverContent.props.onFocusOutside, 'function',
+  'onFocusOutside must be wired');
+const fakeEvent = { preventDefault() { this.defaultPrevented = true; } };
+popoverContent.props.onFocusOutside(fakeEvent);
+assert.equal(fakeEvent.defaultPrevented, true,
+  'onFocusOutside must call preventDefault to block Radix focus-outside dismissal');
+assert.equal(popoverClosed.length, 0,
+  'onFocusOutside must not close the popover');
+// Only focus-outside is blocked. Radix's pointer and keyboard dismissal paths
+// stay unwired, so outside click and Escape still close the popover.
+for (const blocked of ['onInteractOutside','onPointerDownOutside','onEscapeKeyDown']) {
+  assert.equal(popoverContent.props[blocked], undefined,
+    blocked + ' must stay unwired so outside click and Escape still dismiss');
+}
+assert.equal(calls.length, 0);
+assert.equal(acquires, 0);
+""")
