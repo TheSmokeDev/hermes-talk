@@ -37,6 +37,34 @@ const DESKTOP_TALK_VIEW_CSS = `
 function desktopTalkNotice(value, needsToken, lane) {
   if (!value && !needsToken) return null;
   const message = String(value?.message || value || '');
+  const notice = desktopTalkNoticeText(message, needsToken, lane);
+  const code = desktopTalkErrorCode(message);
+  return code ? { ...notice, code } : notice;
+}
+
+// Desktop plugin requests travel over IPC, so devtools shows no request to
+// inspect. A refused request arrives as "STATUS: body"; its code is a fixed
+// identifier that names what failed. The free text stays out of the view.
+function desktopTalkErrorCode(message) {
+  const refused = /^(\d{3}):\s*(\{[\s\S]*\})$/.exec(String(message || ''));
+  if (!refused) return '';
+  try {
+    const code = JSON.parse(refused[2])?.detail?.code;
+    return typeof code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(code)
+      ? refused[1] + ' ' + code : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function desktopTalkNoticeText(message, needsToken, lane) {
+  // Sentences Talk writes for the operator are already the notice.
+  if (/^GPT-Live needs a Hermes host with task context support/.test(message)) {
+    return { text: message, retry: false };
+  }
+  if (/^Send one message in this conversation first/.test(message)) {
+    return { text: message, retry: true };
+  }
   if (/^404\b/.test(message) && /target_missing/.test(message)) {
     return { text: 'Send one message in this conversation first, then Connect. ' +
       'Hermes Desktop saves a conversation on its first message.', retry: true };
@@ -128,7 +156,10 @@ export function DesktopTalkView(props) {
   const captions = (props.transcript || []).filter(row => typeof row?.text === 'string' && row.text.length);
   const voices = (status?.voices || []).filter(name => typeof name === 'string');
   const notice = desktopTalkNotice(error, needsToken, lane);
-  const catalogNotice = desktopTalkNotice(catalogError, false, lane);
+  // A host without task context cannot bind a conversation, list recipients or
+  // switch conversations. Its refusals are expected, so they are not errors here.
+  const taskContext = status?.taskContinuity?.supported !== false;
+  const catalogNotice = taskContext ? desktopTalkNotice(catalogError, false, lane) : null;
   const button = (label, onClick, options = {}) => h(HermesSDK.Button,
     { ...options, type: 'button', onClick }, label);
   const busy = starting || switching;
@@ -200,6 +231,7 @@ export function DesktopTalkView(props) {
       'Talk to Hermes in this conversation. You can interrupt at any time.'),
     notice && h('div', { className: 'htd-stack htd-notice', role: 'alert' },
       h('p', { className: 'htd-text' }, notice.text),
+      notice.code && h('p', { className: 'htd-muted' }, 'Error code: ' + notice.code),
       h('div', null, button(notice.retry ? 'Try again' : 'Check connection',
         () => void (notice.retry && ready && !active ? startTalk() : refresh()),
         { variant: 'outline', size: 'sm', disabled: loading || busy }))),
@@ -239,11 +271,15 @@ export function DesktopTalkView(props) {
         'No recipients match this search.'),
       (props.recipientSources || []).filter(source => source.available === false).map(source =>
         h('p', { className: 'htd-muted', key: source.app }, source.app + ': history unavailable')),
+      !taskContext && h('p', { className: 'htd-muted' },
+        'Other recipients need task context support on this Hermes host.'),
       props.refreshRecipients && h('div', null, button(recipientLoading ? 'Refreshing recipients…' : 'Refresh recipients',
         () => void props.refreshRecipients(), { variant: 'outline', size: 'sm',
-          disabled: recipientLoading || sending || busy })),
-      props.recipientError && h('p', { role: 'alert', className: 'htd-muted' },
-        'The recipient could not be loaded. Refresh the list and try again.')),
+          disabled: !taskContext || recipientLoading || sending || busy })),
+      taskContext && props.recipientError && h('p', { role: 'alert', className: 'htd-muted' },
+        'The recipient could not be loaded. Refresh the list and try again.' +
+        (desktopTalkErrorCode(props.recipientError) &&
+          ' Error code: ' + desktopTalkErrorCode(props.recipientError)))),
 
     setRecipientOperation && h('label', null, 'Action',
       h('select', { value: recipientOperation, disabled: sending || busy,
@@ -439,7 +475,8 @@ export function DesktopTalkView(props) {
           button('Return to previous conversation', () => void switchTarget({ back: true }),
             { variant: 'outline', size: 'sm', disabled: !!voiceOwner || !active || busy })),
         catalogNotice && h('p', { className: 'htd-muted', role: 'status' },
-          'The conversation list is unavailable. ' + catalogNotice.text),
+          'The conversation list is unavailable. ' + catalogNotice.text +
+          (catalogNotice.code ? ' Error code: ' + catalogNotice.code : '')),
         h('div', null, button('Refresh conversations', () => void refreshCatalog(),
           { variant: 'outline', size: 'sm', disabled: loading || busy })),
         taskState && h('label', null, 'Spoken updates',

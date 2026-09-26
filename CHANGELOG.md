@@ -11,6 +11,38 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.21.1] — 2026-09-26
+
+Desktop Talk connects on a stock Hermes host, and when a request fails the panel
+says why.
+
+### Fixed
+- Desktop Talk no longer fails every Connect with "Talk is temporarily
+  unavailable" on a Hermes host without task context support, which is every
+  released core today. It binds the conversation only when `/status` reports
+  `taskContinuity.supported`, and otherwise connects the way the dashboard's
+  legacy Talk does. The composer popover also stays open when the host moves
+  focus back to the composer as the pointer crosses the chat; outside click and
+  Escape still close it. Thanks to @HearthCore for the diagnosis and the fix.
+  (#169, #170)
+- GPT-Live on Desktop still binds its own task when none is preselected, such
+  as an empty conversation on the Talk-enabled build or a catalog that has not
+  loaded yet. #170 inverted that start check on `main`, and no release carried
+  it. On a host without task context the panel now refuses GPT-Live before
+  connecting and names the missing host support, instead of asking for a task
+  it cannot offer. (#174)
+
+### Changed
+- A refused Desktop plugin request shows its status and error code in the
+  panel (`Error code: 503 context_unavailable`) and logs the route and code to
+  the devtools console. Plugin requests travel over IPC, so the Network tab
+  never shows them. The refusal's free text still stays out of both. On a host
+  without task context, the recipient picker says recipients need that support
+  instead of failing a refresh. `docs/DESKTOP.md` describes such hosts, and
+  says what SSH and URL connections need: an SSH connection reaches the remote
+  backend over its loopback, so Talk installed and enabled there admits it
+  without `TALK_DASHBOARD_TOKEN`. (#174)
+
 ## [0.21.0] — 2026-09-16
 
 Talk works on a stock Hermes Desktop, and the refusal text stops asking for an
