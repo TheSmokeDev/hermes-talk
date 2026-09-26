@@ -304,6 +304,22 @@ for (const scenario of ['other-task','other-host','resume-failed','cancel','wron
         "Allow microphone access for Hermes in your system settings, then try again.",
         True,
     ),
+    (
+        '503: {"detail":{"code":"context_unavailable","message":"fixture-private-token"}}',
+        "Error code: 503 context_unavailable",
+        True,
+    ),
+    (
+        '503: {"detail":{"code":"Not A Code fixture-private-token","message":"x"}}',
+        "Talk is temporarily unavailable. Try again.",
+        True,
+    ),
+    (
+        "GPT-Live needs a Hermes host with task context support, which this host does not "
+        "report. Use OpenAI Realtime here (TALK_VOICE_MODE=native).",
+        "GPT-Live needs a Hermes host with task context support",
+        False,
+    ),
 ])
 def test_desktop_notice_distinguishes_request_failure_from_auth(message, expected, retry):
     run_node(r"""
@@ -615,3 +631,56 @@ for (const blocked of ['onInteractOutside','onPointerDownOutside','onEscapeKeyDo
 assert.equal(calls.length, 0);
 assert.equal(acquires, 0);
 """)
+
+
+def test_refused_plugin_request_names_route_and_code_in_the_console():
+    """Plugin REST rides IPC, so the console is the only trace devtools can show."""
+    run_node(r"""
+(async()=>{
+const warnings = [];
+context.console = {warn(line){warnings.push(line);}, error(){}, log(){}};
+const sdk=createSDK();
+host.rest=async()=>{throw new Error("Error invoking remote method 'hermes:api': Error: 503: " +
+  JSON.stringify({detail:{code:'context_unavailable',message:'fixture-private-token'}}));};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/targets',{method:'POST',body:'{}'}),
+  /^Error: 503:/);
+assert.deepEqual(warnings,
+  ['[hermes-talk] POST /targets failed: 503 context_unavailable']);
+host.rest=async()=>{throw new Error("Error invoking remote method 'hermes:api': Error: " +
+  "401: fixture-private-token");};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'));
+assert.equal(warnings[1],'[hermes-talk] GET /status failed: 401');
+assert(!warnings.join(' ').includes('fixture-private-token'),
+  'the refusal free text stays out of the console');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_recipients_explain_a_host_without_task_context_instead_of_failing():
+    run_node(r"""
+let refreshes = 0;
+const view = (supported, recipientError) => context.DesktopTalkView({
+  status:{configured:true,source:'subscription',taskContinuity:{supported}},ready:true,
+  tasks:[],transcript:[],results:{},startTalk(){},refresh(){},
+  setRecipient(){},refreshRecipients(){refreshes++;},recipientError,
+});
+function nodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [node,...(node.children||[]).flat(Infinity).flatMap(nodes)];
+}
+function text(node) {
+  if (typeof node === 'string') return node;
+  return (node?.children||[]).flat(Infinity).map(text).join(' ');
+}
+const refused = '503: ' + JSON.stringify({detail:{code:'context_unavailable',message:'x'}});
+const stock = view(false, refused);
+assert(text(stock).includes('Other recipients need task context support on this Hermes host.'));
+assert(!text(stock).includes('The recipient could not be loaded'),
+  'an expected refusal on this host is not an error');
+const refresh = nodes(stock).find(node=>node.type==='button' && text(node)==='Refresh recipients');
+assert.equal(refresh.props.disabled,true);
+const bound = view(true, refused);
+assert(!text(bound).includes('Other recipients need task context support'));
+assert(text(bound).includes('The recipient could not be loaded. Refresh the list and try ' +
+  'again. Error code: 503 context_unavailable'));
+""", source="ui/desktop-view.js")

@@ -224,6 +224,12 @@ it does not claim that hot lifecycle support already exists here.
 the `request_id` the Hermes run API reads, so they stop failing with HTTP 400
 (0.17.1).
 
+[@HearthCore](https://github.com/HearthCore): diagnosed why Desktop Talk could
+never connect on a stock Hermes host, and made it connect there; the composer
+popover also stops closing when the pointer crosses the chat
+([#169](https://github.com/TheSmokeDev/hermes-talk/issues/169),
+[#170](https://github.com/TheSmokeDev/hermes-talk/pull/170), 0.21.1).
+
 [@kvnloo](https://github.com/kvnloo): PulseAudio WebRTC echo cancellation
 on Linux, and the fix that stopped quiet words being clipped during
 playback ([#81](https://github.com/TheSmokeDev/hermes-talk/pull/81));

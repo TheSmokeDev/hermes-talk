@@ -2289,8 +2289,14 @@ function createTalkSurface(SDK) {
         setError("Talk needs a browser with WebRTC and microphone access.");
         return;
       }
-      if (status && status.voiceMode === "live" && !selectedTask && taskBinding) {
-        setError("Choose an authorized task before starting GPT-Live.");
+      // GPT-Live always runs on a bound task. A surface that can bind one prepares
+      // it below; otherwise a task must already be chosen, and a host without task
+      // context has none to offer, so say that instead of asking for a choice.
+      if (status && status.voiceMode === "live" && !selectedTask && !taskBinding) {
+        setError(status.taskContinuity?.supported === false
+          ? "GPT-Live needs a Hermes host with task context support, which this host does not " +
+            "report. Use OpenAI Realtime here (TALK_VOICE_MODE=native)."
+          : "Choose an authorized task before starting GPT-Live.");
         return;
       }
       setPhase("starting");

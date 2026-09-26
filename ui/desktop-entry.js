@@ -277,6 +277,14 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         const prefix = "Error invoking remote method 'hermes:api': Error: ";
         const normalized = typeof error?.message === 'string' && error.message.startsWith(prefix)
           ? new Error(error.message.slice(prefix.length)) : error;
+        // Plugin REST rides the host's IPC, so the Network tab never shows it.
+        // Name the route and the refusal code, never the refusal's free text.
+        if (normalized?.name !== 'AbortError') {
+          const reason = desktopTalkErrorCode(normalized?.message) ||
+            /^\d{3}\b/.exec(normalized?.message || '')?.[0] || normalized?.name || 'Error';
+          globalThis.console?.warn?.('[hermes-talk] ' + (options.method || 'GET') + ' ' +
+            suffix + ' failed: ' + reason);
+        }
         // A stock host cannot present TALK_DASHBOARD_TOKEN, so a refusal there is a
         // notice to show, not a lost host session to stop.
         if (/^(?:401|403)\b/.test(normalized?.message || '') &&

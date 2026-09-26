@@ -66,6 +66,7 @@ jobs:
             return 1
           }
           fetch plugin_guard.py "${home}/tools/plugin_guard.py"
+          fetch plugin_guard_context.py "${home}/tools/plugin_guard_context.py"
           fetch skills_guard.py "${home}/tools/skills_guard.py"
           touch "${home}/tools/__init__.py"
 
