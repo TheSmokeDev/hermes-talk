@@ -2274,37 +2274,45 @@ t.stop();
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_task_continuity_false_skips_prepare_task_on_start():
-    """With taskContinuity.supported:false, startTalk must not call prepareTask.
-
-    The documented legacy unbound lane is the fallback: the session is minted
-    without a task catalog binding, so hosts that lack
-    hermes_cli.dashboard_task_context never hit the 503 context_unavailable
-    path that blocked the desktop start lane before the fix.
-    """
-
-    script = r"""
+#: The page with an SDK that binds its own target, the way Desktop does. Hooks
+#: memoize like React's, so a mount-time refresh does not clear a start error.
+#: The status document comes from argv[2]; the script prints what Start did.
+PAGE_START_HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
-const prepareCalls = [];
-const sessionRequests = [];
-let sequence = 0;
+const status = JSON.parse(process.argv[2]);
+const prepareCalls = [], sessionRequests = [], errors = [];
 const slots = [], effects = [];
-let cursor = 0;
+let cursor = 0, sequence = 0;
+const changed = (deps, previous) => !previous || !deps ||
+  deps.some((dep, at) => dep !== previous.deps[at]);
 const hooks = {
   useState(initial) {
     const index = cursor++;
     if (!(index in slots)) slots[index] = initial;
-    return [slots[index], (value) => { slots[index] = typeof value === "function" ? value(slots[index]) : value; }];
+    return [slots[index], (value) => {
+      slots[index] = typeof value === "function" ? value(slots[index]) : value;
+      if (typeof slots[index] === "string" && slots[index]) errors.push(slots[index]);
+    }];
   },
-  useRef(initial) { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index]; },
-  useCallback(cb) { cursor++; return cb; },
+  useRef(initial) {
+    const index = cursor++;
+    if (!(index in slots)) slots[index] = { current: initial };
+    return slots[index];
+  },
+  useCallback(callback, deps) {
+    const index = cursor++;
+    if (changed(deps, slots[index])) slots[index] = { callback, deps: deps || [] };
+    return slots[index].callback;
+  },
   useEffect(effect, deps) {
     const index = cursor++, previous = slots[index];
-    if (!previous || deps.some((dep, at) => dep !== previous.deps[at])) {
-      effects.push(() => { if (previous && previous.cleanup) previous.cleanup();
-        slots[index] = { deps, cleanup: effect() }; });
+    if (changed(deps, previous)) {
+      effects.push(() => {
+        if (previous && previous.cleanup) previous.cleanup();
+        slots[index] = { deps, cleanup: effect() };
+      });
     }
   },
 };
@@ -2312,23 +2320,20 @@ const window = {
   __HERMES_TALK_TEST_HOOK__: true,
   __HERMES_PLUGINS__: { register() {} },
   __HERMES_PLUGIN_SDK__: {
-    React: { createElement(tag, props, ...children) { return { tag, props: props || {}, children }; } },
+    React: { createElement: (tag, props, ...children) => ({ tag, props: props || {}, children }) },
     hooks,
     components: { Button: "button" },
-    async prepareTask(opts) {
-      prepareCalls.push(opts);
+    async prepareTask(options) {
+      prepareCalls.push(options);
       return { target_id: "bound-task", label: "Bound task" };
     },
-    async fetchJSON(url, opts) {
-      const body = opts && opts.body ? JSON.parse(opts.body) : null;
-      if (url.endsWith("/status")) return {
-        configured: true, voices: ["marin"], voice: "marin",
-        voiceMode: "cascade", taskContinuity: { supported: false },
-      };
+    async fetchJSON(url, options) {
+      const body = options && options.body ? JSON.parse(options.body) : null;
+      if (url.endsWith("/status")) return status;
+      if (url.endsWith("/targets")) throw new Error("503: catalog not loaded");
       if (url.endsWith("/session")) {
         sessionRequests.push(body);
-        return { task: { connection_id: "page-conn", generation: 1,
-          context: { workspace: "unavailable" } } };
+        throw new Error("409: stop before audio");
       }
       return { ok: true };
     },
@@ -2347,35 +2352,79 @@ const context = {
 };
 vm.runInNewContext(source, context, { filename: "index.js" });
 const Page = window.__HERMES_TALK_TEST__.TalkPage;
-const render = () => { cursor = 0; effects.length = 0; const tree = Page(); effects.forEach((f) => f()); return tree; };
+const render = () => {
+  cursor = 0;
+  effects.length = 0;
+  const tree = Page();
+  effects.forEach((effect) => effect());
+  return tree;
+};
 const nodes = (tree) => !tree || typeof tree !== "object" ? []
   : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.children)];
 const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
   : Array.isArray(tree) ? tree.map(label).join(" ") : label(tree.children);
-const button = (tree, text) => nodes(tree).find((n) => n.tag === "button" && label(n) === text);
 const drain = () => new Promise((resolve) => setTimeout(resolve, 20));
 (async () => {
-  render(); await drain(); let tree = render();
-  const startBtn = button(tree, "Start legacy Talk");
-  assert(startBtn, "start button must be present when status is ready");
-  assert(!startBtn.props.disabled, "start button must be enabled for cascade mode");
-  startBtn.props.onClick();
+  render(); await drain(); render();
+  const start = nodes(render()).find((node) => node.tag === "button" &&
+    /^(?:Start|Join)/.test(label(node)) && node.props.onClick);
+  if (!start) throw new Error("no start button");
+  start.props.onClick();
   await drain();
-  assert.equal(prepareCalls.length, 0,
-    "prepareTask must not be called when taskContinuity.supported is false");
-  const sessionBody = sessionRequests.find((r) => r !== null);
-  assert(sessionBody, "a /session request must have been sent");
-  assert(!Object.hasOwn(sessionBody, "task"),
-    "the legacy unbound lane must not include a task binding");
+  const tree = render();
+  console.log(JSON.stringify({ prepareCalls: prepareCalls.length, sessionRequests,
+    errors, text: label(tree) }));
   process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });
 """
+
+
+def _press_start(status):
     completed = run(
-        ["node", "-e", script, str(DASHBOARD_JS)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=NODE_TIMEOUT_S,
-        check=False,
+        ["node", "-e", PAGE_START_HARNESS, str(DASHBOARD_JS), json.dumps(status)],
+        cwd=ROOT, capture_output=True, text=True, timeout=NODE_TIMEOUT_S, check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def _status(voice_mode, supported):
+    return {"ok": True, "configured": True, "source": "codex-oauth", "voices": ["marin"],
+            "voice": "marin", "voiceMode": voice_mode, "taskContinuity": {"supported": supported}}
+
+
+def test_task_continuity_false_skips_prepare_task_on_start():
+    """With taskContinuity.supported:false, startTalk must not call prepareTask.
+
+    The documented legacy unbound lane is the fallback: the session is minted
+    without a task catalog binding, so hosts that lack
+    hermes_cli.dashboard_task_context never hit the 503 context_unavailable
+    path that blocked the desktop start lane before the fix.
+    """
+
+    result = _press_start(_status("cascade", False))
+    assert result["prepareCalls"] == 0
+    assert len(result["sessionRequests"]) == 1
+    assert "task" not in result["sessionRequests"][0]
+
+
+def test_live_start_binds_its_own_target_without_a_preselected_task():
+    """A surface that binds its own target (Desktop) needs no prior choice for GPT-Live.
+
+    The catalog has not produced a selection here, the way an empty Talk-enabled
+    conversation or a slow catalog leaves it; Start must still bind and mint.
+    """
+
+    result = _press_start(_status("live", True))
+    assert result["prepareCalls"] == 1
+    assert [body["task"]["target_id"] for body in result["sessionRequests"]] == ["bound-task"]
+    assert not any("GPT-Live" in error for error in result["errors"])
+
+
+def test_live_start_on_a_host_without_task_context_names_the_missing_support():
+    """GPT-Live cannot run unbound, so a host without task context refuses before /session."""
+
+    result = _press_start(_status("live", False))
+    assert result["prepareCalls"] == 0
+    assert result["sessionRequests"] == []
+    assert "GPT-Live needs a Hermes host with task context support" in result["text"]
