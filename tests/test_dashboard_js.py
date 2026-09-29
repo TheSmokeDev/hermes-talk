@@ -436,6 +436,9 @@ vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
   window, setTimeout, clearTimeout, AbortController, console, btoa,
   document: { title: "Dashboard task page" }, navigator: { mediaDevices: {} },
     RTCPeerConnection: function () {},
+    CustomEvent: class {
+      constructor(type, init = {}) { this.type = type; this.detail = init.detail; }
+    },
 }, { filename: "index.js" });
 const Page = window.__HERMES_TALK_TEST__.TalkPage;
 window.__HERMES_TALK_TEST__.TalkTransport.prototype.start = async function () {
@@ -489,6 +492,47 @@ process.exit(0);
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+
+
+def test_presence_bus_mirrors_state_and_routes_commands_through_talk_controls():
+    script = PAGE_HARNESS + r"""
+(async()=>{
+const presence=[];let adds=0,removes=0;
+window.dispatchEvent=(event)=>{if(event.type==='hermes-talk:presence')presence.push(event.detail);
+  return true;};
+const add=window.addEventListener,remove=window.removeEventListener;
+window.addEventListener=(name,callback)=>{if(name==='hermes-talk:command')adds++;add(name,callback);};
+window.removeEventListener=(name,callback)=>{if(name==='hermes-talk:command')removes++;
+  remove(name,callback);};
+const command=(action)=>listeners['hermes-talk:command']({detail:{action}});
+render();await drain();render();
+assert(presence.length>=1,'First render must publish presence');
+assert.deepEqual(Object.keys(presence.at(-1)).sort(),
+  ['at','audioActivity','live','muted','phase','sleeping','transcript']);
+assert.equal(presence.at(-1).phase,'idle');
+assert.equal(presence.at(-1).muted,false);
+assert.equal(presence.at(-1).sleeping,false);
+command('mute');render();assert.equal(presence.at(-1).muted,true);
+command('unmute');render();assert.equal(presence.at(-1).muted,false);
+command('sleep');render();assert.equal(presence.at(-1).sleeping,true);
+command('wake');render();assert.equal(presence.at(-1).sleeping,false);
+const settled=presence.length;
+command('self-destruct');command(undefined);listeners['hermes-talk:command']({});
+render();render();
+assert.equal(presence.length,settled,'Unknown commands must change nothing');
+assert.equal(adds,1,'The command listener registers once across renders');
+assert.equal(removes,0);
+assert.equal(transports.length,0,'Presence commands here must not start audio');
+process.exit(0);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 TARGET_PAGE_HARNESS = PAGE_HARNESS + r"""
 const baseFetch = fetchOverride, connections = new Map();

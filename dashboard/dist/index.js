@@ -1966,7 +1966,7 @@ function createTalkSurface(SDK) {
     const [audioActivity, setAudioActivity] = useState({ input: false, output: false });
     const [appearance, updateAppearance] = useState({ skin: "system", animate: false,
       collapseOnConnect: true, hoverExpand: true });
-    // hermes-jarvis presence-bus BEGIN
+    // presence bus BEGIN
     // Optional presence bus: other surfaces can mirror the live call without reading
     // Talk's DOM. Inert when nothing listens; commands call Talk's own functions.
     const presenceBusRef = useRef(null);
@@ -1980,7 +1980,9 @@ function createTalkSurface(SDK) {
       } catch (e) { /* the bus is optional */ }
     }, [phase, live, audioActivity, transcript, muted, sleeping]);
     useEffect(() => {
-      if (typeof window === "undefined") return undefined;
+      if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+        return undefined;
+      }
       const onCommand = (event) => {
         const api = presenceBusRef.current || {}, action = event?.detail?.action;
         const call = (fn, value) => { if (typeof fn === "function") fn(value); };
@@ -1994,7 +1996,7 @@ function createTalkSurface(SDK) {
       window.addEventListener("hermes-talk:command", onCommand);
       return () => window.removeEventListener("hermes-talk:command", onCommand);
     }, []);
-    // hermes-jarvis presence-bus END
+    // presence bus END
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
