@@ -11,6 +11,17 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Added
+- Grok realtime accepts all 28 built-in voices documented by xAI, adding
+  `carina`, `zagan`, `helix`, `orion`, `luna`, `iris`, `altair`, `zenith`,
+  `perseus`, `helios`, `lux`, `kepler`, `rigel`, `cosmo`, `celeste`, `ursa`,
+  `sirius`, `lumen`, `castor`, `naksh`, `atlas`, `aurora`, and `liora` through
+  `TALK_GROK_VOICE`. Ara remains the default; names remain case-insensitive
+  and unknown names refuse closed. Config-to-session regression coverage
+  exercises every documented voice. Contributed by @zoidypuh.
+
 ## [0.21.1] — 2026-09-26
 
 Desktop Talk connects on a stock Hermes host, and when a request fails the panel

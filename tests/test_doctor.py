@@ -556,16 +556,18 @@ def test_provider_check_refuses_an_unknown_provider(monkeypatch):
     assert check["remediation"]
 
 
-def test_grok_provider_check_reports_readiness_without_the_key_value(monkeypatch):
+@pytest.mark.parametrize("voice", ["ara", "carina", "zagan", "liora"])
+def test_grok_provider_check_reports_readiness_without_the_key_value(monkeypatch, voice):
     monkeypatch.setenv("TALK_PROVIDER", "grok")
     monkeypatch.setenv("TALK_XAI_API_KEY", "xai-scoped-test")
+    monkeypatch.setenv("TALK_GROK_VOICE", voice)
 
     check = _checks(talk_doctor.collect_report())["provider"]
 
     assert check["status"] == "pass"
     assert check["details"]["keys"] == {"scoped": "present", "shared": "absent"}
     assert check["details"]["model"] == "grok-voice-latest"
-    assert check["details"]["voice"] == "ara"
+    assert check["details"]["voice"] == voice
     assert check["details"]["voice_valid"] is True
     assert "xai-scoped-test" not in json.dumps(check)
 
