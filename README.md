@@ -101,6 +101,8 @@ Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 The provider knob is fail-closed and never inferred from which keys exist.
 Per-lane detail and the credential order: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
+Experimental xAI speech effects and phrase wrappers, including how native Talk
+differs from verbatim TTS: [docs/XAI-SPEECH-TAGS.md](docs/XAI-SPEECH-TAGS.md).
 
 ## Surfaces
 

@@ -11,6 +11,16 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Added
+- An [xAI speech-tag reference](docs/XAI-SPEECH-TAGS.md) with 114 exact inline
+  spellings and 13 phrase wrappers from Switchboard field notes. It records
+  positive, variable, and unclassified observations, explains how Grok turns
+  Hermes results into speech, and distinguishes that flow from verbatim TTS.
+  This is experimental documentation, not a new provider or runtime guarantee.
+  Contributed by @zoidypuh.
+
 ## [0.21.1] — 2026-09-26
 
 Desktop Talk connects on a stock Hermes host, and when a request fails the panel
