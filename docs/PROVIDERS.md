@@ -53,6 +53,16 @@ logged receipt — never a faked upstream call. The Discord lane refuses
 Gemini for now: its gated-response authorization flow has no Live wire
 equivalent, so connect fails closed rather than answering unvetted speakers.
 
+## Grok speech tags and text-to-speech
+
+The Grok realtime lane generates speech from Hermes tool results and background
+reports; the voice manager summarizes the result rather than synthesizing the
+entire answer verbatim. The [xAI speech-tag field notes](XAI-SPEECH-TAGS.md)
+collect 114 inline spellings and 13 phrase wrappers from Switchboard experiments,
+with exact syntax, listening classifications, and the distinction between native
+Talk, xAI REST TTS, and xAI's separate `force_message` extension. These are
+experimental observations, not automatic tag support in every provider lane.
+
 ## Auth — no API key needed if you have ChatGPT
 
 This section describes **OpenAI Realtime**. GPT-Live uses the independent
