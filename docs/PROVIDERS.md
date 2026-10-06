@@ -32,8 +32,15 @@ tier-denied token gets a one-line remediation at connect, never a
 traceback; `hermes talk doctor --probe` makes two live calls to
 `api.x.ai` to prove the resolved bearer reaches realtime before you sit
 down to talk. The lane rides model `grok-voice-latest`
-(override: `TALK_GROK_MODEL`), and offers five voices — `ara`, `rex`, `sal`,
-`eve`, `leo` — via `TALK_GROK_VOICE` (fail-closed on unknown names). Same
+(override: `TALK_GROK_MODEL`), and offers all 28 documented built-in voices
+via `TALK_GROK_VOICE`: `ara`, `rex`, `sal`, `eve`, `leo`, `carina`, `zagan`,
+`helix`, `orion`, `luna`, `iris`, `altair`, `zenith`, `perseus`, `helios`,
+`lux`, `kepler`, `rigel`, `cosmo`, `celeste`, `ursa`, `sirius`, `lumen`,
+`castor`, `naksh`, `atlas`, `aurora`, `liora`. Names are case-insensitive;
+`ara` remains the default, and unknown names refuse closed. The roster is
+shared with xAI's [text-to-speech voice table](https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#voices)
+([speech-to-speech docs](https://docs.x.ai/developers/model-capabilities/audio/speech-to-speech#available-voices),
+checked 2026-10-04). For example, set `TALK_GROK_VOICE=carina`. Same
 contract, same tools, same barge-in; terminal and Discord lanes both honor
 the knob. The dashboard tab stays OpenAI-only for now — xAI has no WebRTC
 offer endpoint, so that lane is a separate backend-relay piece. Doctor gains

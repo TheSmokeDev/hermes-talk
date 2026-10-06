@@ -99,6 +99,8 @@ Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 | Cascade voice (`TALK_VOICE_MODE=cascade`) | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY`, on top of the OpenAI Realtime lane | `eleven_flash_v2_5` | terminal, Discord, dashboard |
 
 The provider knob is fail-closed and never inferred from which keys exist.
+Grok supports all 28 documented built-in voices through `TALK_GROK_VOICE`
+(for example, `carina`); see the [voice list](docs/PROVIDERS.md#provider-details--openai-default-grok-or-gemini).
 Per-lane detail and the credential order: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
 

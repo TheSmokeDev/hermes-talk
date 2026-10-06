@@ -36,7 +36,38 @@ DEFAULT_GROK_MODEL = "grok-voice-latest"
 DEFAULT_GROK_VOICE = "ara"
 #: Friendly Grok voice names, WITHOUT the wire prefix — the adapter adds
 #: ``xai_`` at encode time so operators never configure wire vocabulary.
-GROK_REALTIME_VOICES = ("ara", "rex", "sal", "eve", "leo")
+#: Speech-to-speech shares the text-to-speech roster, checked 2026-10-04:
+#: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#voices
+GROK_REALTIME_VOICES = (
+    "ara",
+    "rex",
+    "sal",
+    "eve",
+    "leo",
+    "carina",
+    "zagan",
+    "helix",
+    "orion",
+    "luna",
+    "iris",
+    "altair",
+    "zenith",
+    "perseus",
+    "helios",
+    "lux",
+    "kepler",
+    "rigel",
+    "cosmo",
+    "celeste",
+    "ursa",
+    "sirius",
+    "lumen",
+    "castor",
+    "naksh",
+    "atlas",
+    "aurora",
+    "liora",
+)
 #: Gemini Live native-audio preview model, probed against the live endpoint
 #: 2026-08-28 (setup accepted, tool loop round-tripped). The adapter adds the
 #: ``models/`` wire prefix; operators configure the bare id. Fallback line:

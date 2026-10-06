@@ -107,13 +107,13 @@ class _Client:
         return _Context(self.socket, lambda: setattr(self.socket, "exited", True))
 
 
-def _setup(*, automatic_response=True, turn_detection=None):
+def _setup(*, voice="ara", automatic_response=True, turn_detection=None):
     kwargs = {}
     if turn_detection is not None:
         kwargs["turn_detection"] = turn_detection
     return rt.SessionSetup(
         model="grok-voice-test",
-        voice="ara",
+        voice=voice,
         instructions="Be brief.",
         tools=(
             rt.ToolDefinition(
@@ -234,6 +234,56 @@ def test_semantic_vad_is_refused_before_websocket_connection():
 def test_wire_voice_prefix_is_applied_exactly_once():
     assert grok_rt._wire_voice("ara") == "xai_ara"
     assert grok_rt._wire_voice("xai_eve") == "xai_eve"
+
+
+@pytest.mark.parametrize(
+    "voice",
+    (
+        "carina",
+        "zagan",
+        "helix",
+        "orion",
+        "luna",
+        "iris",
+        "altair",
+        "zenith",
+        "perseus",
+        "helios",
+        "lux",
+        "kepler",
+        "rigel",
+        "cosmo",
+        "celeste",
+        "ursa",
+        "sirius",
+        "lumen",
+        "castor",
+        "naksh",
+        "atlas",
+        "aurora",
+        "liora",
+        "ara",
+        "eve",
+        "leo",
+        "rex",
+        "sal",
+    ),
+)
+def test_documented_grok_voice_reaches_session_update(clean_provider_env, voice):
+    # Roster from xAI's speech-to-speech -> text-to-speech voice table,
+    # checked 2026-10-04. Each name must survive config validation and encoding.
+    clean_provider_env.setenv("TALK_GROK_VOICE", f" {voice.upper()} ")
+
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup(voice=talk_config.talk_grok_voice()))
+        await adapter.close()
+        return socket.sent[0]
+
+    payload = asyncio.run(scenario())
+
+    assert payload["session"]["audio"]["output"]["voice"] == f"xai_{voice}"
 
 
 def test_no_tools_means_no_tool_fields():
