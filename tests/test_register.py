@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import subprocess
 import sys
 import textwrap
 import types
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 
 import pytest
@@ -756,3 +758,128 @@ def test_canonical_leave_cancels_only_authorized_current_startup(plugin, monkeyp
             discord.reset_for_tests()
 
     asyncio.run(run())
+
+
+@pytest.fixture
+def scoped_gateway_platform(monkeypatch):
+    """Host contract double: task-local platform survives executor dispatch.
+
+    Keep these regressions runnable without installing Hermes itself. The
+    gateway copies context into its worker, then awaits a returned coroutine
+    on the owner loop; neither step is an ordinary direct async handler call.
+    """
+    platform = ContextVar("test_gateway_platform", default="")
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    context = types.ModuleType("gateway.session_context")
+    context.get_session_env = lambda name: platform.get() if name == (
+        "HERMES_SESSION_PLATFORM"
+    ) else ""
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", context)
+    return platform
+
+
+async def _dispatch_offloaded_talk(plugin, platform, raw, invocation=None):
+    """Mirror run_inbound's sync executor call and coroutine handoff."""
+    token = platform.set("discord")
+    try:
+        context = copy_context()
+
+        def worker():
+            with pytest.raises(RuntimeError):
+                asyncio.get_running_loop()
+            return plugin._talk_command(raw, invocation=invocation)
+
+        result = await asyncio.get_running_loop().run_in_executor(None, context.run, worker)
+        assert inspect.iscoroutine(result)
+        return await result
+    finally:
+        platform.reset(token)
+
+
+@pytest.mark.parametrize("raw", ["", "join", "status", "pause", "resume", "leave"])
+def test_offloaded_discord_command_runs_on_owner_loop(
+    plugin, monkeypatch, scoped_gateway_platform, raw,
+):
+    monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "cascade")
+    monkeypatch.delenv("TALK_TASK_TARGET", raising=False)
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
+    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: pytest.fail("terminal audio"))
+    calls = []
+
+    async def run():
+        owner = asyncio.get_running_loop()
+
+        def room_command():
+            assert asyncio.get_running_loop() is owner
+            calls.append(raw)
+            return "room receipt"
+
+        method = {
+            "": "start_session", "join": "start_session", "status": "session_status",
+            "pause": "pause_session", "resume": "resume_session", "leave": "stop_session",
+        }[raw]
+        monkeypatch.setattr(plugin.talk_discord, method, room_command)
+        return await _dispatch_offloaded_talk(plugin, scoped_gateway_platform, raw)
+
+    assert asyncio.run(run()) == "room receipt"
+    assert calls == [raw]
+
+
+def test_offloaded_canonical_control_awaits_nested_coroutine(
+    plugin, monkeypatch, scoped_gateway_platform,
+):
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: True)
+    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: pytest.fail("terminal audio"))
+    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
+               "anchor_session_id": "Anchor", "proof": "test-host-proof"}
+    invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
+    calls = []
+
+    async def run():
+        owner = asyncio.get_running_loop()
+
+        async def command(line, **ids):
+            assert asyncio.get_running_loop() is owner
+            calls.append((line, ids))
+            return {"output": "PRIVATE-RESULT"}
+
+        monkeypatch.setattr(plugin.talk_discord, "native_command", command)
+        return await _dispatch_offloaded_talk(
+            plugin, scoped_gateway_platform, "result 7", invocation,
+        )
+
+    receipt = asyncio.run(run())
+    assert "PRIVATE-RESULT" not in receipt and "test-host-proof" not in receipt
+    assert "Task access checked" in receipt
+    assert calls == [("/result 7", {"guild_id": 11, "channel_id": 22, "operator_user_id": 33})]
+
+
+def test_offloaded_live_join_still_requires_host_authorization(
+    plugin, monkeypatch, scoped_gateway_platform,
+):
+    monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "live")
+    monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
+    monkeypatch.setattr(plugin.talk_discord, "start_session", lambda **kw: pytest.fail("unbound"))
+    receipt = asyncio.run(_dispatch_offloaded_talk(plugin, scoped_gateway_platform, "join"))
+    assert "authorized Discord command" in receipt
+
+
+def test_terminal_routing_uses_scoped_platform_not_process_env(
+    plugin, monkeypatch, scoped_gateway_platform,
+):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    calls = []
+    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: calls.append(kw) or 0)
+    assert scoped_gateway_platform.get() == ""
+    assert plugin._talk_command("") == "Voice session ended."
+    assert "terminal" in plugin._talk_command("status")
+    assert calls == [{"keyboard_control": False}]
+
+
+def test_terminal_routing_without_gateway_module(plugin, monkeypatch):
+    monkeypatch.setitem(sys.modules, "gateway.session_context", None)
+    monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: 0)
+    assert plugin._talk_command("") == "Voice session ended."
+    assert "terminal" in plugin._talk_command("join")

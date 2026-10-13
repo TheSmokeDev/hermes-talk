@@ -191,8 +191,9 @@ def _register_talk_command(ctx) -> None:
 def _talk_command(raw_args: str = "", invocation=None) -> str:
     """``/talk`` — start a voice session from inside a Hermes session.
 
-    Two rooms, one command. Outside an event loop (a terminal session) the
-    call owns the terminal: microphone in, speaker out. Inside the gateway
+    Two rooms, one command. In a terminal session the call owns the terminal:
+    microphone in, speaker out. Discord gateway workers return a coroutine
+    to resume on the owner loop. Inside the gateway
     it runs in the Discord voice channel the host is already sitting in —
     ``join`` / ``leave`` / ``status`` — because a duplex call cannot own a
     terminal that nobody is looking at, and the gateway has a better room.
@@ -203,6 +204,19 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        # Hermes offloads synchronous gateway handlers to a context-preserving
+        # worker. No event loop there does not imply a terminal invocation.
+        try:
+            from gateway.session_context import get_session_env
+        except ImportError:
+            platform = ""
+        else:
+            platform = get_session_env("HERMES_SESSION_PLATFORM")
+        if platform == "discord":
+            # The gateway awaits returned coroutines on its owning event loop.
+            # Keep Discord objects and tasks on that loop; never asyncio.run()
+            # them in this worker or bypass the existing audience checks.
+            return _talk_command_on_gateway_loop(raw_args, invocation)
         if sub in {"join", "core join", "pause", "resume", "leave", "status"}:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
@@ -264,6 +278,14 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
         return talk_discord.start_session()
     return talk_discord.JOIN_USAGE
 
+
+
+async def _talk_command_on_gateway_loop(raw_args: str = "", invocation=None) -> str:
+    """Resume an offloaded Discord command on the gateway's owning loop."""
+    result = _talk_command(raw_args, invocation)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _canonical_discord_command(raw, invocation):
