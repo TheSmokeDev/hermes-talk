@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
+from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
@@ -34,6 +37,7 @@ DEFAULT_TALK_PROVIDER = "openai"
 #: create). The model rides the socket URL query, never the session update.
 DEFAULT_GROK_MODEL = "grok-voice-latest"
 DEFAULT_GROK_VOICE = "ara"
+DEFAULT_GROK_WS_URL = "wss://api.x.ai/v1/realtime"
 #: Friendly Grok voice names, WITHOUT the wire prefix — the adapter adds
 #: ``xai_`` at encode time so operators never configure wire vocabulary.
 GROK_REALTIME_VOICES = ("ara", "rex", "sal", "eve", "leo")
@@ -457,6 +461,54 @@ def talk_grok_voice() -> str:
             f"({', '.join(GROK_REALTIME_VOICES)})"
         )
     return raw
+
+
+def _validate_grok_ws_url(raw: str) -> str:
+    """Validate one operator-supplied Grok WebSocket endpoint."""
+
+    try:
+        parts = urlsplit(raw)
+        hostname = parts.hostname
+        _port = parts.port  # Accessing this rejects malformed ports.
+    except ValueError:
+        raise TalkConfigError("TALK_GROK_WS_URL is not a valid WebSocket URL") from None
+    if parts.scheme not in {"ws", "wss"} or not parts.netloc or not hostname:
+        raise TalkConfigError(
+            "TALK_GROK_WS_URL must be a ws:// or wss:// URL with a hostname"
+        )
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        raise TalkConfigError("TALK_GROK_WS_URL must not include embedded userinfo")
+    if "#" in raw or parts.fragment:
+        raise TalkConfigError("TALK_GROK_WS_URL must not include a fragment")
+    if parts.scheme == "ws":
+        loopback = hostname.lower() == "localhost"
+        if not loopback:
+            try:
+                loopback = ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = False
+        if not loopback:
+            raise TalkConfigError(
+                "TALK_GROK_WS_URL may use ws:// only for localhost, 127.0.0.0/8, or ::1; "
+                "use wss:// for remote endpoints"
+            )
+    return raw
+
+
+def talk_grok_ws_url(env: Mapping[str, str] | None = None) -> str | None:
+    """Return a validated custom Grok WebSocket URL, or ``None`` for native xAI."""
+
+    source = os.environ if env is None else env
+    raw = source.get("TALK_GROK_WS_URL")
+    if raw is None or not str(raw).strip():
+        return None
+    return _validate_grok_ws_url(str(raw).strip())
+
+
+def talk_grok_ws_endpoint(env: Mapping[str, str] | None = None) -> str:
+    """Return the selected Grok WebSocket endpoint at call time."""
+
+    return talk_grok_ws_url(env) or DEFAULT_GROK_WS_URL
 
 
 def talk_gemini_model() -> str:
@@ -994,6 +1046,7 @@ __all__ = [
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
     "DEFAULT_GROK_VOICE",
+    "DEFAULT_GROK_WS_URL",
     "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_PROVIDER",
@@ -1045,6 +1098,8 @@ __all__ = [
     "talk_gemini_voice",
     "talk_grok_model",
     "talk_grok_voice",
+    "talk_grok_ws_endpoint",
+    "talk_grok_ws_url",
     "talk_model",
     "talk_provider",
     "talk_voice",

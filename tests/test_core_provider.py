@@ -1111,6 +1111,18 @@ def test_availability_reports_configured_without_resolving_a_token(core, monkeyp
     assert core.TalkGeminiCoreProvider().is_available() is False
 
 
+def test_grok_availability_uses_the_custom_endpoint_auth_lane(core, monkeypatch):
+    monkeypatch.setenv("TALK_GROK_WS_URL", "ws://127.0.0.1:4000/realtime")
+    monkeypatch.setenv("XAI_API_KEY", "native-key")
+    monkeypatch.delenv("TALK_GROK_API_KEY", raising=False)
+
+    provider = core.TalkGrokCoreProvider()
+    assert provider.is_available() is False
+
+    monkeypatch.setenv("TALK_GROK_API_KEY", "proxy-key")
+    assert provider.is_available() is True
+
+
 def test_a_broken_probe_reports_unavailable_instead_of_raising(core, monkeypatch):
     import talk_auth
 

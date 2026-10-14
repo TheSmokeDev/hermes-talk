@@ -66,6 +66,8 @@ def _hermetic(monkeypatch, tmp_path):
         "TALK_PROVIDER",
         "TALK_GROK_MODEL",
         "TALK_GROK_VOICE",
+        "TALK_GROK_WS_URL",
+        "TALK_GROK_API_KEY",
         "TALK_XAI_API_KEY",
         "XAI_API_KEY",
         "TALK_PREFER_XAI_OAUTH",
@@ -615,6 +617,39 @@ def test_human_report_renders_the_grok_provider_receipt(monkeypatch):
     assert "xai-shared-test" not in rendered
 
 
+def test_custom_grok_provider_requires_dedicated_key_and_ignores_native_keys(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv("TALK_GROK_WS_URL", "ws://127.0.0.1:4000/v1/realtime")
+    monkeypatch.setenv("XAI_API_KEY", "native-key-canary")
+
+    checks = _checks(talk_doctor.collect_report())
+
+    assert checks["provider"]["status"] == "fail"
+    assert checks["provider"]["details"]["endpoint"] == "custom"
+    assert checks["provider"]["details"]["keys"] == {"endpoint": "absent"}
+    assert "TALK_GROK_API_KEY" in checks["provider"]["summary"]
+    assert checks["auth"]["details"]["custom_endpoint"] is True
+    assert checks["auth"]["details"]["winning_lane"] is None
+    assert "native-key-canary" not in json.dumps(checks)
+
+
+def test_custom_grok_provider_receipt_redacts_endpoint_details(monkeypatch):
+    monkeypatch.setenv("TALK_PROVIDER", "grok")
+    monkeypatch.setenv(
+        "TALK_GROK_WS_URL",
+        "wss://proxy.example/v1/realtime?model=proxy-model&token=proxy-secret",
+    )
+    monkeypatch.setenv("TALK_GROK_API_KEY", "proxy-key-canary")
+
+    check = _checks(talk_doctor.collect_report())["provider"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["endpoint_url"] == "wss://proxy.example"
+    dumped = json.dumps(check)
+    assert "proxy-key-canary" not in dumped
+    assert "proxy-secret" not in dumped
+
+
 def test_gemini_provider_check_reports_readiness_without_the_key_value(monkeypatch):
     monkeypatch.setenv("TALK_PROVIDER", "gemini")
     monkeypatch.setenv("TALK_GEMINI_API_KEY", "gemini-scoped-test")
@@ -1025,6 +1060,63 @@ def test_grok_probe_flags_an_unexpected_first_event():
     assert result["ok"] is False
     assert result["first_event"] == "error"
     assert result["error"] == "unexpected probe receipt (see http_status / first_event)"
+
+
+def test_custom_grok_probe_uses_only_the_configured_websocket(monkeypatch):
+    monkeypatch.setenv(
+        "TALK_GROK_WS_URL",
+        "wss://proxy.example/v1/realtime?model=proxy-model&token=proxy-secret",
+    )
+
+    class NoPostHttp(_ProbeHttp):
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("custom probe must not call native xAI client_secrets")
+
+    http = NoPostHttp(http_status=200, ws=_ProbeSocket("session.created"))
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="proxy-key-canary",
+            auth_source="configured",
+            model="ignored-model",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["custom_endpoint"] is True
+    assert result["http_status"] is None
+    assert [url for url, _ in http.calls] == [
+        "wss://proxy.example/v1/realtime?model=proxy-model&token=proxy-secret"
+    ]
+    assert http.calls[0][1]["headers"] == {"Authorization": "Bearer proxy-key-canary"}
+    rendered = talk_doctor.render_probe(result)
+    assert "one WebSocket call to custom endpoint" in rendered
+    assert "proxy-secret" not in rendered
+    assert "proxy-key-canary" not in rendered
+
+
+def test_custom_grok_probe_redacts_transport_exception(monkeypatch):
+    monkeypatch.setenv(
+        "TALK_GROK_WS_URL",
+        "wss://proxy.example/v1/realtime?token=proxy-secret",
+    )
+    http = _ProbeHttp(
+        http_status=200,
+        ws=RuntimeError("cannot open proxy-secret with bearer proxy-key-canary"),
+    )
+
+    result = _run(
+        talk_doctor.run_grok_probe(
+            auth_token="proxy-key-canary",
+            auth_source="configured",
+            model="grok-voice-latest",
+            aiohttp_module=_fake_aiohttp(http),
+        )
+    )
+
+    assert result["error"] == "RuntimeError: custom Grok endpoint probe failed"
+    assert "proxy-secret" not in json.dumps(result)
+    assert "proxy-key-canary" not in json.dumps(result)
 
 
 def test_probe_refuses_non_grok_providers(monkeypatch):

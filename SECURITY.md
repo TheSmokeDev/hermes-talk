@@ -42,7 +42,9 @@ the code is built to hold, so a break is a bug by definition:
   refresh token, or the ephemeral session secret reaches a log line, an HTTP
   response, a transcript, a run record, a doctor/check/diagnostics report, or
   a spoken sentence. The rule is that the raw credential is spent on exactly
-  one upstream endpoint and appears nowhere else.
+  one upstream endpoint and appears nowhere else. `TALK_GROK_API_KEY` is a
+  dedicated credential for `TALK_GROK_WS_URL`: it never falls back to native
+  xAI keys or OAuth, and it never reaches `api.x.ai`.
 - **Auth-store writes.** Anything that writes to a credential store outside
   the one documented path (the Codex OAuth refresh that rewrites
   `auth.json` atomically with the same tokens the Codex CLI itself would

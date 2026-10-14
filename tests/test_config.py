@@ -91,6 +91,25 @@ def test_unknown_voice_raises(monkeypatch):
         talk_config.talk_voice()
 
 
+def test_grok_custom_endpoint_is_optional_and_validates_transport(monkeypatch):
+    monkeypatch.delenv("TALK_GROK_WS_URL", raising=False)
+    assert talk_config.talk_grok_ws_url() is None
+    assert talk_config.talk_grok_ws_endpoint() == talk_config.DEFAULT_GROK_WS_URL
+
+    monkeypatch.setenv("TALK_GROK_WS_URL", "ws://127.0.0.1:4000/v1/realtime")
+    assert talk_config.talk_grok_ws_url() == "ws://127.0.0.1:4000/v1/realtime"
+
+    for value in (
+        "http://127.0.0.1/realtime",
+        "ws://remote.example/realtime",
+        "ws://user@localhost/realtime",
+        "wss://localhost/realtime#fragment",
+    ):
+        monkeypatch.setenv("TALK_GROK_WS_URL", value)
+        with pytest.raises(talk_config.TalkConfigError, match="TALK_GROK_WS_URL"):
+            talk_config.talk_grok_ws_url()
+
+
 def test_state_dir_follows_hermes_home(monkeypatch, tmp_path):
     # Block the host resolver so the env fallback is what gets exercised —
     # otherwise this passes or fails depending on whether hermes-agent happens

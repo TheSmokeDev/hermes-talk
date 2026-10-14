@@ -41,15 +41,18 @@ from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
+    from . import talk_config
     from . import talk_realtime as rt
 except ImportError:  # pragma: no cover - flat-module fallback
+    import talk_config
     import talk_realtime as rt
 
 logger = logging.getLogger(__name__)
 
-XAI_REALTIME_WS_URL = "wss://api.x.ai/v1/realtime"
+XAI_REALTIME_WS_URL = talk_config.DEFAULT_GROK_WS_URL
 CONNECT_TIMEOUT_S = 30.0
 NORMAL_WEBSOCKET_CLOSE_CODES = (None, 1000, 1001)
 #: xAI-native input transcription model (docs.x.ai speech-to-speech). Setting
@@ -75,6 +78,18 @@ def _import_aiohttp():
             "aiohttp is required for the voice session — run: pip install hermes-talk"
         ) from exc
     return aiohttp
+
+
+def grok_ws_url(model: str, *, base_url: str | None = None) -> str:
+    """Resolve one Grok endpoint and add its model query exactly once."""
+
+    endpoint = base_url or talk_config.talk_grok_ws_endpoint()
+    parts = urlsplit(endpoint)
+    if any(key == "model" for key, _value in parse_qsl(parts.query, keep_blank_values=True)):
+        return endpoint
+    model_query = urlencode({"model": model})
+    query = f"{parts.query}&{model_query}" if parts.query else model_query
+    return urlunsplit(parts._replace(query=query))
 
 
 def _wire_voice(voice: str) -> str:
@@ -437,9 +452,19 @@ class _GrokWireSession:
     cleared on every terminal path.
     """
 
-    def __init__(self, *, auth_token: str, auth_source: str, aiohttp_module=None) -> None:
+    def __init__(
+        self,
+        *,
+        auth_token: str,
+        auth_source: str,
+        ws_url: str,
+        custom_endpoint: bool,
+        aiohttp_module=None,
+    ) -> None:
         self._auth_token: str | None = auth_token
         self._auth_source: str | None = auth_source
+        self._ws_url = ws_url
+        self._custom_endpoint = custom_endpoint
         self._aiohttp = aiohttp_module
         self._stack: AsyncExitStack | None = None
         self._ws = None
@@ -464,12 +489,17 @@ class _GrokWireSession:
             auth_token = self._auth_token
             if auth_token is None:
                 raise GrokWireError("Realtime wire credentials are unavailable")
+            if self._custom_endpoint and self._auth_source == "xai-oauth":
+                raise GrokWireError(
+                    "xAI OAuth cannot be used with a custom Grok endpoint"
+                )
             aiohttp = self._aiohttp or _import_aiohttp()
             http = await stack.enter_async_context(aiohttp.ClientSession())
             try:
+                connect_url = grok_ws_url(model, base_url=self._ws_url)
                 ws = await stack.enter_async_context(
                     http.ws_connect(
-                        f"{XAI_REALTIME_WS_URL}?model={model}",
+                        connect_url,
                         headers={"Authorization": f"Bearer {auth_token}"},
                         timeout=CONNECT_TIMEOUT_S,
                         heartbeat=20.0,
@@ -497,6 +527,10 @@ class _GrokWireSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if self._custom_endpoint:
+                raise GrokWireError(
+                    f"{type(exc).__name__}: custom Grok endpoint send failed"
+                ) from None
             raise GrokWireError(str(exc)) from exc
 
     def __aiter__(self):
@@ -519,7 +553,10 @@ class _GrokWireSession:
         if close_code not in NORMAL_WEBSOCKET_CLOSE_CODES:
             reasons.append(f"close code {close_code}")
         if socket_exception is not None:
-            detail = str(socket_exception).strip() or type(socket_exception).__name__
+            if self._custom_endpoint:
+                detail = f"{type(socket_exception).__name__}: custom Grok endpoint closed"
+            else:
+                detail = str(socket_exception).strip() or type(socket_exception).__name__
             reasons.append(detail)
         return f"Provider WebSocket closed abnormally ({'; '.join(reasons)})"
 
@@ -533,6 +570,8 @@ class _GrokWireSession:
                 raise GrokWireEOF(self._eof_failure_detail()) from None
             aiohttp = self._aiohttp or _import_aiohttp()
             if message.type == getattr(aiohttp.WSMsgType, "ERROR", object()):
+                if self._custom_endpoint:
+                    raise GrokWireError("custom Grok endpoint WebSocket error") from None
                 detail = str(getattr(message, "data", "") or "").strip()
                 raise GrokWireError(detail or "Provider WebSocket receive failed")
             if message.type is not aiohttp.WSMsgType.TEXT:
@@ -620,7 +659,9 @@ _HANDSHAKE_REMEDIATION: dict[int, tuple[str, str]] = {
 }
 
 
-def handshake_remediation(exc: BaseException, *, auth_source: str | None) -> str | None:
+def handshake_remediation(
+    exc: BaseException, *, auth_source: str | None, custom_endpoint: bool = False
+) -> str | None:
     """A one-line operator remediation for an auth-shaped handshake failure.
 
     Returns ``None`` for anything that is not a 401/403 WebSocket handshake
@@ -635,6 +676,12 @@ def handshake_remediation(exc: BaseException, *, auth_source: str | None) -> str
     if texts is None:
         return None
     oauth_text, key_text = texts
+    if custom_endpoint:
+        return (
+            "custom Grok endpoint key rejected (401)"
+            if status == 401
+            else "custom Grok endpoint refused this key (403)"
+        )
     return oauth_text if auth_source == "xai-oauth" else key_text
 
 
@@ -644,10 +691,20 @@ class GrokRealtimeSession:
     def __init__(self, *, auth_token: str, auth_source: str, aiohttp_module=None) -> None:
         self.auth_token = auth_token
         self.auth_source = auth_source
+        custom_url = talk_config.talk_grok_ws_url()
+        if custom_url is not None and auth_source == "xai-oauth":
+            raise rt.RealtimeSessionError(
+                "xAI OAuth cannot be used with a custom Grok endpoint; "
+                "set TALK_GROK_API_KEY"
+            )
+        self.ws_url = custom_url or XAI_REALTIME_WS_URL
+        self.custom_endpoint = custom_url is not None
         self.state = rt.SessionState.NEW
         self._wire = _GrokWireSession(
             auth_token=auth_token,
             auth_source=auth_source,
+            ws_url=self.ws_url,
+            custom_endpoint=self.custom_endpoint,
             aiohttp_module=aiohttp_module,
         )
         self._terminal_emitted = False
@@ -680,10 +737,23 @@ class GrokRealtimeSession:
             self.state = rt.SessionState.FAILED
             if isinstance(exc, rt.RealtimeSessionError):
                 raise
-            remediation = handshake_remediation(exc, auth_source=self.auth_source)
+            remediation = handshake_remediation(
+                exc,
+                auth_source=self.auth_source,
+                custom_endpoint=self.custom_endpoint,
+            )
             if remediation is not None:
+                if self.custom_endpoint:
+                    raise rt.RealtimeSessionError(remediation) from None
                 raise rt.RealtimeSessionError(remediation) from exc
-            raise rt.RealtimeSessionError(str(exc)) from exc
+            detail = (
+                f"{type(exc).__name__}: custom Grok endpoint connection failed"
+                if self.custom_endpoint
+                else str(exc)
+            )
+            if self.custom_endpoint:
+                raise rt.RealtimeSessionError(detail) from None
+            raise rt.RealtimeSessionError(detail) from exc
         self.state = rt.SessionState.CONNECTED
 
     async def send(self, commands: Sequence[rt.RealtimeCommand]) -> None:
@@ -705,6 +775,10 @@ class GrokRealtimeSession:
             await self._wire.send_json(encoded)
         except Exception as exc:
             self.state = rt.SessionState.FAILED
+            if self.custom_endpoint:
+                raise rt.RealtimeSessionError(
+                    f"{type(exc).__name__}: custom Grok endpoint send failed"
+                ) from None
             raise rt.RealtimeSessionError(str(exc)) from exc
 
     def __aiter__(self):
@@ -769,7 +843,14 @@ class GrokRealtimeSession:
             return event
 
     async def close(self) -> None:
-        await self._wire.close()
+        try:
+            await self._wire.close()
+        except Exception as exc:
+            if self.custom_endpoint:
+                raise rt.RealtimeSessionError(
+                    f"{type(exc).__name__}: custom Grok endpoint close failed"
+                ) from None
+            raise
         if self.state is not rt.SessionState.FAILED:
             self.state = rt.SessionState.CLOSED
 
@@ -785,5 +866,6 @@ __all__ = [
     "build_session_update",
     "decode_event",
     "encode_command",
+    "grok_ws_url",
     "handshake_remediation",
 ]

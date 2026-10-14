@@ -39,6 +39,13 @@ the knob. The dashboard tab stays OpenAI-only for now — xAI has no WebRTC
 offer endpoint, so that lane is a separate backend-relay piece. Doctor gains
 a provider check: selection, redacted key presence, model/voice validity.
 
+For a Grok-compatible proxy, set `TALK_GROK_WS_URL` and its dedicated
+`TALK_GROK_API_KEY`. The endpoint must use `wss://`, except for literal
+loopback `ws://` addresses (`localhost`, `127.0.0.0/8`, or `::1`). A custom
+endpoint uses only that dedicated key: native xAI keys and the xAI OAuth login
+are ignored, and `doctor --probe` opens only the configured WebSocket instead
+of calling `api.x.ai`.
+
 The Gemini lane is the zero-cost option: free-tier Google AI Studio keys
 work. Set `GEMINI_API_KEY` (or Talk-scoped `TALK_GEMINI_API_KEY`;
 set-but-blank refuses), ride model `gemini-3.1-flash-live-preview`

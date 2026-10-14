@@ -11,6 +11,13 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## Unreleased
+
+### Added
+- Custom Grok-compatible WebSocket endpoints through `TALK_GROK_WS_URL` with
+  dedicated `TALK_GROK_API_KEY` auth. Native xAI key and OAuth precedence stays
+  unchanged by default; custom probes use only the configured WebSocket.
+
 ## [0.21.1] — 2026-09-26
 
 Desktop Talk connects on a stock Hermes host, and when a request fails the panel

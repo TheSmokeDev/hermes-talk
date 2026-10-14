@@ -320,10 +320,24 @@ def resolve_grok_auth(
 ) -> TalkAuth:
     """Resolve the bearer for the xAI realtime surface.
 
-    Order: ``TALK_PREFER_XAI_OAUTH`` → ``TALK_XAI_API_KEY`` → ``XAI_API_KEY``
-    → the host ``xai-oauth`` login. A key that is set but blank refuses
-    rather than falling through, matching ``talk_config.resolve_xai_key``.
+    A custom ``TALK_GROK_WS_URL`` is a separate trust boundary: it requires
+    ``TALK_GROK_API_KEY`` and never borrows a native xAI key or OAuth token.
+    Without that override, order stays ``TALK_PREFER_XAI_OAUTH`` →
+    ``TALK_XAI_API_KEY`` → ``XAI_API_KEY`` → the host ``xai-oauth`` login.
     """
+
+    if talk_config.talk_grok_ws_url(env) is not None:
+        scoped = _read_env(env, "TALK_GROK_API_KEY")
+        if scoped is None or not scoped.strip():
+            raise TalkAuthError(
+                "a custom TALK_GROK_WS_URL requires TALK_GROK_API_KEY; "
+                "xAI API keys and OAuth are not used for custom endpoints"
+            )
+        return TalkAuth(
+            token=scoped.strip(),
+            source=SOURCE_CONFIGURED,
+            detail="TALK_GROK_API_KEY (custom Grok endpoint key)",
+        )
 
     if prefer_xai_oauth(env):
         auth = _resolve_xai_oauth(hermes_home)
@@ -384,6 +398,31 @@ def grok_auth_diagnostic(
     """
 
     now = int(time.time()) if now_s is None else int(now_s)
+    custom_endpoint = talk_config.talk_grok_ws_url(env) is not None
+    if custom_endpoint:
+        endpoint_key = _key_state(env, "TALK_GROK_API_KEY")
+        native_key_present = any(
+            _key_state(env, key) == "present" for key in ("TALK_XAI_API_KEY", "XAI_API_KEY")
+        )
+        return {
+            "configured": endpoint_key == "present",
+            "winning_lane": SOURCE_CONFIGURED if endpoint_key == "present" else None,
+            "preference": _preference_receipt(env)[0],
+            "xai_oauth": "ignored",
+            "xai_oauth_source": None,
+            "host_refresh_available": _host_refresh_available(),
+            "metered_key_present": native_key_present,
+            "metered_key_wins_over_oauth": False,
+            "metered_keys_ignored": native_key_present,
+            "refresh_required": False,
+            "blocked_by": (
+                "blank-custom-key" if endpoint_key == "blank" else
+                "missing-custom-key" if endpoint_key == "absent" else None
+            ),
+            "custom_endpoint": True,
+            "endpoint_key": endpoint_key,
+        }
+
     preference, preferred = _preference_receipt(env)
     scoped_state = _key_state(env, "TALK_XAI_API_KEY")
     shared_state = _key_state(env, "XAI_API_KEY")
@@ -448,7 +487,14 @@ def grok_auth_status(
 
     diag = grok_auth_diagnostic(env=env, hermes_home=hermes_home, now_s=now_s)
     lane = diag["winning_lane"]
-    if lane == SOURCE_XAI_OAUTH:
+    if diag.get("custom_endpoint"):
+        if lane == SOURCE_CONFIGURED:
+            detail = "TALK_GROK_API_KEY (custom Grok endpoint key)"
+        elif diag["blocked_by"] == "blank-custom-key":
+            detail = "TALK_GROK_API_KEY is set but empty"
+        else:
+            detail = "custom Grok endpoint requires TALK_GROK_API_KEY"
+    elif lane == SOURCE_XAI_OAUTH:
         detail = OAUTH_DETAIL
         if diag["refresh_required"]:
             detail += " (host will refresh the access token on next start)"

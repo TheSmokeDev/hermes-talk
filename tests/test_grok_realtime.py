@@ -27,6 +27,8 @@ PROVIDER_ENV_NAMES = (
     "TALK_PROVIDER",
     "TALK_GROK_MODEL",
     "TALK_GROK_VOICE",
+    "TALK_GROK_WS_URL",
+    "TALK_GROK_API_KEY",
     "TALK_XAI_API_KEY",
     "XAI_API_KEY",
     "TALK_PREFER_XAI_OAUTH",
@@ -187,6 +189,62 @@ def test_connect_sends_grok_session_update_with_prefixed_voice_and_url_model():
     assert session["tool_choice"] == "auto"
     assert socket.exited and client.exited
     assert adapter.state is rt.SessionState.CLOSED
+
+
+def test_custom_endpoint_preserves_explicit_model_query(clean_provider_env):
+    endpoint = "ws://127.0.0.1:4000/v1/realtime?model=realtime-voice"
+    clean_provider_env.setenv("TALK_GROK_WS_URL", endpoint)
+
+    async def scenario():
+        socket = _Socket()
+        adapter, client = _adapter(socket)
+        await adapter.connect(_setup())
+        await adapter.close()
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.connect_args[0][0] == endpoint
+
+
+def test_model_query_is_encoded_and_not_duplicated():
+    base = "wss://proxy.example/realtime?tenant=voice"
+    assert grok_rt.grok_ws_url("voice model/1", base_url=base) == (
+        "wss://proxy.example/realtime?tenant=voice&model=voice+model%2F1"
+    )
+    explicit = "wss://proxy.example/realtime?model=proxy-model&tenant=voice"
+    assert grok_rt.grok_ws_url("ignored", base_url=explicit) == explicit
+
+
+def test_custom_endpoint_rejects_native_oauth(clean_provider_env):
+    clean_provider_env.setenv("TALK_GROK_WS_URL", "ws://localhost:4000/realtime")
+    with pytest.raises(rt.RealtimeSessionError, match="TALK_GROK_API_KEY"):
+        grok_rt.GrokRealtimeSession(auth_token="oauth", auth_source="xai-oauth")
+
+
+def test_custom_endpoint_transport_errors_redact_url_query_and_bearer(clean_provider_env):
+    endpoint = "wss://proxy.example/realtime?model=proxy-model&token=query-secret"
+    clean_provider_env.setenv("TALK_GROK_WS_URL", endpoint)
+
+    class ErrorClient(_RejectingClient):
+        def ws_connect(self, url, **_kwargs):
+            return _RejectingContext(
+                RuntimeError(f"cannot open {url} with bearer proxy-key-secret")
+            )
+
+    aiohttp = types.SimpleNamespace(
+        ClientSession=lambda: ErrorClient(),
+        WSMsgType=types.SimpleNamespace(TEXT="text", ERROR="error"),
+    )
+    adapter = grok_rt.GrokRealtimeSession(
+        auth_token="proxy-key-secret", auth_source="configured", aiohttp_module=aiohttp
+    )
+
+    with pytest.raises(rt.RealtimeSessionError) as info:
+        asyncio.run(adapter.connect(_setup()))
+
+    assert "query-secret" not in str(info.value)
+    assert "proxy-key-secret" not in str(info.value)
+    assert info.value.__cause__ is None
 
 
 @pytest.mark.parametrize(
@@ -754,6 +812,35 @@ def test_grok_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._grok_auth()
     assert auth.token == "xai-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+
+def test_custom_endpoint_requires_its_dedicated_key(clean_provider_env):
+    clean_provider_env.setenv("TALK_GROK_WS_URL", "ws://127.0.0.1:4000/realtime")
+    clean_provider_env.setenv("XAI_API_KEY", "native-key")
+
+    with pytest.raises(talk_auth.TalkAuthError, match="TALK_GROK_API_KEY"):
+        talk_cli._grok_auth()
+
+
+def test_native_endpoint_keeps_xai_precedence_over_dedicated_key(clean_provider_env):
+    clean_provider_env.setenv("TALK_GROK_API_KEY", "proxy-key")
+    clean_provider_env.setenv("XAI_API_KEY", "native-key")
+
+    auth = talk_cli._grok_auth()
+
+    assert auth.token == "native-key"
+    assert auth.source == talk_auth.SOURCE_ENV
+
+
+def test_custom_endpoint_uses_dedicated_key_even_when_oauth_is_preferred(clean_provider_env):
+    clean_provider_env.setenv("TALK_GROK_WS_URL", "ws://127.0.0.1:4000/realtime")
+    clean_provider_env.setenv("TALK_GROK_API_KEY", "proxy-key")
+    clean_provider_env.setenv("TALK_PREFER_XAI_OAUTH", "true")
+
+    auth = talk_cli._grok_auth()
+
+    assert auth.token == "proxy-key"
+    assert auth.source == talk_auth.SOURCE_CONFIGURED
 
 
 def test_grok_auth_delegates_to_the_grok_auth_resolver(clean_provider_env, monkeypatch):

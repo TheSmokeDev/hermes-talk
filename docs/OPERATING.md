@@ -683,6 +683,13 @@ see [Live billing](GPT-LIVE.md#choose-billing-and-voice).
 | `CODEX_HOME` | `~/.codex` | Where the Codex OAuth lane (third in order) reads `auth.json` from. |
 | `TALK_PREFER_CODEX_OAUTH` | unset | Absent/`false` preserves the order above. `true` requires Codex OAuth and ignores API keys; missing/unusable OAuth refuses. Blank or invalid values also refuse. |
 
+Grok custom endpoint configuration is separate from the native xAI auth lanes:
+set `TALK_GROK_WS_URL` to a validated `ws://`/`wss://` endpoint and provide
+`TALK_GROK_API_KEY`. When the URL override is set, that dedicated key is
+required; `TALK_XAI_API_KEY`, `XAI_API_KEY`, and `xai-oauth` are ignored. A
+plaintext `ws://` URL is accepted only for literal loopback hosts
+(`localhost`, `127.0.0.0/8`, or `::1`); use `wss://` for a remote proxy.
+
 Grok (`TALK_PROVIDER=grok`) resolves its own bearer the same shape:
 `TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` → `XAI_API_KEY` → the host
 `xai-oauth` login. When the host is importable its resolver owns refresh

@@ -16,6 +16,7 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     from . import (
@@ -179,6 +180,19 @@ def _key_presence(value: str | None) -> str:
     return "present" if value.strip() else "blank"
 
 
+def _grok_endpoint_display(url: str) -> str:
+    """Keep endpoint host identity without rendering caller-controlled data."""
+
+    parts = urlsplit(url)
+    host = parts.hostname or "<invalid-host>"
+    if "%" in host:
+        host = "<redacted-host>"
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{parts.port}" if parts.port is not None else ""
+    return f"{parts.scheme}://{host}{port}"
+
+
 def _provider_check() -> dict[str, Any]:
     """The selected realtime provider, plus its lane's readiness when chosen.
 
@@ -268,12 +282,24 @@ def _provider_check() -> dict[str, Any]:
             details,
         )
 
+    try:
+        custom_url = talk_config.talk_grok_ws_url()
+    except talk_config.TalkConfigError as exc:
+        return _check(
+            "provider",
+            "fail",
+            "configured Grok WebSocket endpoint is invalid",
+            {"provider": provider, "endpoint": "custom"},
+            (str(exc),),
+        )
     scoped = os.environ.get("TALK_XAI_API_KEY")
     shared = os.environ.get("XAI_API_KEY")
-    keys = {
-        "scoped": _key_presence(scoped),
-        "shared": _key_presence(shared),
-    }
+    endpoint_key = os.environ.get("TALK_GROK_API_KEY")
+    keys = (
+        {"endpoint": _key_presence(endpoint_key)}
+        if custom_url is not None
+        else {"scoped": _key_presence(scoped), "shared": _key_presence(shared)}
+    )
     voice_raw = os.environ.get("TALK_GROK_VOICE")
     model_raw = os.environ.get("TALK_GROK_MODEL")
     details.update(
@@ -284,6 +310,13 @@ def _provider_check() -> dict[str, Any]:
             "voice_source": "TALK_GROK_VOICE" if (voice_raw or "").strip() else "default",
         }
     )
+    if custom_url is not None:
+        details.update(
+            {
+                "endpoint": "custom",
+                "endpoint_url": _grok_endpoint_display(custom_url),
+            }
+        )
     try:
         details["voice"] = talk_config.talk_grok_voice()
         voice_valid = True
@@ -298,6 +331,34 @@ def _provider_check() -> dict[str, Any]:
     receipt = talk_grok_auth.grok_auth_diagnostic()
     details["auth_lane"] = receipt["winning_lane"]
     details["xai_oauth"] = receipt["xai_oauth"]
+    if custom_url is not None:
+        if receipt["blocked_by"] in ("blank-custom-key", "missing-custom-key"):
+            return _check(
+                "provider",
+                "fail",
+                "custom Grok endpoint requires TALK_GROK_API_KEY",
+                details,
+                (
+                    "Set TALK_GROK_API_KEY for the custom endpoint; native xAI keys and OAuth "
+                    "are ignored.",
+                ),
+            )
+        if not voice_valid:
+            return _check(
+                "provider",
+                "fail",
+                "configured Grok voice is not a built-in Grok voice",
+                details,
+                (f"Choose a TALK_GROK_VOICE from: {', '.join(talk_config.GROK_REALTIME_VOICES)}.",),
+            )
+        return _check(
+            "provider",
+            "pass",
+            "grok realtime provider is configured for a custom endpoint "
+            f"(model {details['model']}, "
+            f"voice {details['voice']})",
+            details,
+        )
     if receipt["blocked_by"] in ("blank-talk-key", "blank-xai-key"):
         return _check(
             "provider",
@@ -342,11 +403,44 @@ def _grok_auth_check() -> dict[str, Any]:
     which name is present instead of on the provider.
     """
 
-    receipt = talk_grok_auth.grok_auth_diagnostic()
+    try:
+        receipt = talk_grok_auth.grok_auth_diagnostic()
+    except talk_config.TalkConfigError as exc:
+        return _check(
+            "auth",
+            "fail",
+            "configured Grok WebSocket endpoint is invalid",
+            {"provider": "grok", "custom_endpoint": True},
+            (str(exc),),
+        )
     details = dict(receipt)
     lane = receipt["winning_lane"]
     remediation: list[str] = []
     relogin = f"Run `{talk_grok_auth.RELOGIN_COMMAND}`"
+
+    if receipt.get("custom_endpoint"):
+        if receipt["blocked_by"] == "blank-custom-key":
+            return _check(
+                "auth",
+                "fail",
+                "TALK_GROK_API_KEY is set but blank and blocks custom endpoint auth",
+                details,
+                ("Set a real TALK_GROK_API_KEY or unset TALK_GROK_WS_URL.",),
+            )
+        if lane is None:
+            return _check(
+                "auth",
+                "fail",
+                "custom Grok endpoint has no dedicated key; native xAI auth is ignored",
+                details,
+                ("Set TALK_GROK_API_KEY for the custom endpoint.",),
+            )
+        return _check(
+            "auth",
+            "pass",
+            "TALK_GROK_API_KEY is the custom Grok endpoint auth lane",
+            details,
+        )
 
     if receipt["blocked_by"] == "invalid-preference":
         remediation.append("Set TALK_PREFER_XAI_OAUTH to true or false, or unset it.")
@@ -1007,6 +1101,12 @@ def render_human(report: dict[str, Any]) -> str:
                 f"winner={details.get('winning_lane') or 'none'}, "
                 f"source={details.get('source') or 'none'}, validation=presence-only"
             )
+        elif check["id"] == "auth" and details.get("custom_endpoint"):
+            lines.append(
+                "  receipt: endpoint=custom, "
+                f"winner={details.get('winning_lane') or 'none'}, "
+                f"key={details.get('endpoint_key')}, native-xai-auth=ignored"
+            )
         elif check["id"] == "auth":
             if "xai_oauth" in details:
                 oauth = f"xai-oauth={details['xai_oauth']}"
@@ -1023,11 +1123,18 @@ def render_human(report: dict[str, Any]) -> str:
             )
         elif check["id"] == "provider" and details.get("provider") in ("grok", "gemini"):
             keys = details.get("keys", {})
-            lines.append(
-                "  receipt: "
-                f"model={details.get('model')}, voice={details.get('voice')}, "
-                f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
-            )
+            if details.get("endpoint") == "custom":
+                lines.append(
+                    "  receipt: endpoint=custom, "
+                    f"url={details.get('endpoint_url')}, model={details.get('model')}, "
+                    f"voice={details.get('voice')}, key={keys.get('endpoint')}"
+                )
+            else:
+                lines.append(
+                    "  receipt: "
+                    f"model={details.get('model')}, voice={details.get('voice')}, "
+                    f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
+                )
         elif check["id"] == "cascade" and details.get("voice_mode") == "cascade":
             keys = details.get("keys", {})
             lines.append(
@@ -1083,17 +1190,19 @@ async def run_grok_probe(
     aiohttp_module=None,
     timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    """Two live calls that prove the resolved bearer reaches Grok realtime.
+    """Probe the resolved bearer against native xAI or a configured endpoint.
 
-    The subscription question nobody can answer offline: does an ``xai-oauth``
-    access token work on ``wss://api.x.ai/v1/realtime``? This asks xAI. The
-    receipt carries status codes and the first server event type only — never
-    the token, never a store path. Opt-in (``--probe``), grok only.
+    Native xAI keeps its historical client-secrets POST plus WebSocket check.
+    A custom endpoint gets only the WebSocket check, so its dedicated bearer
+    never reaches ``api.x.ai``. The receipt carries status codes and the first
+    server event type only — never the token, never a store path.
     """
 
     if timeout_s is None:
         timeout_s = PROBE_TIMEOUT_S
     aiohttp = aiohttp_module or talk_grok_realtime._import_aiohttp()
+    custom_url = talk_config.talk_grok_ws_url()
+    custom_endpoint = custom_url is not None
     headers = {"Authorization": f"Bearer {auth_token}"}
     result: dict[str, Any] = {
         "auth_source": auth_source,
@@ -1104,20 +1213,21 @@ async def run_grok_probe(
         "error": None,
         "ok": False,
     }
+    if custom_endpoint:
+        result["custom_endpoint"] = True
+        result["endpoint_url"] = _grok_endpoint_display(custom_url)
     try:
         async with aiohttp.ClientSession() as http:
-            async with http.post(
-                PROBE_HTTP_URL,
-                json={"model": model},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout_s),
-            ) as response:
-                result["http_status"] = int(response.status)
-            async with http.ws_connect(
-                f"{talk_grok_realtime.XAI_REALTIME_WS_URL}?model={model}",
-                headers=headers,
-                timeout=timeout_s,
-            ) as ws:
+            if not custom_endpoint:
+                async with http.post(
+                    PROBE_HTTP_URL,
+                    json={"model": model},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout_s),
+                ) as response:
+                    result["http_status"] = int(response.status)
+            ws_url = talk_grok_realtime.grok_ws_url(model)
+            async with http.ws_connect(ws_url, headers=headers, timeout=timeout_s) as ws:
                 result["ws_status"] = 101
                 message = await asyncio.wait_for(ws.receive(), timeout_s)
                 data = getattr(message, "data", None)
@@ -1129,15 +1239,30 @@ async def run_grok_probe(
                     if isinstance(event, dict):
                         result["first_event"] = str(event.get("type") or "") or None
     except Exception as exc:  # noqa: BLE001 - a probe reports failure, never raises
-        remediation = talk_grok_realtime.handshake_remediation(exc, auth_source=auth_source)
+        remediation = talk_grok_realtime.handshake_remediation(
+            exc, auth_source=auth_source, custom_endpoint=custom_endpoint
+        )
         status = getattr(exc, "status", None)
         if isinstance(status, int) and result["ws_status"] is None:
             result["ws_status"] = status
-        result["error"] = remediation or f"{type(exc).__name__}: {redact_text(str(exc))}"
+        if remediation is not None:
+            result["error"] = remediation
+        elif custom_endpoint:
+            result["error"] = f"{type(exc).__name__}: custom Grok endpoint probe failed"
+        else:
+            result["error"] = f"{type(exc).__name__}: {redact_text(str(exc))}"
         return result
-    result["ok"] = result["http_status"] == 200 and result["first_event"] == "session.created"
+    result["ok"] = (
+        result["first_event"] == "session.created"
+        if custom_endpoint
+        else result["http_status"] == 200 and result["first_event"] == "session.created"
+    )
     if not result["ok"] and result["error"] is None:
-        result["error"] = "unexpected probe receipt (see http_status / first_event)"
+        result["error"] = (
+            "unexpected probe receipt (see ws_status / first_event)"
+            if custom_endpoint
+            else "unexpected probe receipt (see http_status / first_event)"
+        )
     return result
 
 
@@ -1152,7 +1277,7 @@ def _probe_grok() -> dict[str, Any]:
         return {"ok": False, "error": "the live probe exists for TALK_PROVIDER=grok only"}
     try:
         auth = talk_grok_auth.resolve_grok_auth()
-    except talk_auth.TalkAuthError as exc:
+    except (talk_auth.TalkAuthError, talk_config.TalkConfigError) as exc:
         return {"ok": False, "error": redact_text(str(exc))}
     return asyncio.run(
         run_grok_probe(
@@ -1165,13 +1290,25 @@ def _probe_grok() -> dict[str, Any]:
 
 def render_probe(result: dict[str, Any]) -> str:
     result = redact_value(result)
-    lines = ["Hermes Talk probe (live: two calls to api.x.ai)"]
+    custom_endpoint = bool(result.get("custom_endpoint"))
+    lines = [
+        "Hermes Talk probe (live: one WebSocket call to custom endpoint)"
+        if custom_endpoint
+        else "Hermes Talk probe (live: two calls to api.x.ai)"
+    ]
     if "auth_source" in result:
         lines.append(f"  auth lane: {result['auth_source']}, model: {result['model']}")
-        http = result["http_status"] or "no response"
-        lines.append(f"  POST /v1/realtime/client_secrets -> {http}")
-        ws = result["ws_status"] or "no handshake"
-        lines.append(f"  WS /v1/realtime -> {ws}, first event: {result['first_event'] or 'none'}")
+        if custom_endpoint:
+            lines.append(f"  endpoint: {result.get('endpoint_url', 'custom')}")
+            ws = result["ws_status"] or "no handshake"
+            lines.append(f"  WS -> {ws}, first event: {result['first_event'] or 'none'}")
+        else:
+            http = result["http_status"] or "no response"
+            lines.append(f"  POST /v1/realtime/client_secrets -> {http}")
+            ws = result["ws_status"] or "no handshake"
+            lines.append(
+                f"  WS /v1/realtime -> {ws}, first event: {result['first_event'] or 'none'}"
+            )
     if result.get("error"):
         lines.append(f"  -> {result['error']}")
     verdict = "PASS: the resolved bearer reaches Grok realtime" if result["ok"] else "FAIL"
