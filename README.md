@@ -103,6 +103,8 @@ Grok supports all 28 documented built-in voices through `TALK_GROK_VOICE`
 (for example, `carina`); see the [voice list](docs/PROVIDERS.md#provider-details--openai-default-grok-or-gemini).
 Per-lane detail and the credential order: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
+Experimental xAI speech effects and phrase wrappers, including how native Talk
+differs from verbatim TTS: [docs/XAI-SPEECH-TAGS.md](docs/XAI-SPEECH-TAGS.md).
 
 ## Surfaces
 
