@@ -27,6 +27,14 @@ named rather than smoothed.
   Hermes results into speech, and distinguishes that flow from verbatim TTS.
   This is experimental documentation, not a new provider or runtime guarantee.
   Contributed by @zoidypuh.
+- An optional presence bus on the Talk page. Talk dispatches a
+  `hermes-talk:presence` event on `window` whenever the call's phase, live
+  caption, audio activity, recent transcript, mute, or sleep state changes, and
+  listens for `hermes-talk:command` (`start`, `stop`, `mute`, `unmute`, `sleep`,
+  `wake`), which calls the same functions Talk's own controls call. Another
+  surface can mirror or drive the call without reading Talk's DOM. Nothing
+  changes when nobody listens. Thanks to
+  [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
 ## [0.21.1] — 2026-09-26
 
