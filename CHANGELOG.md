@@ -36,6 +36,15 @@ named rather than smoothed.
   changes when nobody listens. Thanks to
   [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
+### Fixed
+- `hermes plugins enable hermes-talk` no longer fails with a
+  `DependencyConflict` on current Hermes. Hermes locks every extra of a plugin
+  in its own workspace, so the exact `ruff==0.16.10` in the dev extra had to
+  agree with Hermes core's `ruff==0.15.10`, and could not. The ruff version
+  pin moved to `requirements-lint.txt`, which only CI and contributors
+  install, and a hygiene test now refuses an exact pin in any extra. Thanks
+  to the reporters on #180.
+
 ## [0.21.1] — 2026-09-26
 
 Desktop Talk connects on a stock Hermes host, and when a request fails the panel

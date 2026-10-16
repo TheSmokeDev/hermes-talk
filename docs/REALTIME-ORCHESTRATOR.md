@@ -117,7 +117,7 @@ Doctor's check set is fixed by `talk_doctor.CHECK_ORDER` and asserted against
 the report it builds, so the denominator is ten: plugin, provider, auth,
 model, voice, cascade, audio, identity, discord, host.
 
-Test gate: `uv run --extra dev pytest -q` + `uv run --extra dev ruff check .`
+Test gate: `uv run --extra dev pytest -q` + `uv run --extra dev --with-requirements requirements-lint.txt ruff check .`
 in a clone. (This page was written at 834 passed / 7 skipped; the suite has
 grown well past that — see CONTRIBUTING for the current baseline and the #93
 known failures.)

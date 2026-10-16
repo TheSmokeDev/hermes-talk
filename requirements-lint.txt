@@ -1,0 +1,10 @@
+# The ruff VERSION pin (the rule set is pinned in pyproject.toml's
+# [tool.ruff.lint]; see the comment there for why both are needed).
+#
+# It lives here, not in the dev extra, because Hermes admits a plugin by adding
+# it to its own uv workspace and locking EVERY extra of every member. An exact
+# ruff in hermes-talk[dev] then has to agree with the ruff pinned by Hermes
+# core's own dev group, and when the two differ no user can enable the plugin
+# (#180). Nothing a normal install resolves should carry contributor tooling
+# pins; this file is installed only by CI and by contributors.
+ruff==0.16.10

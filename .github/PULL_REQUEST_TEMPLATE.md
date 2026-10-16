@@ -43,7 +43,7 @@ filled-in docs/PROVIDER-RECEIPT.md table. -->
 ## Checklist
 
 - [ ] One logical change; tests ride with it, not behind it
-- [ ] `pytest -q` and `ruff check .` pass locally on the pinned ruff (`pip install -e ".[dev]"` or `uv run --extra dev …`)
+- [ ] `pytest -q` and `ruff check .` pass locally on the pinned ruff (`pip install -e ".[dev]" -r requirements-lint.txt`; see CONTRIBUTING for uv)
 - [ ] Commits follow Conventional Commits with a hermes-talk scope (`fix(audio): …`, `feat(realtime): …`, `docs: …`)
 - [ ] No auth-store writes outside the documented Codex refresh; tokens reach only the provider's own host
 - [ ] Nothing secret in logs, receipts, spoken sentences, or test fixtures

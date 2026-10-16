@@ -73,7 +73,7 @@ nothing formatted for a screen.
 ```bash
 git clone https://github.com/TheSmokeDev/hermes-talk.git
 cd hermes-talk
-pip install -e ".[dev]"        # add ,audio if you want a real mic locally
+pip install -e ".[dev]" -r requirements-lint.txt   # add ,audio for a real mic
 ```
 
 Or with [uv](https://docs.astral.sh/uv/), which keeps the whole thing in a
@@ -82,11 +82,14 @@ project-local `.venv`:
 ```bash
 uv sync --extra dev            # --extra audio too, for a real mic
 uv run --extra dev pytest -q
-uv run --extra dev ruff check .
+uv run --extra dev --with-requirements requirements-lint.txt ruff check .
 ```
 
-Either way you get the ruff version pinned in the dev extra (see
-`pyproject.toml`). The pin is load-bearing, see below.
+Either way you get the ruff version pinned in `requirements-lint.txt`. The
+pin is load-bearing, see below. It is deliberately **not** in the dev extra:
+Hermes locks every extra of a plugin when it enables one, so an exact ruff
+there has to match Hermes core's own ruff pin or the plugin cannot be enabled
+at all ([#180](https://github.com/TheSmokeDev/hermes-talk/issues/180)).
 
 Dashboard and Desktop share `ui/talk-surface.js`. Edit that source and the
 appropriate `ui/*-entry.js`, then run `python scripts/build_ui.py`. Commit both
@@ -97,8 +100,8 @@ Blob URL; relative imports and asset paths do not resolve against the plugin.
 The focused surface checks are `pytest tests/test_dashboard_js.py
 tests/test_ui_build.py tests/test_desktop_js.py -q` and require Node.js.
 
-**Why `--extra dev` on every `uv run`:** pytest and the pinned ruff live in
-the `dev` extra, not in the dependencies. `uv run` only guarantees the base
+**Why `--extra dev` on every `uv run`:** pytest lives in the `dev` extra,
+not in the dependencies (and ruff comes from `--with-requirements`). `uv run` only guarantees the base
 dependencies are present, so on a fresh clone — or after anything that
 re-syncs the environment — a bare `uv run pytest` can find no pytest at
 all. Naming the extra on the run is the form that works regardless of what
@@ -116,7 +119,7 @@ for the live proof.
 ```bash
 pytest -q          # the whole suite — seconds, not minutes
 ruff check .       # the exact check CI runs, on the pinned ruff
-                   # (`pip install -e ".[dev]"` gets that version; a
+                   # (`-r requirements-lint.txt` gets that version; a
                    # different ruff can disagree in BOTH directions)
 ```
 
@@ -211,9 +214,10 @@ not a build artifact), `dashboard/manifest.json`.
 ## Code style
 
 - **Ruff decides.** `E F I UP B SIM RUF BLE`, line length 100, target
-  `py311` — all in `pyproject.toml`. Run the pinned version; the rule set
-  and the version are pinned separately, and each pin alone still lets a
-  ruff release turn the build red. Bump both together, in their own PR.
+  `py311` — all in `pyproject.toml`. Run the pinned version from
+  `requirements-lint.txt`; the rule set and the version are pinned
+  separately, and each pin alone still lets a ruff release turn the build
+  red. Bump both together, in their own PR.
 - **Knobs resolve at call time.** Every `TALK_*` setting is read when it
   is needed, in `talk_config.py`, never bound at import or cached in a
   module global. Tests rely on flipping the environment between calls.

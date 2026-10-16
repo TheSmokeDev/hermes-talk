@@ -17,7 +17,12 @@ live = ["aiortc>=1.14,<2"]
 # the real class in CI that branch is untestable, which is exactly how the
 # relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
 # stub when starlette is absent, so the plugin installs without it.
-dev = ["pytest>=8", "pytest-timeout>=2.3", "ruff==0.16.10", "starlette>=0.40"]
+#
+# No exact pins here, and no ruff: Hermes locks every extra of a plugin in its
+# own workspace when the plugin is enabled, so a pin in this list must agree
+# with Hermes core's dev pins or nobody can enable the plugin (#180). ruff's
+# version pin lives in requirements-lint.txt instead.
+dev = ["pytest>=8", "pytest-timeout>=2.3", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -129,7 +134,7 @@ target-version = "py311"
 
 # Two pins, because either one alone still lets a ruff release turn the build
 # red. The RULE SET is pinned here so a new default rule cannot arrive
-# unannounced; the ruff VERSION is pinned in the dev extra above, because the
+# unannounced; the ruff VERSION is pinned in requirements-lint.txt, because the
 # same rule set does not mean the same thing across versions. ruff 0.16 stopped
 # reporting BLE001 when the handler logs the exception through a name it
 # recognises as a logger — it recognises `logger`, not `_log` — so the three

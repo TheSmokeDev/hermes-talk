@@ -208,7 +208,7 @@ voice transport.
 
 ## Contributing
 
-`uv sync --extra dev` (or `pip install -e ".[dev]"`), `pytest -q`, `ruff check .`
+`pip install -e ".[dev]" -r requirements-lint.txt`, `pytest -q`, `ruff check .`
 — offline, no keys, seconds. Priorities, the path for each kind of change
 (a provider, a surface, a tool, a fix), the merge bar, and the one test trap
 on a box that has Hermes installed: [CONTRIBUTING.md](CONTRIBUTING.md).
