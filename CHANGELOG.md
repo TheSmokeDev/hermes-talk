@@ -45,6 +45,11 @@ named rather than smoothed.
   install, and a hygiene test now refuses an exact pin in any extra. Thanks
   to the reporters on #180.
 
+### Changed
+- The 0.17.0 admission-control entry (#101) now credits
+  bielcarpi/hermes-live-voice, where the idea and its names came from. The
+  credit line was missing when it shipped.
+
 ## [0.21.1] — 2026-09-26
 
 Desktop Talk connects on a stock Hermes host, and when a request fails the panel
@@ -503,6 +508,9 @@ contract adapter, a security policy, and a contributing guide.
   sets it, `parallel_read_only` is downgraded to `exclusive` and recorded
   that way, because the declaration is the delegating model's own claim, not
   a sandbox. A task that names no keys is exactly the task Talk always ran.
+  Ported idea from bielcarpi/hermes-live-voice's task admission (MIT),
+  including its `execution_mode`, `resource_keys`, and trust-declared
+  read-only names — idea only, no code.
 - `hermes talk check` proves the whole voice path end to end, right now
   (#97). Doctor is read-only by design, so a green doctor could
   still hide a dead mint, a refused socket, or a delegation lane that never
