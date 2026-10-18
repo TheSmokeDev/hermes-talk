@@ -259,7 +259,7 @@ def test_a_multi_speaker_transport_without_a_ledger_is_refused(monkeypatch, caps
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("TALK_VOICE", raising=False)
     monkeypatch.setattr(
-        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda: None
+        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda **_kw: None
     )
 
     def never():  # pragma: no cover - must not be reached

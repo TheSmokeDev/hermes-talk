@@ -345,7 +345,12 @@ class DiscordToolAuthorizationLedger:
         max_seen_item_ids: int = _DEFAULT_MAX_SEEN_ITEM_IDS,
         max_seen_response_ids: int = _DEFAULT_MAX_SEEN_RESPONSE_IDS,
         max_seen_call_ids: int = _DEFAULT_MAX_SEEN_CALL_IDS,
+        echoes_response_metadata: bool = True,
     ) -> None:
+        # False for a provider whose response.created never returns the
+        # metadata we sent (xAI Grok). Such a lane binds by order instead:
+        # see note_response_created.
+        self._echoes_response_metadata = bool(echoes_response_metadata)
         self._max_segments = max(1, int(max_segments))
         self._max_responses = max(1, int(max_responses))
         self._max_seen_item_ids = max(1, int(max_seen_item_ids))
@@ -682,6 +687,19 @@ class DiscordToolAuthorizationLedger:
             # including an unauthorized one.  A later reuse can never upgrade
             # that address into identity proof.
             self._seen_responses[response_id] = None
+            if (
+                expected is None
+                and not self._echoes_response_metadata
+                and token is None
+                and not (isinstance(metadata, dict) and metadata)
+                and len(self._bindings) == 1
+            ):
+                # The provider cannot echo the token, so bind the one
+                # response we asked for. Only when exactly one binding is
+                # outstanding and the event carries no metadata at all: two
+                # outstanding bindings are ambiguous, and an unknown echoed
+                # token is a forgery, not a missing echo. Both stay unbound.
+                _, expected = self._bindings.popitem(last=False)
             if self._poisoned or expected is None:
                 return
             if expected.chain is not None and expected.chain.tainted:

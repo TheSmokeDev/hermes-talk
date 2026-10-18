@@ -1259,3 +1259,94 @@ def test_free_text_arguments_are_outside_the_cross_check_by_design(monkeypatch):
         "redirect_agent",
         "stop_work",
     }
+
+
+def _commit_without_response(ledger, item_id, *, start_ms, end_ms):
+    ledger.note_speech_started(
+        {"item_id": item_id, "audio_start_ms": start_ms}
+    )
+    ledger.note_speech_stopped({"item_id": item_id, "audio_end_ms": end_ms})
+    return ledger.response_for_commit({"item_id": item_id})
+
+
+def _delegate(ledger, response_id, call_id):
+    return ledger.bind_tool_event(
+        {
+            "response_id": response_id,
+            "call_id": call_id,
+            "name": "delegate_task",
+            "arguments": json.dumps({"task": "ship it"}),
+        }
+    )
+
+
+def test_a_provider_that_never_echoes_metadata_binds_by_order(monkeypatch):
+    # xAI Grok's response.created carries no metadata at all (#178).
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
+        echoes_response_metadata=False
+    )
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    assert _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
+    ledger.note_response_created({"response": {"id": "resp_1"}})
+    event = _delegate(ledger, "resp_1", "call_1")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("delegate_task", event) is None
+
+
+def test_the_same_provider_still_denies_a_non_operator(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
+        echoes_response_metadata=False
+    )
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
+    _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
+    ledger.note_response_created({"response": {"id": "resp_1"}})
+    event = _delegate(ledger, "resp_1", "call_1")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("delegate_task", event) is not None
+
+
+def test_order_binding_refuses_when_two_bindings_are_outstanding(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
+        echoes_response_metadata=False
+    )
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(40))
+    _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
+    _commit_without_response(ledger, "item_2", start_ms=20, end_ms=40)
+    ledger.note_response_created({"response": {"id": "resp_1"}})
+    event = _delegate(ledger, "resp_1", "call_1")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("delegate_task", event) is not None
+
+
+def test_order_binding_never_accepts_a_forged_token(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
+        echoes_response_metadata=False
+    )
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
+    ledger.note_response_created(
+        {
+            "response": {
+                "id": "resp_1",
+                "metadata": {talk_operator_auth.BINDING_METADATA_KEY: "forged"},
+            }
+        }
+    )
+    event = _delegate(ledger, "resp_1", "call_1")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("delegate_task", event) is not None
+
+
+def test_an_echoing_provider_never_falls_back_to_order(monkeypatch):
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
+    ledger.note_response_created({"response": {"id": "resp_1"}})
+    event = _delegate(ledger, "resp_1", "call_1")
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    assert ledger.authorize_tool("delegate_task", event) is not None
