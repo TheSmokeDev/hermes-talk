@@ -44,6 +44,14 @@ named rather than smoothed.
   pin moved to `requirements-lint.txt`, which only CI and contributors
   install, and a hygiene test now refuses an exact pin in any extra. Thanks
   to the reporters on #180.
+- State-changing voice tools such as `delegate_task` work again on the Grok
+  lane in Discord. xAI's `response.created` never echoes the speaker-binding
+  metadata, so every such call was denied as an unbound response. On Grok the
+  ledger now binds the one response it asked for, by order, and only when
+  exactly one binding is outstanding and the event carries no metadata at
+  all. An unknown echoed token or an ambiguous second binding still fails
+  closed, and providers that echo are unchanged. Thanks to the reporter on
+  #178.
 
 ## [0.21.1] — 2026-09-26
 
