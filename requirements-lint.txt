@@ -7,4 +7,4 @@
 # core's own dev group, and when the two differ no user can enable the plugin
 # (#180). Nothing a normal install resolves should carry contributor tooling
 # pins; this file is installed only by CI and by contributors.
-ruff==0.16.10
+ruff==0.17.1
