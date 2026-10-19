@@ -94,6 +94,47 @@ def _setup(*, automatic_response=True):
     )
 
 
+def test_semantic_endpointing_mint_and_update_use_the_same_exact_wire_object(monkeypatch):
+    setup = _setup(automatic_response=False)
+    setup = rt.SessionSetup(
+        model=setup.model,
+        voice=setup.voice,
+        instructions=setup.instructions,
+        tools=setup.tools,
+        automatic_response=setup.automatic_response,
+        turn_detection=rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.MEDIUM,
+        ),
+    )
+    minted = {}
+
+    def fake_post(_auth_token, session):
+        minted.update(session)
+        return {"value": "ephemeral"}
+
+    monkeypatch.setattr(openai_rt.talk_wire, "post_client_secret", fake_post)
+    openai_rt.talk_wire.mint_ephemeral_session(
+        auth_token="secret",
+        model=setup.model,
+        voice=setup.voice,
+        instructions=setup.instructions,
+        tools=[openai_rt._tool_wire(tool) for tool in setup.tools],
+        automatic_response=setup.automatic_response,
+        turn_detection=setup.turn_detection,
+    )
+    update = openai_rt.build_session_update(setup)
+    expected = {
+        "type": "semantic_vad",
+        "eagerness": "medium",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+    assert minted["audio"]["input"]["turn_detection"] == expected
+    assert update["session"]["audio"]["input"]["turn_detection"] == expected
+    assert update["session"] == {key: value for key, value in minted.items() if key != "model"}
+
+
 def _adapter(socket):
     client = _Client(socket)
     aiohttp = types.SimpleNamespace(
@@ -224,6 +265,7 @@ def test_wire_credentials_are_private_one_shot_and_cleared_on_every_terminal_pat
         "instructions": "Be brief.",
         "tools": None,
         "automatic_response": False,
+        "turn_detection": rt.RealtimeTurnDetection(),
         "session_update": {"type": "session.update", "session": {}},
     }
 
@@ -727,3 +769,101 @@ def test_output_events_without_a_response_id_decode_to_none():
     assert audio.response_id is None
     assert delta.response_id is None
     assert done.response_id is None
+
+@pytest.mark.parametrize("automatic_response", [True, False])
+def test_native_task_mode_requires_explicit_responses_before_connect(automatic_response):
+    async def scenario():
+        socket = _Socket()
+        adapter, client = _adapter(socket)
+        setup = rt.SessionSetup(
+            model="gpt-realtime-test",
+            voice="cedar",
+            instructions="Be brief.",
+            task_continuity=True,
+            automatic_response=automatic_response,
+        )
+        if automatic_response:
+            with pytest.raises(rt.RealtimeSessionError, match="explicit response"):
+                await adapter.connect(setup)
+            assert client.connect_args is None
+            assert socket.sent == []
+        else:
+            await adapter.connect(setup)
+            assert (
+                socket.sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"]
+                is False
+            )
+            await adapter.close()
+
+    asyncio.run(scenario())
+
+
+def test_native_typed_input_and_terminal_tool_receipts_keep_exact_identity():
+    text = "  Continue the original job.\nDo not start another.  "
+    metadata = {"talk_request_id": "req-1", "talk_input_id": "input-1"}
+    output = [
+        {
+            "type": "function_call",
+            "id": "item-call",
+            "call_id": "call-1",
+            "name": "steer_work",
+            "arguments": '{"run_id":9}',
+        }
+    ]
+
+    async def scenario():
+        socket = _Socket(
+            [
+                {"type": "response.created", "response": {"id": "resp-1", "metadata": metadata}},
+                {
+                    "type": "response.function_call_arguments.done",
+                    "response_id": "resp-1",
+                    "item_id": "item-call",
+                    "call_id": "call-1",
+                    "name": "steer_work",
+                    "arguments": '{"run_id":9}',
+                },
+                {
+                    "type": "response.done",
+                    "response": {"id": "resp-1", "status": "completed", "output": output},
+                },
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(
+            rt.SessionSetup(
+                model="gpt-realtime-test",
+                voice="cedar",
+                instructions="Be brief.",
+                task_continuity=True,
+                automatic_response=False,
+            )
+        )
+        await adapter.send(
+            (
+                rt.AddInputText(item_id="input-1", text=text),
+                rt.StartResponse(
+                    metadata=metadata, input=({"type": "item_reference", "id": "input-1"},)
+                ),
+            )
+        )
+        events = [event async for event in adapter]
+        await adapter.close()
+        return socket.sent, events
+
+    sent, events = asyncio.run(scenario())
+    assert sent[1] == {
+        "type": "conversation.item.create",
+        "item": {
+            "id": "input-1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+    assert sent[2]["response"]["input"] == [{"type": "item_reference", "id": "input-1"}]
+    assert events[0] == rt.ResponseStarted("resp-1", metadata)
+    assert events[1] == rt.FunctionCall(
+        "call-1", "steer_work", '{"run_id":9}', "resp-1", "item-call"
+    )
+    assert events[2] == rt.ResponseFinished("resp-1", "completed", output)

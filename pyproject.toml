@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.15.0"
+version = "0.21.1"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,7 +10,19 @@ dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
-dev = ["pytest>=8", "ruff>=0.4"]
+live = ["aiortc>=1.14,<2"]
+# starlette is a TEST dependency, never a runtime one: the dashboard relay's
+# streaming response is a starlette response, and its ASGI behavior differs by
+# what the SERVER advertises (uvicorn says spec_version 2.3 for HTTP). Without
+# the real class in CI that branch is untestable, which is exactly how the
+# relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
+# stub when starlette is absent, so the plugin installs without it.
+#
+# No exact pins here, and no ruff: Hermes locks every extra of a plugin in its
+# own workspace when the plugin is enabled, so a pin in this list must agree
+# with Hermes core's dev pins or nobody can enable the plugin (#180). ruff's
+# version pin lives in requirements-lint.txt instead.
+dev = ["pytest>=8", "pytest-timeout>=2.3", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -26,8 +38,30 @@ build-backend = "setuptools.build_meta"
 # it, so a roadmap entry here (talk_actuators, talk_flush) would
 # read as shipped while the wheel quietly omitted it — add each one as it lands.
 [tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 py-modules = [
   "talk_config",
+  "talk_live_audio",
+  "talk_live_browser",
+  "talk_live_config",
+  "talk_live_coordinator",
+  "talk_live_protocol",
+  "talk_live_realtime",
+  "talk_live_routes",
+  "talk_live_transport",
+  "talk_native_surface",
+  "talk_native_api",
+  "talk_native_controller",
+  "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_text_input",
+  "talk_worker_recipients",
+  "talk_codex_wire",
+  "talk_codex_store",
+  "talk_codex_worker",
+  "talk_codex_provider",
   "talk_auth",
   "talk_doctor",
   "talk_setup",
@@ -35,20 +69,40 @@ py-modules = [
   "talk_approvals",
   "talk_capabilities",
   "talk_cascade_voice",
+  "talk_check",
+  "talk_diagnostics",
+  "talk_dashboard_gateway",
+  "talk_dashboard_store",
+  "talk_dashboard_tasks",
+  "talk_target_catalog",
+  "talk_target_selection",
+  "talk_target_state",
   "talk_wire",
   "talk_identity",
+  "talk_input_attachments",
+  "talk_passive",
+  "talk_outbox",
+  "talk_attachment",
+  "talk_task_events",
+  "talk_task_sources",
+  "talk_speech_timing",
   "talk_host",
   "talk_tools",
   "talk_runs",
   "talk_steer",
+  "talk_run_control",
   "talk_lifecycle",
   "talk_operator_auth",
+  "talk_pause",
   "talk_progress",
   "talk_realtime",
   "talk_openai_realtime",
+  "talk_grok_auth",
   "talk_grok_realtime",
   "talk_gemini_realtime",
   "talk_core_realtime",
+  "talk_endpointing_benchmark",
+  "talk_core_provider",
   "talk_core_session",
   "talk_discord",
   "talk_relay",
@@ -62,38 +116,95 @@ py-modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# A wedged coordinator test used to sit until the CI job's 15-minute ceiling
+# and come back as "cancelled" with no stack. Now it fails on its own, with one,
+# well inside that ceiling. Thread method because Windows has no SIGALRM; note
+# it ends the whole pytest process (os._exit) at the first wedge, so you get one
+# stack and no summary for the tests after it, which is still strictly better
+# than a cancelled job.
+timeout = 180
+timeout_method = "thread"
+markers = [
+  "wall_clock: asserts ordering under real wall-clock deadlines; skipped on Windows CI (see tests/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
-# Pinned explicitly: CI installs whatever ruff is current, and an implicit
-# default set turns every ruff release into a possible red build. BLE is on
-# because this codebase catches broadly on purpose (a live voice call must not
-# die on a stack trace) — each one carries a noqa stating why.
+# Two pins, because either one alone still lets a ruff release turn the build
+# red. The RULE SET is pinned here so a new default rule cannot arrive
+# unannounced; the ruff VERSION is pinned in requirements-lint.txt, because the
+# same rule set does not mean the same thing across versions. ruff 0.16 stopped
+# reporting BLE001 when the handler logs the exception through a name it
+# recognises as a logger — it recognises `logger`, not `_log` — so the three
+# handlers in talk_core_provider.py (the only module here that both names its
+# logger `logger` and carries BLE001 directives) had their `noqa` retired and
+# failed CI on RUF100, while every dev box on 0.15.x still required them. Bump
+# both pins together, in their own PR, and expect directives to move. BLE stays
+# on because this codebase catches broadly on purpose (a live voice call must
+# not die on a stack trace) — each one says why, whether or not the current
+# ruff still needs a directive to allow it.
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 
 [tool.ruff.lint.isort]
 known-first-party = [
   "talk_apiserver",
+  "talk_attachment",
   "talk_approvals",
   "talk_audio",
   "talk_auth",
   "talk_capabilities",
   "talk_cascade_voice",
+  "talk_check",
   "talk_cli",
   "talk_config",
+  "talk_live_audio",
+  "talk_live_browser",
+  "talk_live_config",
+  "talk_live_coordinator",
+  "talk_live_protocol",
+  "talk_live_realtime",
+  "talk_live_routes",
+  "talk_live_transport",
+  "talk_native_surface",
+  "talk_native_api",
+  "talk_native_controller",
+  "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_text_input",
+  "talk_worker_recipients",
+  "talk_codex_wire",
+  "talk_codex_store",
+  "talk_codex_worker",
+  "talk_codex_provider",
+  "talk_dashboard_gateway",
+  "talk_dashboard_store",
+  "talk_dashboard_tasks",
+  "talk_target_catalog",
+  "talk_target_selection",
+  "talk_target_state",
+  "talk_diagnostics",
   "talk_discord",
   "talk_doctor",
+  "talk_endpointing_benchmark",
   "talk_gemini_realtime",
+  "talk_grok_auth",
   "talk_grok_realtime",
   "talk_host",
   "talk_identity",
+  "talk_input_attachments",
+  "talk_outbox",
+  "talk_passive",
   "talk_lifecycle",
   "talk_operator_auth",
   "talk_openai_realtime",
   "talk_core_realtime",
+  "talk_core_provider",
+  "talk_pause",
   "talk_progress",
   "talk_providers",
   "talk_realtime",
@@ -101,6 +212,10 @@ known-first-party = [
   "talk_runs",
   "talk_setup",
   "talk_steer",
+  "talk_run_control",
+  "talk_task_events",
+  "talk_task_sources",
+  "talk_speech_timing",
   "talk_tools",
   "talk_transcript",
   "talk_wire",

@@ -13,6 +13,7 @@ import threading
 import time
 
 import pytest
+import wallclock
 
 import talk_apiserver
 import talk_approvals
@@ -484,7 +485,7 @@ def test_reconcile_stays_out_while_the_watcher_lives(monkeypatch):
 
 
 def test_resolve_routes_the_exact_request_when_the_event_carried_one(monkeypatch):
-    """Real SSE events always carry request_id; sending it back as approvalId
+    """Real SSE events always carry request_id; sending it back as request_id
     lets a host with exact routing resolve THIS request instead of
     FIFO-popping the oldest. Hosts that predate the field ignore it."""
 
@@ -506,7 +507,7 @@ def test_resolve_routes_the_exact_request_when_the_event_carried_one(monkeypatch
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> bool:
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + wallclock.stretch(timeout)
     while time.monotonic() < deadline:
         if predicate():
             return True
@@ -729,7 +730,7 @@ def test_the_api_server_worker_starts_the_approval_sidecar(monkeypatch):
         talk_host._api_server_worker("check the screen", session_id=None),
     )
 
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + wallclock.stretch(3)
     while time.monotonic() < deadline:
         run = talk_runs.get_run(run_id)
         if run and run["status"] in talk_runs.TERMINAL_STATUSES:
@@ -822,7 +823,7 @@ def test_respond_to_approval_posts_the_choice(monkeypatch):
     assert seen["headers"] == {"Authorization": "Bearer k-123"}
 
 
-def test_respond_to_approval_carries_the_approval_id_when_given(monkeypatch):
+def test_respond_to_approval_carries_the_request_id_when_given(monkeypatch):
     seen = {}
 
     class Response:
@@ -841,7 +842,7 @@ def test_respond_to_approval_carries_the_approval_id_when_given(monkeypatch):
 
     talk_apiserver.respond_to_approval("run_9", "once", approval_id="req-77")
 
-    assert seen["json"] == {"choice": "once", "approvalId": "req-77"}
+    assert seen["json"] == {"choice": "once", "request_id": "req-77"}
 
 
 def test_respond_to_approval_409_is_the_gone_verdict(monkeypatch):

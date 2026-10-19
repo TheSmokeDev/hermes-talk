@@ -295,3 +295,35 @@ def test_catalog_startup_wait_honors_zero_and_rejects_junk(monkeypatch):
     )
     monkeypatch.delenv("TALK_CATALOG_STARTUP_WAIT_S")
     assert talk_config.catalog_startup_wait_s() == 2.5
+
+
+@pytest.mark.parametrize("provider,mode,accepted", [
+    ("openai", "provider_native", True), ("openai", "server_vad", True),
+    ("openai", "semantic_vad", True), ("grok", "provider_native", True),
+    ("grok", "server_vad", True), ("grok", "semantic_vad", False),
+    ("gemini", "provider_native", True), ("gemini", "server_vad", False),
+    ("gemini", "semantic_vad", False), ("openai", "", False), ("openai", "vad", False),
+])
+def test_turn_detection_config_matrix(monkeypatch, provider, mode, accepted):
+    monkeypatch.setenv("TALK_TURN_DETECTION", mode)
+    monkeypatch.delenv("TALK_SEMANTIC_EAGERNESS", raising=False)
+    if accepted:
+        assert talk_config.turn_detection(provider).mode.value == mode
+    else:
+        with pytest.raises(talk_config.TalkConfigError, match="TALK_TURN_DETECTION"):
+            talk_config.turn_detection(provider)
+
+
+def test_turn_detection_defaults_and_eagerness_are_resolved_at_call_time(monkeypatch):
+    monkeypatch.delenv("TALK_TURN_DETECTION", raising=False)
+    monkeypatch.delenv("TALK_SEMANTIC_EAGERNESS", raising=False)
+    assert talk_config.turn_detection("openai").mode.value == "provider_native"
+    monkeypatch.setenv("TALK_SEMANTIC_EAGERNESS", "low")
+    with pytest.raises(talk_config.TalkConfigError, match="TALK_SEMANTIC_EAGERNESS"):
+        talk_config.turn_detection("openai")
+    monkeypatch.setenv("TALK_TURN_DETECTION", "semantic_vad")
+    assert talk_config.turn_detection("openai").semantic_eagerness.value == "low"
+    for invalid in ("", "fast", "-1"):
+        monkeypatch.setenv("TALK_SEMANTIC_EAGERNESS", invalid)
+        with pytest.raises(talk_config.TalkConfigError, match="TALK_SEMANTIC_EAGERNESS"):
+            talk_config.turn_detection("openai")

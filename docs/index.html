@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Talk — realtime duplex voice for Hermes Agent</title>
+<meta name="description" content="Hermes Talk is a realtime voice plugin for Hermes Agent. Speak to your agent, it answers out loud and calls its own tools mid-conversation, in the terminal, a Discord voice channel or the dashboard. Runs on a ChatGPT or X Premium subscription with no API key.">
+<link rel="canonical" href="https://thesmokedev.github.io/hermes-talk/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Hermes Talk">
+<meta property="og:title" content="Hermes Talk — realtime duplex voice for Hermes Agent">
+<meta property="og:description" content="A realtime voice plugin for Hermes Agent. Speak to your agent, it answers out loud and calls its own tools mid-conversation. Terminal, Discord and dashboard.">
+<meta property="og:url" content="https://thesmokedev.github.io/hermes-talk/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Hermes Talk — realtime duplex voice for Hermes Agent">
+<meta name="twitter:description" content="A realtime voice plugin for Hermes Agent. Speak to your agent, it answers out loud and calls its own tools mid-conversation.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Hermes Talk",
+  "alternateName": "hermes-talk",
+  "description": "A realtime voice plugin for Hermes Agent. One bidirectional speech-to-speech session in which the agent uses its real tools, takes interruption, delegates background work while you keep talking, and speaks results when they land. Runs in the terminal, a Discord voice channel and the Hermes dashboard.",
+  "applicationCategory": "DeveloperApplication",
+  "applicationSubCategory": "Voice interface plugin",
+  "operatingSystem": "Linux, macOS, Windows",
+  "url": "https://thesmokedev.github.io/hermes-talk/",
+  "codeRepository": "https://github.com/TheSmokeDev/hermes-talk",
+  "downloadUrl": "https://pypi.org/project/hermes-talk/",
+  "installUrl": "https://pypi.org/project/hermes-talk/",
+  "license": "https://opensource.org/licenses/MIT",
+  "programmingLanguage": "Python",
+  "runtimePlatform": "Python 3.11+",
+  "softwareRequirements": "Python 3.11 or newer; a Hermes Agent host v0.17 or newer",
+  "author": {
+    "@type": "Person",
+    "name": "SmokeDev",
+    "url": "https://github.com/TheSmokeDev"
+  },
+  "maintainer": {
+    "@type": "Person",
+    "name": "SmokeDev",
+    "url": "https://github.com/TheSmokeDev"
+  },
+  "isAccessibleForFree": true,
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --fg: #1c1c1a;
+  --muted: #5d5d57;
+  --rule: #e2e2dd;
+  --accent: #16653d;
+  --code-bg: #f0f0ec;
+  --card: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14151a;
+    --fg: #e8e8e4;
+    --muted: #9b9b95;
+    --rule: #2a2c33;
+    --accent: #5fcf95;
+    --code-bg: #1d1f26;
+    --card: #191b21;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.62 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+.wrap { max-width: 46rem; margin: 0 auto; padding: 3.5rem 1.25rem 4rem; }
+h1 { font-size: 2.35rem; line-height: 1.12; margin: 0 0 .4rem; letter-spacing: -.02em; }
+.tagline { font-size: 1.12rem; color: var(--muted); margin: 0 0 1.6rem; }
+h2 { font-size: 1.18rem; margin: 2.6rem 0 .7rem; letter-spacing: -.01em; }
+h2::before { content: ""; display: block; border-top: 1px solid var(--rule); margin-bottom: 1.5rem; }
+p { margin: 0 0 1rem; }
+a { color: var(--accent); }
+a:hover { text-decoration: none; }
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: .9em;
+  background: var(--code-bg);
+  padding: .12em .34em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: .9rem 1rem;
+  overflow-x: auto;
+  margin: 0 0 1rem;
+}
+pre code { background: none; padding: 0; font-size: .875rem; line-height: 1.6; }
+ul { margin: 0 0 1rem; padding-left: 1.15rem; }
+li { margin-bottom: .55rem; }
+li strong { font-weight: 600; }
+.lede {
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  padding: 1rem 1.15rem;
+  margin: 0 0 1.4rem;
+}
+.lede p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; margin: 0 0 1rem; }
+th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; }
+.links { display: flex; flex-wrap: wrap; gap: .5rem 1.4rem; margin: .4rem 0 0; padding: 0; list-style: none; }
+.links li { margin: 0; }
+footer {
+  margin-top: 3rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: .9rem;
+}
+@media (max-width: 34rem) {
+  .wrap { padding-top: 2.25rem; }
+  h1 { font-size: 1.85rem; }
+}
+</style>
+</head>
+<body>
+<main class="wrap">
+
+<h1>Hermes Talk</h1>
+<p class="tagline">Realtime duplex voice for your own agent. Talk to it, it runs real work in the background, it reports back out loud.</p>
+
+<div class="lede">
+<p><strong>Hermes Talk</strong> is a realtime voice plugin for
+<a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>. You speak, it
+answers out loud, and it calls the agent's own tools without leaving the conversation.
+It runs in the terminal, in a Discord voice channel, and in the Hermes dashboard.</p>
+<p>It rides your ChatGPT or SuperGrok subscription. No API key required.</p>
+</div>
+
+<h2>Install</h2>
+<pre><code>hermes plugins install TheSmokeDev/hermes-talk --enable
+python -m pip install "hermes-talk[audio]"
+hermes talk</code></pre>
+<p>Needs Python 3.11 or newer and a Hermes Agent host v0.17 or newer. The
+<code>[audio]</code> extra adds microphone and speaker support; skip it if you only
+use the dashboard, where audio is browser-native.</p>
+
+<h2>What it is</h2>
+<p>Not dictation, and not read-my-reply-aloud. One bidirectional audio session where
+turn-taking, interruption and tool calls happen inside the speech layer:</p>
+<ul>
+<li><strong>Duplex.</strong> Cut it off mid-sentence and it stops, because it never
+stopped listening.</li>
+<li><strong>Its tools are the agent's tools.</strong> Realtime function calls relay
+straight into Hermes's real tool surface. Ask it something it cannot know and you hear
+it go look, then answer from what it found.</li>
+<li><strong>Work outlives the sentence.</strong> Delegation spawns a real background
+Hermes agent. You keep talking. The result is spoken when it lands.</li>
+<li><strong>It starts already knowing you.</strong> The session prompt is assembled
+from what Hermes itself knows, including your <code>SOUL.md</code> and whatever your
+configured memory provider contributes.</li>
+</ul>
+
+<h2>Where it runs</h2>
+<table>
+<tr><th>Surface</th><th>Start it</th><th>Audio</th></tr>
+<tr><td>Terminal</td><td><code>hermes talk</code></td><td>native duplex mic and speaker</td></tr>
+<tr><td>Inside a Hermes session</td><td><code>/talk</code></td><td>same as terminal</td></tr>
+<tr><td>Discord voice channel</td><td><code>/voice join</code>, then <code>/talk join</code></td><td>borrows the host's voice connection</td></tr>
+<tr><td>Dashboard <strong>Talk</strong> tab</td><td><code>hermes dashboard</code>, select a task, Start</td><td>browser WebRTC, no local audio drivers</td></tr>
+<tr><td>Desktop <strong>Talk</strong> action</td><td>open a conversation, Talk</td><td>renderer WebRTC</td></tr>
+</table>
+
+<h2>Providers</h2>
+<table>
+<tr><th>Provider</th><th>Model</th><th>Auth</th></tr>
+<tr><td>OpenAI Realtime (default)</td><td><code>gpt-realtime-2.1</code></td><td>a ChatGPT subscription through <code>codex login</code>, or an API key</td></tr>
+<tr><td>xAI Grok Voice</td><td><code>grok-voice-latest</code></td><td>an X Premium or SuperGrok login, no key; or an API key</td></tr>
+<tr><td>Gemini Live</td><td><code>gemini-3.1-flash-live-preview</code></td><td>a Gemini API key; free-tier AI Studio keys work</td></tr>
+<tr><td>GPT-Live</td><td><code>gpt-live-1-codex</code> / <code>gpt-live-1</code></td><td>the Codex subscription, or explicitly chosen API billing</td></tr>
+</table>
+<p>So OpenAI Realtime and xAI Grok Voice ride a subscription today, and Gemini Live
+needs a key. <strong>GPT-Live</strong> is not a row in the provider knob — it is
+selected separately by <code>TALK_VOICE_MODE=live</code>, runs
+<code>gpt-live-1-codex</code> on the subscription and <code>gpt-live-1</code> on API
+billing, and never falls back from one to the other.</p>
+<p>A cascade lane can route speech through ElevenLabs for a custom voice. Provider
+support differs by surface, and the provider knob is fail-closed — it is never inferred
+from which keys happen to exist. <code>hermes talk doctor</code> names which lane came
+up and what is missing.</p>
+
+<h2>Is it working?</h2>
+<pre><code>hermes talk doctor    # read-only diagnostics: auth lane, provider, model, voice, audio
+hermes talk check     # doctor, plus one live provider turn and one bounded Hermes run</code></pre>
+
+<h2>Links</h2>
+<ul class="links">
+<li><a href="https://github.com/TheSmokeDev/hermes-talk">Source on GitHub</a></li>
+<li><a href="https://pypi.org/project/hermes-talk/">Package on PyPI</a></li>
+<li><a href="https://github.com/TheSmokeDev/hermes-talk/blob/main/CHANGELOG.md">Changelog</a></li>
+<li><a href="https://github.com/TheSmokeDev/hermes-talk/issues">Issues</a></li>
+<li><a href="https://github.com/TheSmokeDev/hermes-talk/blob/main/docs/OPERATING.md">Operating guide</a></li>
+</ul>
+
+<footer>
+<p>Hermes Talk is MIT licensed and built by
+<a href="https://github.com/TheSmokeDev">SmokeDev</a>. It is a plug-in for
+<a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>, not a
+standalone assistant.</p>
+</footer>
+
+</main>
+</body>
+</html>

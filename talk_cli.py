@@ -27,12 +27,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 
 try:
     from . import (
@@ -42,15 +46,19 @@ try:
         talk_auth,
         talk_capabilities,
         talk_cascade_voice,
+        talk_check,
         talk_config,
+        talk_diagnostics,
         talk_doctor,
         talk_gemini_realtime,
+        talk_grok_auth,
         talk_grok_realtime,
         talk_host,
         talk_identity,
         talk_lifecycle,
         talk_openai_realtime,
         talk_operator_auth,
+        talk_pause,
         talk_progress,
         talk_realtime,
         talk_runs,
@@ -68,15 +76,19 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_auth
     import talk_capabilities
     import talk_cascade_voice
+    import talk_check
     import talk_config
+    import talk_diagnostics
     import talk_doctor
     import talk_gemini_realtime
+    import talk_grok_auth
     import talk_grok_realtime
     import talk_host
     import talk_identity
     import talk_lifecycle
     import talk_openai_realtime
     import talk_operator_auth
+    import talk_pause
     import talk_progress
     import talk_realtime
     import talk_runs
@@ -86,6 +98,8 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_transcript
     import talk_wire
     from talk_relay import RealtimeRelay
+
+_log = logging.getLogger(__name__)
 
 #: How long the sender waits when the microphone queue is empty. One tenth of
 #: a block: short enough that capture never falls behind, long enough that an
@@ -116,7 +130,8 @@ def build_session_update(
     """
 
     session = talk_wire.build_session_payload(
-        model=model, voice=voice, instructions=instructions, tools=tools
+        model=model, voice=voice, instructions=instructions, tools=tools,
+        turn_detection=talk_config.turn_detection("openai"),
     )
     return {
         "type": "session.update",
@@ -213,6 +228,34 @@ def _announcement_messages(headline: str, report: str) -> list[dict]:
 #: How the announcement pump waits for the wire to go idle. Session teardown
 #: cancels the pump; an active response is never overlapped just to meet a timer.
 ANNOUNCE_IDLE_POLL_S = 0.05
+#: How long one announcement may sit deferred before the operator is told.
+#: The busy predicate is a superset of the decline condition, so a predicate
+#: that never clears (a stuck continuation, a speaker that never drains)
+#: starves the pump as a silent slow poll with nothing to see. Zero disables.
+ANNOUNCE_STARVATION_WARN_S = 30.0
+#: Why a session refused BEFORE it went live. A lane that shows the operator a
+#: receipt (Discord) renders these; they are bounded codes, never exception
+#: text, because that receipt lands in a chat channel where a token, a path, or
+#: a provider payload must never appear. The terminal keeps the detail: every
+#: call site still prints its own stderr line first.
+STARTUP_REFUSAL_CONFIGURATION = "configuration"
+STARTUP_REFUSAL_TOOLS = "tools"
+STARTUP_REFUSAL_AUDIO = "audio"
+STARTUP_REFUSAL_PROVIDER = "provider"
+#: The transport hears speakers the session cannot authorize. Unlike the four
+#: above this is not a knob the operator forgot to set — it is a wiring
+#: contradiction inside this process, so its sentence points at the host, not
+#: at a setting.
+STARTUP_REFUSAL_AUTHORIZATION = "authorization"
+STARTUP_REFUSAL_REASONS = frozenset(
+    {
+        STARTUP_REFUSAL_CONFIGURATION,
+        STARTUP_REFUSAL_TOOLS,
+        STARTUP_REFUSAL_AUDIO,
+        STARTUP_REFUSAL_PROVIDER,
+        STARTUP_REFUSAL_AUTHORIZATION,
+    }
+)
 TOOL_SESSION_QUEUE_SIZE = 1
 TOOL_CLEANUP_WAIT_S = 6.0
 MAX_SPEAKER_DISPLAY_NAME_CHARS = 256
@@ -491,6 +534,25 @@ class ToolResponseCoordinator:
                     self.queue.task_done()
 
 
+def _event_tool_name(event: dict) -> str:
+    """The provider's tool name for this event, or "" when it gave none.
+
+    Empty, never a stand-in like ``"tool"``. Every downstream comparison is
+    exact-match — ``READ_ONLY_TALK_TOOLS`` / ``MUTATING_TALK_TOOLS``
+    membership, ``classify_host_tool``, and the ledger's ``permit.action !=
+    name`` rename tripwire — so an unnamed call has to be matched as the
+    unknown it is. A synthetic name could one day BE a registered tool and
+    would then be classified as one.
+
+    Both authorizer call sites read the name through here: they disagreed
+    (``"tool"`` in :meth:`HostExecutionRelay._consume_tool_attempt`, ``""``
+    in the batch path), which meant the same nameless event was revoked under
+    a different identity than it would have been authorized under.
+    """
+
+    return str(event.get("name") or "")
+
+
 def local_operator_authorizer(tool_name: str, event: dict) -> None:
     """Grant speaker authority for a session with no remote speakers.
 
@@ -564,7 +626,7 @@ class HostExecutionRelay:
     def _consume_tool_attempt(self, event: dict) -> None:
         """Consume a bound call permit on any terminal non-execution path."""
 
-        self.tool_authorizer(str(event.get("name") or "tool"), event)
+        self.tool_authorizer(_event_tool_name(event), event)
 
     def discard_tool_event(self, event: dict) -> None:
         """Revoke a queued tool event that session teardown will never execute."""
@@ -599,7 +661,7 @@ class HostExecutionRelay:
             # event["arguments"] string read below — nothing rewrites the
             # dict in between, so the authorized and executed arguments
             # cannot diverge.
-            name = str(event.get("name") or "")
+            name = _event_tool_name(event)
             denial = self.tool_authorizer(name, event)
             if denial is None:
                 # WHO may act is settled; WHAT may run on this thread is a
@@ -666,8 +728,17 @@ def _announcement_sent(on_sent) -> None:
         on_sent()
 
 
+def _announcement_starved(on_starved, waited: float) -> None:
+    """Report a long deferral; reporting it must never take down the pump."""
+
+    if on_starved is None:
+        return
+    with suppress(Exception):
+        on_starved(waited)
+
+
 async def pump_announcements(
-    announce_queue, relay, ws, send_batch=None, response_busy=None
+    announce_queue, relay, ws, send_batch=None, response_busy=None, on_starved=None
 ) -> None:
     """Serialize every out-of-band announcement (Codex v0.6.1 finding 3).
 
@@ -684,6 +755,11 @@ async def pump_announcements(
     kept for tests — it has no such lock, so it remains check-then-act, and
     it drops a failed batch; provider-session sends surface failure to the
     supervisor.
+
+    ``on_starved`` is called at most once per batch when that deferral passes
+    :data:`ANNOUNCE_STARVATION_WARN_S`. Deferring is correct behaviour, so
+    this is not an error — but a predicate that never clears is
+    indistinguishable from a quiet session unless something says so.
     """
 
     while True:
@@ -692,8 +768,19 @@ async def pump_announcements(
             batch, on_sent = queued.commands, queued.on_sent
         else:
             batch, on_sent = queued, None
+        # Per BATCH, not per wait loop: a batch declined by send_batch goes
+        # round again, and its clock must keep running across that retry.
+        waiting_since: float | None = None
+        starved = False
         while True:
             while response_busy() if response_busy is not None else relay.response_active:
+                if waiting_since is None:
+                    waiting_since = time.monotonic()
+                elif not starved and ANNOUNCE_STARVATION_WARN_S > 0:
+                    waited = time.monotonic() - waiting_since
+                    if waited >= ANNOUNCE_STARVATION_WARN_S:
+                        starved = True
+                        _announcement_starved(on_starved, waited)
                 await asyncio.sleep(ANNOUNCE_IDLE_POLL_S)
             try:
                 if send_batch is None:
@@ -957,6 +1044,174 @@ def approval_outcome_commands(event: dict) -> list[talk_realtime.RealtimeCommand
     return _announcement_commands(headline, "")
 
 
+#: Which operator control flipped the microphone, in words the model can
+#: repeat. The model's OWN flips (the pause_voice_input tool) are absent on
+#: purpose: it speaks those as its tool result, and an announcement on top
+#: would be the same receipt twice.
+_PAUSE_CONTROLS = {
+    talk_pause.SOURCE_KEYBOARD: "the keyboard",
+    talk_pause.SOURCE_COMMAND: "a /talk command",
+}
+
+
+def input_pause_commands(paused: bool, source: str) -> list[talk_realtime.RealtimeCommand]:
+    """Contained speech for an OPERATOR-made microphone flip (hermes-talk#100).
+
+    A control the operator pressed has no voice of its own, so the receipt
+    rides the same self-deleting, tools-off announcement shape as every
+    other out-of-band injection. Nothing untrusted is quoted: the headline
+    is plugin-owned words and a control name from a fixed table.
+    """
+
+    control = _PAUSE_CONTROLS.get(source)
+    if control is None:
+        return []
+    if paused:
+        headline = (
+            f"The operator just paused your microphone from {control}. You will "
+            "not hear them until they resume it; playback and background work "
+            "continue."
+        )
+    else:
+        headline = (
+            f"The operator just resumed your microphone from {control} — you can "
+            "hear them again."
+        )
+    return _announcement_commands(headline, "")
+
+
+#: How often the terminal control checks for a keypress. The reader never
+#: blocks on stdin: a thread parked in ``readline()`` would outlive the
+#: session and swallow the operator's NEXT line — the one meant for the
+#: Hermes prompt `/talk` returns to.
+KEYBOARD_POLL_S = 0.1
+_KEY_ACTIONS = {
+    "": "toggle",
+    "p": "pause",
+    "pause": "pause",
+    "mute": "pause",
+    "r": "resume",
+    "resume": "resume",
+    "unmute": "resume",
+    "listen": "resume",
+}
+#: ``msvcrt.getwch()`` returns one of these for an extended key, then the
+#: key's scan code on the next call (`Python docs: msvcrt.getch`).
+_WIN32_EXTENDED_KEY_PREFIXES = ("\x00", "\xe0")
+
+
+def _read_control_key(stdin, stop: threading.Event) -> str | None:
+    """One bounded poll of the terminal: an action name, or None for nothing.
+
+    Windows consoles have no ``select`` on stdin, so a waiting keypress is
+    read through ``msvcrt`` one character at a time — Enter toggles, ``p``
+    and ``r`` pause and resume. An extended key (an arrow, Insert, an F-key)
+    arrives as a ``'\\x00'`` or ``'\\xe0'`` prefix and THEN its scan code on
+    the next read; the scan code is consumed here with the prefix, because
+    read on its own it is a letter — Down-Arrow's is ``'P'``, Insert's is
+    ``'R'`` — and would pause or resume the microphone. Elsewhere ``select``
+    waits for a whole line in the terminal's own cooked mode (no tty state
+    is ever changed, so a crash cannot leave the shell raw): a bare Enter
+    toggles, and the words in ``_KEY_ACTIONS`` are explicit. EOF stops the
+    watcher for good.
+    """
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        if not msvcrt.kbhit():
+            time.sleep(KEYBOARD_POLL_S)
+            return None
+        char = msvcrt.getwch()
+        if char in _WIN32_EXTENDED_KEY_PREFIXES:
+            msvcrt.getwch()  # the scan code; documented to follow without blocking
+            return None
+        if char in ("\r", "\n"):
+            return "toggle"
+        if char.isascii() and char.isalpha():
+            return _KEY_ACTIONS.get(char.lower())
+        return None
+    import select
+
+    try:
+        ready, _, _ = select.select([stdin], [], [], KEYBOARD_POLL_S)
+    except (OSError, ValueError):
+        stop.set()
+        return None
+    if not ready:
+        return None
+    line = stdin.readline()
+    if line == "":
+        stop.set()
+        return None
+    return _KEY_ACTIONS.get(line.strip().lower())
+
+
+def keyboard_pause_control_available(stdin=None) -> bool:
+    """Whether :func:`start_keyboard_pause_control` would start on ``stdin``.
+
+    The ONE predicate both the advertisement and the watcher use: a pause
+    tool is offered on the terminal lane exactly when this returns True, so
+    the model can never be handed a pause the operator has no key to undo.
+    False for a piped or missing stdin, a closed file, or anything that is
+    not a tty (Git Bash's mintty reports ``isatty() == False`` to Python).
+    """
+
+    stdin = sys.stdin if stdin is None else stdin
+    try:
+        return stdin is not None and bool(stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def start_keyboard_pause_control(
+    stdin=None, *, read_key=None
+) -> Callable[[], None] | None:
+    """Watch the terminal for the operator's pause control (hermes-talk#100).
+
+    Returns a stop callable, or ``None`` when there is no terminal to watch
+    — a piped stdin, a test, a gateway. The watcher is a daemon thread that
+    polls rather than blocks, so ``stop()`` is honoured within one poll and
+    nothing typed after the session ends is ever consumed here. Each key
+    goes through :func:`talk_pause.set_paused` exactly like the tool does;
+    the attached session's receipt callback owns what is said and printed.
+
+    Callers decide WHETHER this terminal may be watched at all: the
+    standalone ``hermes talk`` command owns its tty, but ``/talk`` typed at
+    the Hermes prompt runs while prompt_toolkit holds that same tty in raw
+    mode with its own stdin reader, and a second reader would race it for
+    every byte (and, on POSIX, park in ``readline()`` waiting for a newline
+    raw mode never delivers). That lane passes ``keyboard_control=False``
+    to :func:`run_talk_session` and never reaches here.
+    """
+
+    stdin = sys.stdin if stdin is None else stdin
+    if not keyboard_pause_control_available(stdin):
+        return None
+    stop = threading.Event()
+    read = read_key or _read_control_key
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                action = read(stdin, stop)
+            except Exception as exc:  # noqa: BLE001 — a dead console ends the watcher, not the call
+                _log.debug("keyboard pause control stopped: %s: %s", type(exc).__name__, exc)
+                return
+            if action not in _KEY_ACTIONS.values() or stop.is_set():
+                continue
+            # A toggle with nothing attached reads as "pause": the flip is
+            # refused downstream (NO_SESSION) rather than guessed here.
+            paused = not bool(talk_pause.is_paused()) if action == "toggle" else action == "pause"
+            try:
+                talk_pause.set_paused(paused, source=talk_pause.SOURCE_KEYBOARD)
+            except Exception as exc:  # noqa: BLE001 — one bad key must not end the watcher
+                _log.debug("keyboard pause flip failed: %s: %s", type(exc).__name__, exc)
+
+    threading.Thread(target=watch, name="talk-keyboard-pause", daemon=True).start()
+    return stop.set
+
+
 def _active_parent_session_id() -> str | None:
     """Snapshot the bound Hermes session id, or fail closed on older hosts."""
 
@@ -984,6 +1239,8 @@ def _mint_session(
     instructions: str,
     tools: list[dict],
     text_output: bool = False,
+    automatic_response: bool = True,
+    turn_detection=None,
 ) -> talk_wire.TalkSessionDescriptor:
     """Mint the ephemeral session, translating a 401 into its remediation.
 
@@ -1000,6 +1257,8 @@ def _mint_session(
             instructions=instructions,
             tools=tools,
             text_output=text_output,
+            automatic_response=automatic_response,
+            turn_detection=turn_detection or talk_config.turn_detection("openai"),
         )
     except talk_wire.TalkUpstreamError as exc:
         if "(401)" in str(exc):
@@ -1018,24 +1277,13 @@ def _mint_session(
 def _grok_auth() -> talk_auth.TalkAuth:
     """The xAI credential for the Grok lane, in the factory's auth shape.
 
-    xAI has no OAuth lane and no ephemeral mint — the resolved key itself is
-    the socket's bearer. Source names reuse the OpenAI receipt vocabulary so
-    receipts name lanes, never keys.
+    Metered key or the host's ``xai-oauth`` subscription login; there is no
+    ephemeral mint, so the resolved token itself is the socket's bearer.
+    Source names reuse the OpenAI receipt vocabulary so receipts name lanes,
+    never keys.
     """
 
-    scoped = (os.environ.get("TALK_XAI_API_KEY") or "").strip()
-    token = talk_config.resolve_xai_key()
-    if scoped:
-        return talk_auth.TalkAuth(
-            token=token,
-            source=talk_auth.SOURCE_CONFIGURED,
-            detail="TALK_XAI_API_KEY (Talk-scoped key)",
-        )
-    return talk_auth.TalkAuth(
-        token=token,
-        source=talk_auth.SOURCE_ENV,
-        detail="XAI_API_KEY environment variable",
-    )
+    return talk_grok_auth.resolve_grok_auth()
 
 
 def _gemini_auth() -> talk_auth.TalkAuth:
@@ -1061,21 +1309,90 @@ def _gemini_auth() -> talk_auth.TalkAuth:
     )
 
 
-def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession:
-    """Build the configured provider adapter behind the neutral session contract.
+@dataclass(frozen=True, slots=True)
+class ProviderLane:
+    """One session's provider pick with the credential, model, and voice it uses."""
 
-    The provider comes from ``TALK_PROVIDER`` (call-time, fail-closed), never
-    from which keys happen to exist. The OpenAI branch is the historical
-    default and stays byte-identical to the pre-provider factory.
+    provider: str
+    auth: talk_auth.TalkAuth
+    model: str
+    voice: str
+    configuration: object | None = None
+
+
+def resolve_provider_lane() -> ProviderLane:
+    """Resolve the configured provider's credential, model, and voice at call time.
+
+    The one place the provider pick meets its lane: ``run_talk_session`` and
+    ``hermes talk check`` both call it, so the check proves the session's
+    real resolution path rather than a copy of it. Raises
+    :class:`talk_config.TalkConfigError` or :class:`talk_auth.TalkAuthError`
+    exactly as the session start does.
     """
 
-    if talk_config.talk_provider() == "grok":
+    if talk_config.voice_mode() == "live":
+        try:
+            from .talk_live_config import LiveConfigError, resolve_live_auth, resolve_live_config
+        except ImportError:
+            from talk_live_config import LiveConfigError, resolve_live_auth, resolve_live_config
+        try:
+            config = resolve_live_config()
+            return ProviderLane(
+                "live", resolve_live_auth(config=config), config.model, config.voice, config
+            )
+        except LiveConfigError as exc:
+            raise talk_config.TalkConfigError(str(exc)) from None
+    provider = talk_config.talk_provider()
+    talk_config.turn_detection(provider)
+    if provider == "grok":
+        return ProviderLane(
+            provider=provider,
+            auth=_grok_auth(),
+            model=talk_config.talk_grok_model(),
+            voice=talk_config.talk_grok_voice(),
+        )
+    if provider == "gemini":
+        return ProviderLane(
+            provider=provider,
+            auth=_gemini_auth(),
+            model=talk_config.talk_gemini_model(),
+            voice=talk_config.talk_gemini_voice(),
+        )
+    return ProviderLane(
+        provider=provider,
+        auth=talk_host.host().resolve_auth(),
+        model=talk_config.talk_model(),
+        voice=talk_config.talk_voice(),
+    )
+
+
+def _realtime_session(
+    auth: talk_auth.TalkAuth, *, provider=None, live_config=None,
+) -> talk_realtime.RealtimeSession:
+    """Build the configured provider adapter behind the neutral session contract.
+
+    ``TALK_VOICE_MODE=live`` selects client delegation. Native provider voice
+    follows ``TALK_PROVIDER``; credentials never choose a provider.
+    """
+
+    provider = provider or (
+        "live" if talk_config.voice_mode() == "live" else talk_config.talk_provider()
+    )
+    if provider == "live":
+        try:
+            from .talk_live_config import resolve_live_config
+            from .talk_live_realtime import LiveRealtimeSession
+        except ImportError:
+            from talk_live_config import resolve_live_config
+            from talk_live_realtime import LiveRealtimeSession
+        return LiveRealtimeSession(auth=auth, config=live_config or resolve_live_config())
+    if provider == "grok":
         return talk_grok_realtime.GrokRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
             aiohttp_module=_import_aiohttp(),
         )
-    if talk_config.talk_provider() == "gemini":
+    if provider == "gemini":
         return talk_gemini_realtime.GeminiRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
@@ -1101,6 +1418,8 @@ def _realtime_session(auth: talk_auth.TalkAuth) -> talk_realtime.RealtimeSession
                 for tool in setup.tools
             ],
             text_output=setup.text_output,
+            automatic_response=setup.automatic_response,
+            turn_detection=setup.turn_detection,
         ),
     )
 
@@ -1158,6 +1477,12 @@ async def run_talk_session(
     session_factory=None,
     host_execution_attachment=None,
     lane: str = "cli",
+    on_refusal=None,
+    keyboard_control: bool = False,
+    native_task: dict | None = None,
+    native_task_api=None,
+    control_input=None,
+    on_native_controller=None,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -1170,7 +1495,53 @@ async def run_talk_session(
     CLI lane composes a host summary: it is the lane whose session setup may
     spend an in-process read, and even there a cold or failed catalog yields
     no line rather than a stalled start.
+
+    ``on_refusal`` is an optional sink for the ONE bounded reason
+    (:data:`STARTUP_REFUSAL_REASONS`) a session refused before going live.
+    The exit code is unchanged either way; a lane that only exits a process
+    (the terminal) ignores it, and a lane that owes the operator a spoken
+    receipt (Discord) uses it to say what actually refused instead of
+    collapsing every startup failure into "exited unsuccessfully".
+
+    ``keyboard_control`` says this session OWNS the terminal's stdin and may
+    watch it for the microphone pause key (hermes-talk#100). Only the
+    standalone ``hermes talk`` command passes True; ``/talk`` at the Hermes
+    prompt shares its tty with prompt_toolkit and must not. It is one input
+    to the pause decision — the key still has to exist (a tty) — and that
+    decision is made ONCE, before the tools are built: ``pause_voice_input``
+    is advertised exactly when an operator resume control is guaranteed
+    (that key, or ``/talk resume`` in Discord), and the same control is
+    registered with :mod:`talk_pause`, which refuses to pause without one.
     """
+
+    def refuse(reason: str) -> int:
+        """Record a bounded refusal reason and return the session exit code."""
+
+        if on_refusal is not None:
+            # A caller's receipt hook must never turn a clean refusal into a
+            # crash the lane then reports as an unrelated session error.
+            with suppress(Exception):
+                on_refusal(reason)
+        return 1
+
+    if native_task is not None or native_task_api is not None:
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+            return refuse(STARTUP_REFUSAL_CONFIGURATION)
+        return await run_native_talk_session(
+            audio=audio, session_factory=session_factory, lane=lane,
+            keyboard_control=keyboard_control, task=native_task or {}, api=native_task_api,
+            control_input=control_input, on_controller=on_native_controller, on_refusal=on_refusal,
+        )
+
+    try:
+        if talk_config.voice_mode() == "live":
+            print("talk: Live needs an explicit canonical task. Use --targets, then --task ID.",
+                  file=sys.stderr)
+            return refuse(STARTUP_REFUSAL_CONFIGURATION)
+    except talk_config.TalkConfigError as exc:
+        print(f"talk: {exc}", file=sys.stderr)
+        return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
@@ -1179,19 +1550,12 @@ async def run_talk_session(
     talk_capabilities.warm_in_background()
 
     try:
-        provider = talk_config.talk_provider()
-        if provider == "grok":
-            auth = _grok_auth()
-            model = talk_config.talk_grok_model()
-            voice = talk_config.talk_grok_voice()
-        elif provider == "gemini":
-            auth = _gemini_auth()
-            model = talk_config.talk_gemini_model()
-            voice = talk_config.talk_gemini_voice()
-        else:
-            auth = talk_host.host().resolve_auth()
-            model = talk_config.talk_model()
-            voice = talk_config.talk_voice()
+        lane_pick = resolve_provider_lane()
+        provider = lane_pick.provider
+        auth = lane_pick.auth
+        model = lane_pick.model
+        voice = lane_pick.voice
+        turn_detection = talk_config.turn_detection(provider)
         # Cascade voice mode: the provider thinks in text, ElevenLabs speaks.
         # Resolved HERE, next to the provider pick, so every fail-closed knob
         # (mode, TTS provider, key, voice id) refuses before a single secret
@@ -1205,18 +1569,35 @@ async def run_talk_session(
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_CONFIGURATION)
+
+    # The operator's way back from a pause (hermes-talk#100), decided HERE so
+    # the tool list below and the registry attach further down agree: the
+    # Discord room has `/talk resume`; the terminal has Enter only when this
+    # session owns a real tty. Anything else has no way back, so no pause is
+    # offered — Ctrl+C is the exit this feature exists to avoid.
+    if lane == "discord":
+        resume_control: str | None = talk_pause.RESUME_COMMAND
+    elif lane == "cli" and keyboard_control and keyboard_pause_control_available():
+        resume_control = talk_pause.RESUME_KEYBOARD
+    else:
+        resume_control = None
 
     try:
         tools = (
             host_execution_attachment.tool_definitions()
             if host_execution_attachment is not None
-            else talk_tools.default_talk_tools()
+            else talk_tools.default_talk_tools(pausable=resume_control is not None)
         )
     except Exception as exc:  # noqa: BLE001 - host attachment startup boundary
         print(f"talk: host tool setup failed: {type(exc).__name__}", file=sys.stderr)
-        host_execution_attachment.close()
-        return 1
+        # The legacy lane reaches this handler with NO attachment (its tools
+        # come from talk_tools.default_talk_tools). Closing unconditionally
+        # raised AttributeError out of the session, so a tool-setup refusal
+        # surfaced to the operator as an unrelated crash instead of a reason.
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+        return refuse(STARTUP_REFUSAL_TOOLS)
     # The live-catalog section rides every lane. A cold process used to lose
     # the race between the background warm above and this mint — the FIRST
     # session then permanently lacked the section — so the warm gets a
@@ -1253,13 +1634,30 @@ async def run_talk_session(
         if discord_authorization
         else None
     )
+    # ENFORCED, not documented: `authorization_ledger is None` has to mean
+    # "this transport declared no remote speakers". It holds by construction
+    # three lines up, but the place that RELIES on it is the tool-authorizer
+    # wiring far below, where a None ledger silently selects the allow-all
+    # `local_operator_authorizer`. A transport that hears a whole voice
+    # channel must never reach that branch, so the contradiction is refused
+    # here — before a secret is minted or a socket is opened — instead of
+    # being trusted across a few hundred lines (hermes-talk#47).
+    if discord_authorization and authorization_ledger is None:
+        print(
+            "talk: refusing a multi-speaker session with no authorization "
+            "ledger — every speaker would inherit operator authority",
+            file=sys.stderr,
+        )
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+        return refuse(STARTUP_REFUSAL_AUTHORIZATION)
     try:
         audio.start()
     except talk_audio.TalkAudioError as exc:
         print(f"talk: {exc}", file=sys.stderr)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_AUDIO)
 
     setup = talk_realtime.SessionSetup(
         model=model,
@@ -1267,27 +1665,53 @@ async def run_talk_session(
         instructions=instructions,
         tools=_tool_definitions(tools),
         automatic_response=authorization_ledger is None,
+        turn_detection=turn_detection,
         text_output=voice_mode == "cascade",
     )
     pending: list[talk_realtime.RealtimeCommand] = []
     watchers: list[asyncio.Task] = []
     watched: set[int] = set()
     spoken_item: str | None = None
+    keyboard_stop: Callable[[], None] | None = None
 
     def on_barge_in() -> None:
         played = audio.played_ms
-        audio.drain_playback()
+        boundary = audio.drain_playback()
+        played_item = None
+        if boundary is not None:
+            played_item, played = boundary
         if relay.response_active:
             # An approval question interrupted mid-ask is a question not fully
             # heard: the bridge denies it. Speech after the prompt's response
             # finished (response_active False) is an answer, never a barge-in.
             talk_approvals.note_barge_in()
-        if relay.last_audio_item_id and played > 0:
+        item_id = played_item or relay.last_audio_item_id
+        if item_id and played > 0:
             pending.append(
                 talk_realtime.TruncateOutput(
-                    item_id=relay.last_audio_item_id, audio_end_ms=played
+                    item_id=item_id, audio_end_ms=played
                 )
             )
+
+    def speaker_busy() -> bool:
+        """Whether the previous answer is still coming out of the speaker.
+
+        ``response.done`` says the SERVER stopped generating. It says nothing
+        about the audio already queued locally, so an announcement gated on it
+        alone can start while the last second of the previous response is
+        still playing — two responses overlapping at the only surface the
+        operator actually has (hermes-talk#50). This is the local half of that
+        gate; the protocol half stays exactly as it was.
+
+        Fails OPEN. An audio object without the property is treated as idle,
+        so an unfamiliar device degrades to the old timing rather than
+        starving announcements forever.
+        """
+
+        try:
+            return bool(audio.playback_pending)
+        except Exception:  # noqa: BLE001 — a gate, never a session boundary
+            return False
 
     def on_caption(text: str) -> None:
         print(text, end="", flush=True)
@@ -1324,6 +1748,7 @@ async def run_talk_session(
             model=cascade_config[2],
             on_audio=audio.queue_playback,
             on_error=on_error,
+            voice_settings=talk_config.elevenlabs_voice_settings(),
         )
     session = None
     result = 0
@@ -1362,7 +1787,7 @@ async def run_talk_session(
         talk_transcript.sweep_transcripts(hermes_home)
         if host_execution_attachment is not None:
             host_execution_attachment.close()
-        return 1
+        return refuse(STARTUP_REFUSAL_PROVIDER)
 
     try:
         send_lock = asyncio.Lock()
@@ -1382,11 +1807,16 @@ async def run_talk_session(
             """Serialize every provider write; keep multi-command batches contiguous.
 
             False means an announcement reached the front of the lock while a
-            response was open or about to be (``relay.response_active``) or a
+            response was open or about to be (``relay.response_active``), a
             ``StartResponse`` was sent but not yet confirmed
-            (``continuation_pending``), so it was not written. The caller
-            defers it instead of speaking over the model or racing an
-            in-flight continuation.
+            (``continuation_pending``), or the speaker had not finished the
+            previous answer (``speaker_busy``), so it was not written. The
+            caller defers it instead of speaking over the model, racing an
+            in-flight continuation, or overlapping audio at the speaker.
+
+            The speaker check belongs HERE and not only in the pump poll: the
+            poll is check-then-act, and this lock is the point where the write
+            actually happens, so the wire and the room are decided together.
             """
 
             nonlocal continuation_pending
@@ -1395,7 +1825,9 @@ async def run_talk_session(
                 # pump_announcements decides "the model is idle" BEFORE queuing
                 # for this lock, and a response can start while it waits there.
                 # Re-check at the point the write actually happens.
-                if is_announcement and (relay.response_active or continuation_pending):
+                if is_announcement and (
+                    relay.response_active or continuation_pending or speaker_busy()
+                ):
                     return False
                 if any(
                     isinstance(command, talk_realtime.StartResponse)
@@ -1406,12 +1838,23 @@ async def run_talk_session(
             start_watchers(commands)
             return True
 
+        # The operator's own microphone control (hermes-talk#100), terminal
+        # lane only: a gateway has no keyboard, and its room gets `/talk
+        # pause` instead. Started only when the pause decision above chose
+        # the keyboard (same predicate, so it starts iff the tool was
+        # advertised), and before the connected line so that line can say
+        # the key exists.
+        if resume_control == talk_pause.RESUME_KEYBOARD:
+            keyboard_stop = start_keyboard_pause_control()
+        controls = "Ctrl+C to hang up" + (
+            ", Enter to pause or resume the microphone." if keyboard_stop else "."
+        )
         print(
             f"talk: connected ({model}, voice {voice}, auth {auth.source}). "
-            "Ctrl+C to hang up.\n"
+            f"{controls}\n"
             if cascade_config is None
             else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
-            f"via elevenlabs, auth {auth.source}). Ctrl+C to hang up.\n"
+            f"via elevenlabs, auth {auth.source}). {controls}\n"
         )
 
         async def send_microphone() -> None:
@@ -1492,9 +1935,11 @@ async def run_talk_session(
                         authorization_ledger.authorize_tool
                         if authorization_ledger is not None
                         # No ledger means the transport declared no remote
-                        # speakers (audio.discord_speaker_authorization is
-                        # False): the local operator is the only voice, so
-                        # the allow-all is named, not accidental.
+                        # speakers: session setup above REFUSES the session
+                        # outright when discord_speaker_authorization is true
+                        # and the ledger is absent, so reaching this branch
+                        # proves the local operator is the only voice and the
+                        # allow-all is named, not accidental.
                         else local_operator_authorizer
                     ),
                 )
@@ -1659,6 +2104,25 @@ async def run_talk_session(
             if commands:
                 announce_queue.put_nowait(commands)
 
+        def on_pause_change(paused: bool, source: str) -> None:
+            """Receipt for a microphone flip (hermes-talk#100), from any thread.
+
+            Printed for every flip. SPOKEN only for an operator control: the
+            model's own tool call already speaks its result, and an
+            announcement on top would say the same thing twice.
+            """
+
+            def deliver() -> None:
+                state = "paused" if paused else "listening again"
+                hint = " (Enter to resume)" if paused and keyboard_stop else ""
+                print(f"\ntalk: microphone {state}{hint}", flush=True)
+                commands = input_pause_commands(paused, source)
+                if commands:
+                    announce_queue.put_nowait(commands)
+
+            with suppress(RuntimeError):  # loop closed while the flip was in flight
+                loop.call_soon_threadsafe(deliver)
+
         loop = asyncio.get_running_loop()
         # Snapshot ownership once for this session. Older Hermes builds do not
         # expose the property; None suppresses announcements instead of guessing.
@@ -1688,6 +2152,12 @@ async def run_talk_session(
             operator=auth.source,
             profile=talk_profile,
         )
+        # The microphone pause (hermes-talk#100) binds the SAME way, before
+        # any tool can run: the model's pause_voice_input and the operator's
+        # key or command all flip this one surface. The registered resume
+        # control is the one the tool list was built from; with none, the
+        # registry refuses every pause.
+        talk_pause.attach_session(audio, on_pause_change, resume_control=resume_control)
         # Results this session is OWED — accepted under a durable Hermes
         # session that is still ours, by this SAME operator/profile binding
         # (a ticket bound to a different binding is never adopted), finished
@@ -1736,6 +2206,10 @@ async def run_talk_session(
                     relay.response_active
                     or continuation_pending
                     or bool(tool_coordinator.outputs)
+                    or speaker_busy()
+                ),
+                lambda waited: on_error(
+                    f"an update has been waiting {waited:.0f}s for a safe opening"
                 ),
             )
         )
@@ -1776,6 +2250,7 @@ async def run_talk_session(
             # Unbound again: with no live connection there is no destination,
             # so further dispatch is refused rather than accepted into a void.
             talk_runs.detach_owner()
+            talk_pause.detach_session(audio)
             sender.cancel()
             pump.cancel()
             receiver.cancel()
@@ -1819,6 +2294,9 @@ async def run_talk_session(
         talk_lifecycle.detach_session()
         talk_progress.detach_session()
         talk_approvals.detach_session()
+        talk_pause.detach_session(audio)
+        if keyboard_stop is not None:
+            keyboard_stop()
         if authorization_ledger is not None:
             authorization_ledger.clear()
         if cascade is not None:
@@ -1841,8 +2319,20 @@ async def run_talk_session(
 
 
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
-    """Build the native ``hermes talk`` session/setup/doctor argparse tree."""
+    """Build the native ``hermes talk`` session/setup/doctor/check/diagnostics tree."""
 
+    subparser.add_argument("--task", dest="task_target", default=None,
+                           help="join an authorized canonical task by ID or exact catalog label")
+    subparser.add_argument("--task-api", default=None,
+                           help="authenticated Hermes dashboard origin (or TALK_TASK_API_URL)")
+    subparser.add_argument("--task-tab", default="terminal",
+                           help="stable native attachment identity for reconnect")
+    subparser.add_argument("--peer", dest="task_peer", default="local",
+                           help="explicit registered peer name")
+    subparser.add_argument("--profile", dest="task_profile", default="default",
+                           help="explicit authorized profile")
+    subparser.add_argument("--targets", action="store_true", default=False,
+                           help="list authorized task targets without starting audio")
     commands = subparser.add_subparsers(dest="talk_command")
     commands.add_parser(
         "setup",
@@ -1855,10 +2345,82 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         dest="doctor_json",
         help="emit the versioned machine-readable report",
     )
+    doctor.add_argument(
+        "--probe",
+        action="store_true",
+        dest="doctor_probe",
+        help=(
+            "(grok only) make two live calls to api.x.ai to prove the resolved bearer "
+            "reaches realtime"
+        ),
+    )
+    check = commands.add_parser(
+        "check",
+        help=(
+            "Prove the whole voice path right now: doctor, one live provider turn, "
+            "one bounded Hermes run"
+        ),
+    )
+    check.add_argument(
+        "--json",
+        action="store_true",
+        dest="check_json",
+        help="emit the versioned machine-readable report",
+    )
+    check.add_argument(
+        "--no-run",
+        action="store_true",
+        dest="check_no_run",
+        help="skip the Hermes run step (provider session only)",
+    )
+    check.add_argument(
+        "--timeout",
+        type=float,
+        dest="check_timeout",
+        default=None,
+        metavar="SECONDS",
+        help=f"budget for the Hermes run step (default {talk_check.RUN_STEP_TIMEOUT_S:.0f})",
+    )
+    check.add_argument(
+        "--provider",
+        dest="check_provider",
+        # Live lanes only, enforced by the parser AND by talk_check: a mock
+        # or stub is structurally unable to produce a green report.
+        choices=talk_check.LIVE_PROVIDERS,
+        default=None,
+        help="check this live provider instead of TALK_PROVIDER (this process only)",
+    )
+    diagnostics = commands.add_parser(
+        "diagnostics",
+        help=(
+            "Redacted support bundle for issue reports: versions, variable NAMES, "
+            "device/host facts, doctor outcomes"
+        ),
+    )
+    diagnostics.add_argument(
+        "--json",
+        action="store_true",
+        dest="diagnostics_json",
+        help="print the bundle as JSON instead of the human summary",
+    )
+    diagnostics.add_argument(
+        "--bundle",
+        nargs="?",
+        const="",
+        default=None,
+        dest="diagnostics_bundle",
+        metavar="PATH",
+        help=(
+            "write the bundle owner-only to PATH (default: a timestamped file in the "
+            "Talk state directory) and print where it went"
+        ),
+    )
     subparser.set_defaults(talk_command="session")
 
 
-def cli_entry(args: argparse.Namespace | None = None) -> int:
+def cli_entry(
+    args: argparse.Namespace | None = None, *, keyboard_control: bool | None = None
+) -> int:
     """Synchronous entry point for ``hermes talk``.
 
     A failed session raises ``SystemExit`` rather than returning: Hermes's
@@ -1866,6 +2428,13 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
     (``args.func(args)`` with no exit propagation), so a plain ``return 1``
     would exit the process 0 on failure — scripts and CI would read a dead
     session as success.
+
+    ``keyboard_control`` (hermes-talk#100): whether the session may watch
+    stdin for the pause key. Unset, it follows how we were called — the
+    standalone ``hermes talk`` subcommand arrives with argparse ``args`` and
+    owns the terminal; a bare call is the in-session ``/talk``, whose tty
+    belongs to the Hermes prompt (prompt_toolkit, raw mode) for the whole
+    call. ``/talk`` passes False explicitly as well.
     """
 
     command = getattr(args, "talk_command", "session") if args is not None else "session"
@@ -1875,13 +2444,53 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
             raise SystemExit(code)
         return 0
     if command == "doctor":
-        code = talk_doctor.cli_entry(json_output=bool(getattr(args, "doctor_json", False)))
+        code = talk_doctor.cli_entry(
+            json_output=bool(getattr(args, "doctor_json", False)),
+            probe=bool(getattr(args, "doctor_probe", False)),
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "check":
+        code = talk_check.cli_entry(
+            json_output=bool(getattr(args, "check_json", False)),
+            no_run=bool(getattr(args, "check_no_run", False)),
+            timeout_s=getattr(args, "check_timeout", None),
+            provider=getattr(args, "check_provider", None),
+            session_factory=_realtime_session,
+            lane_resolver=resolve_provider_lane,
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "diagnostics":
+        bundle = getattr(args, "diagnostics_bundle", None)
+        code = talk_diagnostics.cli_entry(
+            json_output=bool(getattr(args, "diagnostics_json", False)),
+            write=bundle is not None,
+            bundle_path=bundle or None,
+        )
         if code:
             raise SystemExit(code)
         return 0
 
+    if keyboard_control is None:
+        keyboard_control = args is not None
+    target = getattr(args, "task_target", None) or os.environ.get("TALK_TASK_TARGET")
+    native = None
+    if target or getattr(args, "targets", False) or getattr(args, "task_api", None):
+        native = {
+            "target_id": target, "origin": getattr(args, "task_api", None),
+            "tab_id": getattr(args, "task_tab", "terminal"),
+            "peer_id": getattr(args, "task_peer", "local"),
+            "profile": getattr(args, "task_profile", "default"),
+            "list_only": bool(getattr(args, "targets", False)),
+        }
     try:
-        code = asyncio.run(run_talk_session())
+        options = {"keyboard_control": keyboard_control}
+        if native is not None:
+            options["native_task"] = native
+        code = asyncio.run(run_talk_session(**options))
     except KeyboardInterrupt:
         print("\ntalk: hung up.")
         return 0
@@ -1891,22 +2500,403 @@ def cli_entry(args: argparse.Namespace | None = None) -> int:
 
 
 __all__ = [
+    "ANNOUNCE_STARVATION_WARN_S",
     "CONNECT_TIMEOUT_S",
     "IDLE_POLL_S",
+    "KEYBOARD_POLL_S",
+    "STARTUP_REFUSAL_AUDIO",
+    "STARTUP_REFUSAL_AUTHORIZATION",
+    "STARTUP_REFUSAL_CONFIGURATION",
+    "STARTUP_REFUSAL_PROVIDER",
+    "STARTUP_REFUSAL_REASONS",
+    "STARTUP_REFUSAL_TOOLS",
     "WATCH_OUTPUT_TAIL_CHARS",
     "WATCH_POLL_S",
     "WORK_STARTED_RE",
+    "ProviderLane",
     "QueuedAnnouncement",
     "SpeakerPacketLane",
     "build_session_update",
     "cli_entry",
+    "input_pause_commands",
+    "keyboard_pause_control_available",
     "landed_note_messages",
     "pump_announcements",
+    "resolve_provider_lane",
     "run_finished_messages",
     "run_phase_messages",
     "run_talk_session",
     "setup_cli",
+    "start_keyboard_pause_control",
     "started_run_ids",
     "subagent_phase_messages",
     "subagent_stop_messages",
 ]
+
+
+def start_native_keyboard_control(deliver, *, stdin=None, read_line=None):
+    """Read complete terminal commands with the same bounded, stoppable ownership."""
+    stdin = sys.stdin if stdin is None else stdin
+    if not keyboard_pause_control_available(stdin):
+        return None
+    stop = threading.Event()
+    buffer = []
+
+    def read():
+        if read_line is not None:
+            return read_line(stdin, stop)
+        if sys.platform == "win32":
+            import msvcrt
+            if not msvcrt.kbhit():
+                stop.wait(KEYBOARD_POLL_S)
+                return None
+            char = msvcrt.getwch()
+            if char in _WIN32_EXTENDED_KEY_PREFIXES:
+                msvcrt.getwch()
+                return None
+            if char in ("\r", "\n"):
+                line = "".join(buffer)
+                buffer.clear()
+                print(flush=True)
+                return line
+            if char == "\b":
+                if buffer:
+                    buffer.pop()
+                    print("\b \b", end="", flush=True)
+            elif char.isprintable() and len(buffer) < 65536:
+                buffer.append(char)
+                print(char, end="", flush=True)
+            return None
+        import select
+        ready, _, _ = select.select([stdin], [], [], KEYBOARD_POLL_S)
+        if not ready:
+            return None
+        line = stdin.readline()
+        if not line:
+            stop.set()
+            return None
+        return line.rstrip("\r\n")
+
+    def watch():
+        while not stop.is_set():
+            try:
+                line = read()
+            except (OSError, ValueError):
+                return
+            if line is not None and not stop.is_set():
+                deliver(line)
+
+    threading.Thread(target=watch, name="talk-native-input", daemon=True).start()
+    return stop.set
+
+
+async def _wait_for_native_selection(ready, selected):
+    while True:
+        await ready.wait()
+        active = selected()
+        if ready.is_set() and active is not None:
+            return active
+
+
+async def run_native_talk_session(
+    *, audio=None, session_factory=None, lane="cli", keyboard_control=False,
+    task=None, api=None, control_input=None, on_controller=None, on_refusal=None,
+):
+    """Run canonical terminal/Discord Talk against the authenticated shared coordinator."""
+    try:
+        from .talk_native_api import NativeTaskAPI, NativeTaskError
+        from .talk_native_controller import NativeTaskController
+    except ImportError:
+        from talk_native_api import NativeTaskAPI, NativeTaskError
+        from talk_native_controller import NativeTaskController
+
+    task = dict(task or {})
+    current = None
+    keyboard_stop = None
+    workers = []
+    audio_started = False
+    activation_lock = asyncio.Lock()
+    ready = asyncio.Event()
+    activation_failed = asyncio.Event()
+    activation_error = None
+    seen_history, seen_jobs = set(), {}
+
+    def emit(value):
+        print("talk: " + json.dumps(value, ensure_ascii=False), flush=True)
+
+    def render_state(state):
+        for row in (state.get("history") or {}).get("messages", []):
+            key = (state.get("task", {}).get("session_id"), row.get("id"))
+            if key not in seen_history:
+                seen_history.add(key)
+                emit({"saved": row})
+        for job in state.get("jobs", []):
+            value = json.dumps(job, ensure_ascii=False, sort_keys=True)
+            if seen_jobs.get(job.get("run_id")) != value:
+                seen_jobs[job.get("run_id")] = value
+                emit({"job": job})
+
+    async def resolve_target(reference, *, peer_id=None, profile=None):
+        catalog = await api.catalog(
+            peer_id=peer_id or task.get("peer_id", "local"),
+            profile=profile or task.get("profile", "default"),
+        )
+        rows = [row for row in catalog.get("targets", []) if reference in {
+            row.get("target_id"), row.get("session_id"), row.get("label")
+        }]
+        if len(rows) != 1:
+            emit(catalog)
+            raise NativeTaskError("Choose one exact authorized task target from the catalog")
+        return rows[0]["target_id"]
+
+    async def activate(intent):
+        nonlocal current, activation_error
+        async with activation_lock:
+            intent = dict(intent)
+            if intent.get("back") is True:
+                fields = {"back": True}
+            else:
+                reference = intent.get("target_id") or intent.get("reference")
+                selected = reference if api.context is not None else await resolve_target(
+                    reference, peer_id=intent.get("peer_id"), profile=intent.get("profile")
+                )
+                fields = {"target_id": selected}
+            previous, current = current, None
+            ready.clear()
+            if previous is not None:
+                previous.service_paused = True
+                flush = getattr(previous, "flush_captures", None)
+                if flush is not None:
+                    try:
+                        await asyncio.wait_for(flush(retry=True), 2)
+                    except (NativeTaskError, TimeoutError) as exc:
+                        current = previous
+                        previous.service_paused = False
+                        ready.set()
+                        if isinstance(exc, TimeoutError):
+                            raise NativeTaskError(
+                                "Transcript capture is still pending; "
+                                "the selected task is unchanged",
+                                category="transient",
+                            ) from None
+                        raise
+            try:
+                attached = await api.attach(
+                    **fields, tab_id=task.get("tab_id", "terminal"),
+                    surface_context=task.get("surface_context") or {"surface": lane},
+                )
+                if attached.get("ok") is not True:
+                    current = previous
+                    if previous is not None:
+                        previous.service_paused = False
+                        ready.set()
+                    emit(attached)
+                    return False
+                if previous is not None:
+                    await previous.close()
+                emit({"selected": attached.get("task"), "voice_state": "not_connected"})
+                guard = None
+                if lane == "discord":
+                    bind_surface = getattr(audio, "bind_native_surface", None)
+                    if not callable(bind_surface):
+                        raise NativeTaskError("Discord canonical room authority is unavailable")
+                    guard = bind_surface(attached.get("surface_context"))
+                setup = talk_realtime.SessionSetup(
+                    model=pick.model, voice=pick.voice, instructions=attached["instructions"],
+                    tools=_tool_definitions(attached["tools"]),
+                    automatic_response=pick.provider == "gemini", task_continuity=True,
+                    turn_detection=turn_detection,
+                )
+                provider_session = (session_factory(pick.auth) if session_factory else
+                    _realtime_session(pick.auth, provider=pick.provider,
+                                      live_config=getattr(pick, "configuration", None)))
+                try:
+                    await provider_session.connect(setup)
+                except BaseException:
+                    await provider_session.close()
+                    raise
+                controller_type = NativeTaskController
+                if (pick.provider == "live"
+                    or getattr(provider_session, "uses_client_delegation", False)):
+                    try:
+                        from .talk_native_live import NativeLiveTaskController
+                    except ImportError:
+                        from talk_native_live import NativeLiveTaskController
+                    controller_type = NativeLiveTaskController
+                current = controller_type(
+                    api, provider_session, attached, audio, on_state=render_state,
+                    on_result=lambda value: emit({"result": value}),
+                    on_notice=emit, on_caption=lambda value: emit({"caption": value.text})
+                    if value.final else None, on_selection=activate, authorize_surface=guard,
+                )
+                if on_controller is not None:
+                    on_controller(current)
+                await current.refresh(announce=False)
+                reconcile = getattr(current, "reconcile_captures", None)
+                if reconcile is not None:
+                    await reconcile()
+                ready.set()
+                emit({"voice_state": "connected", "provider": pick.provider, "model": pick.model})
+                return True
+            except (NativeTaskError, talk_realtime.RealtimeSessionError,
+                    talk_config.TalkConfigError, talk_auth.TalkAuthError,
+                    talk_audio.TalkAudioError) as exc:
+                if previous is not None and not previous.closed:
+                    await previous.close()
+                activation_error = exc
+                activation_failed.set()
+                emit({"voice_state": "not_connected", "reason": str(exc)})
+                return False
+
+    try:
+        api = api or NativeTaskAPI.configured(task.get("origin"))
+        if task.get("list_only"):
+            emit(await api.catalog(peer_id=task.get("peer_id", "local"),
+                                   profile=task.get("profile", "default")))
+            return 0
+        if not task.get("target_id"):
+            raise NativeTaskError("Choose an explicit canonical task before starting native Talk")
+        pick = resolve_provider_lane()
+        if lane == "discord" and pick.provider == "gemini":
+            raise NativeTaskError("Gemini Discord cannot gate responses to authorized speakers")
+        if talk_config.voice_mode() not in {"native", "live"}:
+            raise NativeTaskError("Canonical native surfaces require provider voice output")
+        if pick.provider == "live":
+            if (os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+                    != "provider_native" or os.environ.get("TALK_SEMANTIC_EAGERNESS") is not None):
+                raise NativeTaskError("Live requires provider_native turn detection")
+            turn_detection = talk_realtime.RealtimeTurnDetection()
+        else:
+            turn_detection = talk_config.turn_detection(pick.provider)
+        if lane == "discord" and not (task.get("surface_context") or {}).get("surface_token"):
+            raise NativeTaskError("Discord canonical voice requires a trusted room proof")
+        audio = audio or talk_audio.DuplexAudio()
+        audio.start()
+        audio_started = True
+        if not await activate({"target_id": task["target_id"]}):
+            return 1
+        loop = asyncio.get_running_loop()
+        commands = control_input or asyncio.Queue(maxsize=32)
+        resume_control = talk_pause.RESUME_COMMAND if lane == "discord" else None
+        if lane == "cli" and keyboard_control and keyboard_pause_control_available():
+            resume_control = talk_pause.RESUME_KEYBOARD
+        talk_pause.attach_session(
+            audio, lambda paused, source: emit({"microphone_paused": paused, "source": source}),
+            resume_control=resume_control,
+        )
+        if resume_control == talk_pause.RESUME_KEYBOARD:
+            def deliver(line):
+                def put():
+                    if not commands.full():
+                        commands.put_nowait(line)
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(put)
+            keyboard_stop = start_native_keyboard_control(deliver)
+        emit({"controls": "Type a message; /targets, /select ID, /return, /reconnect, "
+              "/state, /result ID, /replay EVENT_ID, /preference MODE, "
+              "/pause, /resume, /interrupt. "
+              "Enter pauses/resumes; Ctrl+C hangs up."})
+
+        async def receive():
+            while True:
+                active = await _wait_for_native_selection(ready, lambda: current)
+                async for event in active.session:
+                    if active is not current:
+                        break
+                    try:
+                        await active.handle(event)
+                    except (NativeTaskError, asyncio.CancelledError):
+                        if active is current:
+                            raise
+                        break
+                if active is current:
+                    await active.drain()
+                    return
+
+        async def microphone():
+            while True:
+                active = await _wait_for_native_selection(ready, lambda: current)
+                read_packet = getattr(audio, "read_input_packet", None)
+                if lane == "discord":
+                    packet = await asyncio.to_thread(read_packet)
+                    pcm = audio.admit_native_packet(packet)
+                else:
+                    pcm = audio.read_input_chunk()
+                if active is current and pcm:
+                    try:
+                        await active.send_audio(pcm)
+                    except NativeTaskError:
+                        if active is current:
+                            raise
+                else:
+                    await asyncio.sleep(IDLE_POLL_S)
+
+        async def refresh():
+            failures = 0
+            while True:
+                await asyncio.sleep(1)
+                active = await _wait_for_native_selection(ready, lambda: current)
+                try:
+                    await active.tick()
+                    await active.refresh()
+                    failures = 0
+                    active.service_paused = False
+                except NativeTaskError as exc:
+                    if exc.superseded or active is not current:
+                        continue
+                    if exc.retryable and failures < 3:
+                        failures += 1
+                        active.service_paused = True
+                        active.audio.drain_playback()
+                        emit({"state": "reconnecting", "reason": str(exc), "attempt": failures})
+                        continue
+                    raise
+
+        async def controls():
+            while True:
+                line = await commands.get()
+                active = await _wait_for_native_selection(ready, lambda: current)
+                try:
+                    result = await active.command(line)
+                    if result is not None:
+                        emit(result)
+                except NativeTaskError as exc:
+                    emit({"state": "refused", "reason": str(exc)})
+                finally:
+                    commands.task_done()
+
+        async def failed_activation():
+            await activation_failed.wait()
+            raise activation_error
+
+        workers = [asyncio.create_task(function())
+                   for function in (receive, microphone, refresh, controls, failed_activation)]
+        done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
+        for worker in done:
+            await worker
+        return 0
+    except (NativeTaskError, talk_config.TalkConfigError, talk_auth.TalkAuthError,
+            talk_realtime.RealtimeSessionError, talk_audio.TalkAudioError) as exc:
+        emit({"voice_state": "disconnected", "reason": str(exc)})
+        if on_refusal is not None:
+            on_refusal(STARTUP_REFUSAL_PROVIDER)
+        return 1
+    finally:
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        if keyboard_stop is not None:
+            keyboard_stop()
+        if audio is not None:
+            talk_pause.detach_session(audio)
+        try:
+            if current is not None:
+                await current.close()
+        finally:
+            try:
+                if api is not None:
+                    await api.close()
+            finally:
+                if audio_started:
+                    audio.stop()

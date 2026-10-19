@@ -7,10 +7,8 @@ venv/
 .hermes-*.md
 .ruff_cache/
 dist/
-# The dashboard bundle is SOURCE, not a build artifact — it is hand-authored
-# and the host serves it straight from the installed plugin, so an operator
-# who clones this repo must get it. Same reason the in-tree kanban and
-# achievements plugins commit theirs.
+# Commit generated UI bundles because Hermes serves the installed plugin
+# directly. Regenerate dashboard and Desktop together with scripts/build_ui.py.
 !dashboard/dist/
 build/
 *.egg-info/

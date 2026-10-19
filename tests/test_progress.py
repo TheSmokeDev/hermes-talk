@@ -681,3 +681,265 @@ def test_the_phase_replays_off_history_after_a_restart(history_env):
     assert mine[0]["fromHistory"] is True
     assert mine[0]["status"] == "done"
     assert mine[0]["meta"]["phase"] == "complete"
+
+
+# -- eviction caps + the same-phase detail-only run path (hermes-talk#60) ---------
+
+
+def test_run_session_eviction_drops_the_oldest_not_the_newest():
+    """FIFO, not LIFO: at the cap, the FIRST id recorded is the one that goes.
+
+    Popping the wrong end would evict the id that just arrived — so the run
+    actually executing right now would stop being findable by its session id
+    and go silent under load, which is the precise failure the cap exists to
+    prevent.
+    """
+
+    cap = talk_progress._MAX_RUN_SESSIONS
+    for index in range(cap):
+        talk_progress.note_run_session(index, f"sess-{index:04d}")
+    assert len(talk_progress._RUN_BY_SESSION) == cap
+
+    talk_progress.note_run_session(cap, "sess-newest")
+
+    assert len(talk_progress._RUN_BY_SESSION) == cap
+    assert "sess-0000" not in talk_progress._RUN_BY_SESSION  # oldest, evicted
+    assert talk_progress._RUN_BY_SESSION["sess-newest"] == cap  # newest, kept
+    assert talk_progress._RUN_BY_SESSION["sess-0001"] == 1  # runner-up, kept
+
+
+def test_re_noting_a_session_does_not_refresh_its_eviction_position():
+    """The cap is insertion-ordered, not least-recently-used.
+
+    Re-noting an id already in the index rebinds its run in place; it must not
+    move the entry to the back of the queue, or a chatty session could hold a
+    slot forever while quieter live runs are evicted around it.
+    """
+
+    cap = talk_progress._MAX_RUN_SESSIONS
+    for index in range(cap):
+        talk_progress.note_run_session(index, f"sess-{index:04d}")
+
+    talk_progress.note_run_session(999, "sess-0000")
+    assert talk_progress._RUN_BY_SESSION["sess-0000"] == 999  # rebound
+
+    talk_progress.note_run_session(cap, "sess-newest")
+    assert "sess-0000" not in talk_progress._RUN_BY_SESSION  # still first out
+
+
+def test_child_eviction_drops_the_oldest_not_the_newest():
+    """Same FIFO property for the attached-child index, and its consequence.
+
+    An evicted child stops being a progress subject, so its later tool call
+    finds no entry and speaks nothing — which is why evicting the NEWEST would
+    silence the child that just started.
+    """
+
+    events: list[dict] = []
+    _attach(events)
+    cap = talk_progress._MAX_CHILDREN
+    for index in range(cap):
+        _child_start(csid=f"cs-{index:04d}", sid=f"sa-0-{index:04d}")
+    assert len(talk_progress._CHILDREN) == cap
+
+    _child_start(csid="cs-newest", sid="sa-0-newest")
+
+    assert len(talk_progress._CHILDREN) == cap
+    assert "cs-0000" not in talk_progress._CHILDREN
+    assert "cs-newest" in talk_progress._CHILDREN
+
+    spoken = len(events)
+    talk_progress.on_post_tool_call(session_id="cs-0000", tool_name="read_file")
+    assert len(events) == spoken  # the evicted child has no subject to phase
+    talk_progress.on_post_tool_call(session_id="cs-newest", tool_name="read_file")
+    assert len(events) == spoken + 1  # the newest one still speaks
+
+
+def test_the_same_phase_detail_only_update_rides_the_run_path(monkeypatch):
+    """The run path's detail-only branch, exercised directly on a run.
+
+    The child path already covers "finer detail, same phase, no second
+    speech"; this is the same branch in ``set_run_phase``. The evidence is the
+    written FIELD SET, not the resulting meta: within a phase only
+    ``phase_detail`` may be rewritten, so ``phase_at`` keeps marking when the
+    PHASE changed instead of being pushed forward by every tool label.
+    Asserting on ``phase_at``'s value instead would prove nothing here - two
+    ``time.time()`` calls inside one phase can return the same float.
+    """
+
+    calls: list[dict] = []
+    real_annotate = talk_runs.annotate_run
+    monkeypatch.setattr(
+        talk_runs,
+        "annotate_run",
+        lambda *args, **kwargs: real_annotate(*args, **kwargs) or calls.append(kwargs),
+    )
+    run_id, release = _start_live_run()
+    try:
+        assert talk_progress.set_run_phase(run_id, "executing", detail="Reading files")
+        meta = talk_runs.get_run(run_id)["meta"]
+        assert (meta["phase"], meta["phase_detail"]) == ("executing", "Reading files")
+        assert set(calls[0]) == {"durable", "phase", "phase_at", "phase_detail"}
+
+        # Same phase, different detail: the label is replaced, and it is the
+        # ONLY field the write carries.
+        assert talk_progress.set_run_phase(run_id, "executing", detail="Searching the web")
+        assert len(calls) == 2
+        assert calls[1] == {"durable": False, "phase_detail": "Searching the web"}
+        assert talk_runs.get_run(run_id)["meta"]["phase"] == "executing"
+
+        # Same phase, same detail: not a write at all.
+        assert not talk_progress.set_run_phase(run_id, "executing", detail="Searching the web")
+        # Same phase, no detail: the tier-2 poll's blank must not erase it.
+        assert not talk_progress.set_run_phase(run_id, "executing")
+        assert len(calls) == 2
+        assert talk_runs.get_run(run_id)["meta"]["phase_detail"] == "Searching the web"
+    finally:
+        release.set()
+    _wait_terminal(run_id)
+
+
+# -- progress-speech micro coverage (hermes-talk#61) -----------------------------
+
+
+def _child_spoken(**event) -> str:
+    return _spoken_text(talk_cli.subagent_phase_commands(event))
+
+
+def test_subagent_phase_speech_names_the_agent_its_role_and_its_phase():
+    """The child milestone sentences themselves.
+
+    The run-side wording is pinned above; the child side only had "terminal
+    phases build nothing". These are the three sentences an operator actually
+    hears, including the two shapes that are easy to get wrong: an executing
+    child with no tool detail yet (the sentence must still end), and a child
+    with no role (no empty parentheses).
+    """
+
+    base = {"subagent_id": "sa-0-aaaa", "role": "researcher"}
+    assert (
+        "Background agent sa-0-aaaa (researcher) was accepted."
+        in _child_spoken(**base, phase="accepted")
+    )
+    assert (
+        "Background agent sa-0-aaaa (researcher) is executing \u2014 Reading files."
+        in _child_spoken(**base, phase="executing", detail="Reading files")
+    )
+    assert "is executing." in _child_spoken(**base, phase="executing")
+    assert "waiting on an approval" in _child_spoken(**base, phase="blocked")
+    assert (
+        "Background agent sa-0-aaaa was accepted."
+        in _child_spoken(subagent_id="sa-0-aaaa", phase="accepted")
+    )
+    # No id is no subject: nothing is spoken rather than a nameless sentence.
+    assert talk_cli.subagent_phase_commands({"phase": "accepted"}) == []
+
+
+def test_subagent_phase_speech_carries_no_routing_metadata():
+    """Positional redaction, child side: only id, role and a safe label ride."""
+
+    text = _child_spoken(
+        subagent_id="sa-0-aaaa",
+        role="researcher",
+        phase="executing",
+        detail="Reading files",
+        parent_session_id="sess-secret",
+        child_goal="exfiltrate the secrets",
+        tool_name="read_file",
+        tool_input={"path": "C:/secret.env"},
+    )
+    for leaked in ("sess-secret", "exfiltrate", "C:/secret.env", "read_file"):
+        assert leaked not in text
+
+
+def test_an_unknown_phase_is_refused_by_the_run_projection():
+    """The guard is exact membership in PHASES, not a shape or a case fold.
+
+    A phase that is not in the bounded vocabulary must not reach meta at all
+    — the vocabulary is what bounds what can ever be spoken.
+    """
+
+    run_id, release = _start_live_run()
+    try:
+        for bogus in ("gibberish", "", "EXECUTING", "running", "Accepted", None, 7):
+            assert talk_progress.set_run_phase(run_id, bogus) is False
+        assert "phase" not in talk_runs.get_run(run_id)["meta"]
+    finally:
+        release.set()
+    _wait_terminal(run_id)
+
+
+def test_spoken_labels_are_truncated_to_the_progress_label_cap():
+    """Operator-supplied run labels and tool labels are bounded before speech."""
+
+    cap = talk_cli._PROGRESS_LABEL_CHARS
+    long_label = "L" * (cap + 40)
+    long_detail = "D" * (cap + 40)
+
+    run = _run_snapshot(7, "executing", long_detail)
+    run["label"] = long_label
+    text = _spoken_text(talk_cli.run_phase_commands(run, "executing"))
+    assert "L" * cap in text and "L" * (cap + 1) not in text
+    assert "D" * cap in text and "D" * (cap + 1) not in text
+
+    # The heartbeat carries the label too, on the same cap.
+    beat = _spoken_text(talk_cli.run_phase_commands(run, "heartbeat"))
+    assert "L" * cap in beat and "L" * (cap + 1) not in beat
+
+    child = _child_spoken(subagent_id="sa-0-aaaa", phase="executing", detail=long_detail)
+    assert "D" * cap in child and "D" * (cap + 1) not in child
+
+
+def test_concurrent_producers_never_corrupt_the_progress_indexes():
+    """Both indexes are written from the poll loop AND the host's hook threads.
+
+    The caps evict while other threads insert, so this drives every producer
+    at once past both caps and asserts the invariants that a torn write would
+    break: bounded size, whole entries, and a phase still inside the bounded
+    vocabulary.
+    """
+
+    events: list[dict] = []
+    _attach(events)
+    workers = 6
+    errors: list[Exception] = []
+    barrier = threading.Barrier(workers)
+
+    def hammer(worker: int) -> None:
+        try:
+            barrier.wait(timeout=10.0)
+            for index in range(60):
+                key = f"{worker}-{index}"
+                talk_progress.note_run_session(worker * 1000 + index, f"sess-{key}")
+                _child_start(csid=f"cs-{key}", sid=f"sa-{worker}-{index}")
+                talk_progress.on_post_tool_call(session_id=f"cs-{key}", tool_name="read_file")
+                talk_progress.on_pre_approval_request(session_id=f"cs-{key}")
+                if index % 3 == 0:
+                    talk_lifecycle.on_subagent_stop(
+                        child_session_id=f"cs-{key}", child_status="ok", child_summary="done"
+                    )
+        except Exception as exc:  # noqa: BLE001 - the thread's failure IS the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(worker,)) for worker in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert errors == []
+    assert len(talk_progress._RUN_BY_SESSION) <= talk_progress._MAX_RUN_SESSIONS
+    assert len(talk_progress._CHILDREN) <= talk_progress._MAX_CHILDREN
+    for entry in list(talk_progress._CHILDREN.values()):
+        assert set(entry) == {
+            "subagent_id",
+            "parent_session_id",
+            "role",
+            "top_level",
+            "phase",
+            "detail",
+        }
+        assert entry["phase"] in talk_progress.PHASES
+    for phase in [event.get("phase") for event in list(events)]:
+        assert phase in talk_progress.PHASES

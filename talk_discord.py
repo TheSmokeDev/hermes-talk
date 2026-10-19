@@ -1,10 +1,12 @@
-"""Discord voice as an audio device — the same seven methods, a different room.
+"""Discord voice as an audio device — the same eleven methods, a different room.
 
 :class:`DiscordAudio` implements exactly the surface
 :class:`talk_audio.DuplexAudio` exposes (``start`` / ``stop`` /
-``read_input_chunk`` / ``queue_playback`` / ``drain_playback`` /
+``read_input_chunk`` / ``pause_input`` / ``resume_input`` / ``input_paused``
+/ ``queue_playback`` / ``drain_playback`` / ``playback_pending`` /
 ``played_ms`` / ``reset_played_ms``), so the Realtime session, its tool
-calls, the steering ledger, and the announcement pump all run unchanged.
+calls, the steering ledger, the announcement pump, and the microphone pause
+all run unchanged.
 Only the room changes: instead of a microphone and a speaker, the frames
 come from and go to a Discord voice channel.
 
@@ -43,9 +45,11 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from . import talk_audio
+    from . import talk_audio, talk_config, talk_pause
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_audio
+    import talk_config
+    import talk_pause
 
 _log = logging.getLogger(__name__)
 
@@ -264,13 +268,25 @@ class _RealtimeSource:
         self._carry_lock = threading.Lock()
         self._served_lock = threading.Lock()
         self._frames_served = 0
+        self._discarded_bytes = 0
+        self.authorize_playback = None
 
     @property
     def frames_served(self) -> int:
         with self._served_lock:
             return self._frames_served
 
+    @property
+    def carrying(self) -> bool:
+        """Whether a partial frame is still held back from the player."""
+
+        with self._carry_lock:
+            return bool(self._carry)
+
     def read(self) -> bytes:
+        if self.authorize_playback is not None and self.authorize_playback() is not True:
+            self.discard_pending()
+            return SILENCE_FRAME
         with self._carry_lock:
             while len(self._carry) < DISCORD_FRAME_BYTES:
                 try:
@@ -292,7 +308,26 @@ class _RealtimeSource:
 
     def cleanup(self) -> None:
         with self._carry_lock:
+            self._discarded_bytes += len(self._carry)
             self._carry.clear()
+
+    def discard_pending(self) -> None:
+        with self._carry_lock:
+            self._discarded_bytes += len(self._carry)
+            self._carry.clear()
+            while True:
+                try:
+                    self._discarded_bytes += len(self._frames.get_nowait())
+                except queue.Empty:
+                    break
+
+    def playback_progress(self) -> talk_audio.PlaybackProgress:
+        with self._carry_lock:
+            return talk_audio.PlaybackProgress(
+                self.frames_served * DISCORD_FRAME_BYTES,
+                self._discarded_bytes,
+                bool(self._carry) or not self._frames.empty(),
+            )
 
 
 #: Concrete source classes, cached per host base class.
@@ -374,8 +409,11 @@ class DiscordAudio:
         self._listener_lock = threading.RLock()
         self._listener_condition = threading.Condition(self._listener_lock)
         self._played_baseline = 0
+        self._discarded_playback_bytes = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
+        #: SSRCs already warned about (E2EE audio withheld, speaker unknown).
+        self._unidentified_ssrcs: set[Any] = set()
         #: Wall-clock instant up to which we have handed the session audio.
         #: Zero until start(), which is what gates silence synthesis.
         self._audio_clock = 0.0
@@ -396,6 +434,104 @@ class DiscordAudio:
         self._speaker_notifier = None
         self._speaker_notifier_generation = 0
         self._last_speaker_key: Any = _UNSET
+        self._input_paused = False
+        self._native_guard = None
+        self._native_admission = None
+
+    def bind_native_surface(self, proof):
+        """Bind only a host-verified room snapshot; membership changes revoke playback."""
+        try:
+            from .talk_core_session import OperatorPacketAdmission
+            from .talk_native_api import NativeTaskError
+        except ImportError:
+            from talk_core_session import OperatorPacketAdmission
+            from talk_native_api import NativeTaskError
+
+        try:
+            from gateway.discord_task_context import _explicitly_allowed
+        except ImportError:
+            raise NativeTaskError("Host explicit Discord audience policy is unavailable") from None
+
+        if not isinstance(proof, dict) or proof.get("surface") != "discord":
+            raise NativeTaskError("Discord task attachment has no verified room authority")
+        names = ("guild_id", "channel_id", "operator_user_id")
+        if any(type(proof.get(name)) is not int or proof[name] <= 0 for name in names):
+            raise NativeTaskError("Discord task attachment has invalid immutable identities")
+        audience = proof.get("audience_user_ids")
+        if (not isinstance(audience, list) or not audience
+            or any(type(value) is not int or value <= 0 for value in audience)
+            or len(audience) != len(set(audience))
+            or not isinstance(proof.get("audience_revision"), str)
+            or not proof["audience_revision"]):
+            raise NativeTaskError("Discord task attachment has no verified audience snapshot")
+        guild_id, channel_id, operator = (proof[name] for name in names)
+        allowed_audience = frozenset(audience)
+        bridge = self._bridge
+        if bridge is None:
+            raise NativeTaskError("Discord voice bridge is unavailable")
+
+        def authorized():
+            try:
+                if (self._bridge is not bridge or bridge["guild_id"] != guild_id
+                    or not self._published_bridge_is_exact(bridge)
+                    or operator not in talk_config.discord_operator_user_ids()
+                    or operator not in allowed_audience):
+                    return False
+                voice = bridge["voice_client"]
+                if not callable(getattr(voice, "is_connected", None)) or not voice.is_connected():
+                    return False
+                channel = voice.channel
+                if type(channel.id) is not int or channel.id != channel_id:
+                    return False
+                guild = getattr(channel, "guild", None)
+                adapter = bridge["adapter"]
+                if guild is None or type(guild.id) is not int or guild.id != guild_id:
+                    return False
+                members = tuple(channel.members)
+                ids = []
+                for member in members:
+                    if type(member.id) is not int or member.id <= 0:
+                        return False
+                    if type(getattr(member, "bot", None)) is not bool:
+                        return False
+                    if not member.bot:
+                        if _explicitly_allowed(adapter, member) is not True:
+                            return False
+                        ids.append(member.id)
+                if len(ids) != len(set(ids)) or frozenset(ids) != allowed_audience:
+                    return False
+                epoch = getattr(adapter, "_task_voice_epoch", None)
+                revision = (getattr(adapter, "_task_voice_revisions", {}) or {}).get(
+                    (guild_id, channel_id), 0)
+                if not isinstance(epoch, str) or not epoch or type(revision) is not int:
+                    return False
+                import hashlib
+                import json
+                current_revision = hashlib.sha256(json.dumps(
+                    [epoch, revision, sorted(str(value) for value in ids)],
+                    separators=(",", ":"),
+                ).encode()).hexdigest()
+                return current_revision == proof["audience_revision"]
+            except Exception:  # noqa: BLE001 - malformed or changed host identity revokes audio
+                return False
+
+        if not authorized():
+            self.drain_playback()
+            raise NativeTaskError("Discord operator or room audience is no longer authorized")
+        self._native_guard = authorized
+        self._native_admission = OperatorPacketAdmission(operator)
+        if self._source is not None:
+            self._source.authorize_playback = authorized
+        return authorized
+
+    def admit_native_packet(self, packet):
+        """Keep immutable per-packet speaker checks ahead of all provider audio ingress."""
+        if self._native_guard is None or not self._native_guard():
+            self.drain_playback()
+            raise talk_audio.TalkAudioError("Discord canonical room authority changed")
+        if packet is None:
+            return None
+        return self._native_admission.admit(packet)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -550,6 +686,14 @@ class DiscordAudio:
             self._capture_listener_generation = generation
             self._closing_listener_handoff_generation = None
             self._listener_condition.notify_all()
+        with suppress(Exception):  # receipt only; host attributes may differ
+            mapping = getattr(receiver, "_ssrc_to_user", None)
+            _log.info(
+                "discord capture live: bot_ssrc=%s e2ee=%s mapped_ssrcs=%s",
+                getattr(receiver, "_bot_ssrc", None),
+                getattr(receiver, "_dave_session", None) is not None,
+                sorted(mapping) if isinstance(mapping, dict) else None,
+            )
 
         if self._capture_only:
             return
@@ -699,6 +843,7 @@ class DiscordAudio:
             except queue.Empty:
                 break
         self._capture_remainder.clear()
+        self._unidentified_ssrcs.clear()
         self._audio_clock = 0.0
         self._last_keepalive = 0.0
         self._loop = None
@@ -792,36 +937,24 @@ class DiscordAudio:
             lock = getattr(receiver, "_lock", None)
             if lock is not None:
                 with lock:
-                    receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
-                    chunks = [
-                        (
-                            ssrc,
-                            receiver_mapping.get(ssrc)
-                            if isinstance(receiver_mapping, dict)
-                            else None,
-                            bytes(buf),
-                        )
-                        for ssrc, buf in buffers.items()
-                        if buf
-                    ]
-                    for buf in buffers.values():
-                        del buf[:]
+                    chunks = self._take_receiver_chunks(receiver)
             else:  # pragma: no cover - every shipped host has the lock
-                receiver_mapping = getattr(receiver, "_ssrc_to_user", None)
-                chunks = [
-                    (
-                        ssrc,
-                        receiver_mapping.get(ssrc) if isinstance(receiver_mapping, dict) else None,
-                        bytes(buf),
-                    )
-                    for ssrc, buf in buffers.items()
-                    if buf
-                ]
-                for buf in buffers.values():
-                    del buf[:]
+                chunks = self._take_receiver_chunks(receiver)
             if chunks:
                 self._touch_host_timer()
+            with self._lock:
+                paused = self._input_paused
             for ssrc, raw_user_id, chunk in chunks:
+                if paused:
+                    # Paused (hermes-talk#100): the host's buffers were still
+                    # taken — they must not grow — and its inactivity timer
+                    # still re-armed, but nothing reaches the session. The
+                    # per-speaker carry goes too, so a half-sample from
+                    # before the pause cannot prefix the first frame after.
+                    # (One chunk can still race the flag; resume_input
+                    # drains it.)
+                    self._capture_remainder.pop(ssrc, None)
+                    continue
                 # Per speaker: one speaker's partial sample group prepended
                 # to another's audio would shift it and transpose L/R for
                 # that chunk.
@@ -845,6 +978,100 @@ class DiscordAudio:
                         pass
         except Exception:  # noqa: BLE001 — this runs on the HOST's thread
             _log.debug("discord capture drain failed", exc_info=True)
+
+    def _take_receiver_chunks(self, receiver: Any) -> list[tuple[Any, Any, bytes]]:
+        """Swap out every SSRC buffer; the caller holds the receiver lock.
+
+        Discord voice is end-to-end encrypted (DAVE). The host only runs the
+        DAVE decrypt for an SSRC it has already mapped to a user, and it
+        learns that mapping from Discord's SPEAKING event (which never
+        arrives for someone already talking when the bot joined) or from its
+        own silence gate, which our continuous drain starves. An unmapped
+        SSRC therefore reaches the Opus decoder still encrypted and comes
+        out as white noise. Identify the speaker here the way the host
+        would, and withhold the frames decoded before that mapping existed
+        rather than hand the model static.
+        """
+
+        buffers = receiver._buffers
+        mapping = getattr(receiver, "_ssrc_to_user", None)
+        if not isinstance(mapping, dict):
+            mapping = None
+        encrypted = getattr(receiver, "_dave_session", None) is not None
+        chunks: list[tuple[Any, Any, bytes]] = []
+        for ssrc, buf in buffers.items():
+            if not buf:
+                continue
+            raw_user_id = mapping.get(ssrc) if mapping is not None else None
+            if not raw_user_id and mapping is not None:
+                raw_user_id = self._identify_speaker(receiver, ssrc)
+                if encrypted:
+                    # Everything buffered so far was decoded before the
+                    # mapping existed: ciphertext through Opus. Drop it and
+                    # reset the host decoder for this stream so the first
+                    # real frame starts clean.
+                    del buf[:]
+                    decoders = getattr(receiver, "_decoders", None)
+                    if isinstance(decoders, dict):
+                        decoders.pop(ssrc, None)
+                    self._capture_remainder.pop(ssrc, None)
+                    if raw_user_id:
+                        self._unidentified_ssrcs.discard(ssrc)
+                        _log.info(
+                            "identified discord speaker ssrc=%s -> user=%s; "
+                            "E2EE audio flows from the next frame",
+                            ssrc,
+                            raw_user_id,
+                        )
+                    elif ssrc not in self._unidentified_ssrcs:
+                        self._unidentified_ssrcs.add(ssrc)
+                        _log.warning(
+                            "withholding E2EE audio from unidentified discord "
+                            "speaker ssrc=%s until Discord says who it is",
+                            ssrc,
+                        )
+                    continue
+            chunks.append((ssrc, raw_user_id, bytes(buf)))
+            del buf[:]
+        return chunks
+
+    def _identify_speaker(self, receiver: Any, ssrc: Any) -> Any:
+        """Map an unknown SSRC to a user the way the host's silence gate does.
+
+        The caller holds the receiver lock. Prefers the host's own inference
+        so the mapping (and its log line) stay the host's; falls back to the
+        same sole-allowed-member rule on a host build without it.
+        """
+
+        infer = getattr(receiver, "_infer_user_for_ssrc", None)
+        if callable(infer):
+            with suppress(Exception):
+                found = infer(ssrc)
+                if found:
+                    return found
+            return None
+        mapping = getattr(receiver, "_ssrc_to_user", None)
+        if not isinstance(mapping, dict):
+            return None
+        try:
+            voice_client = getattr(receiver, "_vc", None)
+            channel = getattr(voice_client, "channel", None)
+            bot_id = getattr(getattr(voice_client, "user", None), "id", None)
+            allowed = {str(uid) for uid in (getattr(receiver, "_allowed_user_ids", None) or ())}
+            candidates = [
+                member.id
+                for member in getattr(channel, "members", None) or ()
+                if member.id != bot_id and (not allowed or str(member.id) in allowed)
+            ]
+        except Exception:  # noqa: BLE001 - host objects, host thread
+            return None
+        if len(candidates) != 1:
+            return None
+        mapping[ssrc] = candidates[0]
+        _log.info(
+            "auto-mapped discord ssrc=%s -> user=%s (sole allowed member)", ssrc, candidates[0]
+        )
+        return candidates[0]
 
     def _bridge_identity_is_current(self, receiver: Any | None = None) -> bool:
         """Whether the adapter still publishes the exact bridge we borrowed."""
@@ -987,6 +1214,16 @@ class DiscordAudio:
 
         self._fail_if_bridge_lost()
         now = time.monotonic()
+        with self._lock:
+            if self._input_paused:
+                # Nothing flows while paused — not real audio, and not the
+                # synthesized silence either: a server that hears nothing
+                # detects no turn. The pacing clock keeps up with the wall
+                # clock so a resume starts at "now" instead of replaying the
+                # whole pause as a burst of catch-up silence frames.
+                if self._audio_clock > 0.0:
+                    self._audio_clock = max(self._audio_clock, now)
+                return None
         try:
             packet = self._inbound.get_nowait()
         except queue.Empty:
@@ -1019,6 +1256,49 @@ class DiscordAudio:
         packet = self.read_input_packet()
         return packet.pcm if packet is not None else None
 
+    def _discard_queued_input(self) -> None:
+        while True:
+            try:
+                self._inbound.get_nowait()
+            except queue.Empty:
+                break
+
+    def pause_input(self) -> None:
+        """Stop feeding the channel's audio to the session (hermes-talk#100).
+
+        The room keeps hearing the bot: playback, ``playback_pending`` and
+        the heard boundary are untouched. What stops is capture — the
+        host's buffers are still drained (and its inactivity timer still
+        re-armed, so it does not leave the channel), but nothing reaches the
+        session: frames decoded from here on are dropped, the ones already
+        queued are discarded, and the reader answers empty while the flag
+        is up.
+        """
+
+        with self._lock:
+            self._input_paused = True
+        self._discard_queued_input()
+
+    def resume_input(self) -> None:
+        """Feed the channel's audio to the session again, from the next frame on.
+
+        Drains first, for the same reason the terminal does: the drain
+        thread's flag check and its queue write are not one atomic step, so
+        one chunk admitted just before the pause can land after the pause's
+        drain — and it must not be the first thing sent on resume.
+        """
+
+        self._discard_queued_input()
+        with self._lock:
+            self._input_paused = False
+
+    @property
+    def input_paused(self) -> bool:
+        """Whether capture is paused (hermes-talk#100)."""
+
+        with self._lock:
+            return self._input_paused
+
     # -- playback -------------------------------------------------------------
 
     def queue_playback(self, pcm: bytes) -> None:
@@ -1026,6 +1306,9 @@ class DiscordAudio:
 
         if self._capture_only:
             raise talk_audio.TalkAudioError("capture-only Discord audio cannot queue playback")
+        if self._native_guard is not None and not self._native_guard():
+            self.drain_playback()
+            raise talk_audio.TalkAudioError("Discord canonical room authority changed")
         if not pcm:
             return
         converted, self._carry_sample = session_to_discord(pcm, carry=self._carry_sample)
@@ -1034,6 +1317,8 @@ class DiscordAudio:
         try:
             self._outbound.put_nowait(converted)
         except queue.Full:
+            with self._lock:
+                self._discarded_playback_bytes += len(converted)
             _log.debug("discord playback queue full — dropping a chunk")
 
     def drain_playback(self) -> None:
@@ -1042,19 +1327,55 @@ class DiscordAudio:
         with self._lock:
             source = self._source
             self._played_baseline = source.frames_served if source is not None else 0
-        while True:
-            try:
-                self._outbound.get_nowait()
-            except queue.Empty:
-                break
-        source = self._source
         if source is not None:
-            source.cleanup()
+            source.discard_pending()
+        else:
+            with self._lock:
+                while True:
+                    try:
+                        self._discarded_playback_bytes += len(self._outbound.get_nowait())
+                    except queue.Empty:
+                        break
         self._carry_sample = None
 
     @property
+    def playback_pending(self) -> bool:
+        """Whether model audio is still waiting to reach the voice channel.
+
+        The same non-destructive question :attr:`talk_audio.DuplexAudio.
+        playback_pending` answers for the terminal, asked of the room the
+        host owns: frames still queued for the player thread, plus a partial
+        frame the source is holding back. What it cannot see is the host's
+        own player buffer — the same one-block residual the terminal has,
+        not the seconds of queued response this exists to fence.
+
+        Capture-only bridges never play, so they are never pending.
+        """
+
+        if self._capture_only:
+            return False
+        if not self._outbound.empty():
+            return True
+        source = self._source
+        return source is not None and source.carrying
+
+    @property
+    def playback_progress(self) -> talk_audio.PlaybackProgress | None:
+        source = self._source
+        if source is None or self._capture_only:
+            return None
+        progress = source.playback_progress()
+        with self._lock:
+            discarded = self._discarded_playback_bytes
+        return talk_audio.PlaybackProgress(
+            progress.consumed_bytes,
+            progress.discarded_bytes + discarded,
+            progress.pending,
+        )
+
+    @property
     def played_ms(self) -> int:
-        """Milliseconds the channel has actually HEARD since the last reset.
+        """Milliseconds consumed by the local player since the last reset.
 
         Counted from frames the host's player thread pulled — never from
         what we queued. The model streams far faster than realtime, so
@@ -1085,8 +1406,12 @@ __all__ = [
     "InputAudioPacket",
     "TalkDiscordError",
     "discord_to_session",
+    "native_command",
+    "native_session_active",
+    "pause_session",
     "reset_for_tests",
     "resolve_voice_bridge",
+    "resume_session",
     "session_status",
     "session_to_discord",
     "start_core_session",
@@ -1130,7 +1455,54 @@ def _public_exception_failure(error: BaseException) -> str:
     return f"session error ({_safe_exception_name(error)})"
 
 
-JOIN_USAGE = "Say `talk join` once I'm in a voice channel, or `talk leave` to hand it back."
+#: One speakable sentence per bounded startup-refusal reason from
+#: :data:`talk_cli.STARTUP_REFUSAL_REASONS`. Fixed text, never exception text:
+#: this lands in a Discord channel, and the refusing exception can carry a
+#: token, a path, or a provider payload.
+#:
+#: `/talk core join` is offered ONLY where the canonical core lane is genuinely
+#: a different path. Core voice resolves its provider through the HOST, so a
+#: plugin-side configuration or connect refusal is exactly what it routes
+#: around. An audio refusal is the voice channel itself — core join opens the
+#: same channel and fails the same way — so pointing there would just waste the
+#: operator's next attempt.
+#: Keyed by literal so this module keeps its lazy ``talk_cli`` import (the
+#: import runs inside :func:`start_session` to avoid a cycle). The keys are
+#: pinned to ``talk_cli.STARTUP_REFUSAL_REASONS`` by a test, so a new reason
+#: cannot ship without a sentence and every sentence has a live reason.
+_STARTUP_REFUSAL_FAILURES = {
+    "configuration": (
+        "voice is not configured on this host — try `/talk core join`, or run "
+        "`hermes talk doctor` to see which setting is missing"
+    ),
+    "provider": (
+        "the voice provider refused the connection — try `/talk core join`, or "
+        "run `hermes talk doctor` to check the provider is reachable"
+    ),
+    "audio": "the voice channel would not open",
+    "tools": "the session's tools could not be prepared",
+    # No `/talk core join` pointer: this refusal is a wiring contradiction in
+    # this process, not a setting the operator got wrong, and core join takes
+    # the same channel with the same speakers — it would refuse identically.
+    "authorization": (
+        "I can't tell this channel's speakers apart, so I won't take voice "
+        "authority from them — this needs a fix on the host, not a retry"
+    ),
+}
+
+
+def _startup_refusal_failure(reason: str | None) -> str | None:
+    """Map a bounded refusal reason to its speakable line, or None."""
+
+    if reason is None:
+        return None
+    return _STARTUP_REFUSAL_FAILURES.get(reason)
+
+
+JOIN_USAGE = (
+    "Say `talk join` once I'm in a voice channel, `talk pause` / `talk resume` to "
+    "mute or unmute my listening, or `talk leave` to hand it back."
+)
 
 
 def session_status() -> str:
@@ -1146,6 +1518,14 @@ def session_status() -> str:
         if last_failure:
             return f"The last voice session failed: {last_failure}"
         return "No live voice session — I'm not talking in a voice channel right now."
+    if mode == "native-task":
+        with _SESSION_LOCK:
+            controller = _SESSION.get("controller")
+        if controller is None or not controller.current:
+            return f"Canonical task voice is starting on server {guild_id}."
+        selected = controller.attachment["task"]
+        return (f"Canonical task voice is connected on server {guild_id}, "
+                f"task {selected['session_id']}; say `talk leave` to stop.")
     if mode == "core":
         if core_status == "listening":
             return (
@@ -1153,15 +1533,68 @@ def session_status() -> str:
                 "say `talk leave` to stop."
             )
         return f"Canonical core voice is starting on server {guild_id} — say `talk leave` to stop."
+    # The microphone pause (hermes-talk#100) is the one live fact that changes
+    # what "live" means: a paused session plays and announces but hears nobody.
+    paused = " The microphone is paused — say `talk resume` to be heard again." if (
+        talk_pause.is_paused()
+    ) else ""
     if mode == "provider-host-tools":
         return (
             f"Provider-owned Realtime voice with canonical Hermes tools is live on server "
-            f"{guild_id}. Say `talk leave` to stop."
+            f"{guild_id}. Say `talk leave` to stop.{paused}"
         )
     return (
         f"Limited legacy provider-owned voice is live on server {guild_id}. "
         "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
+        f"{paused}"
     )
+
+
+#: The Discord room's own microphone control (hermes-talk#100). Text, on
+#: purpose: a paused session hears nobody, so the way back cannot be spoken.
+_PAUSE_COMMAND_RECEIPTS = {
+    talk_pause.PAUSED: (
+        "Microphone paused — I'll keep talking and announcing, but I'm not "
+        "listening. Say `talk resume` when you want me to hear you again."
+    ),
+    talk_pause.ALREADY_PAUSED: "The microphone is already paused — `talk resume` unpauses it.",
+    talk_pause.RESUMED: "Microphone resumed — I'm listening again.",
+    talk_pause.ALREADY_LISTENING: "I'm already listening — the microphone wasn't paused.",
+    talk_pause.NO_SESSION: (
+        "The voice session isn't listening yet — give it a moment, then try again."
+    ),
+    talk_pause.NO_RESUME_PATH: (
+        "I didn't pause — this session registered no way to resume, and a pause "
+        "nobody can undo would be a hang-up. Say `talk leave` to stop instead."
+    ),
+    talk_pause.UNSUPPORTED: "This voice session can't pause its input.",
+}
+
+
+def _set_session_paused(paused: bool) -> str:
+    with _SESSION_LOCK:
+        task = _SESSION.get("task")
+        mode = _SESSION.get("mode", "legacy")
+    if task is None or task.done():
+        return "I'm not in a voice session right now."
+    if mode == "core":
+        # The canonical core lane is input-only and host-owned: the host's
+        # orchestrator decides what it hears and says, not this plugin.
+        return "The canonical core lane doesn't pause — say `talk leave` to stop it."
+    outcome = talk_pause.set_paused(paused, source=talk_pause.SOURCE_COMMAND)
+    return _PAUSE_COMMAND_RECEIPTS[outcome]
+
+
+def pause_session() -> str:
+    """Mute the live session's listening without leaving the channel."""
+
+    return _set_session_paused(True)
+
+
+def resume_session() -> str:
+    """Unmute a paused session's listening."""
+
+    return _set_session_paused(False)
 
 
 async def _deliver_failure_receipt(adapter: Any, guild_id: int, receipt: str) -> bool:
@@ -1331,7 +1764,8 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
 
 
 def start_session(
-    guild_id: int | None = None, *, host_execution_attachment=None
+    guild_id: int | None = None, *, host_execution_attachment=None,
+    native_task=None, native_task_api=None,
 ) -> str:
     """Start a realtime session on the host's voice connection.
 
@@ -1358,8 +1792,22 @@ def start_session(
     except ImportError:  # pragma: no cover - flat-module fallback
         import talk_cli
 
+    if native_task is not None and host_execution_attachment is not None:
+        return "Choose one canonical task attachment before joining Discord voice."
     audio = DiscordAudio(bridge["guild_id"])
     generation = None
+
+    def bind_controller(controller):
+        with _SESSION_LOCK:
+            if _SESSION.get("task") is task and _SESSION.get("generation") == generation:
+                _SESSION["controller"] = controller
+
+    # Written by the session before it returns its exit code, read by _done
+    # after. Both run on this loop, so the write happens-before the read.
+    refusal: dict[str, str] = {}
+
+    def _note_refusal(reason: str) -> None:
+        refusal["reason"] = reason
 
     def _done(finished) -> None:
         global _LAST_FAILURE, _LAST_FAILURE_GENERATION
@@ -1384,10 +1832,18 @@ def start_session(
                             "the Discord voice connection liveness could not be verified",
                             "the Discord voice connection disconnected while I was listening",
                         }
+                        # A startup refusal knows exactly what refused; the
+                        # catch-all below is what an operator saw for every
+                        # one of them before (hermes-talk#58). A live bridge
+                        # failure still wins: it is the more specific cause
+                        # and it is the one that happens mid-session.
                         failure = (
                             bridge_failure
                             if bridge_failure in safe_bridge_failures
-                            else "session exited unsuccessfully"
+                            else (
+                                _startup_refusal_failure(refusal.get("reason"))
+                                or "session exited unsuccessfully"
+                            )
                         )
         except Exception as exc:  # noqa: BLE001 — a receipt must not raise
             failure = "session outcome unavailable"
@@ -1452,13 +1908,22 @@ def start_session(
         _LAST_FAILURE_GENERATION = None
         _SESSION_GENERATION += 1
         generation = _SESSION_GENERATION
-        if host_execution_attachment is None:
-            session = talk_cli.run_talk_session(audio=audio, lane="discord")
+        if native_task is not None:
+            session = talk_cli.run_talk_session(
+                audio=audio, lane="discord", on_refusal=_note_refusal,
+                native_task=native_task, native_task_api=native_task_api,
+                on_native_controller=bind_controller,
+            )
+        elif host_execution_attachment is None:
+            session = talk_cli.run_talk_session(
+                audio=audio, lane="discord", on_refusal=_note_refusal
+            )
         else:
             session = talk_cli.run_talk_session(
                 audio=audio,
                 host_execution_attachment=host_execution_attachment,
                 lane="discord",
+                on_refusal=_note_refusal,
             )
         task = loop.create_task(session)
         task.add_done_callback(_done)
@@ -1468,9 +1933,8 @@ def start_session(
                 "guild_id": bridge["guild_id"],
                 "audio": audio,
                 "mode": (
-                    "provider-host-tools"
-                    if host_execution_attachment is not None
-                    else "legacy"
+                    "native-task" if native_task is not None else
+                    "provider-host-tools" if host_execution_attachment is not None else "legacy"
                 ),
                 "generation": generation,
             }
@@ -1480,6 +1944,8 @@ def start_session(
     # still has to mint, open a socket, and take the channel, and any of
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
+    if native_task is not None:
+        return "Starting canonical task voice; say `talk status` to check or `talk leave` to stop."
     if host_execution_attachment is not None:
         return (
             "Starting provider-owned Realtime voice with canonical Hermes tools; say "
@@ -1519,3 +1985,37 @@ def reset_for_tests() -> None:
         for notification in _NOTIFICATION_TASKS:
             notification.cancel()
         _NOTIFICATION_TASKS.clear()
+
+
+def native_session_active() -> bool:
+    with _SESSION_LOCK:
+        running = _SESSION.get("task")
+        return (_SESSION.get("mode") == "native-task" and running is not None
+                and not running.done())
+
+
+async def native_command(text, *, operator_user_id, guild_id, channel_id):
+    """Return an inert result to the authenticated host caller, without posting to a channel."""
+    try:
+        from .talk_native_api import NativeTaskError
+    except ImportError:
+        from talk_native_api import NativeTaskError
+    with _SESSION_LOCK:
+        controller = _SESSION.get("controller")
+        generation = _SESSION.get("generation")
+        running = _SESSION.get("task")
+    if controller is None or running is None or running.done():
+        raise NativeTaskError("No canonical Discord task connection is active")
+    proof = controller.attachment.get("surface_context") or {}
+    expected = {
+        "operator_user_id": operator_user_id, "guild_id": guild_id, "channel_id": channel_id,
+    }
+    if any(type(value) is not int or value <= 0 or proof.get(key) != value
+           for key, value in expected.items()):
+        raise NativeTaskError("Discord control caller does not match the immutable room operator")
+    controller.guard()
+    result = await controller.command(text)
+    with _SESSION_LOCK:
+        if _SESSION.get("generation") != generation or _SESSION.get("task") is not running:
+            raise NativeTaskError("Discord control result belongs to an older voice session")
+    return result

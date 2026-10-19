@@ -1,5 +1,3 @@
-"""Behavior regressions for Desktop Realtime Talk interruption ordering."""
-
 from __future__ import annotations
 
 import json
@@ -13,16 +11,15 @@ PLUGIN_JS = ROOT / "desktop" / "plugin.js"
 
 def _transport_source() -> str:
     source = PLUGIN_JS.read_text(encoding="utf-8")
-    start = source.index("class DesktopTalkTransport")
-    end = source.index("function TalkPrimary", start)
+    start = source.index("class DesktopRealtimeRelay")
+    end = source.index("function stopDesktopRelay", start)
     return source[start:end]
 
 
 def _run_transport_scenario(body: str) -> dict[str, object]:
     script = f"""
-const OFFER_TIMEOUT_MS = 30_000
-const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
-const RENDER_INSTRUCTIONS = 'render'
+const DESKTOP_RELAY_TIMEOUT_MS = 30_000
+const DESKTOP_RELAY_INSTRUCTIONS = 'render'
 globalThis.window = {{ setTimeout, clearTimeout }}
 {_transport_source()}
 {body}
@@ -39,7 +36,6 @@ globalThis.window = {{ setTimeout, clearTimeout }}
 def test_latest_interruption_wins_when_transcripts_complete_out_of_order():
     result = _run_transport_scenario(
         """
-let busy = true
 const submitted = []
 const states = []
 const errors = []
@@ -48,14 +44,14 @@ const controller = {
   interrupt: async () => undefined,
   submitText: text => {
     submitted.push(text)
-    busy = true
     return true
   }
 }
-const transport = new DesktopTalkTransport(
+const transport = new DesktopRealtimeRelay(
   { voice: 'cedar' },
   controller,
-  { onState: state => states.push(state), onError: error => errors.push(error) }
+  { release() {} },
+  { onStatus: state => states.push(state), onError: error => errors.push(error) }
 )
 
 transport.handleEvent(JSON.stringify({
@@ -75,7 +71,6 @@ transport.handleEvent(JSON.stringify({
   transcript: 'latest interruption C'
 }))
 
-busy = false
 await new Promise(resolve => setTimeout(resolve, 250))
 transport.stop()
 console.log(JSON.stringify({ submitted, states, errors }))
@@ -96,10 +91,11 @@ const controller = {
   interrupt: async () => undefined,
   submitText: () => true
 }
-const transport = new DesktopTalkTransport(
+const transport = new DesktopRealtimeRelay(
   { voice: 'cedar' },
   controller,
-  { onState: () => undefined, onError: () => undefined }
+  { release() {} },
+  { onStatus: () => undefined, onError: () => undefined }
 )
 transport.channel = {
   readyState: 'open',
@@ -133,10 +129,11 @@ const controller = {
   submitText: () => true,
   subscribeAssistant: () => () => undefined
 }
-const transport = new DesktopTalkTransport(
+const transport = new DesktopRealtimeRelay(
   { voice: 'cedar' },
   controller,
-  { onState: () => undefined, onError: error => { throw new Error(error) } }
+  { release() {} },
+  { onStatus: () => undefined, onError: error => { throw new Error(error) } }
 )
 transport.channel = {
   readyState: 'open',
@@ -168,10 +165,11 @@ const controller = {
   submitText: () => true,
   subscribeAssistant: () => () => undefined
 }
-const transport = new DesktopTalkTransport(
+const transport = new DesktopRealtimeRelay(
   { voice: 'cedar' },
   controller,
-  { onState: () => undefined, onError: () => undefined }
+  { release() {} },
+  { onStatus: () => undefined, onError: () => undefined }
 )
 transport.channel = {
   readyState: 'open',
@@ -201,11 +199,91 @@ console.log(JSON.stringify({ sent }))
     assert cancel["response_id"] == "renderer-response-1"
 
 
+def test_stopping_before_event_channel_opens_finishes_start_and_releases_lease():
+    result = _run_transport_scenario(
+        """
+let releases = 0
+const channel = { addEventListener() {}, close() {} }
+const peer = {
+  connectionState: 'new', addEventListener() {}, addTrack() {},
+  createDataChannel: () => channel,
+  async createOffer() { return { sdp: 'offer' } },
+  async setLocalDescription() {},
+  async setRemoteDescription() {},
+  close() { this.connectionState = 'closed' }
+}
+globalThis.RTCPeerConnection = function () { return peer }
+Object.defineProperty(globalThis, 'navigator', { value: { mediaDevices: { async getUserMedia() {
+  return { getTracks: () => [], getAudioTracks: () => [] }
+} } } })
+globalThis.document = {
+  body: { appendChild() {} }, createElement: () => ({ style: {}, remove() {} })
+}
+globalThis.fetch = async () => ({ ok: true, text: async () => 'answer' })
+const transport = new DesktopRealtimeRelay(
+  { offerUrl: 'https://relay.invalid', clientSecret: 'ephemeral', voice: 'cedar' },
+  { subscribeAssistant: () => () => {}, latestAssistant: () => null, submitText: () => true,
+    interrupt: () => true },
+  { release() { releases++ } },
+  { onStatus() {}, onError(message) { throw new Error(message) } }
+)
+const starting = transport.start()
+await new Promise(resolve => setTimeout(resolve, 0))
+transport.stop()
+await starting
+await new Promise(resolve => setTimeout(resolve, 0))
+console.log(JSON.stringify({
+  closed: transport.closed, releases, timer: transport.channelOpenTimer
+}))
+"""
+    )
+
+    assert result == {"closed": True, "releases": 1, "timer": None}
+
+
+def test_failed_offer_closes_the_unopened_channel_without_unhandled_rejection():
+    result = _run_transport_scenario(
+        """
+let releases = 0
+let unhandled = 0
+process.on('unhandledRejection', () => { unhandled++ })
+const channel = { addEventListener() {}, close() {} }
+const peer = {
+  connectionState: 'new', addEventListener() {}, addTrack() {},
+  createDataChannel: () => channel,
+  async createOffer() { throw new Error('offer failed') },
+  close() { this.connectionState = 'closed' }
+}
+globalThis.RTCPeerConnection = function () { return peer }
+Object.defineProperty(globalThis, 'navigator', { value: { mediaDevices: { async getUserMedia() {
+  return { getTracks: () => [], getAudioTracks: () => [] }
+} } } })
+globalThis.document = {
+  body: { appendChild() {} }, createElement: () => ({ style: {}, remove() {} })
+}
+const transport = new DesktopRealtimeRelay(
+  { offerUrl: 'https://relay.invalid', clientSecret: 'ephemeral', voice: 'cedar' },
+  { subscribeAssistant: () => () => {}, latestAssistant: () => null, submitText: () => true,
+    interrupt: () => true },
+  { release() { releases++ } },
+  { onStatus() {}, onError() {} }
+)
+await assert.rejects(transport.start(), /offer failed/)
+transport.stop()
+await new Promise(resolve => setTimeout(resolve, 0))
+console.log(JSON.stringify({ releases, unhandled, timer: transport.channelOpenTimer }))
+"""
+    )
+
+    assert result == {"releases": 1, "unhandled": 0, "timer": None}
+
+
 def test_rejected_submit_clears_pending_turn_and_allows_the_next_turn():
     result = _run_transport_scenario(
         """
 const submitted = []
 const sent = []
+const errors = []
 const controller = {
   latestAssistant: () => ({ id: 'assistant-a', pending: false, text: 'A' }),
   interrupt: async () => undefined,
@@ -215,10 +293,11 @@ const controller = {
   },
   subscribeAssistant: () => () => undefined
 }
-const transport = new DesktopTalkTransport(
+const transport = new DesktopRealtimeRelay(
   { voice: 'cedar' },
   controller,
-  { onState: () => undefined, onError: error => { throw new Error(error) } }
+  { release() {} },
+  { onStatus: () => undefined, onError: error => errors.push(error) }
 )
 transport.channel = {
   readyState: 'open',
@@ -229,7 +308,7 @@ transport.channel = {
 await transport.submitText('rejected turn')
 const afterReject = {
   waitingForAssistant: transport.waitingForAssistant,
-  activeTurnGeneration: transport.activeTurnGeneration
+  turnGeneration: transport.turnGeneration
 }
 
 await transport.submitText('accepted turn')
@@ -238,6 +317,7 @@ transport.stop()
 console.log(JSON.stringify({
   submitted,
   afterReject,
+  errors,
   responseCreates: sent.filter(event => event.type === 'response.create')
 }))
 """
@@ -246,8 +326,9 @@ console.log(JSON.stringify({
     assert result["submitted"] == ["rejected turn", "accepted turn"]
     assert result["afterReject"] == {
         "waitingForAssistant": False,
-        "activeTurnGeneration": None,
+        "turnGeneration": 1,
     }
+    assert result["errors"] == ["Hermes did not accept the transcript. Try again."]
     response_creates = cast(list[dict], result["responseCreates"])
     assert [event["response"]["input"][0]["content"][0]["text"] for event in response_creates] == [
         "accepted answer"

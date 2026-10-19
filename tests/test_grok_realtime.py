@@ -29,6 +29,7 @@ PROVIDER_ENV_NAMES = (
     "TALK_GROK_VOICE",
     "TALK_XAI_API_KEY",
     "XAI_API_KEY",
+    "TALK_PREFER_XAI_OAUTH",
     "TALK_OPENAI_API_KEY",
     "OPENAI_API_KEY",
 )
@@ -106,10 +107,13 @@ class _Client:
         return _Context(self.socket, lambda: setattr(self.socket, "exited", True))
 
 
-def _setup(*, automatic_response=True):
+def _setup(*, voice="ara", automatic_response=True, turn_detection=None):
+    kwargs = {}
+    if turn_detection is not None:
+        kwargs["turn_detection"] = turn_detection
     return rt.SessionSetup(
         model="grok-voice-test",
-        voice="ara",
+        voice=voice,
         instructions="Be brief.",
         tools=(
             rt.ToolDefinition(
@@ -119,6 +123,7 @@ def _setup(*, automatic_response=True):
             ),
         ),
         automatic_response=automatic_response,
+        **kwargs,
     )
 
 
@@ -184,9 +189,101 @@ def test_connect_sends_grok_session_update_with_prefixed_voice_and_url_model():
     assert adapter.state is rt.SessionState.CLOSED
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+        rt.RealtimeTurnDetectionMode.SERVER_VAD,
+    ],
+)
+def test_supported_turn_detection_modes_keep_exact_ga_server_vad_payload(mode):
+    setup = _setup(
+        automatic_response=False,
+        turn_detection=rt.RealtimeTurnDetection(mode=mode),
+    )
+
+    turn_detection = grok_rt.build_session_update(setup)["session"]["audio"]["input"][
+        "turn_detection"
+    ]
+
+    assert turn_detection == {
+        "type": "server_vad",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+
+
+def test_semantic_vad_is_refused_before_websocket_connection():
+    socket = _Socket()
+    adapter, client = _adapter(socket)
+    setup = _setup(
+        turn_detection=rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.HIGH,
+        )
+    )
+
+    with pytest.raises(rt.RealtimeSessionError, match="does not support semantic VAD"):
+        asyncio.run(adapter.connect(setup))
+
+    assert client.connect_args is None
+    assert socket.sent == []
+    assert adapter.state is rt.SessionState.FAILED
+
+
 def test_wire_voice_prefix_is_applied_exactly_once():
     assert grok_rt._wire_voice("ara") == "xai_ara"
     assert grok_rt._wire_voice("xai_eve") == "xai_eve"
+
+
+@pytest.mark.parametrize(
+    "voice",
+    (
+        "carina",
+        "zagan",
+        "helix",
+        "orion",
+        "luna",
+        "iris",
+        "altair",
+        "zenith",
+        "perseus",
+        "helios",
+        "lux",
+        "kepler",
+        "rigel",
+        "cosmo",
+        "celeste",
+        "ursa",
+        "sirius",
+        "lumen",
+        "castor",
+        "naksh",
+        "atlas",
+        "aurora",
+        "liora",
+        "ara",
+        "eve",
+        "leo",
+        "rex",
+        "sal",
+    ),
+)
+def test_documented_grok_voice_reaches_session_update(clean_provider_env, voice):
+    # Roster from xAI's speech-to-speech -> text-to-speech voice table,
+    # checked 2026-10-04. Each name must survive config validation and encoding.
+    clean_provider_env.setenv("TALK_GROK_VOICE", f" {voice.upper()} ")
+
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(_setup(voice=talk_config.talk_grok_voice()))
+        await adapter.close()
+        return socket.sent[0]
+
+    payload = asyncio.run(scenario())
+
+    assert payload["session"]["audio"]["output"]["voice"] == f"xai_{voice}"
 
 
 def test_no_tools_means_no_tool_fields():
@@ -707,3 +804,287 @@ def test_grok_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._grok_auth()
     assert auth.token == "xai-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
+
+def test_grok_auth_delegates_to_the_grok_auth_resolver(clean_provider_env, monkeypatch):
+    sentinel = talk_auth.TalkAuth(token="sentinel", source="xai-oauth", detail="test")
+    monkeypatch.setattr(talk_cli.talk_grok_auth, "resolve_grok_auth", lambda: sentinel)
+    assert talk_cli._grok_auth() is sentinel
+
+
+# -- handshake remediation -----------------------------------------------------
+
+
+class WSServerHandshakeError(Exception):
+    """Same class NAME as aiohttp's; the helper matches by name + status."""
+
+    def __init__(self, status):
+        super().__init__(f"{status}, message='Invalid response status'")
+        self.status = status
+
+
+@pytest.mark.parametrize(
+    ("status", "source", "expected"),
+    [
+        (401, "xai-oauth", "xAI OAuth token rejected — run `hermes auth add xai-oauth`"),
+        (401, "env", "xAI API key rejected (401)"),
+        (401, "configured", "xAI API key rejected (401)"),
+        (
+            403,
+            "xai-oauth",
+            "your xAI subscription tier does not include realtime API access; "
+            "set `XAI_API_KEY` for Grok voice",
+        ),
+        (403, "env", "xAI refused this key for realtime (403)"),
+    ],
+)
+def test_handshake_remediation_names_the_lane(status, source, expected):
+    exc = WSServerHandshakeError(status)
+    assert grok_rt.handshake_remediation(exc, auth_source=source) == expected
+
+
+def test_handshake_remediation_leaves_other_failures_alone():
+    for exc in (WSServerHandshakeError(500), WSServerHandshakeError("401"), OSError("reset")):
+        assert grok_rt.handshake_remediation(exc, auth_source="xai-oauth") is None
+
+
+class _RejectingContext:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def __aenter__(self):
+        raise self.exc
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _RejectingClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def ws_connect(self, *_args, **_kwargs):
+        return _RejectingContext(WSServerHandshakeError(401))
+
+
+def test_connect_turns_an_oauth_401_into_the_relogin_remediation():
+    aiohttp = types.SimpleNamespace(
+        ClientSession=lambda: _RejectingClient(),
+        WSMsgType=types.SimpleNamespace(TEXT="text", ERROR="error"),
+    )
+    adapter = grok_rt.GrokRealtimeSession(
+        auth_token="oauth-canary", auth_source="xai-oauth", aiohttp_module=aiohttp
+    )
+
+    with pytest.raises(rt.RealtimeSessionError) as info:
+        asyncio.run(adapter.connect(_setup()))
+
+    assert str(info.value) == "xAI OAuth token rejected — run `hermes auth add xai-oauth`"
+    assert "oauth-canary" not in str(info.value)
+    assert adapter.state is rt.SessionState.FAILED
+
+@pytest.mark.parametrize("automatic_response", [True, False])
+def test_native_task_mode_requires_explicit_responses_before_connect(automatic_response):
+    async def scenario():
+        socket = _Socket()
+        adapter, client = _adapter(socket)
+        setup = rt.SessionSetup(
+            model="grok-voice-test",
+            voice="ara",
+            instructions="Be brief.",
+            task_continuity=True,
+            automatic_response=automatic_response,
+        )
+        if automatic_response:
+            with pytest.raises(rt.RealtimeSessionError, match="explicit response"):
+                await adapter.connect(setup)
+            assert client.connect_args is None
+            assert socket.sent == []
+        else:
+            await adapter.connect(setup)
+            assert (
+                socket.sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"]
+                is False
+            )
+            await adapter.close()
+
+    asyncio.run(scenario())
+
+
+def test_native_input_and_isolated_summary_commands_preserve_scope():
+    async def scenario():
+        socket = _Socket()
+        adapter, _client = _adapter(socket)
+        await adapter.connect(
+            rt.SessionSetup(
+                model="grok-voice-test",
+                voice="ara",
+                instructions="Be brief.",
+                task_continuity=True,
+                automatic_response=False,
+            )
+        )
+        await adapter.send(
+            (
+                rt.AddInputText(item_id="input-1", text="  original\n text  "),
+                rt.StartResponse(
+                    metadata={"talk_request_id": "req-1"},
+                    input=({"type": "item_reference", "id": "input-1"},),
+                ),
+                rt.StartResponse(
+                    metadata={"talk_presentation_id": "summary-1"},
+                    allow_tools=False,
+                    conversation="none",
+                    input=(),
+                    instructions="Summarize the authorized result.",
+                    max_output_tokens=200,
+                ),
+                rt.CancelResponse(response_id="response-old"),
+            )
+        )
+        await adapter.close()
+        return socket.sent[1:]
+
+    sent = asyncio.run(scenario())
+    assert sent[0] == {
+        "type": "conversation.item.create",
+        "item": {
+            "id": "input-1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "  original\n text  "}],
+        },
+    }
+    assert sent[1] == {
+        "type": "response.create",
+        "response": {
+            "metadata": {"talk_request_id": "req-1"},
+            "input": [{"type": "item_reference", "id": "input-1"}],
+        },
+    }
+    assert sent[2] == {
+        "type": "response.create",
+        "response": {
+            "metadata": {"talk_presentation_id": "summary-1"},
+            "tool_choice": "none",
+            "input": [],
+            "conversation": "none",
+            "tools": [],
+            "instructions": "Summarize the authorized result.",
+            "max_output_tokens": 200,
+        },
+    }
+    assert sent[3] == {"type": "response.cancel", "response_id": "response-old"}
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed", "incomplete"])
+def test_native_terminal_tool_declarations_preserve_provider_status(status):
+    output = [
+        {
+            "type": "function_call",
+            "id": "item-call",
+            "call_id": "call-1",
+            "name": "delegate_task",
+            "arguments": '{"goal":"Build"}',
+        }
+    ]
+    event = grok_rt.decode_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "response-1",
+                "status": status,
+                "output": output,
+            },
+        }
+    )
+    assert event == rt.ResponseFinished("response-1", status, output)
+    output[0]["call_id"] = "changed-after-decoding"
+    assert event.output[0]["call_id"] == "call-1"
+    missing = grok_rt.decode_event({"type": "response.done", "response": {"id": "response-2"}})
+    assert missing.status is None and missing.output is None
+
+
+def test_late_transcripts_keep_per_item_commit_and_dedupe_state():
+    async def scenario():
+        events = [
+            {"type": "input_audio_buffer.speech_started", "item_id": "a"},
+            {"type": "input_audio_buffer.committed", "item_id": "a"},
+            {"type": "input_audio_buffer.speech_started", "item_id": "b"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "a",
+                "transcript": "first",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "b",
+                "transcript": "second",
+            },
+            {"type": "input_audio_buffer.committed", "item_id": "b"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "b",
+                "transcript": "second",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "a",
+                "transcript": "first",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.updated",
+                "item_id": "a",
+                "transcript": "late partial",
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "uncommitted",
+                "transcript": "cannot authorize",
+            },
+        ]
+        adapter, _client = _adapter(_Socket(events))
+        await adapter.connect(_setup())
+        decoded = [event async for event in adapter]
+        await adapter.close()
+        return [event for event in decoded if isinstance(event, rt.Transcript)]
+
+    assert [(event.item_id, event.text, event.final) for event in asyncio.run(scenario())] == [
+        ("a", "first", True),
+        ("b", "second", False),
+        ("b", "second", True),
+        ("uncommitted", "cannot authorize", False),
+    ]
+
+
+def test_native_truncate_refusal_never_sends_an_unscoped_cancel():
+    async def scenario():
+        socket = _Socket(
+            [
+                {"type": "error", "error": {"message": "conversation.item.truncate unsupported"}},
+                {
+                    "type": "response.done",
+                    "response": {"id": "old", "status": "cancelled", "output": []},
+                },
+            ]
+        )
+        adapter, _client = _adapter(socket)
+        await adapter.connect(
+            rt.SessionSetup(
+                model="grok-voice-test",
+                voice="ara",
+                instructions="Be brief.",
+                task_continuity=True,
+                automatic_response=False,
+            )
+        )
+        event = await adapter.__anext__()
+        assert event == rt.ResponseFinished("old", "cancelled", [])
+        await adapter.send((rt.CancelResponse("old"), rt.TruncateOutput("old-item", 50)))
+        await adapter.close()
+        return socket.sent[1:]
+
+    assert asyncio.run(scenario()) == [{"type": "response.cancel", "response_id": "old"}]

@@ -30,6 +30,7 @@ import types
 import aiohttp
 import fake_realtime as fr
 import pytest
+import wallclock
 from test_discord import _tone, _wired_host
 from test_fake_provider_session import FakeProviderSession
 
@@ -82,7 +83,7 @@ def _cascade_env(monkeypatch) -> None:
 async def _wait_for(condition, timeout: float = 2.0) -> None:
     """Poll the loop until ``condition`` holds; fail the test if it never does."""
 
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + wallclock.stretch(timeout)
     while not condition():
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("condition never became true")
@@ -215,7 +216,7 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
         ws = tts.sockets[0]
         await _wait_for(lambda: len(ws.sent) == 3)
         # BOS, the one sentence chunk, EOS — and the key rode only the header.
-        assert ws.sent[1] == {"text": "Hello Discord.", "try_trigger_generation": True}
+        assert ws.sent[1] == {"text": "Hello Discord."}
         assert ws.sent[2] == {"text": ""}
         assert tts.dials[0]["headers"] == {"xi-api-key": FAKE_KEY}
         assert FAKE_KEY not in tts.dials[0]["url"]

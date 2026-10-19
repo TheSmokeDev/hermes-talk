@@ -961,3 +961,33 @@ def test_working_is_reported_to_diagnostics_by_file_only(_hermetic):
 
     assert diagnostic["WORKING"] == "Dograh is the voice stack."
     assert "search_memory" not in diagnostic["WORKING"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "hermes-talk#56 item 3: the upgrade-trap warning is gated on the pinned "
+        "list alone, never on whether a WORKING section exists, so a deliberate "
+        "MEMORY,PERSONA pin is a standing warning on every session mint"
+    ),
+)
+def test_a_deliberate_pin_with_no_working_section_does_not_warn(
+    _hermetic, monkeypatch, caplog
+):
+    """The warning exists to catch a pin that SILENTLY DROPS curated context.
+
+    Where there is no WORKING.md and no bound ctx, the pin drops nothing, so
+    there is no trap to warn about — and a warning that cannot be acted on is
+    one an operator learns to ignore, which costs the real case its signal.
+    """
+
+    # Measured with no pin at all, because identity_sections() filters its
+    # return value by the pin: asking the pinned call whether WORKING is in
+    # its OUTPUT would be vacuous.
+    assert "WORKING" not in talk_host.host().identity_sections()
+
+    monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "MEMORY,PERSONA")
+    with caplog.at_level("WARNING", logger="talk_host"):
+        talk_host.host().identity_sections()
+
+    assert not [record for record in caplog.records if "WORKING" in record.message]

@@ -9,10 +9,26 @@ on:
   # created). This lets an operator run the suite against any ref by hand.
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN. The suite only checks out the tree, installs
+# from PyPI, and runs pytest/ruff — it writes nothing back to GitHub, so
+# contents:read (what actions/checkout needs) is the whole grant. Without this
+# block the token inherits the repository default, which can be read/write.
+permissions:
+  contents: read
+
 jobs:
   test:
     # No secrets, no network: the suite runs against scripted Realtime
     # transcripts and a stub plugin context, and never opens an audio device.
+    #
+    # A healthy Linux job finishes in ~3 minutes. Windows runs the same suite in
+    # 6 to 14 minutes from one attempt to the next, and the 3x wall-clock scale
+    # tests/wallclock.py applies there stretches every wait that legitimately
+    # expires, so a slow Windows attempt needs ~15. Without a ceiling a wedged
+    # test holds the runner for GitHub's 6-hour default, which reads as "still
+    # running" long after it has failed; pytest-timeout (180 s per test) is the
+    # first line, this is the backstop.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 15 }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,16 +37,16 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev]" -r requirements-lint.txt
 
       - name: Test
         run: pytest -q

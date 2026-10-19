@@ -37,6 +37,7 @@ try:
         talk_doctor,
         talk_host,
         talk_identity,
+        talk_pause,
         talk_runs,
         talk_steer,
         talk_vault,
@@ -51,6 +52,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_doctor
     import talk_host
     import talk_identity
+    import talk_pause
     import talk_runs
     import talk_steer
     import talk_vault
@@ -75,6 +77,7 @@ REGISTRATION_REQUIREMENTS: dict[str, str] = {
     "tts_provider": "optional",
     "transcription_provider": "optional",
     "realtime_voice_provider": "optional",
+    "core_realtime_providers": "optional",
 }
 
 _TOOL_SEARCH_MEMORY: dict = {
@@ -139,7 +142,11 @@ _TOOL_DELEGATE_TASK: dict = {
         "Hand a real task to a background Hermes agent and keep talking. The "
         "agent starts fresh and never sees this call, so write the whole task "
         "out: what to do, where it lives, and what done looks like. Returns a "
-        "WORK_STARTED receipt — say it is running and move on."
+        "WORK_STARTED receipt — say it is running and move on. If the task "
+        "touches something other work might also touch — a repository "
+        "checkout, a deployment target — name it in resource_keys so two jobs "
+        "never collide; a refusal names the run in the way, so offer to wait "
+        "for it, stop it, or retry without that key."
     ),
     "parameters": {
         "type": "object",
@@ -153,6 +160,30 @@ _TOOL_DELEGATE_TASK: dict = {
             "background": {
                 "type": "boolean",
                 "description": "Run without blocking the call (default true).",
+            },
+            "execution_mode": {
+                "type": "string",
+                "enum": ["exclusive", "parallel_read_only"],
+                "description": (
+                    "How this task may share its resource_keys with other running "
+                    "work. 'exclusive' (the default): nothing else touching the "
+                    "same key runs at the same time. 'parallel_read_only': the "
+                    "task only reads, so it may overlap other read-only work on "
+                    "the same key — honored only when the operator has chosen to "
+                    "trust that declaration. Use exclusive unless the task is "
+                    "certainly read-only."
+                ),
+            },
+            "resource_keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 8,
+                "description": (
+                    "Stable names for what the task touches: an absolute "
+                    "repository path, a deployment target, a service name. Two "
+                    "tasks that share a key never run together unless both are "
+                    "parallel_read_only. Omit when the task touches nothing shared."
+                ),
             },
         },
         "required": ["task"],
@@ -358,6 +389,32 @@ _TOOL_TALK_CAPABILITIES: dict = {
 }
 
 
+_TOOL_PAUSE_VOICE_INPUT: dict = {
+    "type": "function",
+    "name": "pause_voice_input",
+    "description": (
+        "Pause listening — mute your microphone WITHOUT ending the call. Use "
+        "when the operator says to stop listening, mute the mic, or hold on "
+        "while they talk to someone else. Playback, background work and its "
+        "announcements all continue; only their speech stops reaching you. "
+        "Once paused you cannot hear a spoken resume: the operator resumes "
+        "from their own control, which the tool result names — repeat it as "
+        "you confirm the pause. Pass paused=false to resume when a non-spoken "
+        "path asks you to."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "paused": {
+                "type": "boolean",
+                "description": "true (default) pauses the microphone; false resumes it.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+
 class TalkToolError(Exception):
     """Unknown tool name or otherwise malformed tool call."""
 
@@ -366,28 +423,34 @@ def plugin_version() -> str:
     """The shipped plugin version, whichever way this plugin was loaded."""
 
     try:
-        from importlib.metadata import version
-
-        return version("hermes-talk")
-    except Exception:  # noqa: BLE001 - file-path load has no installed metadata
-        pass
-    try:
         manifest = Path(__file__).resolve().parent / "plugin.yaml"
         for line in manifest.read_text(encoding="utf-8").splitlines():
-            if line.startswith("version:"):
+            if line.startswith("version:") and line.split(":", 1)[1].strip():
                 return line.split(":", 1)[1].strip()
     except OSError:
         pass
-    return "unknown"
+    try:
+        from importlib.metadata import version
+
+        return version("hermes-talk")
+    except Exception:  # noqa: BLE001 - a wheel may have no adjacent plugin manifest
+        return "unknown"
 
 
-def default_talk_tools() -> list[dict]:
+def default_talk_tools(*, pausable: bool = False) -> list[dict]:
     """The tool set advertised to a new Talk session (fresh copies per call).
 
     The base set is unconditional. ``search_vault`` is CONDITIONAL: it is
     advertised only when a memory provider is actually loadable in this
     process, because advertising a lookup that cannot be served is the same
     defect as the provider block this plugin stopped passing through.
+    ``pause_voice_input`` is conditional the same way, on ``pausable``: the
+    session passes True only when this process pumps the microphone AND the
+    operator has a guaranteed way to resume it (a keyboard the session owns,
+    or ``/talk resume``). Default False — the dashboard tab's microphone
+    lives in the browser, and a terminal whose stdin is not a tty has no key
+    to press — so a pause tool is never offered where the only way back
+    would be Ctrl+C.
     """
 
     tools = [
@@ -402,6 +465,8 @@ def default_talk_tools() -> list[dict]:
         _TOOL_TALK_STATUS,
         _TOOL_TALK_CAPABILITIES,
     ]
+    if pausable:
+        tools.append(_TOOL_PAUSE_VOICE_INPUT)
     try:
         if talk_vault.available():
             tools.insert(1, _TOOL_SEARCH_VAULT)
@@ -461,7 +526,21 @@ def _handle_delegate_task(arguments: dict) -> str:
     if not task:
         return "delegate_task needs a task to hand off."
     background = arguments.get("background")
-    return talk_host.host().run_agent(task, background is not False)
+    # The admission declaration (hermes-talk#101) is validated HERE, before
+    # any backend is consulted: a malformed declaration must not fall through
+    # to a lane that would then run the task unfenced.
+    mode = arguments.get("execution_mode")
+    if mode is not None:
+        mode = str(mode).strip().lower() or None
+        if mode is not None and mode not in talk_runs.EXECUTION_MODES:
+            return "delegate_task's execution_mode must be 'exclusive' or 'parallel_read_only'."
+    try:
+        keys = talk_runs.normalize_resource_keys(arguments.get("resource_keys"))
+    except ValueError as exc:
+        return f"delegate_task could not use those resource_keys: {exc}."
+    return talk_host.host().run_agent(
+        task, background is not False, execution_mode=mode, resource_keys=keys
+    )
 
 
 def _describe_age(run: dict) -> str:
@@ -482,6 +561,12 @@ def _describe_run(run: dict) -> str:
     line = f"run {run.get('runId')} ({run.get('kind')}) {run.get('status')}"
     if run.get("status") == "running":
         line += _describe_age(run)
+        # What a live run holds (hermes-talk#101), so "why was that refused?"
+        # has an answer the model can read out.
+        admission = run.get("admission") if isinstance(run.get("admission"), dict) else {}
+        held = [key for key in admission.get("keys") or () if isinstance(key, str)]
+        if held:
+            line += " holding " + ", ".join(f"'{key}'" for key in held)
     if run.get("status") == "lost":
         line += " (started before this session — I can't see how it ended)"
     # A stop verb's detached confirmation lands in meta (hermes-talk#2) —
@@ -574,6 +659,51 @@ def _handle_resolve_approval(arguments: dict) -> str:
     except (TypeError, ValueError):
         return "resolve_approval needs the run number from the approval question."
     return talk_approvals.resolve(run_id, arguments.get("choice"))
+
+
+#: What the model reads back after a pause flip. Spoken, so each one says
+#: what is TRUE now and, for a pause, how the operator gets back — a paused
+#: microphone cannot carry the word "resume". The PAUSED receipt names the
+#: control THIS session registered (``{resume}``), never a key or a command
+#: from another room.
+PAUSE_RECEIPTS: dict[str, str] = {
+    talk_pause.PAUSED: (
+        "Microphone paused — you are no longer hearing the operator. Playback, "
+        "background work and its announcements continue. Tell them how to "
+        "resume: {resume}."
+    ),
+    talk_pause.ALREADY_PAUSED: "The microphone was already paused.",
+    talk_pause.RESUMED: "Microphone resumed — you are hearing the operator again.",
+    talk_pause.ALREADY_LISTENING: "The microphone was not paused; you are already listening.",
+    talk_pause.NO_SESSION: (
+        "There is no live voice session attached to this process, so there is "
+        "no microphone here to pause — in the dashboard tab the browser owns "
+        "the microphone, so use its own mute control."
+    ),
+    talk_pause.NO_RESUME_PATH: (
+        "The microphone was not paused: this session has no control the "
+        "operator could resume it with, and a pause nobody can undo would end "
+        "the call in all but name. They can still hang up with Ctrl+C."
+    ),
+    talk_pause.UNSUPPORTED: "This session's audio device cannot pause its input.",
+}
+
+_FALSE_WORDS = frozenset({"false", "no", "0", "off", "resume"})
+
+
+def _handle_pause_voice_input(arguments: dict) -> str:
+    raw = arguments.get("paused")
+    if isinstance(raw, str):
+        paused = raw.strip().lower() not in _FALSE_WORDS
+    else:
+        paused = True if raw is None else bool(raw)
+    outcome = talk_pause.set_paused(paused, source=talk_pause.SOURCE_TOOL)
+    receipt = PAUSE_RECEIPTS[outcome]
+    if outcome == talk_pause.PAUSED:
+        # The gate above guarantees a control was registered; the fallback
+        # only covers a detach racing this read.
+        receipt = receipt.format(resume=talk_pause.resume_control() or "their own control")
+    return receipt
 
 
 def _identity_summary() -> dict[str, int]:
@@ -749,12 +879,14 @@ _HANDLERS = {
     "resolve_approval": _handle_resolve_approval,
     "talk_status": _handle_talk_status,
     "talk_capabilities": _handle_talk_capabilities,
+    "pause_voice_input": _handle_pause_voice_input,
 }
 
 
 __all__ = [
     "MAX_CATALOG_ENTRIES",
     "MAX_OUTPUT_CHARS",
+    "PAUSE_RECEIPTS",
     "REGISTRATION_FAILURES",
     "REGISTRATION_RECEIPTS",
     "REGISTRATION_REQUIREMENTS",

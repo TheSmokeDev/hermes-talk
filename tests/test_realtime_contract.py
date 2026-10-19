@@ -111,6 +111,28 @@ def test_setup_events_and_commands_cover_one_ordinary_turn():
     assert all(isinstance(command, rt.RealtimeCommand) for command in commands)
 
 
+def test_turn_detection_defaults_preserve_provider_native_behavior():
+    setup = rt.SessionSetup(model="provider-model", voice="provider-voice", instructions="")
+
+    assert setup.turn_detection == rt.RealtimeTurnDetection()
+    assert setup.turn_detection.mode is rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    assert setup.turn_detection.semantic_eagerness is None
+
+
+def test_semantic_eagerness_is_valid_only_for_semantic_endpointing():
+    semantic = rt.RealtimeTurnDetection(
+        mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        semantic_eagerness=rt.RealtimeSemanticEagerness.HIGH,
+    )
+    assert semantic.semantic_eagerness is rt.RealtimeSemanticEagerness.HIGH
+
+    with pytest.raises(ValueError, match="only for semantic_vad"):
+        rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SERVER_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.LOW,
+        )
+
+
 @pytest.mark.parametrize(
     ("factory", "match"),
     [
@@ -307,3 +329,13 @@ def test_output_events_carry_optional_response_identity():
     # The operator's own speech belongs to no response.
     assert user_speech.response_id is None
     assert answer.response_id == "response-1"
+
+
+def test_unidentified_output_lifecycle_does_not_claim_input_or_transcript_finality():
+    from dataclasses import fields
+
+    for event in (rt.OutputInterrupted(), rt.OutputTurnCompleted()):
+        assert isinstance(event, rt.RealtimeEvent)
+        assert fields(event) == ()
+        assert not isinstance(event, (rt.SpeechStarted, rt.SpeechStopped, rt.Transcript))
+        assert type(event).__name__ in rt.__all__

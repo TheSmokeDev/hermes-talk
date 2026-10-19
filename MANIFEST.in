@@ -1,0 +1,8 @@
+include __init__.py plugin.yaml .env.example
+include .gitattributes
+recursive-include dashboard *.py *.json *.js *.css
+recursive-include desktop *.js
+recursive-include ui *.js
+include scripts/build_ui.py
+include docs/DESKTOP.md
+include docs/GPT-LIVE.md docs/recipient-routing.md

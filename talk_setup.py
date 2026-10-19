@@ -1026,6 +1026,120 @@ def apply_env_write(
         raise SetupApplyError(receipt)
 
 
+def _grok_auth_changes(
+    check: dict,
+    *,
+    input_fn: InputFn,
+    secret_input_fn: InputFn,
+    output_fn: OutputFn,
+) -> list[tuple[str, str | None, bool]]:
+    """The Grok sibling of ``_auth_changes``: xAI OAuth vs a metered xAI key.
+
+    The subscription lane is the host's login (``hermes auth add xai-oauth``);
+    setup never writes an auth store, so choosing it either records the
+    preference knob or prints the login command.
+    """
+
+    details = check.get("details", {})
+    status = check.get("status")
+    preference = details.get("preference")
+    oauth_state = details.get("xai_oauth")
+    blocked_by = details.get("blocked_by")
+    metered_present = bool(details.get("metered_key_present"))
+    login = "hermes auth add xai-oauth"
+
+    if status != "fail" and not (
+        details.get("metered_key_wins_over_oauth") and preference == "absent"
+    ):
+        return []
+
+    if blocked_by in {"blank-talk-key", "blank-xai-key"}:
+        key = "TALK_XAI_API_KEY" if blocked_by == "blank-talk-key" else "XAI_API_KEY"
+        action = _ask_choice(
+            f"{key} is blank. Replace it or remove its dotenv entry?",
+            ("replace", "remove"),
+            input_fn,
+        )
+        if action == "remove":
+            return [(key, None, True)]
+        secret = _ask_nonempty_secret(f"Enter {key} (input hidden): ", secret_input_fn)
+        return [(key, secret, True)]
+
+    if blocked_by == "invalid-preference":
+        lane = _ask_choice(
+            "Choose the Grok auth policy: require the xAI subscription login "
+            "(SuperGrok / X Premium+) or preserve key-first precedence?",
+            ("oauth", "key"),
+            input_fn,
+        )
+        if lane == "oauth":
+            return [("TALK_PREFER_XAI_OAUTH", "true", False)]
+        changes: list[EnvChange] = []
+        if not metered_present:
+            secret = _ask_nonempty_secret(
+                "Enter TALK_XAI_API_KEY (input hidden): ", secret_input_fn
+            )
+            changes.append(("TALK_XAI_API_KEY", secret, True))
+        changes.append(("TALK_PREFER_XAI_OAUTH", "false", False))
+        return changes
+
+    if status == "fail":
+        lane = _ask_choice(
+            "No usable Grok authentication was detected. Use the xAI subscription "
+            f"login (`{login}`) or an xAI API key?",
+            ("subscription", "key"),
+            input_fn,
+        )
+        if lane == "subscription":
+            if oauth_state == "valid":
+                # The login exists; only the policy blocks it (a blank key was
+                # handled above, so this is the preference-enabled-but-unusable
+                # case or a key-lane refusal).
+                return [("TALK_PREFER_XAI_OAUTH", "true", False)]
+            output_fn(f"Run `{login}`, then rerun `hermes talk setup`; no file was changed.")
+            return []
+        changes: list[EnvChange] = []
+        if not metered_present:
+            secret = _ask_nonempty_secret(
+                "Enter TALK_XAI_API_KEY (input hidden): ", secret_input_fn
+            )
+            changes.append(("TALK_XAI_API_KEY", secret, True))
+        if preference == "enabled":
+            changes.append(("TALK_PREFER_XAI_OAUTH", "false", False))
+        return changes
+
+    if metered_present and oauth_state in {"valid", "expired"}:
+        lane = _ask_choice(
+            "Both a metered xAI key and an xAI subscription login are available. "
+            "Which lane should Grok voice require?",
+            ("oauth", "key"),
+            input_fn,
+        )
+        if lane == "oauth":
+            return [("TALK_PREFER_XAI_OAUTH", "true", False)]
+    return []
+
+
+def _gemini_auth_changes(
+    check: dict, *, input_fn: InputFn, secret_input_fn: InputFn,
+) -> list[EnvChange]:
+    """Repair only the Gemini key selected by the offline diagnostic."""
+
+    if check.get("status") != "fail":
+        return []
+    blocked_by = check.get("details", {}).get("blocked_by")
+    key = "GEMINI_API_KEY" if blocked_by == "blank-gemini-key" else "TALK_GEMINI_API_KEY"
+    if blocked_by in {"blank-talk-key", "blank-gemini-key"}:
+        action = _ask_choice(
+            f"{key} is blank. Replace it or remove its dotenv entry?",
+            ("replace", "remove"), input_fn,
+        )
+        if action == "remove":
+            return [(key, None, True)]
+    secret = _ask_nonempty_secret(f"Enter {key} (input hidden): ", secret_input_fn)
+    return [(key, secret, True)]
+
+
 def _auth_changes(
     check: dict,
     *,
@@ -1034,6 +1148,12 @@ def _auth_changes(
     output_fn: OutputFn,
 ) -> list[tuple[str, str | None, bool]]:
     details = check.get("details", {})
+    if details.get("provider") == "gemini":
+        return _gemini_auth_changes(check, input_fn=input_fn, secret_input_fn=secret_input_fn)
+    if "xai_oauth" in details:
+        return _grok_auth_changes(
+            check, input_fn=input_fn, secret_input_fn=secret_input_fn, output_fn=output_fn
+        )
     status = check.get("status")
     preference = details.get("preference")
     oauth_state = details.get("codex_oauth")
@@ -1114,6 +1234,14 @@ def _model_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None
     if check.get("status") == "pass":
         return []
     details = check.get("details", {})
+    if details.get("provider") == "gemini":
+        choice = _ask_choice(
+            "This Gemini model has not been checked live. Keep it or use the default?",
+            ("keep", "default"), input_fn,
+        )
+        return [] if choice == "keep" else [
+            ("TALK_GEMINI_MODEL", talk_config.DEFAULT_GEMINI_MODEL, False)
+        ]
     if check.get("status") == "warn" and details.get("compatibility") == "unknown":
         choice = _ask_choice(
             "The configured model has unknown duplex/tool compatibility. "
@@ -1134,6 +1262,13 @@ def _model_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None
 def _voice_changes(check: dict, input_fn: InputFn) -> list[tuple[str, str | None, bool]]:
     if check.get("status") != "fail":
         return []
+    if check.get("details", {}).get("provider") == "gemini":
+        while True:
+            voice = input_fn(
+                f"Choose a Gemini voice [{talk_config.DEFAULT_GEMINI_VOICE}] (case-sensitive): "
+            ).strip() or talk_config.DEFAULT_GEMINI_VOICE
+            if voice in talk_config.GEMINI_LIVE_VOICES:
+                return [("TALK_GEMINI_VOICE", voice, False)]
     allowed = tuple(talk_config.OPENAI_REALTIME_VOICES)
     while True:
         voice = input_fn(

@@ -8,6 +8,15 @@ on:
   # ref by hand when event delivery drops.
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads two
+# files from a PUBLIC upstream repository through `gh api`; a token scoped to
+# contents:read on this repository can still read public repositories, and
+# the authenticated call is only there for the rate limit. Nothing is written
+# back to GitHub. Without this block the token inherits the repository
+# default, which can be read/write.
+permissions:
+  contents: read
+
 jobs:
   scan:
     # The upstream plugin scanner (tools/plugin_guard.py in
@@ -19,9 +28,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
@@ -57,6 +66,7 @@ jobs:
             return 1
           }
           fetch plugin_guard.py "${home}/tools/plugin_guard.py"
+          fetch plugin_guard_context.py "${home}/tools/plugin_guard_context.py"
           fetch skills_guard.py "${home}/tools/skills_guard.py"
           touch "${home}/tools/__init__.py"
 

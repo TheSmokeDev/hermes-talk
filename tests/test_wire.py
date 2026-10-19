@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 
+import talk_realtime as rt
 import talk_wire
 
 
@@ -26,6 +28,73 @@ def test_session_payload_enables_server_vad_and_barge_in():
         payload["audio"]["input"]["transcription"]["model"] == talk_wire.INPUT_TRANSCRIPTION_MODEL
     )
     assert payload["audio"]["output"]["voice"] == "cedar"
+
+
+def test_turn_detection_encoder_has_exact_native_server_and_semantic_shapes():
+    expected_server = {
+        "type": "server_vad",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+    assert (
+        talk_wire.encode_turn_detection(
+            rt.RealtimeTurnDetection(),
+            automatic_response=False,
+        )
+        == expected_server
+    )
+    assert (
+        talk_wire.encode_turn_detection(
+            rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SERVER_VAD),
+            automatic_response=False,
+        )
+        == expected_server
+    )
+    assert talk_wire.encode_turn_detection(
+        rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD),
+        automatic_response=False,
+    ) == {
+        "type": "semantic_vad",
+        "eagerness": "auto",
+        "create_response": False,
+        "interrupt_response": True,
+    }
+    assert talk_wire.encode_turn_detection(
+        rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=rt.RealtimeSemanticEagerness.HIGH,
+        ),
+        automatic_response=True,
+    ) == {
+        "type": "semantic_vad",
+        "eagerness": "high",
+        "create_response": True,
+        "interrupt_response": True,
+    }
+
+
+def test_invalid_endpointing_is_refused_before_mint_network(monkeypatch):
+    called = False
+
+    def fake_post(_auth_token, _session):
+        nonlocal called
+        called = True
+        return {"value": "must-not-be-used"}
+
+    monkeypatch.setattr(talk_wire, "post_client_secret", fake_post)
+    invalid = types.SimpleNamespace(
+        mode=rt.RealtimeTurnDetectionMode.SERVER_VAD,
+        semantic_eagerness=rt.RealtimeSemanticEagerness.LOW,
+    )
+    with pytest.raises(ValueError, match="only for semantic"):
+        talk_wire.mint_ephemeral_session(
+            auth_token="secret",
+            model="gpt-realtime-test",
+            voice="cedar",
+            instructions="brief",
+            turn_detection=invalid,
+        )
+    assert called is False
 
 
 def test_input_only_payload_disables_automatic_response_at_mint_time():

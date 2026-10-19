@@ -33,6 +33,23 @@ def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(value))
 
 
+def _freeze_json(value):
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def wire_value(value):
+    """Copy immutable provider evidence back to plain wire data."""
+    if isinstance(value, Mapping):
+        return {key: wire_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [wire_value(item) for item in value]
+    return value
+
+
 class SessionState(StrEnum):
     """Observable lifecycle of a provider session."""
 
@@ -41,6 +58,42 @@ class SessionState(StrEnum):
     CONNECTED = "connected"
     CLOSED = "closed"
     FAILED = "failed"
+
+
+class RealtimeTurnDetectionMode(StrEnum):
+    """Provider-neutral input-turn detection strategy."""
+
+    PROVIDER_NATIVE = "provider_native"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+
+
+class RealtimeSemanticEagerness(StrEnum):
+    """How readily semantic endpointing should close an input turn."""
+
+    AUTO = "auto"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeTurnDetection:
+    mode: RealtimeTurnDetectionMode = RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    semantic_eagerness: RealtimeSemanticEagerness | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, RealtimeTurnDetectionMode):
+            raise TypeError("mode must be RealtimeTurnDetectionMode")
+        if self.semantic_eagerness is not None and not isinstance(
+            self.semantic_eagerness, RealtimeSemanticEagerness
+        ):
+            raise TypeError("semantic_eagerness must be None or RealtimeSemanticEagerness")
+        if (
+            self.semantic_eagerness is not None
+            and self.mode is not RealtimeTurnDetectionMode.SEMANTIC_VAD
+        ):
+            raise ValueError("semantic_eagerness is valid only for semantic_vad")
 
 
 class TranscriptRole(StrEnum):
@@ -82,11 +135,15 @@ class SessionSetup:
     #: an external TTS speaks; providers that cannot do text-only output
     #: refuse at their own boundary rather than silently speaking anyway.
     text_output: bool = False
+    turn_detection: RealtimeTurnDetection = RealtimeTurnDetection()
+    task_continuity: bool = False
 
     def __post_init__(self) -> None:
         _identifier(self.model, "model")
         _identifier(self.voice, "voice")
         object.__setattr__(self, "tools", tuple(self.tools))
+        if not isinstance(self.turn_detection, RealtimeTurnDetection):
+            raise TypeError("turn_detection must be RealtimeTurnDetection")
 
 
 class RealtimeEvent:
@@ -138,6 +195,16 @@ class ResponseStarted(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class OutputInterrupted(RealtimeEvent):
+    """The provider interrupted output; this does not assert operator speech."""
+
+
+@dataclass(frozen=True, slots=True)
+class OutputTurnCompleted(RealtimeEvent):
+    """The provider ended its output turn; transcripts may remain partial."""
+
+
+@dataclass(frozen=True, slots=True)
 class OutputAudio(RealtimeEvent):
     data: bytes
     item_id: str | None = None
@@ -159,6 +226,11 @@ class Transcript(RealtimeEvent):
     #: Which response produced this transcript. Always None for input audio —
     #: the operator's own speech belongs to no response.
     response_id: str | None = None
+    item_id: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    event_id: str | None = None
+    finality: str | None = None
 
     def __post_init__(self) -> None:
         expected_role = {
@@ -168,6 +240,42 @@ class Transcript(RealtimeEvent):
         if self.role is not expected_role:
             raise ValueError("Transcript role must match its audio provenance")
         _identifier(self.response_id, "response_id", optional=True)
+        _identifier(self.item_id, "item_id", optional=True)
+        _identifier(self.event_id, "event_id", optional=True)
+        if self.finality not in {None, "delta", "item", "turn"}:
+            raise ValueError("Invalid transcript finality scope")
+        for value in (self.start_ms, self.end_ms):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("Transcript offsets must be non-negative milliseconds")
+        if self.start_ms is not None and self.end_ms is not None and self.end_ms < self.start_ms:
+            raise ValueError("Transcript interval must be ordered")
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationRequested(RealtimeEvent):
+    delegation_id: str
+    offset_ms: int | None = None
+    target: str = "client"
+    prompt: str | None = None
+
+    def __post_init__(self) -> None:
+        _identifier(self.delegation_id, "delegation_id")
+        if self.offset_ms is not None and (type(self.offset_ms) is not int or self.offset_ms < 0):
+            raise ValueError("Delegation offset must be non-negative milliseconds")
+        if self.target != "client":
+            raise ValueError("Only client delegation can enter the Hermes coordinator")
+        if self.prompt is not None and (
+            not isinstance(self.prompt, str) or len(self.prompt) > 16000
+        ):
+            raise ValueError("Delegation prompt must be bounded reference text")
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationRetired(RealtimeEvent):
+    delegation_id: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.delegation_id, "delegation_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,11 +294,43 @@ class FunctionCall(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallsCancelled(RealtimeEvent):
+    """Calls the provider retracted; their results must never be submitted.
+
+    Emitted by providers whose wire can discard a pending call mid-turn
+    (Gemini Live's ``toolCallCancellation``). Without it a cancellation is
+    only observable on the send path, as a dropped result — which tells
+    policy nothing until it has already produced work nobody wants.
+    """
+
+    call_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.call_ids, (str, bytes)):
+            raise ValueError("call_ids must be a sequence of identifiers")
+        call_ids = tuple(self.call_ids)
+        if not call_ids:
+            raise ValueError("call_ids must contain at least one identifier")
+        for call_id in call_ids:
+            _identifier(call_id, "call_id")
+        object.__setattr__(self, "call_ids", call_ids)
+
+
+@dataclass(frozen=True, slots=True)
 class ResponseFinished(RealtimeEvent):
     response_id: str | None = None
+    status: str | None = None
+    output: tuple[Mapping[str, Any], ...] | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.response_id, "response_id", optional=True)
+        if self.status not in {None, "completed", "cancelled", "failed", "incomplete"}:
+            raise ValueError("Invalid terminal response status")
+        if self.output is not None:
+            if (not isinstance(self.output, (list, tuple)) or len(self.output) > 64
+                or any(not isinstance(item, Mapping) for item in self.output)):
+                raise ValueError("Invalid terminal response output")
+            object.__setattr__(self, "output", tuple(_freeze_json(item) for item in self.output))
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +365,17 @@ class AppendInputAudio(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True)
+class AddInputText(RealtimeCommand):
+    item_id: str
+    text: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.item_id, "item_id")
+        if not isinstance(self.text, str) or not self.text.strip() or len(self.text) > 65536:
+            raise ValueError("Input text must be bounded original user text")
+
+
+@dataclass(frozen=True, slots=True)
 class AddContext(RealtimeCommand):
     item_id: str
     text: str
@@ -246,14 +397,36 @@ class RemoveContext(RealtimeCommand):
 class StartResponse(RealtimeCommand):
     metadata: Mapping[str, str] = field(default_factory=dict)
     allow_tools: bool | None = None
+    input: tuple[Mapping[str, Any], ...] | None = None
+    conversation: str | None = None
+    instructions: str | None = None
+    max_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _frozen_mapping(self.metadata))
+        if self.conversation not in {None, "auto", "none"}:
+            raise ValueError("Invalid response conversation")
+        if self.conversation == "none" and (self.input is None or self.allow_tools is not False):
+            raise ValueError("Isolated responses require explicit input and disabled tools")
+        if self.input is not None:
+            if (not isinstance(self.input, (list, tuple)) or len(self.input) > 128
+                or any(not isinstance(item, Mapping) for item in self.input)):
+                raise ValueError("Invalid response input")
+            object.__setattr__(self, "input", tuple(_freeze_json(item) for item in self.input))
+        if self.instructions is not None and (not isinstance(self.instructions, str)
+                                             or len(self.instructions) > 16000):
+            raise ValueError("Invalid response instructions")
+        if self.max_output_tokens is not None and (type(self.max_output_tokens) is not int
+                                                  or not 1 <= self.max_output_tokens <= 4096):
+            raise ValueError("Invalid response token bound")
 
 
 @dataclass(frozen=True, slots=True)
 class CancelResponse(RealtimeCommand):
-    pass
+    response_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _identifier(self.response_id, "response_id", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,9 +444,39 @@ class TruncateOutput(RealtimeCommand):
 class SubmitToolResult(RealtimeCommand):
     call_id: str
     output: str
+    item_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.call_id, "call_id")
+        _identifier(self.item_id, "item_id", optional=True)
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitDelegationResult(RealtimeCommand):
+    delegation_id: str
+    content: str
+    kind: str = "commentary"
+
+    def __post_init__(self) -> None:
+        _identifier(self.delegation_id, "delegation_id")
+        if not isinstance(self.content, str) or not self.content or len(self.content) > 16000:
+            raise ValueError("Delegation content must be bounded text")
+        if self.kind not in {"commentary", "context"}:
+            raise ValueError("Invalid delegation content kind")
+
+
+@dataclass(frozen=True, slots=True)
+class AppendLiveContext(RealtimeCommand):
+    content: str
+    kind: str = "instructions"
+    delegation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _identifier(self.delegation_id, "delegation_id", optional=True)
+        if not isinstance(self.content, str) or not self.content or len(self.content) > 32000:
+            raise ValueError("Live context must be bounded text")
+        if self.kind not in {"instructions", "context", "message"}:
+            raise ValueError("Invalid Live context kind")
 
 
 class RealtimeSessionError(RuntimeError):
@@ -298,17 +501,26 @@ class RealtimeSession(Protocol):
 __all__ = [
     "MAX_IDENTIFIER_CHARS",
     "AddContext",
+    "AddInputText",
     "AppendInputAudio",
+    "AppendLiveContext",
     "CancelResponse",
     "ContextRole",
+    "DelegationRequested",
+    "DelegationRetired",
     "FunctionCall",
     "InputAudioCommitted",
     "OutputAudio",
+    "OutputInterrupted",
+    "OutputTurnCompleted",
     "ProviderFailure",
     "RealtimeCommand",
     "RealtimeEvent",
+    "RealtimeSemanticEagerness",
     "RealtimeSession",
     "RealtimeSessionError",
+    "RealtimeTurnDetection",
+    "RealtimeTurnDetectionMode",
     "RemoveContext",
     "ResponseFinished",
     "ResponseStarted",
@@ -319,10 +531,13 @@ __all__ = [
     "SpeechStarted",
     "SpeechStopped",
     "StartResponse",
+    "SubmitDelegationResult",
     "SubmitToolResult",
+    "ToolCallsCancelled",
     "ToolDefinition",
     "Transcript",
     "TranscriptProvenance",
     "TranscriptRole",
     "TruncateOutput",
+    "wire_value",
 ]

@@ -1,0 +1,433 @@
+"""Bounded, profile-resolved derived history queue. Never opens a host database."""
+
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+try:
+    from .talk_passive import HistoryError, HistoryMessage, HistoryOwner, dialogue_messages, digest
+except ImportError:  # pragma: no cover - flat Hermes plugin load
+    from talk_passive import HistoryError, HistoryMessage, HistoryOwner, dialogue_messages, digest
+
+# How long a connection waits for a lock before the outbox reports itself unavailable.
+# A bound on contention, not a deadline for work: no transaction spans a network request.
+_BUSY_TIMEOUT_S = 10.0
+# The constructor keeps the historical short wait; it runs on hot paths (attach, delegate).
+_CONSTRUCTOR_TIMEOUT_S = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class PendingHistory:
+    event_id: str
+    origin_turn_id: str
+    owner: HistoryOwner
+    conversation_id: str
+    connection_id: str
+    generation: int
+    messages: tuple[HistoryMessage, ...] = field(repr=False)
+    state: str
+    attempts: int
+    code: str
+
+
+class HistoryOutbox:
+    """Pass an absolute profile home resolved by trusted host code, never model text.
+
+    There is intentionally no root-home fallback or profile auto-detection. SQLite
+    writer transactions serialize capacity admission and generation changes across
+    processes. No transaction spans a network request. Content is scrubbed on save,
+    failure, expiration and retirement; this is not a second conversation archive.
+    """
+
+    def __init__(
+        self,
+        profile_home: Path,
+        *,
+        profile: str,
+        max_events: int = 128,
+        max_bytes: int = 1024 * 1024,
+        ttl_s: float = 86400,
+        clock: Callable[[], float] = time.time,
+    ):
+        if (
+            not profile_home.is_absolute()
+            or not profile
+            or type(max_events) is not int
+            or not 1 <= max_events <= 128
+            or type(max_bytes) is not int
+            or not 1 <= max_bytes <= 1024 * 1024
+            or not math.isfinite(ttl_s)
+            or not 0 < ttl_s <= 86400
+        ):
+            raise HistoryError("invalid_input")
+        self._profile = profile
+        self._max_events, self._max_bytes, self._ttl_s = max_events, max_bytes, ttl_s
+        self._clock = clock
+        self._schema_lock = threading.RLock()
+        self._schemas = set()
+        self._last_prune = float("-inf")
+        self._maintenance_interval = min(60, ttl_s / 4)
+        self._path = profile_home / "state" / "talk-history-outbox.sqlite3"
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._path.touch(mode=0o600, exist_ok=True)
+            self._path.chmod(0o600)
+        except OSError:
+            raise HistoryError("outbox_unavailable") from None
+        # Write-ahead logging, set once and persisted in the file: readers never wait on a
+        # committing writer and a writer never waits on readers. In the default rollback
+        # journal a steady stream of commits (a liveness probe, a lease renewal) starves
+        # every concurrent read on a slow disk until the busy timeout turns that starvation
+        # into "storage broken". Must run outside a transaction, hence its own connection.
+        # Best effort with a short lock wait, and the schema transaction below keeps the
+        # same short wait: this constructor runs per dashboard attach and per Codex
+        # delegation, so it fails in 2 s behind a held writer as it always did, while
+        # ordinary reads and writes get the longer busy bound. A filesystem that refuses
+        # WAL keeps rollback mode and that bound still applies.
+        db = None
+        try:
+            db = sqlite3.connect(self._path, timeout=_CONSTRUCTOR_TIMEOUT_S)
+            db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+        except OSError:
+            raise HistoryError("outbox_unavailable") from None
+        finally:
+            if db is not None:
+                db.close()
+        with self._db(prune=False, timeout=_CONSTRUCTOR_TIMEOUT_S) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS metadata "
+                "(profile TEXT NOT NULL, next_generation INTEGER NOT NULL)"
+            )
+            row = db.execute("SELECT profile FROM metadata").fetchone()
+            if row is None:
+                db.execute("INSERT INTO metadata VALUES (?,0)", (profile,))
+            elif row[0] != profile:
+                raise HistoryError("owner_mismatch")
+            db.execute("""CREATE TABLE IF NOT EXISTS connections (
+                scope TEXT PRIMARY KEY, owner TEXT NOT NULL, generation INTEGER NOT NULL,
+                touched REAL NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY, origin_turn_id TEXT NOT NULL, owner TEXT NOT NULL,
+                owner_json TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                connection_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                messages TEXT NOT NULL, payload_hash TEXT NOT NULL, bytes INTEGER NOT NULL,
+                created REAL NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '')""")
+
+    @contextmanager
+    def _db(
+        self, *, prune: bool = False, write: bool = True, timeout: float = _BUSY_TIMEOUT_S
+    ) -> Iterator[sqlite3.Connection]:
+        db = None
+        try:
+            db = sqlite3.connect(self._path, timeout=timeout)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA secure_delete=ON")
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            if prune and self._clock() - self._last_prune >= self._maintenance_interval:
+                # Retention cleanup must survive a subsequent admission/read refusal.
+                self._prune(db)
+                db.commit()
+                self._last_prune = self._clock()
+                db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except (sqlite3.Error, OSError):
+            raise HistoryError("outbox_unavailable") from None
+        finally:
+            if db is not None:
+                db.close()
+
+    def ensure_schema(self, name, initialize):
+        """Initialize each derived schema once per outbox, after a committed transaction."""
+        with self._schema_lock:
+            if name not in self._schemas:
+                with self._db() as db:
+                    initialize(db)
+                self._schemas.add(name)
+
+    def _prune(self, db):
+        cutoff = self._clock() - self._ttl_s
+        # Preserve a content-free failed state for one TTL so expiration is observable.
+        db.execute("DELETE FROM events WHERE created < ?", (cutoff - self._ttl_s,))
+        db.execute(
+            """UPDATE events SET state='failed',code='expired',messages='',bytes=0,
+            owner='',owner_json='',conversation_id='',origin_turn_id='',connection_id=''
+            WHERE created < ?""",
+            (cutoff,),
+        )
+        db.execute("DELETE FROM connections WHERE touched < ?", (cutoff,))
+
+    def _scope(self, owner: HistoryOwner, connection_id: str) -> str:
+        if owner.profile != self._profile:
+            raise HistoryError("owner_mismatch")
+        return digest([owner.host, owner.profile, owner.principal, connection_id])
+
+    def _check(self, db, owner: HistoryOwner, connection_id: str, generation: int):
+        row = db.execute(
+            "SELECT owner,generation,touched FROM connections WHERE scope=?",
+            (self._scope(owner, connection_id),),
+        ).fetchone()
+        if (
+            row is None
+            or row["owner"] != owner.key
+            or row["generation"] != generation
+            or row["touched"] < self._clock() - self._ttl_s
+        ):
+            raise HistoryError("stale_generation")
+
+    def begin(
+        self, owner: HistoryOwner, connection_id: str, *, expected_generation: int | None = None
+    ) -> int:
+        scope = self._scope(owner, connection_id)
+        with self._db(prune=True) as db:
+            if expected_generation is not None:
+                self._check(db, owner, connection_id, expected_generation)
+            row = db.execute(
+                "SELECT generation FROM connections WHERE scope=?", (scope,)
+            ).fetchone()
+            if row is None and db.execute("SELECT count(*) FROM connections").fetchone()[0] >= 128:
+                raise HistoryError("outbox_full")
+            generation = db.execute(
+                "UPDATE metadata SET next_generation=next_generation+1 RETURNING next_generation"
+            ).fetchone()[0]
+            db.execute(
+                "INSERT OR REPLACE INTO connections VALUES (?,?,?,?)",
+                (scope, owner.key, generation, self._clock()),
+            )
+            return generation
+
+    def check(self, owner: HistoryOwner, connection_id: str, generation: int):
+        with self._db(write=False) as db:
+            self._check(db, owner, connection_id, generation)
+            touched = db.execute(
+                "SELECT touched FROM connections WHERE scope=?",
+                (self._scope(owner, connection_id),),
+            ).fetchone()[0]
+        if self._clock() - touched >= self._maintenance_interval:
+            with self._db() as db:
+                self._check(db, owner, connection_id, generation)
+                db.execute(
+                    "UPDATE connections SET touched=? WHERE scope=?",
+                    (self._clock(), self._scope(owner, connection_id)),
+                )
+
+    @contextmanager
+    def fenced(
+        self, owner: HistoryOwner, connection_id: str, generation: int, *, write: bool = True
+    ) -> Iterator[sqlite3.Connection]:
+        """Atomic generation fence for shared derived-state projections, never host state."""
+        with self._db(prune=write, write=write) as db:
+            self._check(db, owner, connection_id, generation)
+            yield db
+
+    def end(self, owner: HistoryOwner, connection_id: str, generation: int):
+        with self._db() as db:
+            self._check(db, owner, connection_id, generation)
+            db.execute(
+                "UPDATE connections SET owner='',generation=generation+1 WHERE scope=?",
+                (self._scope(owner, connection_id),),
+            )
+
+    def add(self, event: PendingHistory):
+        encoded = json.dumps([row.wire() for row in event.messages], ensure_ascii=False)
+        size = len(encoded.encode("utf-8"))
+        fingerprint = digest([event.owner.key, event.origin_turn_id, encoded])
+        with self._db(prune=True) as db:
+            self._check(db, event.owner, event.connection_id, event.generation)
+            prior = db.execute(
+                "SELECT payload_hash FROM events WHERE event_id=?", (event.event_id,)
+            ).fetchone()
+            if prior:
+                if prior[0] != fingerprint:
+                    raise HistoryError("event_conflict")
+                return
+            count, used = db.execute(
+                "SELECT count(*),coalesce(sum(bytes),0) FROM events"
+            ).fetchone()
+            if count >= self._max_events:
+                # Only terminal, content-free entries may give way to fresh dialogue.
+                oldest = db.execute(
+                    "SELECT event_id FROM events WHERE state!='pending' ORDER BY created LIMIT 1"
+                ).fetchone()
+                if oldest:
+                    db.execute("DELETE FROM events WHERE event_id=?", (oldest[0],))
+                    count -= 1
+            if count >= self._max_events or used + size > self._max_bytes:
+                raise HistoryError("outbox_full")
+            db.execute(
+                """INSERT INTO events
+                (event_id,origin_turn_id,owner,owner_json,conversation_id,connection_id,
+                 generation,messages,payload_hash,bytes,created,state)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event.event_id,
+                    event.origin_turn_id,
+                    event.owner.key,
+                    json.dumps(asdict(event.owner)),
+                    event.conversation_id,
+                    event.connection_id,
+                    event.generation,
+                    encoded,
+                    fingerprint,
+                    size,
+                    self._clock(),
+                    "pending",
+                ),
+            )
+
+    def get(self, owner: HistoryOwner, event_id: str) -> PendingHistory:
+        # Expired content is scrubbed on discovery, not by every normal read.
+        with self._db(write=False) as db:
+            created = db.execute(
+                "SELECT created FROM events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        if created and created[0] < self._clock() - self._ttl_s:
+            with self._db() as db:
+                self._prune(db)
+        with self._db(write=False) as db:
+            row = db.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if row is None:
+                raise HistoryError("unknown_event")
+            if row["code"] in {"expired", "retired", "target_missing", "target_unavailable"}:
+                raise HistoryError(row["code"])
+            if row["owner"] != owner.key or owner.profile != self._profile:
+                raise HistoryError("owner_mismatch")
+            try:
+                rows = json.loads(row["messages"]) if row["messages"] else []
+                stored_owner = HistoryOwner(**json.loads(row["owner_json"]))
+                if stored_owner != owner:
+                    raise HistoryError("owner_mismatch")
+                messages = tuple(HistoryMessage(**message) for message in rows)
+                if row["state"] == "pending":
+                    dialogue_messages(messages)
+                    fingerprint = digest([owner.key, row["origin_turn_id"], row["messages"]])
+                    if fingerprint != row["payload_hash"]:
+                        raise HistoryError("outbox_unavailable")
+                return PendingHistory(
+                    row["event_id"],
+                    row["origin_turn_id"],
+                    stored_owner,
+                    row["conversation_id"],
+                    row["connection_id"],
+                    row["generation"],
+                    messages,
+                    row["state"],
+                    row["attempts"],
+                    row["code"],
+                )
+            except (ValueError, TypeError, KeyError):
+                raise HistoryError("outbox_unavailable") from None
+
+    def mark(
+        self,
+        owner: HistoryOwner,
+        event_id: str,
+        *,
+        connection_id: str,
+        generation: int,
+        state: str = "pending",
+        code: str = "",
+        attempted: bool = False,
+    ):
+        if state not in {"pending", "saved", "failed", "conflicted"}:
+            raise HistoryError("invalid_input")
+        safe_code = HistoryError(code).code if code else ""
+        with self._db() as db:
+            self._check(db, owner, connection_id, generation)
+            result = db.execute(
+                """UPDATE events SET state=?,code=?,attempts=attempts+?,
+                messages=CASE WHEN ?='pending' THEN messages ELSE '' END,
+                bytes=CASE WHEN ?='pending' THEN bytes ELSE 0 END
+                WHERE event_id=? AND owner=? AND state='pending'""",
+                (state, safe_code, int(attempted), state, state, event_id, owner.key),
+            )
+            if result.rowcount != 1:
+                prior = db.execute(
+                    "SELECT state FROM events WHERE event_id=? AND owner=?", (event_id, owner.key)
+                ).fetchone()
+                if prior is None:
+                    raise HistoryError("unknown_event")
+                return prior[0]
+            return state
+
+    def invalidate(
+        self,
+        owner: HistoryOwner,
+        *,
+        code: str,
+        connection_id: str,
+        generation: int,
+        event_id: str | None = None,
+    ):
+        if code not in {"retired", "target_missing", "target_unavailable"}:
+            raise HistoryError("invalid_input")
+        if event_id is None and code != "target_missing":
+            raise HistoryError("invalid_input")
+        with self._db() as db:
+            self._check(db, owner, connection_id, generation)
+            db.execute(
+                """UPDATE events SET state='failed',code=?,messages='',bytes=0,
+                owner='',owner_json='',conversation_id='',origin_turn_id='',connection_id=''
+                WHERE owner=?"""
+                + (" AND event_id=?" if event_id is not None else ""),
+                (code, owner.key, event_id) if event_id is not None else (code, owner.key),
+            )
+            has_task_projection = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_event_owners'"
+            ).fetchone()
+            if event_id is not None and has_task_projection:
+                db.execute(
+                    "DELETE FROM task_events WHERE owner=? AND canonical_event=?",
+                    (owner.key, event_id),
+                )
+            if event_id is None:
+                if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_preferences'"
+                ).fetchone():
+                    db.execute("DELETE FROM task_preferences WHERE owner=?", (owner.key,))
+                if has_task_projection:
+                    db.execute("DELETE FROM task_event_owners WHERE owner=?", (owner.key,))
+                db.execute(
+                    "UPDATE connections SET owner='',generation=generation+1 WHERE owner=?",
+                    (owner.key,),
+                )
+
+    def pending(self, owner: HistoryOwner) -> tuple[str, ...]:
+        if owner.profile != self._profile:
+            raise HistoryError("owner_mismatch")
+        with self._db(write=False) as db:
+            return tuple(
+                row[0]
+                for row in db.execute(
+                    "SELECT event_id FROM events WHERE owner=? AND state='pending' AND created>=? "
+                    "ORDER BY created,rowid",
+                    (owner.key, self._clock() - self._ttl_s),
+                )
+            )
+
+    def diagnostics(self) -> dict:
+        """Counts and enumerated states only; no text, paths, credentials or owner IDs."""
+        with self._db(write=False) as db:
+            counts = {state: 0 for state in ("pending", "saved", "failed", "conflicted")}
+            for state, count in db.execute("SELECT state,count(*) FROM events GROUP BY state"):
+                if state in counts:
+                    counts[state] = count
+            return {
+                "states": counts,
+                "pending_bytes": db.execute("SELECT coalesce(sum(bytes),0) FROM events").fetchone()[
+                    0
+                ],
+            }

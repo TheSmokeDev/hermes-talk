@@ -154,20 +154,19 @@ def test_pending_tool_timeout_says_it_never_started(monkeypatch):
         release.wait()
         return "late"
 
-    async def scenario():
+    # Occupy the only worker and wait until that job is really running. A fixed
+    # sleep let a slow runner time out the occupying call before its thread ever
+    # picked it up, which freed the worker for the call under test.
+    occupying = pool.submit(release.wait)
+    try:
+        assert occupying.started.wait(5)
         relay = talk_relay.RealtimeRelay(tool_executor=blocked)
-        first = asyncio.create_task(
-            relay.handle_event_async(fr.function_call("first", "{}", "call_first"))
+        messages = asyncio.run(
+            relay.handle_event_async(fr.function_call("second", "{}", "call_second"))
         )
-        await asyncio.sleep(0.005)
-        second = await relay.handle_event_async(
-            fr.function_call("second", "{}", "call_second")
-        )
+    finally:
         release.set()
-        await first
-        return second
 
-    messages = asyncio.run(scenario())
     output = messages[0]["item"]["output"]
     assert "did not start" in output
     assert "still running" not in output

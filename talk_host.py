@@ -222,6 +222,15 @@ HONCHO_SEARCH_TOOL_NAME = "honcho_search"
 #: aloud on every such answer.
 REMEMBERED_PREFIX = "from remembered context: "
 
+#: Appended to a tier-1 receipt when the model declared resource keys
+#: (hermes-talk#101). The host's own delegation registry ran the child and
+#: this plugin's run registry does not hold it, so a later run naming the
+#: same key would not be fenced against it — said rather than assumed.
+HOST_LOOP_ADMISSION_NOTE = (
+    " (this lane runs inside Hermes's own delegation registry, which does "
+    "not hold resource keys — the fence applies to api-server and detached runs)"
+)
+
 MAX_TOOL_OUTPUT_CHARS = 2_000
 
 
@@ -1022,7 +1031,14 @@ class HostAdapter:
             "Hermes agent through the api server; I'll tell you what it finds."
         )
 
-    def run_agent(self, prompt: str, background: bool = True) -> str:
+    def run_agent(
+        self,
+        prompt: str,
+        background: bool = True,
+        *,
+        execution_mode: str | None = None,
+        resource_keys: Any = None,
+    ) -> str:
         """Hand a self-contained task to a background Hermes agent.
 
         Four backends, tried in order, and every fall-through is ANNOUNCED in
@@ -1044,10 +1060,23 @@ class HostAdapter:
         ``background`` is accepted for the caller's mental model but never
         forwarded: Hermes documents the tool's own flag as deprecated and
         ignored, and every real backend is asynchronous regardless.
+
+        ``execution_mode`` / ``resource_keys`` are the admission declaration
+        (hermes-talk#101), enforced by the run registry on tiers 2 and 3. Tier
+        1 hands the child to Hermes's own delegation registry, which this
+        plugin does not own: it is still checked against the keys the run
+        registry holds — never started on top of one — but it holds none
+        itself afterwards, and the receipt says so.
         """
 
         ctx = get_ctx()
         if ctx is not None:
+            try:
+                talk_runs.check_admission(execution_mode, resource_keys)
+            except talk_runs.AdmissionRefused as exc:
+                return f"I can't start that yet — {exc}."
+            except ValueError as exc:
+                return f"I couldn't start that work: {exc}"
             try:
                 raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
@@ -1058,14 +1087,27 @@ class HostAdapter:
                     # A host refusal (paused delegation, depth limit) must
                     # never ride behind a WORK_STARTED prefix.
                     return f"I couldn't start that work — {spoken}"
-                return f"WORK_STARTED — {spoken}"
+                started = f"WORK_STARTED — {spoken}"
+                if talk_runs.normalize_resource_keys(resource_keys):
+                    started += HOST_LOOP_ADMISSION_NOTE
+                return started
 
-        via_api_server = self._run_api_server_agent(prompt)
+        via_api_server = self._run_api_server_agent(
+            prompt, execution_mode=execution_mode, resource_keys=resource_keys
+        )
         if via_api_server is not None:
             return via_api_server
-        return self._run_detached_agent(prompt)
+        return self._run_detached_agent(
+            prompt, execution_mode=execution_mode, resource_keys=resource_keys
+        )
 
-    def _run_api_server_agent(self, prompt: str) -> str | None:
+    def _run_api_server_agent(
+        self,
+        prompt: str,
+        *,
+        execution_mode: str | None = None,
+        resource_keys: Any = None,
+    ) -> str | None:
         """Tier 2: run the task on a real agent over the api_server.
 
         ``None`` means the lane is unavailable and the caller should fall
@@ -1077,9 +1119,13 @@ class HostAdapter:
         label = prompt.strip()[:60]
         try:
             run_id = talk_runs.start_run(
-                "agent", label, _api_server_worker(prompt, session_id=None)
+                "agent",
+                label,
+                _api_server_worker(prompt, session_id=None),
+                execution_mode=execution_mode,
+                resource_keys=resource_keys,
             )
-        except talk_runs.RoutingUnavailable as exc:
+        except (talk_runs.RoutingUnavailable, talk_runs.AdmissionRefused) as exc:
             return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that work: {type(exc).__name__}: {exc}"
@@ -1088,7 +1134,13 @@ class HostAdapter:
             "Hermes agent through the api server; I'll tell you when it lands."
         )
 
-    def _run_detached_agent(self, prompt: str) -> str:
+    def _run_detached_agent(
+        self,
+        prompt: str,
+        *,
+        execution_mode: str | None = None,
+        resource_keys: Any = None,
+    ) -> str:
         """Tier 3/4: run the task as a detached ``hermes -z`` one-shot."""
 
         binary = hermes_binary()
@@ -1101,9 +1153,13 @@ class HostAdapter:
         label = prompt.strip()[:60]
         try:
             run_id = talk_runs.start_run(
-                "agent", label, _detached_agent_worker(prompt, binary)
+                "agent",
+                label,
+                _detached_agent_worker(prompt, binary),
+                execution_mode=execution_mode,
+                resource_keys=resource_keys,
             )
-        except talk_runs.RoutingUnavailable as exc:
+        except (talk_runs.RoutingUnavailable, talk_runs.AdmissionRefused) as exc:
             return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
             return f"I couldn't start that work: {type(exc).__name__}: {exc}"
@@ -1827,6 +1883,7 @@ __all__ = [
     "AGENT_LOOP_ABSENT_MARKERS",
     "DELEGATE_TOOL_NAME",
     "HERMES_BINARY",
+    "HOST_LOOP_ADMISSION_NOTE",
     "LANE_API_SERVER",
     "LANE_ATTACHED",
     "LANE_NONE",

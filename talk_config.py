@@ -36,7 +36,38 @@ DEFAULT_GROK_MODEL = "grok-voice-latest"
 DEFAULT_GROK_VOICE = "ara"
 #: Friendly Grok voice names, WITHOUT the wire prefix — the adapter adds
 #: ``xai_`` at encode time so operators never configure wire vocabulary.
-GROK_REALTIME_VOICES = ("ara", "rex", "sal", "eve", "leo")
+#: Speech-to-speech shares the text-to-speech roster, checked 2026-10-04:
+#: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#voices
+GROK_REALTIME_VOICES = (
+    "ara",
+    "rex",
+    "sal",
+    "eve",
+    "leo",
+    "carina",
+    "zagan",
+    "helix",
+    "orion",
+    "luna",
+    "iris",
+    "altair",
+    "zenith",
+    "perseus",
+    "helios",
+    "lux",
+    "kepler",
+    "rigel",
+    "cosmo",
+    "celeste",
+    "ursa",
+    "sirius",
+    "lumen",
+    "castor",
+    "naksh",
+    "atlas",
+    "aurora",
+    "liora",
+)
 #: Gemini Live native-audio preview model, probed against the live endpoint
 #: 2026-08-28 (setup accepted, tool loop round-tripped). The adapter adds the
 #: ``models/`` wire prefix; operators configure the bare id. Fallback line:
@@ -54,7 +85,7 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: provider as the brain and hands speech synthesis to a streaming TTS the
 #: operator chooses. Fail-closed like the provider list: a mode knob that
 #: guesses silently would spend the wrong metered TTS key.
-TALK_VOICE_MODES = ("native", "cascade")
+TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
 #: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
 #: today; the list exists so a typo refuses instead of silently selecting.
@@ -63,6 +94,18 @@ DEFAULT_CASCADE_TTS = "elevenlabs"
 #: ElevenLabs TTS model for the cascade lane, probed against the live
 #: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+#: Delivery pace for the cascade voice. The bounds are the stream-input
+#: ``RealtimeVoiceSettings`` schema's own, not a house rule — that schema
+#: documents "Values range from 0.7 to 1.2, with 1.0 being the default
+#: speed", and the REST endpoint's wider 0.25-4.0 range belongs to a
+#: DIFFERENT schema that this lane never speaks.
+ELEVENLABS_SPEED_MIN = 0.7
+ELEVENLABS_SPEED_MAX = 1.2
+DEFAULT_ELEVENLABS_SPEED = 1.0
+#: Delivery defaults for the cascade voice, probed against the live
+#: stream-input endpoint (2026-08-28). ``style`` stays unsent: ElevenLabs
+#: recommends keeping it at 0, and an unsent field is the documented 0.
+DEFAULT_ELEVENLABS_VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75}
 
 #: Where Hermes's api_server gateway platform listens by default
 #: (gateway/platforms/api_server.py DEFAULT_HOST/DEFAULT_PORT).
@@ -372,6 +415,35 @@ def session_key() -> str | None:
     return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
 
 
+def turn_detection(provider: str | None = None):
+    """Resolve a supported detector before opening provider or microphone resources."""
+    try:
+        from . import talk_realtime as rt
+    except ImportError:
+        import talk_realtime as rt
+
+    provider = provider or talk_provider()
+    raw = os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+    eagerness = os.environ.get("TALK_SEMANTIC_EAGERNESS")
+    supported = {
+        "openai": {"provider_native", "server_vad", "semantic_vad"},
+        "grok": {"provider_native", "server_vad"},
+        "gemini": {"provider_native"},
+    }
+    if raw not in supported.get(provider, set()):
+        raise TalkConfigError(f"TALK_TURN_DETECTION is invalid or unsupported for {provider}")
+    try:
+        return rt.RealtimeTurnDetection(
+            mode=rt.RealtimeTurnDetectionMode(raw),
+            semantic_eagerness=(rt.RealtimeSemanticEagerness(eagerness.strip().lower())
+                               if eagerness is not None else None),
+        )
+    except (ValueError, TypeError):
+        raise TalkConfigError(
+            "TALK_SEMANTIC_EAGERNESS requires semantic_vad and auto, low, medium or high"
+        ) from None
+
+
 def talk_provider() -> str:
     """Realtime voice provider, resolved at call time. Fail-closed.
 
@@ -513,7 +585,8 @@ def resolve_xai_key() -> str:
 
     Order: TALK_XAI_API_KEY (Talk-scoped) -> XAI_API_KEY. Same rule as
     :func:`resolve_openai_key`: a key that is SET but blank is a hard
-    refusal, not a fall-through. xAI has no OAuth lane — API key only.
+    refusal, not a fall-through. This is the metered-key half of Grok auth;
+    the subscription lane lives in ``talk_grok_auth.resolve_grok_auth``.
     """
 
     scoped = os.environ.get("TALK_XAI_API_KEY")
@@ -563,7 +636,8 @@ def voice_mode() -> str:
 
     ``TALK_VOICE_MODE`` = ``native`` (default; the provider synthesizes its
     own voice, exactly the pre-cascade behaviour) or ``cascade`` (the
-    provider thinks in text, a streaming TTS speaks). Any other value
+    provider thinks in text, a streaming TTS speaks), or ``live`` (GPT-Live
+    with explicitly selected subscription or API billing). Any other value
     refuses with the valid names rather than silently picking one — a
     misread mode would spend the wrong metered key or mute the call.
     """
@@ -654,6 +728,55 @@ def elevenlabs_model() -> str:
         (os.environ.get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
         or DEFAULT_ELEVENLABS_MODEL
     )
+
+
+def elevenlabs_speed() -> float | None:
+    """Cascade delivery pace (``TALK_CASCADE_SPEED``), or ``None`` when unset.
+
+    ``None`` means "send no ``speed`` field", which is not the same as
+    sending ``1.0``: an omitted field leaves the wire frame byte-identical
+    to the pre-knob cascade, so turning the knob on is the only thing that
+    changes what ElevenLabs receives.
+
+    Fail-closed like every other cascade knob. Junk and out-of-range values
+    REFUSE rather than clamping: a silently clamped 2.0 would speak at a
+    pace the operator did not ask for and never say why, and pace is
+    audible on every single word.
+    """
+
+    raw = (os.environ.get("TALK_CASCADE_SPEED") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        raise TalkConfigError(
+            f"TALK_CASCADE_SPEED '{raw}' is not a number — set it between "
+            f"{ELEVENLABS_SPEED_MIN} and {ELEVENLABS_SPEED_MAX} "
+            f"({DEFAULT_ELEVENLABS_SPEED} is normal pace), or unset it"
+        ) from None
+    if not ELEVENLABS_SPEED_MIN <= parsed <= ELEVENLABS_SPEED_MAX:
+        raise TalkConfigError(
+            f"TALK_CASCADE_SPEED {parsed:g} is outside the range ElevenLabs "
+            f"accepts on this lane ({ELEVENLABS_SPEED_MIN}-"
+            f"{ELEVENLABS_SPEED_MAX}, {DEFAULT_ELEVENLABS_SPEED} is normal pace)"
+        )
+    return parsed
+
+
+def elevenlabs_voice_settings() -> dict:
+    """The cascade's BOS ``voice_settings``, resolved at CALL time.
+
+    Rule 1: this is rebuilt per session start, never bound to a default
+    argument, so an operator's live edit to ``TALK_CASCADE_SPEED`` takes
+    effect on the next call instead of the next process.
+    """
+
+    settings = dict(DEFAULT_ELEVENLABS_VOICE_SETTINGS)
+    speed = elevenlabs_speed()
+    if speed is not None:
+        settings["speed"] = speed
+    return settings
 
 
 def cascade_voice_config(provider: str) -> tuple[str, str, str]:
@@ -869,6 +992,21 @@ def approval_prompt_timeout_s() -> float:
     )
 
 
+def trust_declared_read_only() -> bool:
+    """Whether a model's ``parallel_read_only`` declaration is believed.
+
+    Default **off** (hermes-talk#101): the declaration is the delegating
+    model's own claim about work it has not done yet — policy input, not a
+    sandbox — so by default every delegated run is treated as ``exclusive``
+    and two runs sharing a resource key never overlap. Only an explicit
+    ``TALK_TRUST_DECLARED_READ_ONLY=true`` lets read-only runs on a shared
+    key run together; anything else, junk included, keeps the fence.
+    """
+
+    raw = (os.environ.get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 __all__ = [
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
@@ -881,6 +1019,8 @@ __all__ = [
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_CATALOG_STARTUP_WAIT_S",
     "DEFAULT_ELEVENLABS_MODEL",
+    "DEFAULT_ELEVENLABS_SPEED",
+    "DEFAULT_ELEVENLABS_VOICE_SETTINGS",
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
@@ -891,6 +1031,8 @@ __all__ = [
     "DEFAULT_TALK_VOICE",
     "DEFAULT_VOICE_MODE",
     "DUPLEX_TOOL_COMPATIBLE_MODELS",
+    "ELEVENLABS_SPEED_MAX",
+    "ELEVENLABS_SPEED_MIN",
     "GEMINI_LIVE_VOICES",
     "GROK_REALTIME_VOICES",
     "KNOWN_INCOMPATIBLE_REALTIME_MODELS",
@@ -917,7 +1059,9 @@ __all__ = [
     "detect_agent_profile",
     "discord_operator_user_ids",
     "elevenlabs_model",
+    "elevenlabs_speed",
     "elevenlabs_voice_id",
+    "elevenlabs_voice_settings",
     "get_hermes_home",
     "identity_include",
     "memory_search_timeout_s",
@@ -935,5 +1079,7 @@ __all__ = [
     "talk_model",
     "talk_provider",
     "talk_voice",
+    "trust_declared_read_only",
+    "turn_detection",
     "voice_mode",
 ]

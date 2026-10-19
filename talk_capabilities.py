@@ -444,6 +444,46 @@ def wait_until_warm(timeout_s: float) -> CatalogSnapshot | None:
 #: resident and re-billed on every turn — a budget, not a preference.
 MAX_SECTION_CATEGORIES = 10
 
+#: High-agency categories lead the resident section so the per-turn budget cap
+#: can never truncate the tools that make delegation worth naming. Catalog
+#: order put ``computer_use`` last (27 of 27), so the cap dropped it — and a
+#: voice model that never sees ``computer_use`` refuses screen work instead of
+#: delegating it. Anything not listed keeps catalog order behind these.
+_PRIORITY_CATEGORIES = (
+    "computer_use",
+    "terminal",
+    "browser",
+    "code_execution",
+    "vision",
+    "file",
+    "web",
+    "memory",
+    "skills",
+    "delegation",
+)
+
+#: Resolved TOOL name -> the plain phrase spoken in the delegate directive. A
+#: voice model assumes its own missing tools are Hermes-wide limits and says
+#: "I can't"; naming the high-agency actions it can hand off is what turns that
+#: into a delegated run. Spoken ONLY when the tool is in the live resolved set,
+#: so the honesty floor this whole feature defends is never crossed.
+_DELEGATE_HEADLINERS = (
+    ("computer_use", "see and control the screen"),
+    ("terminal", "run terminal commands"),
+    ("execute_code", "run code"),
+    ("browser_navigate", "browse the web"),
+)
+
+
+def _natural_join(items: list[str]) -> str:
+    """``[a]`` -> ``a``; ``[a, b]`` -> ``a and b``; ``[a, b, c]`` -> ``a, b, and c``."""
+
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
 #: One catalog name, fit for the resident prompt. Catalog entries are
 #: upstream text; a name with punctuation or whitespace tricks does not get
 #: to ride a prompt nobody is reading on a screen. Identifiers only.
@@ -498,20 +538,40 @@ def instruction_section(snapshot: CatalogSnapshot | None = None) -> str | None:
     live = set(snap.tools) if snap.tools_resolved else None
     categories: list[str] = []
     for entry in snap.toolsets:
-        if not _usable(entry):
-            continue
         name = _section_name(entry.get("name") or entry.get("label"))
         if name is None or name in categories:
             continue
+        tools = entry.get("tools")
         if live is not None:
-            tools = entry.get("tools")
-            if isinstance(tools, list) and not any(
-                isinstance(tool, str) and tool in live for tool in tools
+            # A live read is present: the resolved tool set is the source of
+            # truth (Rule 2). A category counts as usable iff one of its declared
+            # tools actually resolved — a stale/narrow toolset ``enabled: false``
+            # does not get to hide a tool the host just handed back as callable.
+            # (computer_use resolves live on this host yet its toolset flag is
+            # false; trusting the flag dropped the one tool the model needed.)
+            if not (
+                isinstance(tools, list)
+                and any(isinstance(tool, str) and tool in live for tool in tools)
             ):
                 continue
+        elif not _usable(entry):
+            # No live answer (REST tier): the static enabled/configured flags
+            # are the only evidence there is.
+            continue
         categories.append(name)
-        if len(categories) >= MAX_SECTION_CATEGORIES:
-            break
+    # Order high-agency-first, THEN truncate to the per-turn budget. Raw catalog
+    # order buried computer_use at 27 of 27, so the cap dropped the one tool that
+    # makes "check my screen" answerable — the model never saw it and refused
+    # work it could have delegated.
+    categories.sort(
+        key=lambda n: (
+            _PRIORITY_CATEGORIES.index(n)
+            if n in _PRIORITY_CATEGORIES
+            else len(_PRIORITY_CATEGORIES),
+            n,
+        )
+    )
+    categories = categories[:MAX_SECTION_CATEGORIES]
     if not skill_count and not categories:
         return None
     inventory = f"This Hermes install reports {skill_count} "
@@ -521,15 +581,45 @@ def instruction_section(snapshot: CatalogSnapshot | None = None) -> str | None:
         inventory += (
             ", and these tool categories usable right now: " + ", ".join(categories)
         )
+        # The shortlist is a per-turn preview, not the ceiling. Name the total
+        # group count and point at the talk_capabilities tool so neither the
+        # model nor the operator reads these ten as the whole story. Only when
+        # there is genuinely more behind it — a small install that fits entirely
+        # must not claim a phantom "full list".
+        total_groups = len(snap.toolsets)
+        if total_groups > len(categories):
+            inventory += (
+                f" — a shortlist of Hermes's {total_groups} tool groups; ask "
+                '"what can you do" for the full catalog'
+            )
     inventory += "."
-    return (
-        inventory
-        + " You can delegate anything Hermes can do: hand it to the delegate_task tool and "
-        "the agent runs the full Hermes toolset — if the host needs approval for an action, "
-        "you will be asked out loud before it fires. Never invent tool names: the only tools "
-        "you can call directly are this session's advertised tools, and capability questions "
-        "go to the talk_capabilities tool."
+    # Name the high-agency tools that ACTUALLY resolved this session, only when
+    # the live set confirms them — the fix for a voice model treating its own
+    # missing tools as Hermes-wide limits. Without the live answer (REST tier)
+    # there is nothing honest to name, so the directive stays generic.
+    headliners = (
+        [phrase for tool, phrase in _DELEGATE_HEADLINERS if tool in live]
+        if live is not None
+        else []
     )
+    delegate = (
+        " You can delegate anything Hermes can do: hand it to the delegate_task "
+        "tool and the agent runs the full Hermes toolset."
+    )
+    if headliners:
+        delegate += (
+            " That includes actions you can't take yourself — "
+            + _natural_join(headliners)
+            + "."
+        )
+    delegate += (
+        " Never tell the operator you can't do something Hermes can do; delegate "
+        "it. If the host needs approval for an action, you will be asked out loud "
+        "before it fires. Never invent tool names: the only tools you can call "
+        "directly are this session's advertised tools, and capability questions go "
+        "to the talk_capabilities tool."
+    )
+    return inventory + delegate
 
 
 def reset_for_tests() -> None:

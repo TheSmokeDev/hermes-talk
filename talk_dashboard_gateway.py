@@ -1,0 +1,438 @@
+"""Configured, fixed-route gateway transport for bound dashboard task operations."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import ClassVar
+from urllib.parse import quote, urlsplit
+
+import httpx
+
+try:
+    from .talk_passive import HistoryError, HistoryTransport, identifier, session_id
+except ImportError:  # pragma: no cover - flat plugin load
+    from talk_passive import HistoryError, HistoryTransport, identifier, session_id
+
+
+#: The host's canonical input-attachment ingress. Fixed here, never taken from the
+#: capability document: ``_request`` chooses its suffix only from the methods in this
+#: file, and a published endpoint is verified against this constant instead.
+INPUT_ATTACHMENT_PATH = "/v1/input-attachments"
+#: Exactly what leaves this process for the browser. The host receipt carries no path,
+#: but projecting the allowed keys makes that a property of this file, not of the host.
+ATTACHMENT_RECEIPT_FIELDS = ("attachment_id", "filename", "content_type", "bytes", "sha256")
+_ATTACHMENT_ID = re.compile(r"att_[0-9a-f]{32}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class DashboardTaskError(Exception):
+    MESSAGES: ClassVar[dict[str, str]] = {
+        "context_unavailable": "This host lacks verified dashboard task context support.",
+        "context_denied": "This request has no authorized dashboard task identity.",
+        "catalog_host_unverified": "The task catalog and gateway store could not be matched.",
+        "unverified_remote_host": "Remote task continuity needs an explicit verified host binding.",
+        "child_dispatch_unsupported": "This gateway lacks durable linked-child dispatch support.",
+        "approval_reader_unsupported": "This gateway lacks a verified current-approval reader.",
+        "gateway_unavailable": "The gateway is unavailable; the original intent remains pending.",
+        "gateway_response_invalid": "The gateway returned an unsupported response.",
+        "gateway_refused": "The gateway refused this operation.",
+        "live_decision_invalid": "Hermes returned an invalid Live task decision.",
+        "invalid_event": "This task event is incomplete or invalid.",
+        "event_conflict": "An existing event identity has different content.",
+        "connection_stale": "This connection is no longer current; reconnect to the original task.",
+        "interaction_unlinked": "The response is not linked to a durably staged original input.",
+        "interaction_incomplete": "This interaction has unfinished response or tool events.",
+        "capacity": "The bounded pending task store is full.",
+        "result_unavailable": "That job's result is not currently available.",
+        "unsupported_tool": "This tool is unavailable in canonical task mode.",
+        "busy": "The original task is busy; persistence remains pending.",
+        "target_missing": "That authorized target is missing or its catalog entry expired.",
+        "target_already_selected": "That target is already selected; use Rejoin to reconnect.",
+        "target_ambiguous": "More than one authorized target matches; choose an exact target.",
+        "target_route_changed": "That target's configured route or canonical store changed.",
+        "target_auth_unavailable": "The configured target has no usable scoped credential.",
+        "target_auth_denied": "The configured target refused authentication.",
+        "target_offline": "The configured target is offline; no local substitute was selected.",
+        "target_unsupported": "The configured target lacks the required continuity capability.",
+        "selection_store_unavailable": "The local selection state could not be read safely.",
+        "selection_busy": "A target change is already being prepared for this tab.",
+        "return_empty": "There is no previous authorized target to return to.",
+        "recipient_reconciliation_required": (
+            "An earlier delivery of this message is unconfirmed. Check its original result "
+            "before sending another message."
+        ),
+        "steering_unsupported": "This host cannot steer that existing job with an origin receipt.",
+        "steering_origin_pending": "The original correction is awaiting its canonical receipt.",
+        "steering_target_denied": "That run does not belong to this canonical task.",
+        "recipient_history_unsupported": "This host does not support recipient history reads.",
+        "recipient_history_stale": "This history snapshot expired or changed; refresh the catalog.",
+        "recipient_history_unavailable": "The recipient's native history is unavailable.",
+        "attachments_unsupported": "This host does not accept input attachments.",
+        "attachment_rejected": "The host refused this attachment; nothing was attached.",
+        "attachment_size_limit": "This attachment exceeds the host's published size limits.",
+        "attachment_reference_unknown": "That attachment was not uploaded for this input.",
+        "attachment_operation_unsupported": "This operation cannot carry attachments.",
+    }
+
+    def __init__(self, code: str, status: int = 409, *, retryable=False):
+        self.code = code if code in self.MESSAGES else "gateway_refused"
+        self.status = status
+        self.retryable = retryable
+        super().__init__(self.MESSAGES[self.code])
+
+    def detail(self):
+        return {"code": self.code, "message": str(self),
+                **({"retryable": True} if self.retryable else {})}
+
+
+@dataclass(frozen=True, slots=True)
+class TaskGateway:
+    transport: HistoryTransport
+    before_request: object = field(default=None, repr=False, compare=False)
+
+    def discord_context(self, operation, body):
+        if operation not in {"redeem", "verify", "rebind", "revoke"}:
+            raise DashboardTaskError("invalid_event", 400)
+        return self._request("POST", "/v1/task-context/discord/" + operation, body=body)
+
+    def _request(
+        self, method, suffix, *, body=None, key=None, max_bytes=2 * 1024 * 1024,
+        not_found=None, timeout=3
+    ):
+        """Suffix is chosen only by the fixed methods below, never by a browser/model."""
+        if self.before_request is not None:
+            self.before_request()
+        prefix = f"/p/{self.transport.profile}" if self.transport.named_profile else ""
+        headers = {"Authorization": "Bearer " + self.transport.credential}
+        if key is not None:
+            headers["Idempotency-Key"] = identifier(key)
+        try:
+            with (
+                httpx.Client(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=self.transport._http_transport,
+                ) as client,
+                client.stream(
+                    method,
+                    self.transport.base_url.rstrip("/") + prefix + suffix,
+                    json=body,
+                    headers=headers,
+                ) as response,
+            ):
+                raw = bytearray()
+                for chunk in response.iter_bytes(chunk_size=4096):
+                    if len(raw) + len(chunk) > max_bytes:
+                        raise DashboardTaskError("gateway_response_invalid", 502, retryable=True)
+                    raw.extend(chunk)
+                status = response.status_code
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError
+            if status == 404 and not_found and data.get("error") == not_found:
+                return None
+            if status not in {200, 202}:
+                code = data.get("error")
+                if isinstance(code, dict):
+                    code = code.get("code")
+                if status in {401, 403}:
+                    raise DashboardTaskError("context_denied", 403)
+                if suffix == INPUT_ATTACHMENT_PATH:
+                    # The host's own refusal vocabulary is richer than this class; keep the
+                    # two distinctions an operator can act on (too large / refused) and let
+                    # everything else fall through to the ordinary gateway codes.
+                    if status == 413 or code == "attachment_size_limit":
+                        code = "attachment_size_limit"
+                    elif status in {400, 409} or (
+                        isinstance(code, str) and "attachment" in code
+                    ):
+                        code = "attachment_rejected"
+                if suffix.startswith("/v1/recipient-bridge/"):
+                    if code in {
+                        "history_target_expired", "history_cursor_expired",
+                        "history_cursor_mismatch", "history_snapshot_changed",
+                        "history_source_changed", "history_task_identity_unverified",
+                    }:
+                        code = "recipient_history_stale"
+                    elif status == 503:
+                        code = "recipient_history_unavailable"
+                    elif status == 404:
+                        code = "target_missing"
+                raise DashboardTaskError(
+                    code if code in DashboardTaskError.MESSAGES else "gateway_refused",
+                    status,
+                    retryable=status in {429, 500, 502, 503, 504}
+                    or code in {"busy", "store_unavailable"},
+                )
+            return data
+        except (httpx.HTTPError, OSError):
+            raise DashboardTaskError("gateway_unavailable", 503, retryable=True) from None
+        except (ValueError, TypeError, UnicodeError):
+            raise DashboardTaskError("gateway_response_invalid", 502, retryable=True) from None
+
+    def capabilities(self):
+        return self._request("GET", "/v1/capabilities", max_bytes=256 * 1024)
+
+    def require_local(self):
+        if urlsplit(self.transport.base_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise DashboardTaskError("unverified_remote_host", 503)
+
+    def require_child(self, capabilities):
+        features = capabilities.get("features", {})
+        if not isinstance(features, dict):
+            raise DashboardTaskError("child_dispatch_unsupported", 503)
+        child = features.get("linked_child_dispatch", {})
+        durable = features.get("runs_idempotency", {})
+        origins = child.get("origin_sources", []) if isinstance(child, dict) else []
+        if (
+            not isinstance(child, dict)
+            or type(child.get("version")) is not int
+            or child["version"] != 1
+            or child.get("supported") is not True
+            or child.get("separate_child_goal") is not True
+            or not isinstance(origins, list)
+            or not all(isinstance(item, str) for item in origins)
+            or not {"fresh", "passive_receipt"}.issubset(origins)
+            or not isinstance(durable, dict)
+            or durable.get("durable") is not True
+        ):
+            raise DashboardTaskError("child_dispatch_unsupported", 503)
+
+    def session(self, selected_session):
+        try:
+            value = self._request(
+                "GET", "/api/sessions/" + quote(session_id(selected_session), safe="")
+            )
+        except DashboardTaskError as exc:
+            if exc.status == 404:
+                raise DashboardTaskError("target_missing", 404) from None
+            raise
+        data = value.get("session")
+        if not isinstance(data, dict) or data.get("id") != selected_session:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return data
+
+    def sessions(self, *, bot=False):
+        query = "?title=Bot%20Chat&include_hidden=1&limit=2" if bot else "?limit=20"
+        response = self._request("GET", "/api/sessions" + query, max_bytes=256 * 1024)
+        rows = response.get("data")
+        if not isinstance(rows, list) or len(rows) > 200:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        if any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("id"), str)
+            or self.transport.credential in row["id"]
+            for row in rows
+        ):
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return rows
+
+    def dispatch(self, body, *, idempotency_key):
+        if set(body) != {"input", "session_id", "origin", "child"}:
+            raise DashboardTaskError("invalid_event", 400)
+        response = self._request("POST", "/v1/runs", body=body, key=idempotency_key)
+        try:
+            identifier(response.get("run_id"))
+        except HistoryError:
+            raise DashboardTaskError("gateway_response_invalid", 502, retryable=True) from None
+        return response
+
+    def upload_attachment(self, body):
+        """One file to the host's own ingress; the reply is projected to opaque fields.
+
+        The gateway credential and the resolved host route stay in this process. The
+        receipt is re-checked against the bytes this call actually sent, so a host that
+        answers about a different file is a response error rather than a silent swap.
+        """
+        if set(body) != {
+            "session_id", "upload_id", "filename", "content_type", "content_base64",
+        }:
+            raise DashboardTaskError("invalid_event", 400)
+        data = self._request(
+            "POST", INPUT_ATTACHMENT_PATH, body=body, max_bytes=16384, timeout=60,
+        )
+        if (
+            data.get("state") != "stored"
+            or not isinstance(data.get("attachment_id"), str)
+            or not _ATTACHMENT_ID.fullmatch(data["attachment_id"])
+            or not isinstance(data.get("sha256"), str)
+            or not _SHA256.fullmatch(data["sha256"])
+            or type(data.get("bytes")) is not int
+            or data["bytes"] < 1
+            or not isinstance(data.get("filename"), str)
+            or not isinstance(data.get("content_type"), str)
+        ):
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return {key: data[key] for key in ATTACHMENT_RECEIPT_FIELDS}
+
+    def run(self, run_id):
+        data = self._request("GET", "/v1/runs/" + identifier(run_id))
+        if data.get("run_id") != run_id:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return data
+
+    def stop(self, run_id):
+        return self._request("POST", "/v1/runs/" + identifier(run_id) + "/stop", body={})
+
+    def steering(self, run_id):
+        return self._request("GET", "/v1/runs/" + identifier(run_id) + "/steer", max_bytes=16384)
+
+    def steer_receipt(self, run_id, action_id):
+        return self._request(
+            "GET",
+            "/v1/runs/" + identifier(run_id) + "/steer?action_id=" + identifier(action_id),
+            max_bytes=16384,
+            not_found="steer_receipt_not_found",
+        )
+
+    def steer(self, run_id, body):
+        return self._request(
+            "POST", "/v1/runs/" + identifier(run_id) + "/steer", body=body, max_bytes=16384
+        )
+
+    def approve(self, run_id, request_id, choice):
+        if choice not in {"once", "session", "deny"}:
+            raise DashboardTaskError("invalid_event", 400)
+        return self._request(
+            "POST",
+            "/v1/runs/" + identifier(run_id) + "/approval",
+            body={"request_id": identifier(request_id), "choice": choice},
+        )
+
+    def approvals(self, run_id):
+        try:
+            data = self._request("GET", "/v1/runs/" + identifier(run_id) + "/approval")
+        except DashboardTaskError as exc:
+            if exc.status in {404, 405}:
+                raise DashboardTaskError("approval_reader_unsupported", 503) from None
+            raise
+        if (
+            data.get("object") != "hermes.run.approvals"
+            or data.get("run_id") != run_id
+            or not isinstance(data.get("approvals"), list)
+            or len(data["approvals"]) > 64
+        ):
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        projected = []
+        for pending in data["approvals"]:
+            if not isinstance(pending, dict):
+                raise DashboardTaskError("gateway_response_invalid", 502)
+            try:
+                request_id = identifier(pending.get("request_id"))
+            except HistoryError:
+                raise DashboardTaskError("gateway_response_invalid", 502) from None
+            offered = pending.get("choices")
+            if not isinstance(offered, list):
+                offered = ["once", "deny"]
+                if pending.get("allow_session") is True and not pending.get("smart_denied", False):
+                    offered.insert(1, "session")
+            projected.append(
+                {
+                    "request_id": request_id,
+                    "description": str(pending.get("description") or "Pending host approval")[:500],
+                    "choices": [
+                        choice for choice in ("once", "session", "deny") if choice in offered
+                    ],
+                }
+            )
+        return {**data, "approvals": projected}
+
+
+class RecipientGateway:
+    """Existing-application controls on the voice owner's verified execution host."""
+
+    def __init__(self, bound):
+        self.bound = bound
+
+    def _call(self, operation, *, native_host_id=None, **fields):
+        if operation not in {
+            "probe", "list", "select", "send", "reconcile", "inspect",
+            "catalog", "history", "status",
+        }:
+            raise DashboardTaskError("invalid_event", 400)
+        owner, gateway = self.bound.attachment.owner, self.bound.gateway
+        body = {"session_id": owner.session_id, "actor_scope": owner.principal, **fields}
+        surface = self.bound.native_surface
+        if surface is not None:
+            issuer = surface.issuer.transport
+            target = gateway.transport
+            if (issuer.base_url, issuer.profile) == (target.base_url, target.profile):
+                body["discord_binding"] = dict(surface.binding)
+        result = gateway._request(
+            "POST", "/v1/recipient-bridge/" + operation, body=body,
+            timeout=20, max_bytes=4 * 1024 * 1024,
+        )
+        if native_host_id is not None and result.get("host_id") != native_host_id:
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        if operation == "catalog":
+            rows = result.get("recipients")
+            if not isinstance(rows, list) or len(rows) > 50:
+                raise DashboardTaskError("gateway_response_invalid", 502)
+            normalized = []
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("host_id"), str):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                normalized.append({**row, "native_host_id": row["host_id"], "host_id": owner.host})
+            result = {**result, "recipients": normalized}
+        return {**result, "host_id": owner.host}
+
+    def _require_history(self, operation):
+        descriptor = self._call("probe").get("recipient_bridge")
+        if (
+            not isinstance(descriptor, dict)
+            or type(descriptor.get("version")) is not int
+            or descriptor["version"] != 1
+            or not isinstance(descriptor.get("operations"), list)
+            or operation not in descriptor["operations"]
+            or not isinstance(descriptor.get("history"), dict)
+            or descriptor["history"].get("read_only") is not True
+        ):
+            raise DashboardTaskError("recipient_history_unsupported", 503)
+
+    def catalog(self, *, app=None, limit=20, cursor=None):
+        self._require_history("catalog")
+        return self._call(
+            "catalog", limit=limit, **({"app": app} if app else {}),
+            **({"cursor": cursor} if cursor is not None else {}),
+        )
+
+    def history(self, target, *, limit=20, cursor=None):
+        self._require_history("history")
+        return self._call(
+            "history", target_token=target["target_token"], limit=limit,
+            native_host_id=target.get("native_host_id"),
+            **({"cursor": cursor} if cursor is not None else {}),
+        )
+
+    def status(self, target):
+        self._require_history("status")
+        return self._call(
+            "status", target_token=target["target_token"],
+            native_host_id=target.get("native_host_id"),
+        )
+
+    def list_recipients(self, app=None):
+        return self._call("list", **({"app": app} if app else {}))
+
+    def select(self, target):
+        return self._call(
+            "select", target_token=target["target_token"],
+            native_host_id=target.get("native_host_id"),
+        )
+
+    def send(self, operation_id, target, message, *, commit_token=None):
+        return self._call(
+            "send", operation_id=operation_id, target_token=target["target_token"],
+            message=message, **({"commit_token": commit_token} if commit_token else {}),
+        )
+
+    def reconcile(self, operation_id, target):
+        return self._call(
+            "reconcile", operation_id=operation_id, target_token=target["target_token"],
+        )
+
+    def inspect(self, target, *, capture=True):
+        return self._call("inspect", target_token=target["target_token"], capture=capture)

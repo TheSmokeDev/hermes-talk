@@ -1,0 +1,1003 @@
+"""Exercise the bundled Desktop entry against the host SDK boundary."""
+
+import json
+from pathlib import Path
+from subprocess import run
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+HARNESS = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert/strict');
+const calls = [], registered = [], disposers = [];
+const React = {createElement(type, props, ...children) {return {type, props, children};}};
+const atom = value => {
+  const listeners = new Set();
+  return {get() {return value;}, set(next) {value = next; listeners.forEach(fn=>fn(next));},
+    subscribe(fn) {listeners.add(fn); return ()=>listeners.delete(fn);}};
+};
+const hostState = {
+  focusedSessionOwner:atom({connectionId:'connection-a',profile:'profile-a'}),
+  focusedSessionId:atom('pane-a'), focusedStoredSessionId:atom('stored-a'),
+  focusedSessionProfile:atom('profile-a'),
+  connectionId:atom('connection-a'), profile:atom('profile-a')};
+const requests = [];
+const HermesSDK = {Button:'button',Input:'input',
+  host:{state:hostState, notify(){},
+    request(method, params) {
+      requests.push({method, params});
+      return Promise.resolve({title:'Fixture conversation',
+        session_key:hostState.focusedStoredSessionId.get()});
+    }}};
+const stockHooks = () => {
+  React.useState = initial => [typeof initial === 'function' ? initial() : initial, ()=>{}];
+  React.useEffect = () => {};
+  React.useRef = value => ({current:value});
+};
+const context = vm.createContext({React,HermesSDK,Headers,DOMException,AbortController,
+  console, window:{setTimeout,clearTimeout,sessionStorage:{getItem(){return '';}}}});
+const source = fs.readFileSync(process.argv[1],'utf8')
+  .replace(/^import .* from .*\r?\n/gm,'')
+  .replace(/export function /g,'function ')
+  .replace('export default {','globalThis.plugin = {');
+vm.runInContext(source,context);
+const owner = {connectionId:'connection-a',profile:'profile-a',sessionId:'pane-a',
+  storedSessionId:'stored-a'};
+const leaseController = new AbortController();
+let acquires = 0, releases = 0;
+const controller = {capabilities:{microphoneLease:1,pinnedRest:1,prepareSession:1},owner,
+  async acquire() {acquires++;return {signal:leaseController.signal,release(){releases++;}};}};
+const host = {rest(path,options) {calls.push({path,options});return Promise.resolve({ok:true});},
+  register(entry) {registered.push(entry);},onDispose(fn){disposers.push(fn);}};
+const createSDK=()=>context.createDesktopTalkSDK(host,controller);
+"""
+
+
+def run_node(script, *, source="desktop/plugin.js"):
+    result = run(
+        ["node", "-e", HARNESS + script, str(ROOT / source)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_desktop_pins_route_token_and_late_receipt():
+    run_node(r"""
+(async()=>{
+const sdk=createSDK(); let finish;
+host.rest=(path,options)=>{calls.push({path,options});return new Promise(r=>{finish=r;});};
+const abort = new AbortController();
+const pending=sdk.fetchJSON('/api/plugins/hermes-talk/session',{
+  method:'POST',body:JSON.stringify({taskId:'task-a'}),signal:abort.signal,
+  headers:{'x-talk-token':'talk-gate','Authorization':'Bearer unrelated-host-token'}},17500);
+controller.owner={...owner,connectionId:'connection-b',profile:'profile-b'};
+abort.abort(); finish({receipt:'session-a'});
+assert.equal((await pending).receipt,'session-a');
+assert.equal(calls[0].options.scope.connectionId,'connection-a');
+assert.equal(calls[0].options.scope.profile,'profile-a');
+assert.equal(calls[0].options.pluginToken,'talk-gate');
+assert.equal(calls[0].options.timeoutMs,17500);
+assert.equal(calls[0].options.body.taskId,'task-a');
+assert.equal(calls[0].options.headers,undefined);
+host.rest=async(path,options)=>{calls.push({path,options});return {};};
+await sdk.fetchJSON('/api/plugins/hermes-talk/close',{
+  method:'POST',body:JSON.stringify({sessionId:'session-a'})});
+assert.equal(calls[1].options.scope.connectionId,'connection-a');
+assert.equal(calls[1].options.scope.profile,'profile-a');
+await assert.rejects(sdk.acquireMicrophone(),/conversation changed/);
+assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize("scenario", [
+    r"""
+controller.capabilities={microphoneLease:1};
+assert.throws(createSDK,/incomplete Talk contract/);
+""",
+    r"""
+controller.owner=null; assert.throws(createSDK,/connected Hermes conversation/);
+""",
+    r"""
+const sdk=createSDK(); const abort=new AbortController();abort.abort();
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status',{
+  signal:abort.signal}),{name:'AbortError'});assert.equal(calls.length,0);
+""",
+    r"""
+const sdk=createSDK();
+await assert.rejects(sdk.fetchJSON('/api/plugins/another-plugin/status'),/different plugin/);
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/session',{body:'{broken'}));
+assert.equal(calls.length,0);
+""",
+    r"""
+const sdk=createSDK();
+sdk.validateVoiceMode({voiceMode:'live'});sdk.validateVoiceMode({voiceMode:'native'});
+assert.throws(()=>sdk.validateVoiceMode({voiceMode:'cascade'}),/supports GPT-Live/);
+assert.throws(()=>sdk.validateVoiceMode({voiceMode:'unrecognized'}));
+assert.equal(acquires,0);assert.equal(calls.length,0);
+""",
+    r"""
+controller.acquire=async()=>null;
+await assert.rejects(createSDK().acquireMicrophone(),/microphone ownership/);
+""",
+    r"""
+controller.acquire=async()=>({release(){releases++;}});
+await assert.rejects(createSDK().acquireMicrophone(),/microphone ownership/);
+assert.equal(releases,1);
+""",
+    r"""
+const lease=await createSDK().acquireMicrophone();assert.equal(acquires,1);
+assert.equal(lease.signal,leaseController.signal);lease.release();assert.equal(releases,1);
+""",
+])
+def test_desktop_rejects_unavailable_or_invalid_operations(scenario):
+    run_node("\n(async()=>{\n" + scenario + r"""
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_desktop_registers_inside_the_composer_without_starting_audio():
+    run_node(r"""
+context.plugin.register(host);
+assert.equal(context.plugin.id,'hermes-talk');assert.equal(registered.length,2);
+assert.equal(registered[0].area,'composer.actions');
+assert.equal(registered[1].area,'titleBar.tools.right');
+assert.equal(typeof registered[1].data.onSelect,'function');
+assert.equal(typeof registered[0].render().type,'function');
+assert.equal(acquires,0);assert.equal(calls.length,0);
+assert.equal(disposers.length,1);disposers[0]();
+""")
+
+
+def test_renderer_relay_uses_canonical_composer_and_release_only_lease():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const composerOwner={connectionId:'connection-b',profile:'profile-b',
+  sessionId:'pane-b',storedSessionId:'stored-b'};
+hostState.focusedSessionOwner.set({connectionId:composerOwner.connectionId,profile:composerOwner.profile});
+hostState.focusedSessionId.set(composerOwner.sessionId);
+hostState.focusedStoredSessionId.set(composerOwner.storedSessionId);
+hostState.focusedSessionProfile.set(composerOwner.profile);
+let acquiredSignal, releases=0;
+const channel={readyState:'open',listeners:{},addEventListener(type,fn){this.listeners[type]=fn;
+  if(type==='open')queueMicrotask(fn);},send(){},close(){}};
+class Peer {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){}
+  addTrack(){}
+  createDataChannel(){return channel;}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){}
+  async setRemoteDescription(){}
+  close(){}
+}
+const track={enabled:true,stop(){}};
+const submitted=[];
+context.RTCPeerConnection=Peer;
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+HermesSDK.useComposerVoiceController=()=>({
+  owner:composerOwner,
+  acquire:async signal=>{acquiredSignal=signal;return {release(){releases++;}};},
+  submitText:text=>{submitted.push(text);return true;},
+  subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+host.rest=async(path,options)=>{
+  calls.push({path,options});
+  return {mode:'desktop-relay',clientSecret:'ephemeral',offerUrl:'https://relay.invalid',voice:'cedar'};
+};
+context.plugin.register(host);
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.type,'button');
+button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(acquiredSignal instanceof AbortSignal,true);
+assert.equal(calls[0].path,'/session');
+assert.equal(calls[0].options.scope.connectionId,composerOwner.connectionId);
+assert.equal(calls[0].options.scope.profile,composerOwner.profile);
+channel.listeners.message({data:JSON.stringify({
+  type:'conversation.item.input_audio_transcription.completed',transcript:'from tile B'
+})});
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.deepEqual(submitted,['from tile B'],
+  'the minted session and canonical submit use the same tile-bound controller owner');
+assert.equal(releases,0);
+disposers[0]();
+assert.equal(releases,1,'plugin disposal releases the host lease');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_renderer_relay_fails_closed_without_resolved_composer_owner():
+    run_node(r"""
+stockHooks();
+let acquired=0;
+HermesSDK.useComposerVoiceController=()=>({
+  acquire:async()=>{acquired++;return {release(){}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.props.disabled,true);
+assert.match(button.props.title,/resolved composer owner/);
+button.props.onClick();
+assert.equal(acquired,0,'an ownerless Core controller cannot start microphone capture');
+assert.equal(calls.length,0,'an ownerless Core controller cannot mint a Realtime session');
+""")
+
+
+def test_renderer_relay_refuses_global_focus_that_differs_from_composer_owner():
+    run_node(r"""
+stockHooks();
+let acquired=0;
+const otherOwner={connectionId:'connection-b',profile:'profile-b',
+  sessionId:'pane-b',storedSessionId:'stored-b'};
+HermesSDK.useComposerVoiceController=()=>({owner:otherOwner,
+  acquire:async()=>{acquired++;return {release(){}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.props.disabled,true);
+assert.match(button.props.title,/does not match this composer/);
+button.props.onClick();
+assert.equal(acquired,0,'mismatched focus is refused before mic acquisition');
+assert.equal(calls.length,0,'mismatched focus is refused before provider session mint');
+""")
+
+
+def test_renderer_relay_stops_when_global_focus_leaves_bound_composer():
+    run_node(r"""
+(async()=>{
+const refs=[];let refIndex=0,effects=[];
+React.useRef=value=>{
+  const index=refIndex++;
+  if(!refs[index])refs[index]={current:value};
+  return refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>{effects.push(effect);};
+const owner={connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'};
+let composer={owner,async acquire(){return {release(){releases++;}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true};
+HermesSDK.useComposerVoiceController=()=>composer;
+const render=()=>{refIndex=0;effects=[];const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],effects};};
+let releases=0,trackStops=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',addEventListener(type,listener){
+    if(type==='open')queueMicrotask(()=>listener());},send(){},close(){}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>({mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'});
+context.plugin.register(host);
+let action=render();action.effects.at(-1)();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(trackStops,0);assert.equal(releases,0);
+hostState.focusedSessionOwner.set({connectionId:'connection-b',profile:'profile-b'});
+hostState.focusedSessionId.set('pane-b');hostState.focusedStoredSessionId.set('stored-b');
+hostState.focusedSessionProfile.set('profile-b');
+action=render();action.effects.at(-1)();
+assert.equal(trackStops,1,'leaving the bound composer focus closes active capture');
+assert.equal(releases,1,'leaving the bound composer focus releases its Core lease');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_same_owner_composer_invalidation_stops_capture_and_rejects_stale_acquire():
+    run_node(r"""
+(async()=>{
+const refs=[];let refIndex=0,effects=[];
+React.useRef=value=>{
+  const index=refIndex++;
+  if(!refs[index])refs[index]={current:value};
+  return refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>{effects.push(effect);};
+let currentComposer;
+HermesSDK.useComposerVoiceController=()=>currentComposer;
+const render=()=>{refIndex=0;effects=[];const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],invalidate:effects.at(-1)};};
+const makeComposer=acquire=>({owner:{connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'},acquire,submitText:()=>true,
+  subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true});
+let releases=0,mediaCalls=0,trackStops=0;
+let sessionCalls=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',listeners:{},
+    addEventListener(type,listener){this.listeners[type]=listener;
+      if(type==='open')queueMicrotask(()=>{this.readyState='open';listener();});},
+    send(){},close(){this.readyState='closed';this.listeners.close?.();}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){mediaCalls++;
+  return {getTracks:()=>[track],getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>{sessionCalls++;return {mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'};};
+context.plugin.register(host);
+currentComposer=makeComposer(async()=>({release(){releases++;}}));
+let action=render();action.invalidate();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(mediaCalls,1);assert.equal(trackStops,0);assert.equal(releases,0);
+
+currentComposer=makeComposer(async()=>({release(){releases++;}}));
+action=render();action.invalidate();
+assert.equal(trackStops,1,'a refreshed controller for the same owner releases active capture');
+assert.equal(releases,1,'the refreshed controller releases its original Core lease');
+
+action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(mediaCalls,2);
+currentComposer=null;
+action=render();action.invalidate();
+assert.equal(trackStops,2,'disabling the composer releases active capture');
+assert.equal(releases,2,'disabling the composer releases the Core lease');
+
+let finishAcquire,acquireSignal,staleReleases=0;
+currentComposer=makeComposer(signal=>{
+  acquireSignal=signal;
+  return new Promise(resolve=>{finishAcquire=resolve;});
+});
+action=render();action.invalidate();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(typeof finishAcquire,'function');
+currentComposer=null;
+action=render();action.invalidate();
+assert.equal(acquireSignal.aborted,true,'controller invalidation aborts pending lease acquisition');
+finishAcquire({release(){staleReleases++;}});
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(staleReleases,1,'a late lease is released after its controller expires');
+assert.equal(mediaCalls,2,'an expired controller never starts microphone capture');
+assert.equal(sessionCalls,2,'an expired controller never opens a backend voice session');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_late_cleanup_from_an_old_relay_preserves_the_current_relay():
+    run_node(r"""
+let oldStopped=0,currentStopped=0;
+const oldRelay={stop(){oldStopped++;}};
+const currentRelay={stop(){currentStopped++;}};
+const before=7;
+context.oldRelay=oldRelay;context.currentRelay=currentRelay;context.generationBefore=before;
+vm.runInContext(`activeDesktopRelay=currentRelay;desktopRelayGeneration=generationBefore;
+  stopDesktopRelay(oldRelay);globalThis.cleanupResult={active:activeDesktopRelay,
+    generation:desktopRelayGeneration};`,context);
+assert.equal(context.cleanupResult.active,currentRelay,
+  'cleaning a stale relay must not detach the current microphone session');
+assert.equal(context.cleanupResult.generation,before,
+  'cleaning a stale relay must not invalidate the current start attempt');
+assert.equal(oldStopped,1);assert.equal(currentStopped,0);
+""")
+
+
+def test_unrelated_composer_actions_cannot_stop_or_steal_the_active_relay():
+    run_node(r"""
+(async()=>{
+const instances=new Map();let activeInstance;
+React.useRef=value=>{
+  const state=instances.get(activeInstance),index=state.refIndex++;
+  if(!state.refs[index])state.refs[index]={current:value};
+  return state.refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>instances.get(activeInstance).effects.push(effect);
+let composer;
+HermesSDK.useComposerVoiceController=()=>composer;
+const render=instance=>{
+  if(!instances.has(instance))instances.set(instance,{refs:[],refIndex:0,effects:[]});
+  activeInstance=instance;
+  const state=instances.get(instance);state.refIndex=0;state.effects=[];
+  const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],effects:[...state.effects]};
+};
+const makeComposer=()=>({owner:{connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'},async acquire(){return {release(){releases++;}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true});
+let releases=0,trackStops=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',addEventListener(type,listener){
+    if(type==='open')queueMicrotask(()=>listener());},send(){},close(){}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>({mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'});
+context.plugin.register(host);
+
+composer=makeComposer();
+const first=render('first');
+const firstCleanups=first.effects.map(effect=>effect());
+first.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(trackStops,0);assert.equal(releases,0);
+
+composer=makeComposer();
+let second=render('second');
+const secondCleanups=second.effects.map(effect=>effect());
+assert.equal(trackStops,0,'mounting a same-owner action cannot stop the active relay');
+assert.equal(releases,0);
+
+composer=makeComposer();
+second=render('second');second.effects.at(-1)();
+second.button.props.onClick();
+assert.equal(trackStops,0,'refreshing and starting another action cannot steal the microphone');
+assert.equal(releases,0);
+secondCleanups[2]();
+assert.equal(trackStops,0,'unmounting an unrelated action leaves capture active');
+assert.equal(releases,0);
+
+first.button.props.onClick();
+assert.equal(trackStops,1,'the action that acquired the relay can stop its capture');
+assert.equal(releases,1,'the owning action releases the Core lease');
+firstCleanups[2]?.();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize("status", [401, 403, 503])
+def test_desktop_exposes_http_status_inside_electron_errors(status):
+    run_node(r"""
+(async()=>{
+const message = STATUS + ': {"detail":"fixture refusal"}';
+host.rest=async()=>{
+  throw new Error("Error invoking remote method 'hermes:api': Error: " + message);
+};
+await assert.rejects(createSDK().fetchJSON('/api/plugins/hermes-talk/status'),
+  error=>error.message===message);
+const unchanged = new Error('Temporary outage while retrieving item 401');
+host.rest=async()=>{throw unchanged;};
+await assert.rejects(createSDK().fetchJSON('/api/plugins/hermes-talk/status'),
+  error=>error===unchanged);
+assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""".replace("STATUS", str(status)))
+
+
+def test_same_owner_controller_refresh_preserves_page_and_updates_acquisition():
+    run_node(r"""
+(async()=>{
+let ref, memo, deps;
+React.useRef=value=>ref||(ref={current:value});
+React.useMemo=(factory,next)=>{
+  if(!deps || deps.some((value,index)=>value!==next[index])){memo=factory();deps=next;}
+  return memo;
+};
+const first=context.DesktopTalkPanel({context:host,controller});
+let latest=controller, refreshedAcquires=0;
+const sdk=context.createDesktopTalkSDK(host,()=>latest);
+const refreshed={...controller,owner:{...owner},async acquire(){
+  refreshedAcquires++;return {signal:leaseController.signal,release(){}};}};
+latest=refreshed;
+const second=context.DesktopTalkPanel({context:host,controller:refreshed});
+assert.equal(first.children[1].type,second.children[1].type,
+  'same-owner controller refresh must retain the mounted TalkPage');
+await sdk.acquireMicrophone();assert.equal(refreshedAcquires,1);assert.equal(acquires,0);
+const third=context.DesktopTalkPanel({context:host,
+  controller:{...refreshed,owner:{...owner,storedSessionId:'different-task'}}});
+assert.equal(second.children[1].type,third.children[1].type,
+  'the action owns remount/close; preparation must preserve the in-flight surface');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_opening_talk_cannot_submit_the_composer_draft():
+    run_node(r"""
+React.useState=()=>[null,()=>{}];React.useEffect=()=>{};
+React.useRef=value=>({current:value});
+HermesSDK.useComposerVoiceController=()=>controller;
+HermesSDK.Popover='popover';HermesSDK.PopoverTrigger='popover-trigger';
+HermesSDK.PopoverContent='popover-content';
+const tree=context.DesktopTalkAction();
+const popover=tree.children[0].children[0];
+assert.equal(popover.type,'popover');assert.equal(popover.props.modal,false);
+assert.equal(popover.children[0].children[0].props.type,'button');
+popover.props.onOpenChange(true);assert.equal(calls.length,0);assert.equal(acquires,0);
+const presentation=context.DesktopTalkPresentation({popoverOpen:true,
+  onPopoverOpenChange(){},stopTalk(){}});
+let stopped=0;
+presentation.children[1].props.onSubmit({stopPropagation(){stopped++;}});
+assert.equal(stopped,1,'Talk form submits must stop before the host composer');
+""")
+
+
+def test_desktop_prepares_exact_conversation_before_catalog_and_microphone():
+    run_node(r"""
+(async()=>{
+for (const draft of [false,true]) {
+  controller.owner={...owner,storedSessionId:draft?null:owner.storedSessionId};
+  controller.capabilities.prepareSession=1;
+  let prepared=false, pendingPublication;
+  const next={...owner,sessionId:'prepared-runtime'};
+  controller.prepareSession=async()=>{
+    prepared=true;
+    pendingPublication=setTimeout(()=>{controller.owner=next;},5);
+    return next;
+  };
+  host.rest=async(path,options)=>{
+    assert(prepared);assert.equal(path,'/targets');
+    assert.equal(options.scope.connectionId,owner.connectionId);
+    assert.equal(options.body.session_id,owner.storedSessionId);
+    assert.equal(options.body.profile,owner.profile);
+    assert.equal(options.pluginToken,undefined);
+    return {ok:true,targets:[{target_id:'target-current',peer_id:'local',
+      profile:owner.profile,session_id:owner.storedSessionId}]};
+  };
+  const notices=[];
+  const sdk=context.createDesktopTalkSDK(host,()=>controller,(...args)=>notices.push(args));
+  const result=await sdk.prepareTask({tabId:'tab-a'});
+  clearTimeout(pendingPublication);
+  assert.equal(result.target_id,'target-current');
+  assert.equal(sdk.desktopOwner.storedSessionId,owner.storedSessionId);
+  assert.equal(notices[0][0],true);assert.equal(notices.at(-1)[0],false);
+  assert.equal(acquires,0,'preparing does not open the microphone');
+}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_desktop_refuses_wrong_or_cancelled_preparation_without_fallback():
+    run_node(r"""
+(async()=>{
+for (const scenario of ['other-task','other-host','resume-failed','cancel','wrong-catalog']) {
+  controller.owner={...owner};controller.capabilities.prepareSession=1;
+  const abort=new AbortController();let catalog=0;
+  controller.prepareSession=async()=>{
+    if(scenario==='resume-failed') throw Error('Resume failed');
+    if(scenario==='cancel') abort.abort();
+    return {...owner,...(scenario==='other-task'?{storedSessionId:'other'}:{}),
+      ...(scenario==='other-host'?{connectionId:'other'}:{})};
+  };
+  host.rest=async()=>{catalog++;return {ok:true,targets:[{target_id:'wrong',
+    peer_id:'local',profile:owner.profile,session_id:'somewhere-else'}]};};
+  await assert.rejects(createSDK().prepareTask({tabId:'tab-a',signal:abort.signal}));
+  assert.equal(catalog,scenario==='wrong-catalog'?1:0);
+  assert.equal(acquires,0);
+}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+@pytest.mark.parametrize(("message", "expected", "retry"), [
+    (
+        '400: {"error":"invalid_event","detail":"file://fixture/private?token=fixture-private-token"}',
+        "Talk could not complete this request. Try again.",
+        True,
+    ),
+    (
+        '401: {"detail":"fixture-private-token"}',
+        "Reconnect to this Hermes connection and try again.",
+        False,
+    ),
+    (
+        '403: {"detail":"fixture-private-token"}',
+        "Reconnect to this Hermes connection and try again.",
+        False,
+    ),
+    (
+        "Temporary failure retrieving item 401: fixture-private-token",
+        "Talk could not complete this request. Try again.",
+        True,
+    ),
+    (
+        '503: {"detail":"fixture-private-token"}',
+        "Talk is temporarily unavailable. Try again.",
+        True,
+    ),
+    (
+        "NotAllowedError: Permission denied; fixture-private-token",
+        "Allow microphone access for Hermes in your system settings, then try again.",
+        True,
+    ),
+    (
+        '503: {"detail":{"code":"context_unavailable","message":"fixture-private-token"}}',
+        "Error code: 503 context_unavailable",
+        True,
+    ),
+    (
+        '503: {"detail":{"code":"Not A Code fixture-private-token","message":"x"}}',
+        "Talk is temporarily unavailable. Try again.",
+        True,
+    ),
+    (
+        "GPT-Live needs a Hermes host with task context support, which this host does not "
+        "report. Use OpenAI Realtime here (TALK_VOICE_MODE=native).",
+        "GPT-Live needs a Hermes host with task context support",
+        False,
+    ),
+])
+def test_desktop_notice_distinguishes_request_failure_from_auth(message, expected, retry):
+    run_node(r"""
+const message = __MESSAGE__, expected = __EXPECTED__, retry = __RETRY__;
+let starts = 0, refreshes = 0;
+const tree = context.DesktopTalkView({
+  status:{configured:true,source:'subscription'},ready:true,error:new Error(message),
+  tasks:[],transcript:[],results:{},startTalk(){starts++;},refresh(){refreshes++;},
+});
+function nodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [node,...(node.children||[]).flat(Infinity).flatMap(nodes)];
+}
+function text(node) {
+  if (typeof node === 'string') return node;
+  return (node?.children||[]).flat(Infinity).map(text).join(' ');
+}
+const alert = nodes(tree).find(node=>node.props?.role==='alert');
+assert(alert,'the failure must produce an actionable notice');
+assert(text(alert).includes(expected));
+const action = nodes(alert).find(node=>node.type==='button');
+assert.equal(text(action),retry?'Try again':'Check connection');
+assert.equal(action.props.type,'button');
+action.props.onClick();
+assert.equal(starts,retry?1:0);assert.equal(refreshes,retry?0:1);
+for (const privateDetail of ['fixture-private-token','invalid_event','file://']) {
+  assert(!text(tree).includes(privateDetail),'raw server error details must stay out of the view');
+}
+assert.equal(calls.length,0);assert.equal(acquires,0);
+""".replace("__MESSAGE__", json.dumps(message))
+        .replace("__EXPECTED__", json.dumps(expected))
+        .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+
+
+def test_stock_lane_prepares_the_focused_conversation_before_the_catalog():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+assert.equal(stock.capabilities.lane,'stock');
+assert.equal(stock.capabilities.microphoneLease,0);
+assert.equal(stock.capabilities.pinnedRest,0);
+assert.deepEqual(JSON.parse(JSON.stringify(stock.owner)),{connectionId:'connection-a',
+  profile:'profile-a',sessionId:'pane-a',storedSessionId:'stored-a'});
+host.rest=async(path,options)=>{
+  assert.equal(requests.length,1,'the stored conversation is confirmed before the catalog');
+  calls.push({path,options});
+  return {ok:true,targets:[{target_id:'target-a',peer_id:'local',profile:'profile-a',
+    session_id:'stored-a'}]};
+};
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const target=await sdk.prepareTask({tabId:'tab-a'});
+assert.equal(target.target_id,'target-a');
+assert.equal(requests[0].method,'session.title');
+assert.equal(requests[0].params.session_id,'pane-a');
+assert.equal(requests[0].params.title,undefined,'a title read must not rename the conversation');
+assert.equal(calls.length,1);assert.equal(calls[0].path,'/targets');
+assert.equal(calls[0].options.body.session_id,'stored-a');
+assert.equal(calls[0].options.body.profile,'profile-a');
+assert.equal(sdk.desktopOwner.storedSessionId,'stored-a');
+assert.equal(acquires,0,'preparing does not open the microphone');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_a_stored_session_mismatch():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+HermesSDK.host.request=async(method,params)=>{
+  requests.push({method,params});
+  return {title:'Fixture conversation',session_key:'stored-elsewhere'};
+};
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/conversation changed/);
+assert.equal(requests.length,1);
+assert.equal(calls.length,0,'a mismatched conversation never reaches the catalog');
+assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_when_the_active_profile_moved():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+hostState.profile.set('profile-b');
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/follows the active profile/);
+assert.equal(requests.length,0,'a moved profile is refused before the host is asked');
+assert.equal(calls.length,0);assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_rest_refuses_after_the_active_profile_moves():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await sdk.fetchJSON('/api/plugins/hermes-talk/status');
+assert.equal(calls.length,1);
+assert.equal(calls[0].options.scope.profile,'profile-a');
+hostState.connectionId.set('connection-b');
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/session',
+  {method:'POST',body:JSON.stringify({taskId:'task-a'})}),/follows the active profile/);
+assert.equal(calls.length,1,'no request leaves for the moved connection');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize(("atom_name", "expected"), [
+    ("focusedStoredSessionId", "Send one message in this conversation first"),
+    ("focusedSessionId", "Send one message in this conversation first"),
+])
+def test_stock_lane_asks_for_a_first_message_when_the_conversation_is_unsaved(atom_name, expected):
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.__ATOM__.set(null);
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/__EXPECTED__/);
+assert.equal(requests.length,0);
+assert.equal(calls.length,0);assert.equal(acquires,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""".replace("__ATOM__", atom_name).replace("__EXPECTED__", expected))
+
+
+def test_stock_lane_grants_a_release_only_microphone_lease():
+    run_node(r"""
+(async()=>{
+stockHooks();
+let prompts=0;
+context.window.hermesDesktop={requestMicrophoneAccess(){
+  prompts++;return Promise.reject(new Error('Hermes has no microphone bridge'));}};
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const lease=await sdk.acquireMicrophone();
+assert.equal(prompts,1,'a stock host is still asked for system microphone access');
+assert.equal(lease.signal,stock.signal);
+lease.release();
+assert.equal(stock.signal.aborted,false,'releasing a stock lease cannot end the session');
+sdk.stopHost();
+assert.equal(stock.signal.aborted,true);
+await assert.rejects(sdk.acquireMicrophone(),{name:'AbortError'});
+assert.equal(prompts,1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+@pytest.mark.parametrize(("message", "lane", "expected", "retry"), [
+    (
+        '404: {"detail":"target_missing"}',
+        "stock",
+        "Send one message in this conversation first, then Connect.",
+        True,
+    ),
+    (
+        '404: {"detail":"target_missing"}',
+        None,
+        "Send one message in this conversation first, then Connect.",
+        True,
+    ),
+    (
+        '404: {"detail":"unknown_route"}',
+        "stock",
+        "Talk could not complete this request. Try again.",
+        True,
+    ),
+    (
+        '401: {"detail":"fixture-private-token"}',
+        "stock",
+        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+        False,
+    ),
+    (
+        '403: {"detail":"fixture-private-token"}',
+        "stock",
+        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+        False,
+    ),
+    (
+        '401: {"detail":"fixture-private-token"}',
+        None,
+        "Reconnect to this Hermes connection and try again.",
+        False,
+    ),
+])
+def test_stock_lane_notice_explains_the_first_message_and_token_rules(
+    message, lane, expected, retry
+):
+    run_node(r"""
+const message = __MESSAGE__, expected = __EXPECTED__, retry = __RETRY__;
+let starts = 0, refreshes = 0;
+const tree = context.DesktopTalkView({
+  status:{configured:true,source:'subscription'},ready:true,error:new Error(message),
+  lane:__LANE__,tasks:[],transcript:[],results:{},
+  startTalk(){starts++;},refresh(){refreshes++;},
+});
+function nodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [node,...(node.children||[]).flat(Infinity).flatMap(nodes)];
+}
+function text(node) {
+  if (typeof node === 'string') return node;
+  return (node?.children||[]).flat(Infinity).map(text).join(' ');
+}
+const alert = nodes(tree).find(node=>node.props?.role==='alert');
+assert(alert,'the failure must produce an actionable notice');
+assert(text(alert).includes(expected));
+const action = nodes(alert).find(node=>node.type==='button');
+assert.equal(text(action),retry?'Try again':'Check connection');
+action.props.onClick();
+assert.equal(starts,retry?1:0);assert.equal(refreshes,retry?0:1);
+assert(!text(tree).includes('fixture-private-token'),
+  'raw server error details must stay out of the view');
+assert.equal(calls.length,0);assert.equal(acquires,0);
+""".replace("__MESSAGE__", json.dumps(message))
+        .replace("__EXPECTED__", json.dumps(expected))
+        .replace("__LANE__", json.dumps(lane))
+        .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+
+
+def test_stock_lane_token_refusal_keeps_the_stock_lifetime():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+host.rest=async()=>{throw new Error(
+  "Error invoking remote method 'hermes:api': Error: 401: {\"detail\":\"token required\"}");};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: 401:/);
+assert.equal(stock.signal.aborted,false,
+  'a stock host cannot present the token: the refusal stays a notice and the panel renders');
+host.rest=async(path,options)=>{calls.push({path,options}); return {ok:true};};
+await sdk.fetchJSON('/api/plugins/hermes-talk/status');
+assert.equal(calls.length,1,'the panel still reaches the host after a token refusal');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_refuses_a_conversation_with_no_profile():
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.focusedSessionOwner.set({connectionId:'connection-a'});
+hostState.focusedSessionProfile.set(null);
+hostState.profile.set(null);
+const stock=context.useStockVoiceController();
+assert.equal(stock.owner.connectionId,'connection-a');
+assert.equal(stock.owner.profile,null,'an absent profile is never invented');
+assert.throws(()=>context.createDesktopTalkSDK(host,()=>stock),
+  /Open a connected Hermes conversation before starting Talk/);
+assert.equal(requests.length,0,'no host request carries a fabricated profile');
+assert.equal(calls.length,0,'no plugin request carries a fabricated profile');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_does_not_read_an_absent_profile_as_a_profile_named_local():
+    run_node(r"""
+(async()=>{
+stockHooks();
+hostState.focusedSessionOwner.set({connectionId:'connection-a',profile:'local'});
+hostState.profile.set(null);
+const stock=context.useStockVoiceController();
+assert.equal(stock.owner.profile,'local','a conversation may genuinely use this name');
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/follows the active profile/);
+assert.equal(requests.length,0,'an unreported active profile is not that conversation');
+assert.equal(calls.length,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_popover_content_receives_focus_outside_guard():
+    """PopoverContent must receive onFocusOutside; outside-click and Escape still dismiss."""
+    run_node(r"""
+React.useState=()=>[null,()=>{}];React.useEffect=()=>{};
+React.useRef=value=>({current:value});
+HermesSDK.Popover='popover';HermesSDK.PopoverTrigger='popover-trigger';
+HermesSDK.PopoverContent='popover-content';
+const popoverClosed = [];
+const onPopoverOpenChange = (open) => { if (!open) popoverClosed.push(true); };
+const tree = context.DesktopTalkPresentation({
+  popoverOpen: true, onPopoverOpenChange, stopTalk() {},
+});
+const popoverContent = (tree.children || []).filter(Boolean)
+  .find(c => c.type === 'popover-content');
+assert(popoverContent, 'PopoverContent must be rendered when popoverOpen is true');
+assert.equal(typeof popoverContent.props.onFocusOutside, 'function',
+  'onFocusOutside must be wired');
+const fakeEvent = { preventDefault() { this.defaultPrevented = true; } };
+popoverContent.props.onFocusOutside(fakeEvent);
+assert.equal(fakeEvent.defaultPrevented, true,
+  'onFocusOutside must call preventDefault to block Radix focus-outside dismissal');
+assert.equal(popoverClosed.length, 0,
+  'onFocusOutside must not close the popover');
+// Only focus-outside is blocked. Radix's pointer and keyboard dismissal paths
+// stay unwired, so outside click and Escape still close the popover.
+for (const blocked of ['onInteractOutside','onPointerDownOutside','onEscapeKeyDown']) {
+  assert.equal(popoverContent.props[blocked], undefined,
+    blocked + ' must stay unwired so outside click and Escape still dismiss');
+}
+assert.equal(calls.length, 0);
+assert.equal(acquires, 0);
+""")
+
+
+def test_refused_plugin_request_names_route_and_code_in_the_console():
+    """Plugin REST rides IPC, so the console is the only trace devtools can show."""
+    run_node(r"""
+(async()=>{
+const warnings = [];
+context.console = {warn(line){warnings.push(line);}, error(){}, log(){}};
+const sdk=createSDK();
+host.rest=async()=>{throw new Error("Error invoking remote method 'hermes:api': Error: 503: " +
+  JSON.stringify({detail:{code:'context_unavailable',message:'fixture-private-token'}}));};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/targets',{method:'POST',body:'{}'}),
+  /^Error: 503:/);
+assert.deepEqual(warnings,
+  ['[hermes-talk] POST /targets failed: 503 context_unavailable']);
+host.rest=async()=>{throw new Error("Error invoking remote method 'hermes:api': Error: " +
+  "401: fixture-private-token");};
+await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'));
+assert.equal(warnings[1],'[hermes-talk] GET /status failed: 401');
+assert(!warnings.join(' ').includes('fixture-private-token'),
+  'the refusal free text stays out of the console');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_recipients_explain_a_host_without_task_context_instead_of_failing():
+    run_node(r"""
+let refreshes = 0;
+const view = (supported, recipientError) => context.DesktopTalkView({
+  status:{configured:true,source:'subscription',taskContinuity:{supported}},ready:true,
+  tasks:[],transcript:[],results:{},startTalk(){},refresh(){},
+  setRecipient(){},refreshRecipients(){refreshes++;},recipientError,
+});
+function nodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [node,...(node.children||[]).flat(Infinity).flatMap(nodes)];
+}
+function text(node) {
+  if (typeof node === 'string') return node;
+  return (node?.children||[]).flat(Infinity).map(text).join(' ');
+}
+const refused = '503: ' + JSON.stringify({detail:{code:'context_unavailable',message:'x'}});
+const stock = view(false, refused);
+assert(text(stock).includes('Other recipients need task context support on this Hermes host.'));
+assert(!text(stock).includes('The recipient could not be loaded'),
+  'an expected refusal on this host is not an error');
+const refresh = nodes(stock).find(node=>node.type==='button' && text(node)==='Refresh recipients');
+assert.equal(refresh.props.disabled,true);
+const bound = view(true, refused);
+assert(!text(bound).includes('Other recipients need task context support'));
+assert(text(bound).includes('The recipient could not be loaded. Refresh the list and try ' +
+  'again. Error code: 503 context_unavailable'));
+""", source="ui/desktop-view.js")

@@ -22,14 +22,16 @@ def _pcm(ms):
     return bytes(ms * 24 * 2)
 
 
-def _bind_response(ledger, *, response_id="resp-1", start_ms=0, end_ms=20):
+def _bind_response(
+    ledger, *, response_id="resp-1", start_ms=0, end_ms=20, input_item="input-1"
+):
     ledger.note_speech_started(
-        {"item_id": "input-1", "audio_start_ms": start_ms}
+        {"item_id": input_item, "audio_start_ms": start_ms}
     )
     ledger.note_speech_stopped(
-        {"item_id": "input-1", "audio_end_ms": end_ms}
+        {"item_id": input_item, "audio_end_ms": end_ms}
     )
-    create = ledger.response_for_commit({"item_id": "input-1"})
+    create = ledger.response_for_commit({"item_id": input_item})
     ledger.note_response_created(
         {
             "response": {
@@ -48,10 +50,11 @@ def _make_tool_event(
     arguments='{"task":"ship it"}',
     response_id="resp-1",
     call_id="call-1",
+    item_id="item-1",
 ):
     raw = {
         "response_id": response_id,
-        "item_id": "item-1",
+        "item_id": item_id,
         "call_id": call_id,
         "name": tool_name,
         "arguments": arguments,
@@ -225,7 +228,7 @@ def test_provider_metadata_cannot_satisfy_authority(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 8a. discard_tool_event consumes permit ----------
+# ---------- 8. discard_tool_event consumes permit ----------
 
 
 def test_discard_consumes_permit_through_host_path(monkeypatch):
@@ -246,7 +249,7 @@ def test_discard_consumes_permit_through_host_path(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 8b. tool_queue_full_commands consumes permit ----------
+# ---------- 9. tool_queue_full_commands consumes permit ----------
 
 
 def test_queue_full_consumes_permit_through_host_path(monkeypatch):
@@ -267,7 +270,7 @@ def test_queue_full_consumes_permit_through_host_path(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 8. Replayed proof denied on second use ----------
+# ---------- 10. Replayed proof denied on second use ----------
 
 
 def test_replayed_proof_denied_through_host_path(monkeypatch):
@@ -289,7 +292,7 @@ def test_replayed_proof_denied_through_host_path(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 9. Session reconnect invalidates old proofs ----------
+# ---------- 11. Session reconnect invalidates old proofs ----------
 
 
 def test_reconnect_invalidates_old_proofs(monkeypatch):
@@ -311,7 +314,7 @@ def test_reconnect_invalidates_old_proofs(monkeypatch):
     assert any("not run" in cmd.output for cmd in results[0])
 
 
-# ---------- 10. Relay refuses to exist without an explicit authorizer ----------
+# ---------- 12. Relay refuses to exist without an explicit authorizer ----------
 
 
 def test_relay_requires_explicit_authorizer():
@@ -330,7 +333,7 @@ def test_relay_requires_explicit_authorizer():
         raise AssertionError("tool_authorizer=None must raise")
 
 
-# ---------- 11. Named single-speaker authorizer permits the host path ----------
+# ---------- 13. Named single-speaker authorizer permits the host path ----------
 
 
 def test_local_operator_authorizer_permits_host_path():
@@ -353,7 +356,7 @@ def test_local_operator_authorizer_permits_host_path():
     assert any("exact host output" in cmd.output for cmd in results[0])
 
 
-# ---------- 12. Malformed event without call_id cannot crash the batch ----------
+# ---------- 14. Malformed event without call_id cannot crash the batch ----------
 
 
 def test_missing_call_id_is_dropped_not_crashed(monkeypatch):
@@ -377,7 +380,130 @@ def test_missing_call_id_is_dropped_not_crashed(monkeypatch):
     assert results == [[]]
 
 
-# ---------- 13. Reading the capability catalog grants no authority ----------
+# ---------- 16. One batch carrying both an authorized and a denied event ----------
+
+
+def test_a_mixed_batch_authorizes_each_event_on_its_own_merits(monkeypatch):
+    """Authorization is per EVENT, not per batch (Archon LOW, #47).
+
+    Every other batch test carries events that all pass or all fail, so a
+    relay that decided once and applied the verdict to the whole tuple would
+    have looked identical. Here one event is the operator's and one is a
+    stranger's, in the same batch, under the same permit-minting span.
+    """
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(
+        ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1"
+    )
+    permitted = _make_tool_event(
+        ledger, response_id="resp-1", call_id="call-ok", item_id="item-1"
+    )
+
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
+    _bind_response(
+        ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2"
+    )
+    denied = _make_tool_event(
+        ledger, response_id="resp-2", call_id="call-no", item_id="item-2"
+    )
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    results = _run_batch(relay, [permitted, denied])
+
+    # Exactly one permit reached the host, and it is the operator's.
+    assert len(attachment.minted) == 1
+    assert attachment.minted[0][0]["call_id"] == "call-ok"
+
+    assert any("exact host output" in cmd.output for cmd in results[0])
+    assert results[1], "the denied event produced no result at all"
+    assert not any("exact host output" in cmd.output for cmd in results[1])
+    # Denied for its SPEAKER, not incidentally: the same wording every other
+    # non-operator denial in this file asserts.
+    assert any("not run" in cmd.output for cmd in results[1])
+    assert any("Discord operator" in cmd.output for cmd in results[1])
+    # Each result is addressed to its own call, not merged.
+    assert results[0][0].call_id == "call-ok"
+    assert results[1][0].call_id == "call-no"
+
+
+def test_a_mixed_batch_consumes_the_denied_events_permit_too(monkeypatch):
+    """A denied event must not leave a replayable permit behind."""
+
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
+
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    _bind_response(
+        ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1"
+    )
+    permitted = _make_tool_event(
+        ledger, response_id="resp-1", call_id="call-ok", item_id="item-1"
+    )
+
+    ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
+    _bind_response(
+        ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2"
+    )
+    denied = _make_tool_event(
+        ledger, response_id="resp-2", call_id="call-no", item_id="item-2"
+    )
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=ledger.authorize_tool
+    )
+    _run_batch(relay, [permitted, denied])
+
+    # Replay the once-denied event now that the operator has spoken again:
+    # its permit was consumed on the denial, so it cannot come back.
+    ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
+    replay = _run_batch(relay, [denied], batch_id="batch-2")
+
+    assert len(attachment.minted) == 1, "a consumed permit was replayed"
+    assert not any("exact host output" in cmd.output for cmd in replay[0])
+
+
+# ---------- 17. An unnamed call is matched as the unknown it is ----------
+
+
+def test_an_unnamed_call_is_revoked_under_the_same_name_it_is_authorized_under():
+    """#47 item 3: the two authorizer call sites disagreed on the fallback.
+
+    `_consume_tool_attempt` said "tool" and the batch path said "" for the
+    same nameless event, so the identity used to revoke a permit was not the
+    identity used to authorize it. One owner now answers for both.
+    """
+
+    seen: list[str] = []
+
+    def recording_authorizer(name, _event):
+        seen.append(name)
+        return None
+
+    attachment = HostExecutionAttachment()
+    relay = talk_cli.HostExecutionRelay(
+        attachment, tool_authorizer=recording_authorizer
+    )
+    nameless = {"call_id": "call-1", "arguments": "{}", "response_id": "r", "item_id": "i"}
+
+    relay.discard_tool_event(dict(nameless))
+    relay.tool_queue_full_commands(dict(nameless))
+    _run_batch(relay, [dict(nameless)])
+
+    assert seen == ["", "", ""], "an unnamed call took a different identity per path"
+    assert talk_cli._event_tool_name({}) == ""
+    assert talk_cli._event_tool_name({"name": None}) == ""
+    assert talk_cli._event_tool_name({"name": "delegate_task"}) == "delegate_task"
+
+
+# ---------- 15. Reading the capability catalog grants no authority ----------
 
 
 def test_capability_catalog_is_readable_by_a_non_operator(monkeypatch):

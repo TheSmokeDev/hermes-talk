@@ -1,0 +1,29 @@
+# Deliberately carries no `version` or `date-released`. Those would be a fourth
+# version surface for the release flow to keep in step with pyproject.toml,
+# plugin.yaml and dashboard/manifest.json — and the one nobody would remember
+# to bump. The fields here are the ones that do not change between releases.
+cff-version: 1.2.0
+message: "If you use Hermes Talk in your work, please cite it using these metadata."
+title: "Hermes Talk"
+abstract: >-
+  A realtime voice plugin for Hermes Agent. One bidirectional speech-to-speech
+  session in which the agent uses its real tools, takes interruption, delegates
+  background work while you keep talking, and speaks results when they land.
+  Runs in the terminal, in a Discord voice channel and in the Hermes dashboard.
+type: software
+authors:
+  - name: "SmokeDev"
+    alias: "TheSmokeDev"
+    website: "https://github.com/TheSmokeDev"
+repository-code: "https://github.com/TheSmokeDev/hermes-talk"
+url: "https://pypi.org/project/hermes-talk/"
+license: MIT
+keywords:
+  - hermes-talk
+  - hermes-agent
+  - voice
+  - realtime
+  - speech-to-speech
+  - voice-agent
+  - plugin
+  - python

@@ -1,0 +1,5 @@
+ui/*.js text eol=lf
+scripts/build_ui.py text eol=lf
+dashboard/dist/index.js text eol=lf
+dashboard/dist/style.css text eol=lf
+desktop/plugin.js text eol=lf

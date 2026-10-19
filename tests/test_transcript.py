@@ -10,6 +10,7 @@ from pathlib import Path
 
 import fixture_data
 import pytest
+import wallclock
 
 import talk_transcript
 
@@ -435,7 +436,7 @@ def test_detached_handoff_lease_blocks_another_process_until_done(tmp_path, monk
     assert result.stdout == ""
     release.set()
     root = tmp_path / "state" / "talk-transcripts"
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + wallclock.stretch(2)
     while any(root.glob("*.claimed-*")) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not list(root.glob("*.claimed-*"))
@@ -457,8 +458,12 @@ def test_force_killed_sweeper_claim_is_recovered_by_next_process(tmp_path):
             f"talk_transcript.sweep_transcripts(Path({str(tmp_path)!r}), block)",
         ]
     )
+    # Windows venv python.exe is a redirector; terminate the process holding the lease.
+    executable = (
+        getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
+    )
     child = subprocess.Popen(
-        [sys.executable, "-c", code],
+        [executable, "-c", code],
         cwd=Path(__file__).parents[1],
         stdout=subprocess.PIPE,
         text=True,
@@ -601,7 +606,7 @@ def test_dead_claim_is_recovered_when_pid_now_belongs_to_unrelated_live_process(
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> bool:
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + wallclock.stretch(timeout)
     while time.monotonic() < deadline:
         if predicate():
             return True
@@ -867,3 +872,36 @@ def test_a_detached_nonzero_exit_keeps_the_transcript(
     )
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
+
+
+
+def test_recovered_claim_replaces_marker_and_preserves_process_owned_lease(tmp_path, monkeypatch):
+    capture = talk_transcript.TranscriptCapture(tmp_path)
+    capture.append_turn("user", _long_turn("recover user"))
+    capture.append_turn("assistant", _long_turn("recover assistant"))
+    capture.finish()
+    claimed = capture.path.with_name(capture.path.name + ".claimed-1-" + "a" * 32)
+    os.rename(capture.path, claimed)
+    lease_path = talk_transcript._lease_path(claimed)
+    lease = talk_transcript._Lease.try_acquire(lease_path)
+    assert lease is not None
+    prompts = []
+    try:
+        talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+        assert not prompts and claimed.exists()
+    finally:
+        lease.close()
+    rename = os.rename
+    destinations = []
+
+    def bounded_reclaim(source, destination):
+        source, destination = Path(source), Path(destination)
+        assert talk_transcript._lease_path(destination) == lease_path
+        assert destination.name.count(".claimed-") == 1
+        destinations.append(destination)
+        return rename(source, destination)
+
+    monkeypatch.setattr(talk_transcript.os, "rename", bounded_reclaim)
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=prompts.append)
+    assert len(prompts) == len(destinations) == 1
+    assert not claimed.exists()

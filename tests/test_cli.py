@@ -93,6 +93,245 @@ def test_missing_audio_stack_exits_one_before_dialling(monkeypatch, capsys):
     assert "hermes-talk[audio]" in capsys.readouterr().err
 
 
+def _reasons(monkeypatch, **env):
+    """Run one session to refusal and return (exit_code, reasons_recorded)."""
+
+    seen: list[str] = []
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    code = asyncio.run(talk_cli.run_talk_session(on_refusal=seen.append))
+    assert set(seen) <= talk_cli.STARTUP_REFUSAL_REASONS, seen
+    return code, seen
+
+
+def test_a_configuration_refusal_names_itself(monkeypatch):
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE="not-a-voice")
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_CONFIGURATION]
+
+
+def test_an_audio_refusal_names_itself(monkeypatch):
+    def fail(_self):
+        raise talk_audio.TalkAudioError('run: pip install "hermes-talk[audio]"')
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", fail)
+
+    def never():  # pragma: no cover - must not be reached
+        raise AssertionError("dialled the provider without a working audio device")
+
+    monkeypatch.setattr(talk_cli, "_import_aiohttp", never)
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE=None)
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_AUDIO]
+
+
+def test_a_provider_refusal_names_itself(monkeypatch):
+    class _Audio:
+        played_ms = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def read_input_chunk(self):  # pragma: no cover - connect never lands
+            raise AssertionError("read the microphone after a refused connect")
+
+        def queue_playback(self, _pcm):  # pragma: no cover - nothing plays
+            raise AssertionError("played audio after a refused connect")
+
+        def drain_playback(self):
+            pass
+
+        def reset_played_ms(self):
+            pass
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("provider said no")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    seen: list[str] = []
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=_Audio(),
+            session_factory=lambda _auth: _RefusingSession(),
+            on_refusal=seen.append,
+        )
+    )
+
+    assert code == 1
+    assert seen == [talk_cli.STARTUP_REFUSAL_PROVIDER]
+
+
+def test_a_legacy_tool_setup_failure_refuses_instead_of_crashing(monkeypatch, capsys):
+    """hermes-talk#58: the legacy lane has NO attachment to close.
+
+    The handler closed ``host_execution_attachment`` unconditionally, so on
+    the one lane that reaches it with ``None`` a tool-setup failure raised
+    ``AttributeError`` out of the session — and the operator's receipt named
+    that crash instead of the tool problem that actually refused.
+    """
+
+    def boom():
+        raise RuntimeError("tool catalog is unreadable")
+
+    monkeypatch.setattr(talk_cli.talk_tools, "default_talk_tools", boom)
+
+    def never(_self):  # pragma: no cover - must not be reached
+        raise AssertionError("opened audio after the tools refused")
+
+    monkeypatch.setattr(talk_audio.DuplexAudio, "start", never)
+    code, seen = _reasons(monkeypatch, OPENAI_API_KEY="sk-test", TALK_VOICE=None)
+
+    assert code == 1, "a legacy tool-setup failure must refuse, not raise"
+    assert seen == [talk_cli.STARTUP_REFUSAL_TOOLS]
+    assert "host tool setup failed" in capsys.readouterr().err
+
+
+def test_a_raising_refusal_hook_cannot_turn_a_refusal_into_a_crash(monkeypatch):
+    def explode(_reason):
+        raise RuntimeError("the receipt lane is broken")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_VOICE", "not-a-voice")
+
+    assert asyncio.run(talk_cli.run_talk_session(on_refusal=explode)) == 1
+
+
+def test_a_session_with_no_refusal_hook_still_exits_one(monkeypatch):
+    """The exit-code contract is unchanged; the hook is purely additive."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TALK_VOICE", "not-a-voice")
+
+    assert asyncio.run(talk_cli.run_talk_session()) == 1
+
+
+class _RemoteSpeakerAudio:
+    """A transport that declares it hears speakers other than the operator."""
+
+    played_ms = 0
+    discord_speaker_authorization = True
+
+    def __init__(self):
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+    def read_input_chunk(self):  # pragma: no cover - the session never runs
+        return None
+
+    def queue_playback(self, _pcm):  # pragma: no cover - the session never runs
+        pass
+
+    def drain_playback(self):
+        pass
+
+    def reset_played_ms(self):
+        pass
+
+
+def test_a_multi_speaker_transport_without_a_ledger_is_refused(monkeypatch, capsys):
+    """hermes-talk#47 item 1: enforce the wiring invariant, do not document it.
+
+    `authorization_ledger is None` has to mean "no remote speakers", because
+    a None ledger silently selects the allow-all `local_operator_authorizer`
+    hundreds of lines below. It holds by construction today; a construction
+    bug that broke it would hand every Discord speaker operator authority
+    with nothing anywhere refusing.
+    """
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    monkeypatch.setattr(
+        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda: None
+    )
+
+    def never():  # pragma: no cover - must not be reached
+        raise AssertionError("dialled the provider for an unauthorized transport")
+
+    monkeypatch.setattr(talk_cli, "_import_aiohttp", never)
+    audio = _RemoteSpeakerAudio()
+    seen: list[str] = []
+
+    assert asyncio.run(talk_cli.run_talk_session(audio=audio, on_refusal=seen.append)) == 1
+    assert not audio.started, "opened the channel before refusing"
+    err = capsys.readouterr().err
+    assert "authorization ledger" in err
+    assert "operator authority" in err
+    # It refuses through the SAME bounded-reason sink every other startup
+    # refusal uses (#58), so the Discord lane can speak it instead of
+    # collapsing it into "session exited unsuccessfully".
+    assert seen == [talk_cli.STARTUP_REFUSAL_AUTHORIZATION]
+    assert talk_cli.STARTUP_REFUSAL_AUTHORIZATION in talk_cli.STARTUP_REFUSAL_REASONS
+
+
+def test_a_multi_speaker_transport_with_its_ledger_is_not_refused(monkeypatch):
+    """The refusal must be the contradiction, not the transport."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    audio = _RemoteSpeakerAudio()
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("stop here, past the ledger check")
+
+        async def close(self):
+            pass
+
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: _RefusingSession()
+        )
+    )
+
+    assert code == 1  # refused at the provider, not at the ledger gate
+    assert audio.started, "the ledger gate rejected a correctly wired transport"
+
+
+def test_a_single_speaker_transport_still_needs_no_ledger(monkeypatch):
+    """The named allow-all stays reachable for the operator's own microphone."""
+
+    class _LocalAudio(_RemoteSpeakerAudio):
+        discord_speaker_authorization = False
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("TALK_VOICE", raising=False)
+    audio = _LocalAudio()
+
+    class _RefusingSession:
+        async def connect(self, _setup):
+            raise ConnectionRefusedError("stop here, past the ledger check")
+
+        async def close(self):
+            pass
+
+    code = asyncio.run(
+        talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: _RefusingSession()
+        )
+    )
+
+    assert code == 1
+    assert audio.started
+
+
 def test_slow_tool_does_not_block_inbound_barge_in(monkeypatch):
     """Receive and cancel keep moving while the serialized tool worker is busy."""
 
@@ -383,7 +622,7 @@ def test_concurrent_announcement_cannot_split_speaker_context_from_pcm(monkeypat
 
     ws = _WS()
 
-    async def competing_pump(_queue, _relay, _ws, send_batch, _response_busy):
+    async def competing_pump(_queue, _relay, _ws, send_batch, _response_busy, _on_starved=None):
         await ws.speaker_create_seen.wait()
         await send_batch(
             [
@@ -1334,7 +1573,7 @@ def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkey
     ws = _WS()
     declined = []
 
-    async def racing_pump(_queue, relay, _ws, send_batch, _response_busy):
+    async def racing_pump(_queue, relay, _ws, send_batch, _response_busy, _on_starved=None):
         # Simulate: pump_announcements saw idle and queued for send_lock, but
         # a response actually started before send_batch acquired the lock.
         relay._start_response("resp_1")
@@ -1380,6 +1619,393 @@ def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkey
     assert asyncio.run(asyncio.wait_for(talk_cli.run_talk_session(audio=_Audio()), 3.0)) == 0
     assert declined == [False]  # the real in-lock check said no
     assert not any(message.get("item", {}).get("id") == "ann-1" for message in ws.sent)
+
+
+def test_an_announcement_waits_for_the_speaker_to_drain(monkeypatch):
+    """hermes-talk#50: `response.done` is the SERVER, not the speaker.
+
+    The model streams far faster than realtime, so the terminal event can
+    arrive with a second of that answer still queued locally. An announcement
+    written on the terminal alone overlaps the previous response at the only
+    surface the operator actually has.
+    """
+
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        playing = {"value": True}  # server done, speaker still going
+        attempts: list[tuple] = []
+
+        async def send_batch(batch, *, is_announcement=False):
+            assert is_announcement
+            attempts.append(tuple(batch))
+            return True
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),  # response_active is False: the server is done
+                None,
+                send_batch,
+                lambda: playing["value"],
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.08)
+        while_playing = list(attempts)
+
+        playing["value"] = False  # the speaker drains
+        for _ in range(300):
+            if attempts:
+                break
+            await asyncio.sleep(0.01)
+        pump.cancel()
+        return while_playing, attempts
+
+    while_playing, attempts = asyncio.run(scenario())
+
+    assert while_playing == [], "spoke over audio the operator was still hearing"
+    assert len(attempts) == 1, "the deferred announcement was dropped, not delayed"
+
+
+def test_a_deferred_announcement_is_delivered_in_order_not_dropped(monkeypatch):
+    """Deferral must not reorder or lose the flip that marks it delivered."""
+
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        playing = {"value": True}
+        sent: list[str] = []
+        flipped: list[str] = []
+
+        async def send_batch(batch, *, is_announcement=False):
+            sent.append(batch[0].item_id)
+            return True
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),
+                None,
+                send_batch,
+                lambda: playing["value"],
+            )
+        )
+        for name in ("first", "second"):
+            announce_queue.put_nowait(
+                talk_cli.QueuedAnnouncement(
+                    [talk_cli.talk_realtime.AddContext(item_id=name, text=name)],
+                    lambda n=name: flipped.append(n),
+                )
+            )
+        await asyncio.sleep(0.05)
+        assert flipped == [], "a queued batch was marked delivered before the wire"
+
+        playing["value"] = False
+        for _ in range(300):
+            if len(sent) == 2:
+                break
+            await asyncio.sleep(0.01)
+        pump.cancel()
+        return sent, flipped
+
+    sent, flipped = asyncio.run(scenario())
+
+    assert sent == ["first", "second"]
+    assert flipped == ["first", "second"]
+
+
+def test_the_starvation_warning_fires_once_after_the_threshold(monkeypatch):
+    """A predicate that never clears is a silent slow poll unless it speaks."""
+
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_STARVATION_WARN_S", 0.05)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        warned: list[float] = []
+
+        async def send_batch(_batch, *, is_announcement=False):  # pragma: no cover
+            raise AssertionError("wrote while the predicate said busy")
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),
+                None,
+                send_batch,
+                lambda: True,  # never clears
+                warned.append,
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.02)
+        early = list(warned)
+        await asyncio.sleep(0.2)
+        pump.cancel()
+        return early, warned
+
+    early, warned = asyncio.run(scenario())
+
+    assert early == [], "warned before the threshold"
+    assert len(warned) == 1, "the warning repeated instead of firing once per batch"
+    assert warned[0] >= 0.05
+
+
+def test_a_starvation_warning_that_raises_cannot_take_down_the_pump(monkeypatch):
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_STARVATION_WARN_S", 0.02)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        busy = {"value": True}
+        attempts: list[tuple] = []
+
+        def explode(_waited):
+            raise RuntimeError("the warning sink is broken")
+
+        async def send_batch(batch, *, is_announcement=False):
+            attempts.append(tuple(batch))
+            return True
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue,
+                _StubRelay(),
+                None,
+                send_batch,
+                lambda: busy["value"],
+                explode,
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.08)
+        busy["value"] = False
+        for _ in range(300):
+            if attempts:
+                break
+            await asyncio.sleep(0.01)
+        alive = not pump.done()
+        pump.cancel()
+        return alive, attempts
+
+    alive, attempts = asyncio.run(scenario())
+
+    assert alive, "a broken warning sink killed the pump"
+    assert len(attempts) == 1
+
+
+def test_a_zero_threshold_disables_the_starvation_warning(monkeypatch):
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_IDLE_POLL_S", 0.01)
+    monkeypatch.setattr(talk_cli, "ANNOUNCE_STARVATION_WARN_S", 0.0)
+
+    async def scenario():
+        announce_queue: asyncio.Queue = asyncio.Queue()
+        warned: list[float] = []
+
+        async def send_batch(_batch, *, is_announcement=False):  # pragma: no cover
+            raise AssertionError("wrote while busy")
+
+        pump = asyncio.create_task(
+            talk_cli.pump_announcements(
+                announce_queue, _StubRelay(), None, send_batch, lambda: True, warned.append
+            )
+        )
+        announce_queue.put_nowait(talk_cli.landed_note_messages("sa-0-aaaa"))
+        await asyncio.sleep(0.1)
+        pump.cancel()
+        return warned
+
+    assert asyncio.run(scenario()) == []
+
+
+def _speaker_gate_harness(monkeypatch, audio, pump_factory):
+    """Drive the REAL send_outgoing/send_lock with a given audio + pump."""
+
+    class _WS:
+        def __init__(self):
+            self.sent: list[dict] = []
+            self.done = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+            await asyncio.sleep(0)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.done.wait()
+            raise StopAsyncIteration
+
+    ws = _WS()
+
+    class _ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, *_args, **_kwargs):
+            return ws
+
+    host = types.SimpleNamespace(
+        resolve_auth=lambda: types.SimpleNamespace(token="token", source="test"),
+        identity_sections=lambda: {},
+    )
+    monkeypatch.setattr(talk_cli.talk_host, "host", lambda: host)
+    monkeypatch.setattr(talk_cli.talk_apiserver, "warm_in_background", lambda: None)
+    monkeypatch.setattr(
+        talk_cli,
+        "_mint_session",
+        lambda *a, **k: types.SimpleNamespace(client_secret="ephemeral"),
+    )
+    monkeypatch.setattr(talk_cli, "pump_announcements", pump_factory(ws))
+    monkeypatch.setattr(
+        talk_cli,
+        "_import_aiohttp",
+        lambda: types.SimpleNamespace(
+            ClientSession=_ClientSession,
+            WSMsgType=types.SimpleNamespace(TEXT="text"),
+        ),
+    )
+    code = asyncio.run(asyncio.wait_for(talk_cli.run_talk_session(audio=audio), 3.0))
+    return code, ws
+
+
+class _GateAudio:
+    """Audio whose speaker state the test drives directly."""
+
+    played_ms = 0
+
+    def __init__(self, pending):
+        self.playback_pending = pending
+        self.stopped = False
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.stopped = True
+
+    def read_input_packet(self):
+        return None
+
+    def queue_playback(self, _pcm):
+        pass
+
+    def drain_playback(self):
+        pass
+
+    def reset_played_ms(self):
+        pass
+
+
+def test_send_outgoing_declines_an_announcement_while_the_speaker_is_busy(monkeypatch):
+    """The in-lock re-check, not just the poll: the write point decides.
+
+    The poll is check-then-act — playback can resume between "idle" and the
+    send lock. This drives the real send_outgoing through the real lock with
+    a speaker that is still playing and a server that is idle, which is
+    exactly the window `response.done` cannot see.
+    """
+
+    declined: list[bool] = []
+
+    def pump_factory(ws):
+        async def racing_pump(_queue, _relay, _ws, send_batch, _busy, _on_starved=None):
+            ok = await send_batch(
+                [talk_cli.talk_realtime.AddContext(item_id="ann-1", text="hi")],
+                is_announcement=True,
+            )
+            declined.append(ok)
+            ws.done.set()
+            await asyncio.Event().wait()
+
+        return racing_pump
+
+    code, ws = _speaker_gate_harness(monkeypatch, _GateAudio(True), pump_factory)
+
+    assert code == 0
+    assert declined == [False], "wrote an announcement over live playback"
+    assert not any(message.get("item", {}).get("id") == "ann-1" for message in ws.sent)
+
+
+def test_send_outgoing_writes_an_announcement_once_the_speaker_is_quiet(monkeypatch):
+    """The gate must open again — a drained speaker is a safe opening."""
+
+    accepted: list[bool] = []
+
+    def pump_factory(ws):
+        async def quiet_pump(_queue, _relay, _ws, send_batch, _busy, _on_starved=None):
+            ok = await send_batch(
+                [talk_cli.talk_realtime.AddContext(item_id="ann-1", text="hi")],
+                is_announcement=True,
+            )
+            accepted.append(ok)
+            ws.done.set()
+            await asyncio.Event().wait()
+
+        return quiet_pump
+
+    code, ws = _speaker_gate_harness(monkeypatch, _GateAudio(False), pump_factory)
+
+    assert code == 0
+    assert accepted == [True]
+    assert any(message.get("item", {}).get("id") == "ann-1" for message in ws.sent)
+
+
+def test_an_audio_device_without_the_drain_signal_never_starves_the_pump(monkeypatch):
+    """Fail OPEN: an unfamiliar device degrades to the old timing."""
+
+    class _NoSignalAudio(_GateAudio):
+        def __init__(self):
+            super().__init__(False)
+            del self.playback_pending  # the property simply does not exist
+
+    accepted: list[bool] = []
+
+    def pump_factory(ws):
+        async def quiet_pump(_queue, _relay, _ws, send_batch, _busy, _on_starved=None):
+            accepted.append(
+                await send_batch(
+                    [talk_cli.talk_realtime.AddContext(item_id="ann-1", text="hi")],
+                    is_announcement=True,
+                )
+            )
+            ws.done.set()
+            await asyncio.Event().wait()
+
+        return quiet_pump
+
+    code, _ws = _speaker_gate_harness(monkeypatch, _NoSignalAudio(), pump_factory)
+
+    assert code == 0
+    assert accepted == [True]
+
+
+def test_the_production_busy_predicate_includes_the_speaker():
+    """The gate is only real if the shipped predicate carries it (#50)."""
+
+    source = inspect.getsource(talk_cli.run_talk_session)
+    start = source.index("pump = asyncio.create_task(")
+    predicate = source[start : source.index("tool_worker = asyncio.create_task(", start)]
+
+    assert "speaker_busy()" in predicate
+    # And the in-lock re-check, which is the one that owns the wire.
+    lock_check = source[
+        source.index("async def send_outgoing") : source.index("async def send_microphone")
+    ]
+    assert "speaker_busy()" in lock_check
 
 
 def test_subagent_stop_messages_cap_the_summary_tail():
@@ -1535,7 +2161,7 @@ def test_session_always_detaches_the_lifecycle_target(monkeypatch, capsys):
 
 
 def test_keyboard_interrupt_hangs_up_cleanly(monkeypatch, capsys):
-    async def interrupted():
+    async def interrupted(**_kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(talk_cli, "run_talk_session", interrupted)
@@ -1552,7 +2178,7 @@ def test_setup_cli_adds_no_required_arguments():
 
 
 def test_cli_entry_raises_systemexit_on_failure(monkeypatch):
-    async def failing():
+    async def failing(**_kwargs):
         return 1
 
     monkeypatch.setattr(talk_cli, "run_talk_session", failing)
@@ -1669,3 +2295,25 @@ def test_a_caller_named_lane_buys_no_summary(monkeypatch, tmp_path):
     assert seen["lane"] == "discord"
     assert seen["host_summary"] is None
     assert talk_identity.LANE_LINES["discord"] in seen["instructions"]
+
+
+@pytest.mark.parametrize("provider,mode", [("grok", "semantic_vad"), ("gemini", "server_vad")])
+def test_unsupported_endpointing_refuses_before_resolving_credentials(monkeypatch, provider, mode):
+    monkeypatch.setenv("TALK_PROVIDER", provider)
+    monkeypatch.setenv("TALK_TURN_DETECTION", mode)
+    monkeypatch.setattr(talk_cli, "_grok_auth", lambda: pytest.fail("credentials read"))
+    monkeypatch.setattr(talk_cli, "_gemini_auth", lambda: pytest.fail("credentials read"))
+    with pytest.raises(talk_cli.talk_config.TalkConfigError, match="TALK_TURN_DETECTION"):
+        talk_cli.resolve_provider_lane()
+
+
+def test_cli_mint_keeps_manual_response_and_semantic_detection(monkeypatch):
+    rt = talk_cli.talk_realtime
+    seen = []
+    monkeypatch.setattr(talk_cli.talk_wire, "mint_ephemeral_session", lambda **kw: seen.append(kw))
+    detection = rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD)
+    talk_cli._mint_session(types.SimpleNamespace(token="fixture", source="fixture"),
+                           model="fixture", voice="cedar", instructions="", tools=[],
+                           automatic_response=False, turn_detection=detection)
+    assert seen[0]["automatic_response"] is False
+    assert seen[0]["turn_detection"] is detection

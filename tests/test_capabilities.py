@@ -604,6 +604,127 @@ def test_section_names_the_count_the_categories_and_the_two_rules():
     assert "talk_capabilities" in section
 
 
+def test_section_leads_with_power_tools_so_the_cap_never_drops_them():
+    """The 10-cap used to truncate computer_use (last of 27 in catalog order),
+    so the model never saw it and refused screen work it could delegate.
+    Priority ordering pins the high-agency tools to the front, and the delegate
+    line names the ones that resolved live."""
+
+    filler = [f"cat{i}" for i in range(10)]
+    toolsets = (
+        *({"name": n, "enabled": True, "configured": True, "tools": [f"{n}_tool"]} for n in filler),
+        {
+            "name": "computer_use",
+            "enabled": True,
+            "configured": True,
+            "tools": ["computer_use"],
+        },
+    )
+    live = (*(f"{n}_tool" for n in filler), "computer_use")
+    snapshot = _section_snapshot(toolsets=toolsets, tools=live)
+
+    section = talk_capabilities.instruction_section(snapshot)
+    # computer_use survived the budget cap that used to drop it...
+    assert "computer_use" in section
+    # ...and the delegate directive names it so the model hands off, not refuses.
+    assert "see and control the screen" in section
+
+
+def test_delegate_line_only_names_tools_that_resolved_live():
+    """Honesty floor: a headliner phrase is spoken only when its tool is in the
+    live resolved set — a configured-but-unavailable computer_use is neither
+    named nor listed."""
+
+    snapshot = _section_snapshot(
+        toolsets=(
+            {
+                "name": "computer_use",
+                "enabled": True,
+                "configured": True,
+                "tools": ["computer_use"],
+            },
+            {
+                "name": "browser",
+                "enabled": True,
+                "configured": True,
+                "tools": ["browser_navigate"],
+            },
+        ),
+        tools=("browser_navigate",),  # computer_use configured but did NOT resolve
+    )
+
+    section = talk_capabilities.instruction_section(snapshot)
+    assert "browse the web" in section  # browser_navigate resolved -> named
+    assert "see and control the screen" not in section  # computer_use did not
+    assert "computer_use" not in section  # and its category was gate-dropped
+
+
+def test_section_trusts_the_live_read_over_a_stale_enabled_flag():
+    """Rule 2: with a live read present, a tool that actually resolved is
+    claimed even if its toolset carries enabled:false — the host handed the
+    tool back as callable, and stale metadata must not hide it. This is the
+    real-host case: computer_use resolves live with its toolset flag false."""
+
+    snapshot = _section_snapshot(
+        toolsets=(
+            {
+                "name": "computer_use",
+                "enabled": False,
+                "configured": True,
+                "tools": ["computer_use"],
+            },
+        ),
+        tools=("computer_use",),
+    )
+
+    section = talk_capabilities.instruction_section(snapshot)
+    assert "computer_use" in section  # not hidden by the stale flag
+    assert "see and control the screen" in section
+
+
+def test_section_flags_the_shortlist_and_points_at_the_full_catalog():
+    """The 10-cap is a preview, not a ceiling — the section says so and points
+    at the talk_capabilities tool, so neither the model nor the operator reads
+    the shortlist as the whole story."""
+
+    toolsets = tuple(
+        {
+            "name": f"grp{i:02d}",
+            "enabled": True,
+            "configured": True,
+            "tools": [f"grp{i:02d}_tool"],
+        }
+        for i in range(14)
+    )
+    live = tuple(f"grp{i:02d}_tool" for i in range(14))
+    snapshot = _section_snapshot(toolsets=toolsets, tools=live)
+
+    section = talk_capabilities.instruction_section(snapshot)
+    assert "shortlist of Hermes's 14 tool groups" in section
+    assert 'ask "what can you do"' in section
+
+
+def test_section_omits_the_shortlist_hint_when_everything_fits():
+    """No phantom 'full list': when every group is already shown, the hint is
+    absent."""
+
+    toolsets = tuple(
+        {
+            "name": f"grp{i}",
+            "enabled": True,
+            "configured": True,
+            "tools": [f"grp{i}_tool"],
+        }
+        for i in range(3)
+    )
+    live = tuple(f"grp{i}_tool" for i in range(3))
+    snapshot = _section_snapshot(toolsets=toolsets, tools=live)
+
+    section = talk_capabilities.instruction_section(snapshot)
+    assert "shortlist" not in section
+    assert "full catalog" not in section
+
+
 def test_section_claims_nothing_when_nothing_is_usable():
     snapshot = _section_snapshot(
         skills=({"name": "x", "installed": False},),

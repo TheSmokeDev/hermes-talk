@@ -11,6 +11,828 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [Unreleased]
+
+### Added
+- An opt-in **Hermes voice** action in Desktop. It sends finalized speech to
+  the controller-bound Hermes composer and speaks only the resulting Hermes
+  answer. The Realtime session has no tools and cannot auto-answer. It requires
+  a resolved composer owner for the exact connection, profile, runtime session
+  and stored session; missing or mismatched ownership refuses before minting or
+  microphone acquisition. Hermes PR #100666's currently published contract
+  does not expose this owner identity, so that PR alone does not activate the
+  action. The plugin has offline contract tests, not live microphone or provider
+  validation. Contributed by @TheAngryPit. (#80)
+- Grok realtime accepts all 28 built-in voices documented by xAI, adding
+  `carina`, `zagan`, `helix`, `orion`, `luna`, `iris`, `altair`, `zenith`,
+  `perseus`, `helios`, `lux`, `kepler`, `rigel`, `cosmo`, `celeste`, `ursa`,
+  `sirius`, `lumen`, `castor`, `naksh`, `atlas`, `aurora`, and `liora` through
+  `TALK_GROK_VOICE`. Ara remains the default; names remain case-insensitive
+  and unknown names refuse closed. Config-to-session regression coverage
+  exercises every documented voice. Contributed by @zoidypuh.
+- An [xAI speech-tag reference](docs/XAI-SPEECH-TAGS.md) with 114 exact inline
+  spellings and 13 phrase wrappers from Switchboard field notes. It records
+  positive, variable, and unclassified observations, explains how Grok turns
+  Hermes results into speech, and distinguishes that flow from verbatim TTS.
+  This is experimental documentation, not a new provider or runtime guarantee.
+  Contributed by @zoidypuh.
+- An optional presence bus on the Talk page. Talk dispatches a
+  `hermes-talk:presence` event on `window` whenever the call's phase, live
+  caption, audio activity, recent transcript, mute, or sleep state changes, and
+  listens for `hermes-talk:command` (`start`, `stop`, `mute`, `unmute`, `sleep`,
+  `wake`), which calls the same functions Talk's own controls call. Another
+  surface can mirror or drive the call without reading Talk's DOM. Nothing
+  changes when nobody listens. Thanks to
+  [@gabrieljudah](https://github.com/gabrieljudah). (#171)
+
+### Fixed
+- `hermes plugins enable hermes-talk` no longer fails with a
+  `DependencyConflict` on current Hermes. Hermes locks every extra of a plugin
+  in its own workspace, so the exact `ruff==0.16.10` in the dev extra had to
+  agree with Hermes core's `ruff==0.15.10`, and could not. The ruff version
+  pin moved to `requirements-lint.txt`, which only CI and contributors
+  install, and a hygiene test now refuses an exact pin in any extra. Thanks
+  to the reporters on #180.
+
+## [0.21.1] — 2026-09-26
+
+Desktop Talk connects on a stock Hermes host, and when a request fails the panel
+says why.
+
+### Fixed
+- Desktop Talk no longer fails every Connect with "Talk is temporarily
+  unavailable" on a Hermes host without task context support, which is every
+  released core today. It binds the conversation only when `/status` reports
+  `taskContinuity.supported`, and otherwise connects the way the dashboard's
+  legacy Talk does. The composer popover also stays open when the host moves
+  focus back to the composer as the pointer crosses the chat; outside click and
+  Escape still close it. Thanks to @HearthCore for the diagnosis and the fix.
+  (#169, #170)
+- GPT-Live on Desktop still binds its own task when none is preselected, such
+  as an empty conversation on the Talk-enabled build or a catalog that has not
+  loaded yet. #170 inverted that start check on `main`, and no release carried
+  it. On a host without task context the panel now refuses GPT-Live before
+  connecting and names the missing host support, instead of asking for a task
+  it cannot offer. (#174)
+
+### Changed
+- A refused Desktop plugin request shows its status and error code in the
+  panel (`Error code: 503 context_unavailable`) and logs the route and code to
+  the devtools console. Plugin requests travel over IPC, so the Network tab
+  never shows them. The refusal's free text still stays out of both. On a host
+  without task context, the recipient picker says recipients need that support
+  instead of failing a refresh. `docs/DESKTOP.md` describes such hosts, and
+  says what SSH and URL connections need: an SSH connection reaches the remote
+  backend over its loopback, so Talk installed and enabled there admits it
+  without `TALK_DASHBOARD_TOKEN`. (#174)
+
+## [0.21.0] — 2026-09-16
+
+Talk works on a stock Hermes Desktop, and the refusal text stops asking for an
+update that does not exist.
+
+### Added
+- The Desktop composer **Talk** button now runs on a stock Hermes Desktop build.
+  Talk reads the focused conversation from the host state, confirms its stored
+  identity with a read-only title request, and attaches through the composer
+  popover. Connect once the conversation has one message, because Desktop saves a
+  conversation on its first message. Requests on this lane follow whichever
+  profile Desktop has active, and Talk refuses a request rather than address
+  another gateway once that profile moves. There is no microphone lease to share
+  with Desktop dictation, and `TALK_DASHBOARD_TOKEN` is unsupported here; the
+  panel names both when they matter. The Talk-enabled build is unchanged and
+  keeps the floating window, the lease, pinned requests and empty conversations.
+  (#168)
+
+### Changed
+- A host that reports only part of the Talk contract now says that, instead of
+  asking for an update that no release carries. The composer popover names the
+  Talk-enabled Hermes Desktop build as what the floating window needs, and
+  `docs/DESKTOP.md` describes the two lanes side by side. (#168)
+
+## [0.20.2] — 2026-09-16
+
+The floating Talk window gets out of the way, and the subscription lane's
+self-check tells the truth.
+
+### Changed
+- The floating window shrinks to the round Talk button once the session
+  connects; hovering the button opens the panel and leaving it closes the
+  panel again unless a click pinned it or a control inside has focus. Both
+  behaviors are toggles under Advanced and persist with the other appearance
+  settings; saved settings without them keep the defaults. A reconnect never
+  closes a panel the operator pinned. (#163, #164)
+- The round button, the hover status line and the expanded panel paint their
+  own theme background, so a collapsed control is just the button over
+  whatever is underneath. With a Hermes Desktop host that makes the window
+  transparent and click-through, nothing around the button blocks the app,
+  and a press on the button drags the window as soon as the pointer travels;
+  a still tap toggles the panel. (#165)
+
+### Fixed
+- `hermes talk check` on the GPT-Live lane (`TALK_VOICE_MODE=live`). The
+  provider step refused the resolved `live` lane as "not a live realtime
+  provider" before opening a session; behind that, the probe sent
+  `StartResponse`, which the Live client-delegation protocol has no encoding
+  for, and then waited for a response boundary that lane never reports. The
+  step now admits the lane, sends one speakable message and passes on the
+  first audio back, under the same wall-clock budget. Doctor's model check
+  names the live model and voice under live mode instead of `TALK_MODEL`.
+  Nothing here touches a live conversation. (#161, #166)
+
+## [0.20.1] — 2026-09-16
+
+### Added
+- Attachments on a worker start. `POST /attachments/upload` is an
+  authenticated, owner- and input-bound adapter over the host's attachment
+  ingress: it refuses unless the host advertises `features.input_attachments`
+  (read live), enforces the host's published limits, forwards through the
+  existing task gateway, and returns only an opaque
+  `{attachment_id, filename, content_type, bytes, sha256}`. `textInput.
+  attachments` on `/status` is sourced from the same live capability.
+  `/text/input` admits `{attachment_id, sha256}` references on `start_worker`
+  only, verified again at the single dispatch chokepoint against the same
+  owner, connection, generation and input; the other operations refuse with a
+  fixed code, matching the host's unsupported-delivery flags. In the panel, a
+  Send with files uploads first and then sends with the references frozen
+  into the captured send; an upload failure keeps the draft and sends
+  nothing. (#160)
+
+### Fixed
+- The browser-flow route test awaited the delivery emit before reading the
+  event cursor, closing a race that flaked on slow Windows runners. (#160)
+
+## [0.20.0] — 2026-09-16
+
+### Added
+- A floating Talk panel shared by the dashboard tab and the Desktop Talk view:
+  a runtime that survives collapsing the controls and browsing other tasks,
+  a recipient picker with exact identities, typed input alongside voice with
+  draft retention, task cards with approvals gated on the server's descriptor,
+  and honest playback presentation. Attachments stay local and Send with files
+  is disabled with a visible reason until the host route exists. (#156)
+- `POST /text/input` and a `textInput` descriptor on `GET /status`: one
+  authenticated route for explicit operations from the panel, `message` to the
+  pinned task or to the exact selected recipient, `start_worker`, `steer`,
+  `cancel`, `approval`. Every call binds the connection and generation, the
+  recipient is the store's current selection compared field for field and
+  frozen into the captured send, and a repeated input returns its stored
+  receipt instead of dispatching twice. Reply states are the honest ones the
+  transports report; nothing retries an uncertain dispatch. (#158)
+- Live replay: `POST /live/speech` with `replay:true` re-announces a terminal
+  result into the exact bound Live session, answering a still-open delegation
+  or appending context once it is retired, persisting the `submitting` fence
+  before the send and `context_submitted` or `unknown` after. (#158)
+- `POST /native/attach` accepts `input_mode:"typed"` for microphone-off use
+  that mints no voice credentials, and `POST /recipients/catalog|history|
+  status|select` expose read-only recipient history through the host bridge.
+  A history read never confers send. (#154)
+- Result presentation across transports: result ready, context submitted,
+  playback started, playback finished, interrupted and unknown stay separate
+  facts; browser WebRTC playback stays `unknown`; native terminal and Discord
+  gain `/replay EVENT_ID`. (#153)
+- Talk inside the current Desktop conversation, plug-and-play: open a
+  conversation, Talk, Connect. (#142)
+
+### Changed
+- A cancel is recorded as submitting before the stop is posted, so a retry
+  after a lost reply observes the run instead of posting a second stop. (#158)
+- The history outbox runs SQLite in write-ahead-logging mode with a 10 s busy
+  bound, so a busy writer can no longer starve concurrent reads into
+  `outbox_unavailable`. (#152)
+- README leads with the product name and names the realtime lanes and how
+  each is billed; a static landing page and a citation file were added. (#157)
+
+### Fixed
+- Windows CI: wall-clock waits scale on slow runners, a wedged test fails on
+  its own instead of holding the job, and the tests that assert ordering under
+  real deadlines are skipped on Windows CI only, visibly, and still run on
+  Linux and locally. (#152, #155)
+
+## [0.19.2] — 2026-09-15
+
+### Fixed
+- GPT-Live subscription mode works again on a stock Hermes install signed in
+  with `hermes auth login openai-codex`. The borrowed Hermes login carried no
+  account id, so `validate_live_auth` refused it and only users who had also
+  run `codex login` could connect. The account is read from the token's
+  `https://api.openai.com/auth` → `chatgpt_account_id` claim, the same claim
+  Hermes uses for its own `ChatGPT-Account-Id` header, and `expires_at` now
+  reports the token's `exp`. The Codex CLI store path reads the same claim
+  when `auth.json` has no `account_id`. Fail-closed behavior is unchanged: a
+  token naming no account still cannot open subscription mode, and nothing
+  falls through to API billing. Reported in #149, fixed in #150.
+- `dashboard/manifest.json` is bumped in step with `pyproject.toml` and
+  `plugin.yaml`; 0.19.1's tag tree missed it.
+
+## [0.19.1] — 2026-09-15
+
+### Changed
+- The Codex subscription lane is read-only. It borrows Hermes' own Codex login
+  first through `hermes_cli.auth_codex.resolve_codex_runtime_credentials`, so
+  Hermes stays the single owner of that token store and refreshes it under its
+  own lock. Without a Hermes login, Talk reads `~/.codex/auth.json` without ever
+  refreshing or rewriting it; an expired CLI token surfaces a `TalkAuthError`
+  pointing at `codex login`. Removed `_post_token_form`, `_write_auth_json` and
+  `_refresh_codex_credential`. Written by @teknium1 in #146 to clear the one
+  catalog-admission blocker on NousResearch/hermes-agent#108798.
+
+## [0.19.0] — 2026-09-12
+
+### Changed
+- Address existing Codex Desktop and Claude Code recipients by verified task
+  identity, separately from starting a Codex worker. Delivery receipts preserve
+  the original recipient through reconnect and uncertain-send reconciliation.
+- Admit Live delegation asynchronously while transcript capture, status and
+  controls continue. Capture batches preserve event identities, whitespace,
+  provider-item finality and late arrivals; native pending batches survive a
+  matching-owner reconnect.
+- Give GPT-Live a dedicated delegation prompt and deliver completion updates
+  independently of transcript persistence. Host-verified screen inspection stays
+  on demand, and Discord output still requires current audience authorization.
+
+## [0.18.0] — 2026-09-12
+
+GPT-Live connects voice conversation to Hermes tasks and Codex background
+workers on dashboard, terminal and Discord. Subscription is the default;
+API billing is selected explicitly.
+
+### Added
+- GPT-Live with subscription authentication by default and explicit API billing,
+  separate validated model/voice settings, browser WebRTC, native subscription
+  WebRTC and native API WebSockets. Subscription failure never spends an API key.
+- Shared task handoffs across dashboard, terminal and Discord: exact typed input,
+  background delegation, task selection/return, steering, current approvals,
+  cancellation, complete results and reconnect recovery. Discord controls and
+  delivery require a current host-issued operator/audience binding.
+- Opt-in Codex CLI 0.154.0 workers through the host's profile-scoped worker hook,
+  preserving Hermes job ownership and original Codex thread/turn identity.
+- [GPT-Live operating guide](docs/GPT-LIVE.md) and
+  [source notices](THIRD_PARTY_NOTICES.md), including OpenClaw PR #133079's MIT
+  subscription integration and JakeStevenson's selectively incorporated PR #135 ideas.
+- Added a deterministic, content-free endpointing trace evaluator that reports
+  nearest-rank endpoint/playback latency and classified cutoff, split, timeout,
+  and false-activation counts without retaining audio or transcripts.
+- Provider-neutral semantic endpointing controls for the core realtime
+  contract: `RealtimeTurnDetection` with native/server/semantic modes and
+  `RealtimeSemanticEagerness` are mirrored through the setup and live-update
+  paths, Grok advertises native/server support and Gemini native-only with
+  fail-fast refusals on unsupported modes, and the semantic names are probed
+  as an optional capability so pre-semantic core heads keep the full lane
+  with provider-native turn detection instead of losing it.
+
+## [0.17.3] — 2026-09-09
+
+One fix, for the dashboard tab. Ending a session could strand it: if any
+teardown step threw, the rest of `stop()` was skipped, the UI reset to
+idle, and the server kept listening, so the next session started with the
+previous one still live. Every teardown step now owns its own failure and a
+repeated `stop()` is a no-op. Found and fixed by
+[@JakeStevenson](https://github.com/JakeStevenson) while building a mobile
+surface on the dashboard transport, the second outside fix to a live lane.
+
+### Fixed
+- The dashboard transport's `stop()` is now idempotent and every teardown
+  step is guarded, so a throw in one can never skip the rest. Previously a
+  throw in `abortCascade()` (or any other step) left the channel and peer
+  open — the server kept listening even though the UI reset to idle, and a
+  second `stop()` could throw again. Each step now nulls its reference and
+  swallows its own failure, so teardown always completes and a repeated
+  call is a no-op. Regression test drives the real bundle through `node`
+  with a throwing `abortCascade()` and asserts every wire is closed. (#130)
+
+
+## [0.17.2] — 2026-09-07
+
+One fix, for the Gemini lane. A Gemini-only install used to fail an OpenAI
+auth check it never needed and get told to run `codex login`; doctor, check,
+and setup now follow Gemini's own credential, model, and voice settings, and
+the live check reaches Google instead of stopping at a false failure.
+Reported as #122 by @eabase, fixed by Codex, reviewed and live-verified
+before merge.
+
+### Fixed
+- Gemini `doctor`, `check`, and `setup` now follow Gemini's own credential,
+  model, and voice settings. A Gemini-only install no longer fails an
+  unrelated OpenAI auth check or gets told to run `codex login`. Human
+  reports and redacted support bundles carry the Gemini receipt without
+  requiring Codex/xAI fields. Static diagnostics remain offline: configured
+  keys and models are not a claim that Google accepted a live connection.
+  (#122)
+
+## [0.17.1] — 2026-09-07
+
+Seven fixes and one knob. Spoken approvals in a Discord room now reach the
+host under the field name it actually reads, so they stop failing with HTTP
+400 (the first outside fix to a live production lane, by @danclaw93). The
+cascade voice stops forcing a generation per chunk and lets ElevenLabs buffer
+the turn, the dashboard relay no longer deadlocks on the servers Hermes
+actually runs, cloned-voice playback is gapless, and a browser that cannot
+stream says so instead of going mute. `TALK_CASCADE_SPEED` sets the delivery
+pace.
+
+### Added
+- `TALK_CASCADE_SPEED` — delivery pace for the cascade voice, `0.7`–`1.2`
+  (`1.0` is normal), resolved at call time so an operator's edit lands on
+  the next session rather than the next process. Fail-closed like the rest
+  of the cascade knobs: junk and out-of-range values refuse with the range
+  rather than clamping, because a silently clamped pace is audible on every
+  word and never says why. Unset sends no `speed` field at all, so a cascade
+  that does not use the knob puts exactly the same bytes on the wire as
+  before it existed. `CascadeVoice` grew a `voice_settings` argument to
+  carry it; omitting it reproduces the previous BOS frame exactly.
+### Changed
+- `starlette` is now a **dev/test** dependency. It is where
+  `StreamingResponse` and `ClientDisconnect` actually live (fastapi
+  re-exports them), and the relay deadlock fixed below is starlette
+  behavior — untestable in CI without the real class, which is exactly how the
+  deadlock shipped. `dashboard/plugin_api.py` still falls back to its own
+  stub when starlette is absent, so the plugin installs with no web
+  dependency of its own.
+
+### Fixed
+- Room-scoped spoken approvals now return the approval event's exact
+  `request_id` under the field name required by the Hermes run API. They no
+  longer fail with HTTP 400 `approval_request_required` while a pending action
+  waits for an answer. Fixed by
+  [@danclaw93](https://github.com/danclaw93), the first outside fix to a
+  live production lane.
+- The dashboard cascade relay no longer deadlocks on the servers Hermes
+  actually runs on. `POST /api/plugins/hermes-talk/cascade-tts` returned
+  HTTP 200 and then zero bytes of PCM, followed by a `ClientDisconnect` in
+  the log once the browser gave up — so the dashboard's cloned voice
+  silently degraded to text-only with no error anywhere.
+
+  Starlette's `StreamingResponse` only trusts `send()` for disconnect
+  signalling when the server advertises ASGI `spec_version` 2.4 or above.
+  Below that it races the body generator against a disconnect listener, and
+  that listener calls `receive()` first — taking the browser's
+  `http.request` messages off the channel. The relay's own
+  `request.stream()` then only ever saw `http.disconnect`, so it waited
+  forever for text that had already arrived. **Uvicorn advertises 2.3 for
+  HTTP**, hardcoded in both `h11_impl.py` and `httptools_impl.py`, so this
+  was the branch every dashboard took; only its websocket protocols say
+  2.4, which is why the websocket lanes never showed it.
+
+  The relay now returns a `RelayResponse` that owns the request body
+  channel and takes Starlette's own `>= 2.4` path verbatim. A browser that
+  vanishes mid-upload raises `ClientDisconnect` into the feeder, which is
+  now handled as an abort — the same path as a stream that ends without its
+  `done` line — rather than escaping as an error.
+
+  The existing tests could not have caught this: they drive the route with
+  a fake request and never touch an ASGI server, and Starlette's own
+  `TestClient` omits `spec_version` from the scope, so a test written
+  through it takes the same broken branch and HANGS instead of failing. The
+  new coverage drives the real relay body over a real single-consumer ASGI
+  channel and asserts on the scope VALUE rather than on a version string,
+  so a future uvicorn that advertises 2.4 leaves it meaningful.
+
+- The dashboard's cloned voice no longer ticks at every chunk seam. The
+  page opened its AudioContext at the browser default (48kHz on Windows)
+  and then handed it 24kHz buffers, and Web Audio resamples each
+  `AudioBuffer` independently — two chunks resampled in isolation do not
+  line up where they meet, so every chunk boundary was a discontinuity
+  while the PCM leaving the server was provably clean. Measured on a 440 Hz
+  tone split into 40 uneven chunks: the per-chunk path jumped 0.105 between
+  adjacent output samples where a smooth signal steps 0.035, and a 3x step
+  at a seam is the tick you hear. The context is now requested at the PCM's
+  own 24kHz so nothing is resampled at all; browsers that refuse the rate
+  get a resampler that carries the previous chunk's last sample and its
+  fractional read position across chunks, which measures identical to
+  resampling the whole tone at once. Barge-in clears that carry-over along
+  with the generation bump, so an interrupted sentence cannot splice itself
+  onto the next answer.
+- The dashboard cascade no longer goes silently mute on HTTP/1.1. The relay
+  posted its request body as a `ReadableStream` with `duplex: "half"`, and
+  Chrome only sends a streaming request body over HTTP/2 or HTTP/3 — on a
+  plain HTTP/1.1 origin, which a local dashboard almost always is, the
+  fetch rejects outright. The `.catch(() => {})` swallowed it by design, so
+  the model's text captioned normally, no audio ever played, no error
+  appeared anywhere, and zero requests reached `/cascade-tts`. The page now
+  checks the protocol it actually negotiated
+  (`performance.getEntriesByType("navigation")[0].nextHopProtocol`) and
+  posts the whole answer once its text is done when it cannot stream. That
+  costs sentence pipelining — the first sentence no longer plays while the
+  model writes the second — but it produces audio instead of silence.
+- A cascade relay that fails for a real reason now says so once, through
+  the tab's own error surface and the console, instead of vanishing into
+  the same `.catch()`. "Silently" was half of the bug above: a mute voice
+  and a working one were indistinguishable. A deliberate abort (barge-in,
+  hang-up) stays quiet, because that is not a failure.
+- The cascade voice no longer forces a generation per chunk, which is what
+  flattened its prosody. Every text frame carried
+  `try_trigger_generation: true`, defeating the buffer whose entire purpose
+  is giving ElevenLabs enough context to carry intonation across a sentence
+  boundary — their own reference calls forcing generation on small amounts
+  of text "lower quality audio" and recommends leaving the flag at `false`.
+  It compounded with the chunker: `SentenceChunker` ends a chunk on an
+  ellipsis run, so a line written with "..." pacing markers became a
+  separate forced generation per marker, and a multi-sentence answer read as
+  a series of unrelated fragments. Chunks now go out as bare text and
+  nothing replaces the trigger: the model buffers on its own
+  `chunk_length_schedule`, and the empty-text EOS frame the turn already
+  ended on closes the socket — which ElevenLabs documents as forcing
+  generation of whatever is still buffered. The cascade opens and closes one
+  socket per RESPONSE, so that close happens on every turn regardless.
+  Latency where it is audible is therefore unchanged. All three cascade
+  surfaces — terminal, Discord, dashboard relay — change together.
+
+  Deliberately NOT added: an explicit `flush: true` on the EOS frame. Their
+  flush example attaches the flag to a frame carrying real text, `text` is a
+  required field on `SendText`, and an empty-text frame is `CloseConnection`
+  — a different message in the same schema. A combined
+  `{"text": "", "flush": true}` appears nowhere in their documentation, and
+  on this endpoint there is no schema-legal way to force generation without
+  either real text or the close. Their sibling `multi-stream-input` endpoint
+  does define a purpose-built `FlushContextClient` frame with optional
+  `text`, which is what a persistent-socket design would need; this lane
+  does not, because its socket is per-turn.
+- The cascade socket now states `enable_ssml_parsing` instead of relying on
+  a default ElevenLabs does not document. Every neighbouring query parameter
+  declares a default in their schema and this one declares none, so a
+  `<break time="0.4s" />` was as likely to be dropped as spoken, with
+  nothing in the response saying which. Break tags are supported on this
+  lane's model and cap at 3 seconds.
+
+## [0.17.0] — 2026-09-03
+
+Prove it, then pause it. `hermes talk check` runs the whole path — doctor,
+one live provider turn, one bounded Hermes run that has to echo a token —
+so a green report means the lane works right now, not that the config
+parses. `hermes talk diagnostics --bundle` turns a bug report into one
+redacted file. The model can pause the microphone without hanging up, two
+delegated jobs that touch the same thing can no longer race each other, and
+an announcement waits for the speaker to finish instead of talking over the
+answer you are still hearing. First release with the Hermes core realtime
+contract adapter, a security policy, and a contributing guide.
+
+### Added
+- `pause_voice_input` — the model can pause listening without ending the
+  call (#100). "Stop listening" or "mute the mic" is a tool call: the
+  session stays connected, playback keeps playing, background work keeps
+  running and its results are still announced; only the operator's speech
+  stops reaching the provider. The flag lives on the capture surface —
+  `DuplexAudio` and `DiscordAudio` grew `pause_input` / `resume_input` /
+  `input_paused`, the same one-interface pattern as `playback_pending` in
+  #87 — so both rooms honour it identically: blocks captured while paused
+  are dropped (never queued stale), the already-queued ones are discarded,
+  and the Discord bridge keeps the host's buffers drained and its inactivity
+  timer armed so the bot is not evicted from the channel. A paused
+  microphone cannot hear the word "resume", so the way back is the
+  operator's own control — Enter in the standalone `hermes talk` terminal
+  (toggle; `p`/`r` explicit — a polling watcher, never a blocking stdin
+  read), `/talk pause` / `/talk resume` in Discord (`/talk status` says when
+  it is paused) — and the tool is offered ONLY where that control is
+  guaranteed: the pause decision is made once, before the tool list is
+  built, from the same predicate that starts the keyboard watcher, and the
+  registered control is what the receipt names. No control, no pause: a
+  piped or non-tty stdin gets no key and no tool; `/talk` at the Hermes
+  prompt shares its tty with prompt_toolkit, so that lane never watches
+  stdin and offers no pause; and a pause call that arrives anyway is refused
+  (`no_resume_path`) rather than armed, because a pause nobody can undo
+  would be a hang-up. On Windows an extended key (arrows, Insert, F-keys) is
+  consumed whole — before, Down-Arrow's scan code read as `p` and paused the
+  microphone. Both directions get a spoken receipt: the model's tool result
+  for its own flips, a contained announcement for the operator's. The tool
+  classifies read-only (it can only narrow what a session does, and a pause
+  is never a path to authority) and refuses — never arms — when no session
+  is attached. Ported idea from bielcarpi/hermes-live-voice (MIT), idea
+  only.
+- Run admission control on `delegate_task` (#101). The model may
+  declare `execution_mode` (`exclusive`, the default, or
+  `parallel_read_only`) and up to eight normalized `resource_keys` naming
+  what a task touches — a repo checkout, a deployment target. Two live runs
+  that share a key never overlap unless both are read-only; the check runs
+  before a run id is minted or an acceptance record is written, so a refused
+  job burns nothing and can never surface as `lost`. The refusal is a spoken
+  tool result naming the run in the way and the shared key, never a hang or
+  a silent queue, and `check_work` reads out what each running job holds.
+  New knob `TALK_TRUST_DECLARED_READ_ONLY`, default off: until the operator
+  sets it, `parallel_read_only` is downgraded to `exclusive` and recorded
+  that way, because the declaration is the delegating model's own claim, not
+  a sandbox. A task that names no keys is exactly the task Talk always ran.
+- `hermes talk check` proves the whole voice path end to end, right now
+  (#97). Doctor is read-only by design, so a green doctor could
+  still hide a dead mint, a refused socket, or a delegation lane that never
+  starts. The check runs the doctor checks, then a REAL session on the
+  configured provider through the same adapter and credential resolution the
+  voice uses (connect, `SessionReady`, one text turn, `ResponseFinished`),
+  then ONE bounded Hermes run through the same delegation path the voice
+  uses whose output must contain `HERMES_TALK_CHECK_OK`. `--json` reports
+  every step as pass/fail/skip with its duration and the exit code is 0 only
+  when every non-skipped step passed; `--no-run` skips the agent step;
+  `--timeout` budgets it (a run that outlives its budget is stopped, not
+  abandoned). The report never carries tokens or paths. A mock cannot go
+  green: `--provider` accepts only live lanes, the report's provider is
+  validated against the same fail-closed list `TALK_PROVIDER` uses, and the
+  live steps refuse under the test harness unless a test opts in by name.
+  Ported idea from bielcarpi/hermes-live-voice's `launch-check` (MIT) — idea
+  only, no code. Session credential/model/voice resolution moved into one
+  `talk_cli.resolve_provider_lane()` so the check proves the session's real
+  path rather than a copy of it.
+- `hermes talk diagnostics` writes a redacted support bundle for issue
+  reports (#98). Most "it doesn't work" reports could not be
+  reproduced from what the reporter pasted. The bundle carries versions
+  (Python, hermes-talk, the Hermes host, the OS), the NAMES of the `TALK_*` /
+  `HERMES_*` variables that are set plus a fixed list of shared ones
+  (presence only — values are never read), audio device counts and default
+  device names, host capability facts, and every doctor check's outcome with
+  an allowlisted subset of its details. No logs, prompts, transcripts, task
+  results, audio, secret values, or paths. The serializer is default-deny:
+  `BUNDLE_ALLOWLIST` names every key and the shape its value must have,
+  identifier-shaped leaves are dropped outright if secret redaction would
+  change them, free-text leaves pass redaction plus a path scrub and a
+  length cap, and anything not on the list is dropped — a key doctor grows
+  later cannot leak by inheritance (a test plants secret-shaped values at
+  every level and proves none reach the file). `--bundle [PATH]` writes it
+  owner-only (POSIX `0600`; the setup wizard's protected owner-only DACL on
+  Windows, applied to the empty temp before any bytes land) and verifies the
+  permissions after the move, deleting the file if they cannot be proven;
+  `--json` prints it instead. The bug-report issue template now asks for the
+  bundle first. Ported idea from bielcarpi/hermes-live-voice's `diagnostics`
+  (MIT) — idea only, no code.
+- hermes-talk's three realtime lanes now register on the Hermes core
+  `RealtimeVoiceProvider` contract (`agent/realtime_voice_provider.py`, API v2 —
+  NousResearch/hermes-agent#101808) as `hermes-talk/openai`,
+  `hermes-talk/grok`, and `hermes-talk/gemini`, so `hermes realtime --provider
+  <name>` drives them through core's own orchestrator. Registration is
+  feature-detected on both sides: a host without the hook, or with a different
+  contract version, loads hermes-talk exactly as before — one debug line, no
+  warning, every other surface intact. Capabilities are declared per lane
+  rather than assumed, so core degrades explicitly instead of calling an
+  operation the wire cannot perform. Availability stays offline and read-only
+  on all three lanes: no socket, no token refresh, no auth-store write.
+- The neutral session contract gained `ToolCallsCancelled`, and the Gemini Live
+  adapter emits it for `toolCallCancellation`. The server can discard a
+  pending tool call mid-turn; until now that was recorded silently and only
+  visible as a dropped result on the send path, which told policy nothing until
+  it had already produced work nobody wanted.
+- The contributor experience, written down. `CONTRIBUTING.md` now
+  ranks what we take first (bug fixes on live lanes, then provider and host
+  compatibility, security hardening, cross-platform, new providers behind
+  the contract, new surfaces, docs), maps the common paths — a new realtime
+  provider, a new surface, a new talk tool, a fix, a docs change — to the
+  exact files each one touches and ships with, and states the merge bar
+  (live-verified before merge on a provider wire; offline tests and fake
+  sessions otherwise; no auth-store writes; tokens only to the provider's
+  own host; nothing secret in logs or receipts), the branch and
+  Conventional-Commit scope conventions derived from the history, a
+  first-response-within-24-hours review promise, and how merged work is
+  credited. A pull request template carries the same contract (what and
+  why, how to test, platforms, a `check --json` receipt when a lane is
+  touched, `Fixes #N`). Two new issue forms — a feature request that asks
+  for the problem before the proposal and which surfaces and providers it
+  reaches, and a **provider compatibility report** that collects a
+  provider's PASS/PARTIAL/FAIL as a fixed table (provider, model,
+  credential lane, versions, which of `SessionReady` / `SpeechStarted` /
+  `FunctionCall` round-trip / barge-in were observed, the `check --json`
+  report, the wire error verbatim) with no audio, transcripts, or secrets;
+  `docs/PROVIDER-RECEIPT.md` is the how-to behind it and says how
+  maintainers act on each verdict. The bug form gained the core-contract
+  lane and the check/doctor/diagnostics commands as places a bug can
+  happen, and the issue chooser now links private security reporting and
+  Discussions. Labels `provider`, `surface`, `security`, and `docs` join
+  `good first issue` / `help wanted`. The README credits the people who
+  showed up: @kvnloo, @TheAngryPit, @webdevtodayjason. Ported idea from
+  bielcarpi/hermes-live-voice's provider-compatibility receipt (MIT) — idea
+  only, no text.
+
+### Changed
+- README leads with what works today (#96). The first screen is now:
+  what it is, the three surfaces and three providers as facts, a one-line
+  install, the demo GIF with the with-sound cut on its own line, a full badge
+  row (CI, CodeQL, Scorecard, PyPI version and downloads, license), and an
+  "Is it working?" block that puts `hermes talk doctor` before any narrative.
+  New Surfaces and Providers tables, a "Current boundaries" section that
+  states the no-self-hosted-lane limit and the other honest gaps ourselves,
+  and a "Where this sits upstream" section for RFC #77111, core PR #101808,
+  and docs PR #97325. The stale "650+ offline tests" receipt is now 1,400+
+  across 46 files, and the Status block no longer hardcodes a stale version —
+  the PyPI badge carries it.
+  Every existing section survives — reorganized, none deleted. CONTRIBUTING
+  gains the `uv sync --extra dev` path, the `ruff==0.16.5` pin's reason, the
+  #93 twelve-test baseline on a box where Hermes is importable, and the
+  module table now lists every shipped module.
+- The software echo gate (mic blocks below the playback echo floor are
+  dropped while model audio plays) now runs on every platform whenever
+  PulseAudio AEC is not active — that is always on Windows and macOS.
+  On headphones there is no echo to suppress, so it is tunable:
+  `TALK_ECHO_GATE=off` disables it; `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL`,
+  `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL`, and `TALK_ECHO_GATE_RATIO` retune it.
+  Read when the audio stream is constructed. All four are now in
+  `docs/OPERATING.md`'s Audio table.
+
+### Fixed
+- `talk doctor` no longer reports a working Grok lane as unconfigured. The
+  read-only parse of the host store knew one of the two shapes a Hermes
+  `xai-oauth` login lives in — a `providers` block with the tokens nested
+  under `tokens` — and a current host writes a device-code login into
+  `credential_pool` instead, as a list whose rows carry the tokens FLAT. So
+  every operator who logged in on a current Hermes was told
+  `no usable Grok authentication lane was found` while the lane resolved and
+  connected fine; only the read-only diagnostic was blind, never the call.
+  The parse now mirrors the host's own resolver
+  (`hermes_cli.auth._xai_oauth_state_from_store`) end to end: `providers`
+  first, then the pool in stored order, both tokens required on either — the
+  same pair check that rejects a quarantined login, since the host
+  quarantines by popping the tokens. A non-list pool slice still yields
+  nothing, because the host would not read one either. The receipt gained
+  `xai_oauth_source`, and `talk doctor` now prints
+  `xai-oauth=valid (via credential_pool)`, so the next person to debug this
+  can tell an empty store from an unread one.
+- Linux terminal calls now route default audio through PulseAudio's WebRTC
+  echo canceller and noise suppressor. Echo-cancelled input bypasses the
+  fallback amplitude/VAD gate so barge-in does not clip quiet words.
+  ([#81](https://github.com/TheSmokeDev/hermes-talk/pull/81), thanks
+  [@kvnloo](https://github.com/kvnloo) — the first outside contribution to a
+  live lane.)
+- Proactive announcements now wait for the SPEAKER to drain, not just for the
+  server's `response.done`. The model streams far faster than
+  realtime, so the terminal event can arrive with a second of the previous
+  answer still queued locally — and the announcement started on top of it,
+  overlapping two responses at the only surface the operator actually has.
+  `DuplexAudio` and the Discord bridge gained a non-destructive
+  `playback_pending`; the announcement gate now consults it both in the
+  pump's poll and in the re-check inside the send lock, so the wire and the
+  room are decided together. A deferred announcement is delayed, never
+  dropped.
+- An announcement deferred for longer than `ANNOUNCE_STARVATION_WARN_S`
+  (30s, 0 disables) now tells the operator once. Deferring is
+  correct, but a gate that never opens was previously a silent slow poll
+  with nothing to see.
+- A Discord `talk join` that refuses before going live now says WHAT
+  refused instead of "session exited unsuccessfully". The session
+  already knew — it printed the reason to the gateway's stderr and returned
+  a bare exit code — so the operator, the one person who could act on it,
+  was the only one who never saw it. Configuration and provider-connect
+  refusals also point at `/talk core join`, which resolves its provider
+  through the host and so routes around exactly those two. An audio refusal
+  does not: core voice opens the same channel and would fail the same way.
+- A tool-setup failure on the legacy Discord lane raised
+  `AttributeError` out of the session instead of refusing. That lane
+  has no host execution attachment, and the handler closed one
+  unconditionally, so the crash — not the tool problem — was what reached
+  the operator.
+- CI lints against a pinned ruff. The dev extra asked for
+  `ruff>=0.4` and CI installed whatever was current, so ruff 0.16 arrived on
+  its own and failed the build on `RUF100`: it stopped reporting `BLE001`
+  where the handler logs the exception through a name it treats as a logger,
+  which retired three `noqa: BLE001` directives in `talk_core_provider.py` —
+  the only module that both names its logger `logger` (the other fourteen
+  use `_log`, which ruff does not recognise) and carries those directives.
+  The trap was that the two versions wanted opposite source: deleting the
+  directives fixed CI and broke every dev box still on 0.15.x. `ruff==0.16.5`
+  is now pinned in the dev extra (which is what CI installs), the three
+  retired directives are gone with their reasons kept as plain comments, and
+  the `[tool.ruff]` comment no longer claims CI runs whatever ruff is
+  current.
+- The plugin scans `safe` again. A literal U+FEFF typed into
+  `tests/test_grok_auth.py` — the BOM fixture for the BOM-prefixed auth-store
+  test, added with the Grok subscription lane in `01518ae` — tripped the
+  upstream `plugin_guard` scanner's `invisible_unicode` check as a HIGH
+  finding, taking the whole repo to a BLOCKED verdict. That scanner gates
+  `hermes plugins install`, so the block reached users, not just CI. The BOM
+  is now written as the escape `"\ufeff"`: identical bytes on disk, pinned by
+  the same `startswith(b"ï»¿")` assertion the test already made, and
+  no invisible character left in the source for a reader or a scanner to have
+  to distinguish from an accidental one.
+- The README demo GIF is re-rendered from the original 1280x582 screen
+  recording instead of the 640x291 downscale it shipped as, so the
+  transcript and the agent's brief in the runs panel are readable rather
+  than grey mush (#79). `docs/render-dashboard-gif.py` regenerates it
+  from the published release asset.
+
+### Security
+- A visible trust surface on the repository (#95). Three new
+  workflows: CodeQL over the Python and over the workflow files themselves
+  (PR, push, weekly), OpenSSF Scorecard (push, weekly, results published so
+  the badge and the public viewer render), and dependency review on every PR
+  (fails on a moderate-or-worse advisory or a license outside the permissive
+  allowlist). Releases now carry provenance twice: `publish.yml` attests the
+  built dist with `actions/attest-build-provenance` before uploading, and the
+  PyPI upload passes `attestations: true` (PEP 740). Every third-party action
+  in every workflow is pinned to a full commit SHA with its version alongside
+  — the standard `plugin-guard.yml` already set for the upstream scanner —
+  which also moves `checkout` and `setup-python` from their floating `v4`/`v5`
+  majors to current releases. The README header gained CodeQL, Scorecard, and
+  PyPI badges.
+- `SECURITY.md`: supported versions (the latest PyPI release and
+  `main`), private reporting through GitHub security advisories (private
+  vulnerability reporting is enabled on the repository), a 72-hour
+  acknowledgement target, and what counts — credential leakage, auth-store
+  writes outside the documented refresh, tool-authority bypass, redaction
+  failures, supply chain.
+- `.github/dependabot.yml`: weekly `pip` and `github-actions`
+  updates, minor and patch bumps grouped into one PR per ecosystem, majors on
+  their own.
+- The `ci`, `plugin-guard`, and `CodeQL` workflows run on a least-privilege
+  `GITHUB_TOKEN`: `contents: read` at the workflow level (they
+  inherited the repository default, which can be read/write), with the one
+  write CodeQL needs — `security-events: write` to upload its SARIF —
+  granted on the analyze job alone. Closes CodeQL alerts #20/#21 and
+  Scorecard's Token-Permissions findings.
+- The dashboard `/status` route no longer echoes a configuration error's
+  text into its response (CodeQL `py/stack-trace-exposure`). An
+  unusable `TALK_VOICE` or `TALK_VOICE_MODE` still keeps the tile
+  answerable, but the response now names only WHICH setting refused plus a
+  short reference; the exception text — which quotes the offending value —
+  goes to the dashboard's own log under the same reference. The mint keeps
+  repeating the exact remediation on its own refusal path, where the caller
+  is the operator pressing Start.
+- A voice session whose transport declares remote speakers
+  (`discord_speaker_authorization`) but carries no authorization ledger is now
+  REFUSED at session setup, before a secret is minted or a socket is
+  opened. That equivalence held by construction and was asserted only in a
+  comment several hundred lines from where it is relied on — and the branch
+  relying on it silently selects the allow-all `local_operator_authorizer`,
+  so a construction bug would have handed every speaker in a voice channel
+  full operator authority with nothing anywhere refusing. It refuses through
+  the same bounded-reason sink every other startup refusal uses, so a Discord
+  `talk join` says what happened instead of "session exited unsuccessfully" —
+  and that sentence does not offer `/talk core join`, which would take the
+  same channel with the same speakers and refuse identically.
+- An unnamed tool call is now identified the same way on every path.
+  The two authorizer call sites disagreed (`"tool"` when revoking a permit,
+  `""` when authorizing one), so the identity a nameless event was revoked
+  under was not the identity it would have been authorized under. One helper
+  answers for both, and it returns `""` — which cannot collide with a
+  registered tool, a classification set, or a permit's recorded action.
+
+## [0.16.0] — 2026-09-01
+
+Grok voice on an X subscription. `hermes auth add xai-oauth` once,
+`TALK_PROVIDER=grok`, no API key — the last provider that still forced a
+metered key now rides the host login the way the OpenAI lane rides the
+Codex CLI's. Verified live on **X Premium** (the $8 tier) on 2026-09-03:
+`POST /v1/realtime/client_secrets` → 200, the realtime socket → 101,
+`session.created`. A tier without realtime access still gets the honest
+403 line instead of a traceback.
+
+### Added
+- **`xai-oauth` auth lane for Grok** (`talk_grok_auth.py`). Resolved
+  fail-closed: `TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` →
+  `XAI_API_KEY` → the host's `xai-oauth` login. The host resolver owns
+  refresh and quarantine when importable; otherwise `HERMES_HOME/auth.json`
+  is parsed read-only. Talk never writes an auth store and the bearer only
+  ever reaches `*.x.ai`.
+- **`TALK_PREFER_XAI_OAUTH`** — `true` requires the subscription login and
+  refuses metered fallback; blank or invalid values refuse, like the Codex
+  twin.
+- **`hermes talk doctor --probe`** (grok only, opt-in) — two live calls to
+  `api.x.ai` (`POST /v1/realtime/client_secrets` + the realtime handshake)
+  that print status codes and the first server event, never the token.
+- **Handshake remediation.** A 401/403 on the Grok socket becomes one
+  operator line (`run hermes auth add xai-oauth` / `your xAI subscription
+  tier does not include realtime API access; set XAI_API_KEY`) instead of
+  an aiohttp traceback. Every other failure keeps its original text.
+
+### Changed
+- `hermes talk doctor` on the Grok lane reports the winning auth lane and
+  `xai-oauth=valid|expired|invalid|missing` without refreshing anything;
+  "no xAI key" alone no longer fails when a usable login exists.
+- `hermes talk setup` offers the xAI subscription vs an xAI key for
+  `TALK_PROVIDER=grok`; without a login it names the command and writes
+  nothing.
+
+### Not in this release
+- Reading Grok Build CLI's `~/.grok/auth.json`; a device-code login inside
+  the plugin; any write to any auth store. The dashboard tab stays
+  OpenAI-only.
+
+## [0.15.1] — 2026-09-01
+
+Voice hears you again on end-to-end-encrypted Discord calls. 0.15.0's
+`/talk join` could forward white noise to the model for the whole session
+when the operator was already in the channel and had not spoken through
+`/voice` first — not a microphone problem, an identity one.
+
+### Fixed
+- **E2EE audio from an unmapped speaker no longer reaches the model as
+  static.** Discord voice is DAVE-encrypted; the host only decrypts an SSRC
+  it has already mapped to a user, and it learns that mapping from Discord's
+  SPEAKING event (which never arrives for someone already transmitting when
+  the bot joins) or from its own silence gate — which `/talk`'s continuous
+  drain starved, so the mapping never formed, decrypt was skipped, and Opus
+  decoded ciphertext. The bridge now identifies the speaker itself the way
+  the host's silence gate would (host inference preferred, sole-allowed-
+  member fallback), discards the frames decoded before the mapping existed,
+  resets the host decoder for that stream, and warns once per SSRC when a
+  speaker cannot be identified rather than forwarding noise. Unencrypted
+  (passthrough) audio flows exactly as before.
+- **Capability section reflects the live install.** The prompt's toolset
+  list is priority-ordered so high-agency tools (`computer_use`, browser,
+  terminal) survive the display cap instead of being truncated in catalog
+  order; the delegate line names only the categories whose tools actually
+  resolved; a category with no tool list is kept rather than silently
+  filtered out.
+
+### Added
+- One `INFO` receipt when the capture tap goes live —
+  `discord capture live: bot_ssrc=… e2ee=… mapped_ssrcs=…` — so the next
+  "it hears noise" report carries whether the call was encrypted and who
+  was mapped at the moment `/talk` attached.
+
 ## [0.15.0] — 2026-08-30
 
 The capability bridge: voice becomes the manager of Hermes's whole capability
@@ -76,8 +898,9 @@ regression tests:
   single-shot upstream (a reconnect 404s); when a run's watcher dies, the
   poll loop reconciles one conservative prompt (`once`/`deny`) instead of
   letting the approval sit silent until the host's 300s auto-deny. Resolves
-  also carry the request's own id (`approvalId`) for exact routing on hosts
-  that support it.
+  also carry the request's own id for exact routing; this release sent it as
+  `approvalId`, while current Hermes requires `request_id` (corrected under
+  [Unreleased](#unreleased)).
 - **Stale sidecars are quarantined by attach generation.** A delegated run
   outliving its session can no longer speak its approval into — or be
   resolved from — the next session.

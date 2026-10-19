@@ -1026,3 +1026,95 @@ def test_no_lane_at_all_still_names_the_lanes_not_the_routing(monkeypatch, lane_
     assert "api server isn't reachable" in out
     assert "PATH" in out
     assert "I can't start that yet" not in out
+
+
+# -- PR #54 gate follow-ups (hermes-talk#56) ------------------------------------
+#
+# Both of these assert the behavior the issue ASKS FOR, and both fail today.
+# They are marked xfail(strict) rather than written to pass against current
+# behavior: a test that pinned today's shape would have to be rewritten by the
+# fix, and strict means the marker itself fails the build once the fix lands,
+# so it cannot rot into a permanently-skipped test.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "hermes-talk#56 item 1: the call site re-derives 'was this an error' by "
+        "string-matching _speakable's 'that failed' prefix instead of the parsed "
+        "{'error': ...} shape, so a remembered FACT beginning with those words "
+        "is misread as a refusal and loses its provenance label"
+    ),
+)
+def test_a_honcho_fact_that_starts_with_that_failed_keeps_its_provenance(
+    monkeypatch, lane_on
+):
+    """A FACT is operator content Honcho may return verbatim.
+
+    The error branch in ``_speakable`` already keys on the parsed dict, but
+    what it returns is a bare string, so the caller can only look at the words.
+    A recollection that happens to open with the same two words as a minted
+    refusal is then spoken without ``REMEMBERED_PREFIX`` — the operator hears a
+    remembered fact as if it were Honcho failing.
+    """
+
+    _set_lane(monkeypatch, UP)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "found it")
+    fact = "that failed to release on schedule, so it slipped to Friday"
+    talk_host.bind_ctx(
+        ByToolCtx({talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": fact})})
+    )
+
+    out = talk_tools.execute_talk_tool("search_memory", {"query": "the release"})
+
+    assert out == f"{talk_host.REMEMBERED_PREFIX}{fact}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "hermes-talk#56 item 2: _dispatch_bounded's timeout reclaims the caller's "
+        "pipeline thread but never the daemon worker it spawned, and nothing "
+        "caps them - a permanently wedged Honcho leaks one live thread per query"
+    ),
+)
+def test_a_wedged_honcho_does_not_leak_one_daemon_thread_per_query(
+    monkeypatch, lane_on
+):
+    """F4 bounded the PIPELINE; the worker itself is still unbounded.
+
+    The assertion is deliberately shape-agnostic — it says only that live
+    workers must not grow one-for-one with queries. Any bound satisfies it (a
+    semaphore, one shared worker, a join on the previous one); nothing today
+    does.
+    """
+
+    _set_lane(monkeypatch, UP)
+    monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "found it")
+    monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0.05")
+    release = threading.Event()
+    queries = 5
+
+    class Hang(ByToolCtx):
+        def dispatch_tool(self, name, args):
+            if name == talk_host.HONCHO_SEARCH_TOOL_NAME:
+                release.wait(30)
+                return json.dumps({"result": "too late"})
+            return super().dispatch_tool(name, args)
+
+    talk_host.bind_ctx(Hang({}))
+    try:
+        for _ in range(queries):
+            out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
+            assert "didn't answer in time" in out
+        wedged = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "talk-memory-dispatch"
+        ]
+        assert len(wedged) < queries
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "talk-memory-dispatch":
+                thread.join(5.0)

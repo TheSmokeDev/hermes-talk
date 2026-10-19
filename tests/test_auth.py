@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 import time
+import types
 
 import pytest
 
 import talk_auth
+import talk_live_config
 
 
 def _jwt_with_exp(exp: float) -> str:
@@ -27,21 +30,34 @@ def _write_codex_auth(
     access: str,
     refresh: str = "refresh-1",
     auth_mode: str = "chatgpt",
+    account_id: str | None = "acct-1",
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
+    tokens = {"access_token": access, "refresh_token": refresh}
+    if account_id is not None:
+        tokens["account_id"] = account_id
     (home / "auth.json").write_text(
-        json.dumps(
-            {
-                "auth_mode": auth_mode,
-                "tokens": {
-                    "access_token": access,
-                    "refresh_token": refresh,
-                    "account_id": "acct-1",
-                },
-            }
-        ),
+        json.dumps({"auth_mode": auth_mode, "tokens": tokens}),
         encoding="utf-8",
     )
+
+
+_ACCOUNT_CLAIM = {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-hermes"}}
+
+
+def _install_fake_hermes_login(monkeypatch, api_key: str) -> None:
+    """Stand in for ``hermes_cli.auth_codex`` so the real borrow path runs, not a stub."""
+
+    package = types.ModuleType("hermes_cli")
+    module = types.ModuleType("hermes_cli.auth_codex")
+    module.resolve_codex_runtime_credentials = lambda **_kwargs: {
+        "provider": "openai-codex",
+        "api_key": api_key,
+        "auth_mode": "chatgpt",
+    }
+    package.auth_codex = module
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
 
 
 @pytest.fixture(autouse=True)
@@ -116,65 +132,87 @@ def test_api_key_mode_auth_json_is_not_oauth(monkeypatch, tmp_path):
         talk_auth.resolve_auth()
 
 
-def test_expired_token_refreshes_and_writes_back(monkeypatch, tmp_path):
+def test_expired_token_is_reported_and_the_codex_store_is_never_rewritten(monkeypatch, tmp_path):
+    """Talk reads ~/.codex/auth.json but never refreshes or rewrites it (catalog policy)."""
     home = tmp_path / "codex"
     _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10), refresh="refresh-old")
     monkeypatch.setenv("CODEX_HOME", str(home))
-
-    seen: dict = {}
-
-    def fake_post(fields: dict[str, str]) -> dict:
-        seen.update(fields)
-        return {
-            "access_token": _jwt_with_exp(time.time() + 3600),
-            "refresh_token": "refresh-new",
-            "expires_in": 3600,
-            "id_token": "id-new",
-        }
-
-    monkeypatch.setattr(talk_auth, "_post_token_form", fake_post)
-
-    auth = talk_auth.resolve_auth()
-    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
-    assert seen["grant_type"] == "refresh_token"
-    assert seen["refresh_token"] == "refresh-old"
-
-    # Write-back is atomic and preserves shape: the CLI keeps working.
-    persisted = json.loads((home / "auth.json").read_text(encoding="utf-8"))
-    assert persisted["tokens"]["refresh_token"] == "refresh-new"
-    assert persisted["tokens"]["account_id"] == "acct-1"
-    assert "last_refresh" in persisted
-
-
-def test_refresh_race_rereads_the_cli_winner(monkeypatch, tmp_path):
-    home = tmp_path / "codex"
-    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
-    monkeypatch.setenv("CODEX_HOME", str(home))
-
-    def losing_post(fields: dict[str, str]) -> dict:
-        # Simulate the Codex CLI refreshing concurrently: our single-use
-        # refresh token is dead, but the file now holds the CLI's fresh token.
-        _write_codex_auth(home, access=_jwt_with_exp(time.time() + 3600), refresh="refresh-cli")
-        raise talk_auth.TalkAuthError("refresh failed (400)")
-
-    monkeypatch.setattr(talk_auth, "_post_token_form", losing_post)
-
-    auth = talk_auth.resolve_auth()
-    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
-
-
-def test_refresh_failure_with_no_winner_is_actionable(monkeypatch, tmp_path):
-    home = tmp_path / "codex"
-    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
-    monkeypatch.setenv("CODEX_HOME", str(home))
-
-    def failing_post(fields: dict[str, str]) -> dict:
-        raise talk_auth.TalkAuthError("refresh failed (400)")
-
-    monkeypatch.setattr(talk_auth, "_post_token_form", failing_post)
+    monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)
+    before = (home / "auth.json").read_bytes()
 
     with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
         talk_auth.resolve_auth()
+
+    assert (home / "auth.json").read_bytes() == before
+    assert not any(p.name != "auth.json" for p in home.iterdir()), "no temp files left behind"
+
+
+def test_hermes_codex_login_wins_over_the_cli_store(monkeypatch, tmp_path):
+    """When Hermes itself holds a Codex login, Talk borrows it and never opens ~/.codex."""
+    home = tmp_path / "codex"  # deliberately absent
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(
+        talk_auth,
+        "_resolve_hermes_codex_oauth",
+        lambda: talk_auth.TalkAuth(
+            token="hermes-access", source=talk_auth.SOURCE_CODEX_OAUTH, detail="Hermes Codex login"
+        ),
+    )
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.token == "hermes-access"
+
+
+def test_hermes_codex_login_carries_the_account_id_from_the_token(monkeypatch, tmp_path):
+    """#149: Hermes hands back only the bearer; the account id is a claim inside it."""
+    exp = int(time.time()) + 3600
+    token = _jwt_with_payload({"exp": exp, **_ACCOUNT_CLAIM})
+    _install_fake_hermes_login(monkeypatch, token)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.token == token
+    assert auth.account_id == "acct-hermes"
+    assert auth.expires_at is not None and int(auth.expires_at.timestamp()) == exp
+    assert "acct-hermes" not in repr(auth)
+    # The whole point: the subscription gate accepts the borrowed login as-is.
+    talk_live_config.validate_live_auth(auth, talk_live_config.LiveConfig(auth_mode="subscription"))
+
+
+def test_hermes_codex_login_without_the_claim_still_fails_closed(monkeypatch, tmp_path):
+    """A borrowed token naming no account cannot open subscription mode; no key fallback."""
+    token = _jwt_with_payload({"exp": int(time.time()) + 3600})
+    _install_fake_hermes_login(monkeypatch, token)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.account_id is None
+    with pytest.raises(talk_auth.TalkAuthError, match="account ID"):
+        talk_live_config.validate_live_auth(
+            auth, talk_live_config.LiveConfig(auth_mode="subscription")
+        )
+
+
+def test_hermes_codex_login_with_a_malformed_token_yields_to_the_cli_store(monkeypatch, tmp_path):
+    _install_fake_hermes_login(monkeypatch, "header.!!!.sig")
+    _write_codex_auth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+    auth = talk_auth.resolve_auth()
+    assert auth.source == talk_auth.SOURCE_CODEX_OAUTH
+    assert auth.account_id == "acct-1"
+    assert auth.detail.startswith("Codex CLI login")
+
+
+def test_cli_store_without_account_id_reads_it_from_the_token_claim(monkeypatch, tmp_path):
+    token = _jwt_with_payload({"exp": int(time.time()) + 3600, **_ACCOUNT_CLAIM})
+    _write_codex_auth(tmp_path / "codex", access=token, account_id=None)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)
+
+    auth = talk_auth.resolve_auth()
+    assert auth.account_id == "acct-hermes"
 
 
 def test_status_reports_lane_without_tokens(monkeypatch, tmp_path):
@@ -260,7 +298,7 @@ def test_explicit_false_keeps_existing_key_precedence(monkeypatch, tmp_path):
     assert talk_auth.resolve_auth().source == talk_auth.SOURCE_ENV
 
 
-def test_preferred_expired_oauth_refreshes_instead_of_spending_a_key(
+def test_preferred_expired_oauth_fails_closed_instead_of_spending_a_key(
     monkeypatch, tmp_path
 ):
     home = tmp_path / "codex"
@@ -268,17 +306,10 @@ def test_preferred_expired_oauth_refreshes_instead_of_spending_a_key(
     monkeypatch.setenv("CODEX_HOME", str(home))
     monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
-    monkeypatch.setattr(
-        talk_auth,
-        "_post_token_form",
-        lambda fields: {
-            "access_token": _jwt_with_exp(time.time() + 3600),
-            "refresh_token": "refresh-new",
-            "expires_in": 3600,
-        },
-    )
+    monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)
 
-    assert talk_auth.resolve_auth().source == talk_auth.SOURCE_CODEX_OAUTH
+    with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
+        talk_auth.resolve_auth()
 
 
 def test_preferred_blank_oauth_fails_closed_without_spending_a_key(
@@ -292,3 +323,26 @@ def test_preferred_blank_oauth_fails_closed_without_spending_a_key(
 
     with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
         talk_auth.resolve_auth()
+
+
+def test_resolved_oauth_keeps_account_identity_server_side(monkeypatch, tmp_path):
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() + 3600))
+    resolved = talk_auth.resolve_auth(env={}, codex_home=home)
+    assert resolved.account_id == "acct-1"
+    assert "acct-1" not in repr(resolved)
+    assert resolved.token not in repr(resolved)
+    receipt = talk_auth.auth_diagnostic(env={}, codex_home=home)
+    assert "account_id" not in receipt
+    assert "acct-1" not in json.dumps(receipt)
+
+
+def test_live_subscription_expired_token_refuses_without_touching_the_store(monkeypatch, tmp_path):
+    from talk_live_config import resolve_live_auth
+    home = tmp_path / "codex"
+    _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
+    monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)
+    before = (home / "auth.json").read_bytes()
+    with pytest.raises(talk_auth.TalkAuthError, match="codex login"):
+        resolve_live_auth(env={"OPENAI_API_KEY": "paid"}, codex_home=home)
+    assert (home / "auth.json").read_bytes() == before

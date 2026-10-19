@@ -49,6 +49,7 @@ def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
         instructions=setup.instructions,
         tools=[_tool_wire(tool) for tool in setup.tools] or None,
         automatic_response=setup.automatic_response,
+        turn_detection=setup.turn_detection,
         text_output=setup.text_output,
     )
     return {
@@ -114,13 +115,13 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(command.data).decode("ascii"),
         }
-    if isinstance(command, rt.AddContext):
+    if isinstance(command, (rt.AddContext, rt.AddInputText)):
         return {
             "type": "conversation.item.create",
             "item": {
                 "id": command.item_id,
                 "type": "message",
-                "role": command.role.value,
+                "role": "user" if isinstance(command, rt.AddInputText) else command.role.value,
                 "content": [{"type": "input_text", "text": command.text}],
             },
         }
@@ -132,9 +133,20 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             response["metadata"] = dict(command.metadata)
         if command.allow_tools is False:
             response["tool_choice"] = "none"
+        if command.input is not None:
+            response["input"] = rt.wire_value(command.input)
+        if command.conversation is not None:
+            response["conversation"] = command.conversation
+        if command.conversation == "none":
+            response["tools"] = []
+        if command.instructions is not None:
+            response["instructions"] = command.instructions
+        if command.max_output_tokens is not None:
+            response["max_output_tokens"] = command.max_output_tokens
         return {"type": "response.create", **({"response": response} if response else {})}
     if isinstance(command, rt.CancelResponse):
-        return {"type": "response.cancel"}
+        return {"type": "response.cancel", **({"response_id": command.response_id}
+                                               if command.response_id else {})}
     if isinstance(command, rt.TruncateOutput):
         return {
             "type": "conversation.item.truncate",
@@ -147,6 +159,7 @@ def encode_command(command: rt.RealtimeCommand) -> dict[str, Any]:
             "type": "conversation.item.create",
             "item": {
                 "type": "function_call_output",
+                **({"id": command.item_id} if command.item_id else {}),
                 "call_id": command.call_id,
                 "output": command.output,
             },
@@ -228,6 +241,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=False,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.output_audio_transcript.done":
             completed = event.get("transcript")
@@ -237,6 +251,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=True,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.output_text.delta":
             # Text-output mode (the cascade voice lane): the model emits its
@@ -253,6 +268,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=False,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "response.output_text.done":
             completed = event.get("text")
@@ -262,6 +278,7 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 final=True,
                 provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
                 response_id=event.get("response_id"),
+                item_id=event.get("item_id"),
             )
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript")
@@ -269,9 +286,10 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
                 return None
             return rt.Transcript(
                 role=rt.TranscriptRole.USER,
-                text=transcript.strip(),
+                text=transcript,
                 final=True,
                 provenance=rt.TranscriptProvenance.INPUT_AUDIO,
+                item_id=event.get("item_id"),
             )
         if event_type == "response.function_call_arguments.done":
             return rt.FunctionCall(
@@ -283,7 +301,11 @@ def decode_event(event: dict[str, Any]) -> rt.RealtimeEvent | None:
             )
         if event_type == "response.done":
             response = _mapping(event.get("response"))
-            return rt.ResponseFinished(response_id=response.get("id"))
+            return rt.ResponseFinished(
+                response_id=response.get("id"),
+                status=response.get("status"),
+                output=response.get("output"),
+            )
         if event_type == "error":
             error = event.get("error")
             if isinstance(error, dict):
@@ -348,6 +370,7 @@ class _OpenAIWireSession:
             instructions=configuration["instructions"],
             tools=configuration.get("tools"),
             automatic_response=configuration["automatic_response"],
+            turn_detection=configuration["turn_detection"],
             text_output=configuration.get("text_output", False),
         )
 
@@ -359,6 +382,7 @@ class _OpenAIWireSession:
         instructions: str,
         tools: list[dict] | None,
         automatic_response: bool,
+        turn_detection: rt.RealtimeTurnDetection | None = None,
         session_update: dict[str, Any],
         text_output: bool = False,
     ) -> None:
@@ -374,6 +398,7 @@ class _OpenAIWireSession:
                     instructions=instructions,
                     tools=tools,
                     automatic_response=automatic_response,
+                    turn_detection=turn_detection or rt.RealtimeTurnDetection(),
                     text_output=text_output,
                 )
             finally:
@@ -538,6 +563,8 @@ class OpenAIRealtimeSession:
     async def connect(self, setup: rt.SessionSetup) -> None:
         if self.state is not rt.SessionState.NEW:
             raise rt.RealtimeSessionError("Realtime session connect may only run once")
+        if setup.task_continuity and setup.automatic_response:
+            raise rt.RealtimeSessionError("Canonical task mode requires explicit response creation")
         self.state = rt.SessionState.CONNECTING
         if self._legacy_mint is not None:
             self._wire._mint_session = lambda **_configuration: self._legacy_mint(setup)
@@ -549,6 +576,7 @@ class OpenAIRealtimeSession:
                 instructions=setup.instructions,
                 tools=tools,
                 automatic_response=setup.automatic_response,
+                turn_detection=setup.turn_detection,
                 session_update=build_session_update(setup),
                 text_output=setup.text_output,
             )
