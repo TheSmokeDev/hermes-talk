@@ -23,6 +23,7 @@ import contextvars
 import json
 import queue
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,6 +35,9 @@ try:
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_realtime as rt
     from talk_tools import TalkToolError, execute_talk_tool
+
+# A missing stop event must not hold completion notices forever.
+OPERATOR_SPEECH_STALE_S = 120.0
 
 BARGE_IN_MESSAGE: dict = {"type": "response.cancel"}
 UNPARSEABLE_ARGS_TEXT = (
@@ -199,6 +203,7 @@ class RealtimeRelay:
         on_error: Callable[[str], None] | None = None,
         tool_executor: Callable[[str, dict], str] | None = None,
         tool_authorizer: Callable[[str, dict], str | None] | None = None,
+        speech_clock: Callable[[], float] | None = None,
     ) -> None:
         self.on_audio = on_audio or _noop
         self.on_caption = on_caption or _noop
@@ -208,6 +213,9 @@ class RealtimeRelay:
         self.tool_executor = tool_executor or execute_talk_tool
         self.tool_authorizer = tool_authorizer
         self.session_id: str | None = None
+        self._speech_clock = speech_clock or time.monotonic
+        self._operator_speech_started_at: float | None = None
+        self._operator_speech_id: str | None = None
         #: Item the model is currently speaking — the CLI needs it to truncate
         #: the server-side transcript at the point playback actually reached.
         #: Only a response allowed to speak may write it, so a cancelled
@@ -246,6 +254,35 @@ class RealtimeRelay:
         """
 
         return self._response_in_flight
+
+    @property
+    def operator_speaking(self) -> bool:
+        """Bounded speech-event state, not an authorization or audio detector."""
+        if self._operator_speech_started_at is None:
+            return False
+        if self._speech_clock() - self._operator_speech_started_at >= OPERATOR_SPEECH_STALE_S:
+            self._clear_operator_speech()
+            return False
+        return True
+
+    def _clear_operator_speech(self) -> None:
+        self._operator_speech_started_at = None
+        self._operator_speech_id = None
+
+    def _note_operator_speech_started(self, input_id: str | None) -> None:
+        # Duplicate starts for one utterance cannot keep extending a lost stop.
+        if not self.operator_speaking or self._operator_speech_id != input_id:
+            self._operator_speech_started_at = self._speech_clock()
+            self._operator_speech_id = input_id
+
+    def _note_operator_speech_stopped(self, input_id: str | None) -> None:
+        # A delayed stop for an earlier named utterance cannot clear a new one.
+        if (
+            input_id is None
+            or self._operator_speech_id is None
+            or input_id == self._operator_speech_id
+        ):
+            self._clear_operator_speech()
 
     # -- response identity ----------------------------------------------------
 
@@ -442,12 +479,16 @@ class RealtimeRelay:
 
         if isinstance(event, rt.SessionReady):
             self.session_id = event.session_id
+            self._clear_operator_speech()
         elif isinstance(event, rt.ResponseStarted):
             self._start_response(event.response_id)
         elif isinstance(event, rt.SpeechStarted):
+            self._note_operator_speech_started(event.input_id)
             self.on_barge_in()
             if self._cancel_active_response():
                 return [rt.CancelResponse()]
+        elif isinstance(event, rt.SpeechStopped):
+            self._note_operator_speech_stopped(event.input_id)
         elif isinstance(event, rt.OutputAudio):
             if not self._belongs_to_active(event.response_id):
                 return []  # tail audio from a cancelled or superseded response
@@ -560,6 +601,8 @@ class RealtimeRelay:
     # -- event handlers -------------------------------------------------------
 
     def _on_session(self, event: dict) -> list[dict]:
+        if event.get("type") == "session.created":
+            self._clear_operator_speech()
         session = event.get("session")
         if isinstance(session, dict) and session.get("id"):
             self.session_id = str(session["id"])
@@ -570,6 +613,8 @@ class RealtimeRelay:
         return []
 
     def _on_speech_started(self, _event: dict) -> list[dict]:
+        raw_id = _event.get("item_id")
+        self._note_operator_speech_started(str(raw_id) if raw_id else None)
         # Barge-in. The callback drains whatever is still queued locally
         # (always safe); the cancel goes out only when a response is actually
         # in flight and not already cancelled — the model idling needs nothing
@@ -578,6 +623,11 @@ class RealtimeRelay:
         if not self._cancel_active_response():
             return []
         return [dict(BARGE_IN_MESSAGE)]
+
+    def _on_speech_stopped(self, event: dict) -> list[dict]:
+        raw_id = event.get("item_id")
+        self._note_operator_speech_stopped(str(raw_id) if raw_id else None)
+        return []
 
     def _on_audio_delta(self, event: dict) -> list[dict]:
         if not self._belongs_to_active(_event_response_id(event)):
@@ -713,6 +763,7 @@ class RealtimeRelay:
         "session.updated": _on_session,
         "response.created": _on_response_created,
         "input_audio_buffer.speech_started": _on_speech_started,
+        "input_audio_buffer.speech_stopped": _on_speech_stopped,
         "response.output_audio.delta": _on_audio_delta,
         "response.output_audio_transcript.delta": _on_transcript_delta,
         "response.output_audio_transcript.done": _on_output_transcript_done,

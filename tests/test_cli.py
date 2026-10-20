@@ -1517,7 +1517,8 @@ def test_pump_declined_by_a_miswired_busy_predicate_polls_instead_of_spinning(
     assert attempts <= 50
 
 
-def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkeypatch):
+@pytest.mark.parametrize("race", ["response", "operator"])
+def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkeypatch, race):
     # Regression guard for the actual atomic re-check in send_outgoing
     # (talk_cli.py:977), not the pump's retry wrapper — the two tests above
     # only prove pump_announcements retries when told "no" via a hand-rolled
@@ -1576,7 +1577,10 @@ def test_send_outgoing_declines_a_racing_announcement_under_the_real_lock(monkey
     async def racing_pump(_queue, relay, _ws, send_batch, _response_busy, _on_starved=None):
         # Simulate: pump_announcements saw idle and queued for send_lock, but
         # a response actually started before send_batch acquired the lock.
-        relay._start_response("resp_1")
+        if race == "operator":
+            relay.handle_realtime_event(talk_cli.talk_realtime.SpeechStarted(input_id="speech-1"))
+        else:
+            relay._start_response("resp_1")
         ok = await send_batch(
             [talk_cli.talk_realtime.AddContext(item_id="ann-1", text="hi")],
             is_announcement=True,

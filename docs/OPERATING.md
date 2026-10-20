@@ -919,8 +919,8 @@ either way" — an honest answer, not a failure.
 
 **`[talk] an update has been waiting 30s for a safe opening`** — an
 announcement (a finished run, a landed note) is queued and being held back
-because the model is mid-response or the speaker has not finished the
-previous answer. Deferring is correct — the alternative is two voices at
+because the model is mid-response, the speaker has not finished the
+previous answer, or a provider speech-start event says the operator is speaking. Deferring is correct — the alternative is two voices at
 once — and the update is delayed, never dropped. The warning fires once per
 held update, after `ANNOUNCE_STARVATION_WARN_S`. That is a module constant
 in `talk_cli.py` (30 seconds; `0` disables the warning, not the deferral),
@@ -928,6 +928,16 @@ in `talk_cli.py` (30 seconds; `0` disables the warning, not the deferral),
 repeatedly means a gate that is not clearing: check whether a tool call is
 stuck or playback is wedged, because a pump that never opens is otherwise
 indistinguishable from a quiet session.
+
+Operator speech is tracked for both provider-neutral and legacy wire events.
+A matching speech-stop releases it; a late stop for an older named utterance
+does not clear a newer one. A missing stop cannot hold updates forever:
+`OPERATOR_SPEECH_STALE_S` in `talk_relay.py` bounds this state to 120 seconds,
+without extending the deadline for duplicate starts of the same utterance.
+This is an event-loss fallback, not a microphone-silence detector. After that
+bound an unusually long continuous utterance can overlap an update; the model
+and playback gates still apply. The bound is a code constant, not a new
+environment setting. Announcements re-check speech state inside the send lock.
 
 **"I can't watch for delivery on this build"** — the steer queued fine,
 but neither delivery artifact is observable in this process, so

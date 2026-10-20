@@ -37,6 +37,10 @@ named rather than smoothed.
   [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
 ### Fixed
+- Background announcements wait while provider speech events mark the operator
+  as speaking, including an atomic send-lock re-check. Matching stops release
+  the gate; a 120-second stale-event bound prevents a missing stop from holding
+  updates forever (#90). See the operating guide for the long-utterance tradeoff.
 - `hermes plugins enable hermes-talk` no longer fails with a
   `DependencyConflict` on current Hermes. Hermes locks every extra of a plugin
   in its own workspace, so the exact `ruff==0.16.10` in the dev extra had to
