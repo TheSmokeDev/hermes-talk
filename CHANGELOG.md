@@ -37,6 +37,9 @@ named rather than smoothed.
   [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
 ### Fixed
+- Capability-catalog and CLI prompt tests isolate ambient Hermes registries and
+  restore import state after explicit test fakes, so an installed host cannot
+  supply unexpected catalog results (#93). Production discovery is unchanged.
 - `hermes plugins enable hermes-talk` no longer fails with a
   `DependencyConflict` on current Hermes. Hermes locks every extra of a plugin
   in its own workspace, so the exact `ruff==0.16.10` in the dev extra had to

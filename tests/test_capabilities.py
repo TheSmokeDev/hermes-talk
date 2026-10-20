@@ -42,7 +42,7 @@ DOWN = talk_apiserver.ApiServerStatus(
 
 
 @pytest.fixture(autouse=True)
-def clean():
+def clean(isolated_capability_catalog):
     """Detached from Hermes, no cached snapshot, no cached lane verdict."""
 
     talk_host.bind_ctx(None)

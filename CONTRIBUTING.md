@@ -129,16 +129,14 @@ host against a stub plugin context, audio against fakes. That's why CI
 needs nothing from you — no keys, no env, no fixtures — and why a test
 that wants the network is a test shaped wrong for this repo.
 
-**One trap on a box that runs the plugin for real** ([#93](https://github.com/TheSmokeDev/hermes-talk/issues/93)):
-if `hermes-agent` is importable from the interpreter running the tests —
-which it is when `pytest` resolves to the Hermes install's own venv, e.g.
-`%LOCALAPPDATA%\hermes\hermes-agent\venv` on Windows — twelve tests in
-`tests/test_capabilities.py` and `tests/test_cli.py` fail, because the
-capability catalog answers in-process from the live install instead of
-staying inert. CI never sees it (no Hermes there). A project-local venv
-(`uv sync` above, or `python -m venv .venv && pip install -e ".[dev]"`)
-side-steps it; until the tests are hermetic, those twelve are the known
-baseline on such a box and anything else red is yours.
+**Catalog tests own their host-discovery state** ([#93](https://github.com/TheSmokeDev/hermes-talk/issues/93)):
+`isolated_capability_catalog` blocks ambient Hermes catalog modules for
+`tests/test_capabilities.py` and the CLI prompt-composition test that expects
+no host summary. In-process catalog tests explicitly install their own fake
+registries instead. The fixture restores the original modules afterward;
+production discovery is unchanged. Keep using a project-local environment
+for dependency isolation, and request this fixture for tests that require
+an absent catalog rather than relying on Hermes not being installed.
 
 ### The live proof — `hermes talk check`
 
