@@ -125,12 +125,11 @@ known failures.)
 ## Known limits
 
 - Subagent completion announcements need
-  `PluginContext.active_parent_session_id` (upstream
-  [PR #79716](https://github.com/NousResearch/hermes-agent/pull/79716)).
-  Below that, announcements are suppressed, not guessed. Whether that PR has
-  landed is a hermes-agent fact this page cannot verify — `docs/OPERATING.md`
-  and the README carry the same compatibility boundary, and `hermes talk
-  doctor` reports what your host actually exposes.
+  `PluginContext.active_parent_session_id`, which no Hermes release exposes
+  today (the upstream proposal was closed without merging). Without it,
+  announcements are suppressed, not guessed. `docs/OPERATING.md` carries the
+  same compatibility boundary, and `hermes talk doctor` reports what your
+  host actually exposes.
 - `redirect_agent`'s clean-abort path wants host ≥ 0.20; below that it
   degrades to the steer queue and says so.
 - Live voice proof (speak a real tool request; Discord `/talk join`) needs a
