@@ -773,7 +773,9 @@ async def pump_announcements(
         waiting_since: float | None = None
         starved = False
         while True:
-            while response_busy() if response_busy is not None else relay.response_active:
+            while (
+                response_busy() if response_busy is not None else relay.response_active
+            ) or getattr(relay, "operator_speaking", False):
                 if waiting_since is None:
                     waiting_since = time.monotonic()
                 elif not starved and ANNOUNCE_STARVATION_WARN_S > 0:
@@ -1813,9 +1815,10 @@ async def run_talk_session(
             response was open or about to be (``relay.response_active``), a
             ``StartResponse`` was sent but not yet confirmed
             (``continuation_pending``), or the speaker had not finished the
-            previous answer (``speaker_busy``), so it was not written. The
+            previous answer (``speaker_busy``), or the operator was speaking,
+            so it was not written. The
             caller defers it instead of speaking over the model, racing an
-            in-flight continuation, or overlapping audio at the speaker.
+            in-flight continuation, or overlapping either speaker.
 
             The speaker check belongs HERE and not only in the pump poll: the
             poll is check-then-act, and this lock is the point where the write
@@ -1830,6 +1833,7 @@ async def run_talk_session(
                 # Re-check at the point the write actually happens.
                 if is_announcement and (
                     relay.response_active or continuation_pending or speaker_busy()
+                    or relay.operator_speaking
                 ):
                     return False
                 if any(
@@ -2210,6 +2214,7 @@ async def run_talk_session(
                     or continuation_pending
                     or bool(tool_coordinator.outputs)
                     or speaker_busy()
+                    or relay.operator_speaking
                 ),
                 lambda waited: on_error(
                     f"an update has been waiting {waited:.0f}s for a safe opening"
