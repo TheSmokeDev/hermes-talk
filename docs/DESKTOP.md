@@ -50,6 +50,30 @@ of the contract gets the stock lane in the composer instead of a half driven
 controller; the four additions above arrive together or not at all, and the panel
 says which build the floating window needs.
 
+### Renderer-only Realtime voice
+
+When Desktop exposes the canonical composer voice controller, a separate
+**Hermes voice** action can use OpenAI Realtime for microphone input and
+playback while Hermes remains the only answer path. Finalized transcripts go
+through the focused conversation's `submitText`; the renderer subscribes to
+the resulting canonical assistant response and asks Realtime to speak that text
+verbatim. This session is minted with no tools and automatic response disabled.
+It requires `TALK_VOICE_MODE=native`; it does not change the existing Talk,
+GPT-Live, cascade, or dashboard routes. Navigation, a rejected composer submit,
+or stopping the action releases the microphone and closes the renderer session.
+
+The action is available only in a host build that exposes `acquire(signal)`,
+`submitText`, `subscribeAssistant`, `latestAssistant`, and `interrupt` on its
+composer controller, plus a resolved immutable owner containing the exact
+connection, profile, runtime session and stored session for that composer. The
+owner must match Desktop's focused conversation before the action can start;
+missing or mismatched identity leaves it disabled. The currently published
+contract in [Hermes PR #100666](https://github.com/NousResearch/hermes-agent/pull/100666)
+does not expose that owner identity, so that PR alone is not sufficient and the
+action remains unavailable until the host adds the scoped owner contract. This
+renderer integration has offline contract tests; it does not claim live
+microphone or provider validation.
+
 ### Hosts without task context
 
 Attaching Talk to the conversation also needs support from the Hermes backend:

@@ -14,6 +14,15 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- An opt-in **Hermes voice** action in Desktop. It sends finalized speech to
+  the controller-bound Hermes composer and speaks only the resulting Hermes
+  answer. The Realtime session has no tools and cannot auto-answer. It requires
+  a resolved composer owner for the exact connection, profile, runtime session
+  and stored session; missing or mismatched ownership refuses before minting or
+  microphone acquisition. Hermes PR #100666's currently published contract
+  does not expose this owner identity, so that PR alone does not activate the
+  action. The plugin has offline contract tests, not live microphone or provider
+  validation. Contributed by @TheAngryPit. (#80)
 - Grok realtime accepts all 28 built-in voices documented by xAI, adding
   `carina`, `zagan`, `helix`, `orion`, `luna`, `iris`, `altair`, `zenith`,
   `perseus`, `helios`, `lux`, `kepler`, `rigel`, `cosmo`, `celeste`, `ursa`,

@@ -151,6 +151,323 @@ assert.equal(disposers.length,1);disposers[0]();
 """)
 
 
+def test_renderer_relay_uses_canonical_composer_and_release_only_lease():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const composerOwner={connectionId:'connection-b',profile:'profile-b',
+  sessionId:'pane-b',storedSessionId:'stored-b'};
+hostState.focusedSessionOwner.set({connectionId:composerOwner.connectionId,profile:composerOwner.profile});
+hostState.focusedSessionId.set(composerOwner.sessionId);
+hostState.focusedStoredSessionId.set(composerOwner.storedSessionId);
+hostState.focusedSessionProfile.set(composerOwner.profile);
+let acquiredSignal, releases=0;
+const channel={readyState:'open',listeners:{},addEventListener(type,fn){this.listeners[type]=fn;
+  if(type==='open')queueMicrotask(fn);},send(){},close(){}};
+class Peer {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){}
+  addTrack(){}
+  createDataChannel(){return channel;}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){}
+  async setRemoteDescription(){}
+  close(){}
+}
+const track={enabled:true,stop(){}};
+const submitted=[];
+context.RTCPeerConnection=Peer;
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+HermesSDK.useComposerVoiceController=()=>({
+  owner:composerOwner,
+  acquire:async signal=>{acquiredSignal=signal;return {release(){releases++;}};},
+  submitText:text=>{submitted.push(text);return true;},
+  subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+host.rest=async(path,options)=>{
+  calls.push({path,options});
+  return {mode:'desktop-relay',clientSecret:'ephemeral',offerUrl:'https://relay.invalid',voice:'cedar'};
+};
+context.plugin.register(host);
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.type,'button');
+button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(acquiredSignal instanceof AbortSignal,true);
+assert.equal(calls[0].path,'/session');
+assert.equal(calls[0].options.scope.connectionId,composerOwner.connectionId);
+assert.equal(calls[0].options.scope.profile,composerOwner.profile);
+channel.listeners.message({data:JSON.stringify({
+  type:'conversation.item.input_audio_transcription.completed',transcript:'from tile B'
+})});
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.deepEqual(submitted,['from tile B'],
+  'the minted session and canonical submit use the same tile-bound controller owner');
+assert.equal(releases,0);
+disposers[0]();
+assert.equal(releases,1,'plugin disposal releases the host lease');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_renderer_relay_fails_closed_without_resolved_composer_owner():
+    run_node(r"""
+stockHooks();
+let acquired=0;
+HermesSDK.useComposerVoiceController=()=>({
+  acquire:async()=>{acquired++;return {release(){}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.props.disabled,true);
+assert.match(button.props.title,/resolved composer owner/);
+button.props.onClick();
+assert.equal(acquired,0,'an ownerless Core controller cannot start microphone capture');
+assert.equal(calls.length,0,'an ownerless Core controller cannot mint a Realtime session');
+""")
+
+
+def test_renderer_relay_refuses_global_focus_that_differs_from_composer_owner():
+    run_node(r"""
+stockHooks();
+let acquired=0;
+const otherOwner={connectionId:'connection-b',profile:'profile-b',
+  sessionId:'pane-b',storedSessionId:'stored-b'};
+HermesSDK.useComposerVoiceController=()=>({owner:otherOwner,
+  acquire:async()=>{acquired++;return {release(){}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true
+});
+const action=context.DesktopRealtimeAction();
+const button=action.children[0];
+assert.equal(button.props.disabled,true);
+assert.match(button.props.title,/does not match this composer/);
+button.props.onClick();
+assert.equal(acquired,0,'mismatched focus is refused before mic acquisition');
+assert.equal(calls.length,0,'mismatched focus is refused before provider session mint');
+""")
+
+
+def test_renderer_relay_stops_when_global_focus_leaves_bound_composer():
+    run_node(r"""
+(async()=>{
+const refs=[];let refIndex=0,effects=[];
+React.useRef=value=>{
+  const index=refIndex++;
+  if(!refs[index])refs[index]={current:value};
+  return refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>{effects.push(effect);};
+const owner={connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'};
+let composer={owner,async acquire(){return {release(){releases++;}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true};
+HermesSDK.useComposerVoiceController=()=>composer;
+const render=()=>{refIndex=0;effects=[];const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],effects};};
+let releases=0,trackStops=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',addEventListener(type,listener){
+    if(type==='open')queueMicrotask(()=>listener());},send(){},close(){}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>({mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'});
+context.plugin.register(host);
+let action=render();action.effects.at(-1)();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(trackStops,0);assert.equal(releases,0);
+hostState.focusedSessionOwner.set({connectionId:'connection-b',profile:'profile-b'});
+hostState.focusedSessionId.set('pane-b');hostState.focusedStoredSessionId.set('stored-b');
+hostState.focusedSessionProfile.set('profile-b');
+action=render();action.effects.at(-1)();
+assert.equal(trackStops,1,'leaving the bound composer focus closes active capture');
+assert.equal(releases,1,'leaving the bound composer focus releases its Core lease');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_same_owner_composer_invalidation_stops_capture_and_rejects_stale_acquire():
+    run_node(r"""
+(async()=>{
+const refs=[];let refIndex=0,effects=[];
+React.useRef=value=>{
+  const index=refIndex++;
+  if(!refs[index])refs[index]={current:value};
+  return refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>{effects.push(effect);};
+let currentComposer;
+HermesSDK.useComposerVoiceController=()=>currentComposer;
+const render=()=>{refIndex=0;effects=[];const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],invalidate:effects.at(-1)};};
+const makeComposer=acquire=>({owner:{connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'},acquire,submitText:()=>true,
+  subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true});
+let releases=0,mediaCalls=0,trackStops=0;
+let sessionCalls=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',listeners:{},
+    addEventListener(type,listener){this.listeners[type]=listener;
+      if(type==='open')queueMicrotask(()=>{this.readyState='open';listener();});},
+    send(){},close(){this.readyState='closed';this.listeners.close?.();}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){mediaCalls++;
+  return {getTracks:()=>[track],getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>{sessionCalls++;return {mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'};};
+context.plugin.register(host);
+currentComposer=makeComposer(async()=>({release(){releases++;}}));
+let action=render();action.invalidate();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(mediaCalls,1);assert.equal(trackStops,0);assert.equal(releases,0);
+
+currentComposer=makeComposer(async()=>({release(){releases++;}}));
+action=render();action.invalidate();
+assert.equal(trackStops,1,'a refreshed controller for the same owner releases active capture');
+assert.equal(releases,1,'the refreshed controller releases its original Core lease');
+
+action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(mediaCalls,2);
+currentComposer=null;
+action=render();action.invalidate();
+assert.equal(trackStops,2,'disabling the composer releases active capture');
+assert.equal(releases,2,'disabling the composer releases the Core lease');
+
+let finishAcquire,acquireSignal,staleReleases=0;
+currentComposer=makeComposer(signal=>{
+  acquireSignal=signal;
+  return new Promise(resolve=>{finishAcquire=resolve;});
+});
+action=render();action.invalidate();action.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(typeof finishAcquire,'function');
+currentComposer=null;
+action=render();action.invalidate();
+assert.equal(acquireSignal.aborted,true,'controller invalidation aborts pending lease acquisition');
+finishAcquire({release(){staleReleases++;}});
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.equal(staleReleases,1,'a late lease is released after its controller expires');
+assert.equal(mediaCalls,2,'an expired controller never starts microphone capture');
+assert.equal(sessionCalls,2,'an expired controller never opens a backend voice session');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_late_cleanup_from_an_old_relay_preserves_the_current_relay():
+    run_node(r"""
+let oldStopped=0,currentStopped=0;
+const oldRelay={stop(){oldStopped++;}};
+const currentRelay={stop(){currentStopped++;}};
+const before=7;
+context.oldRelay=oldRelay;context.currentRelay=currentRelay;context.generationBefore=before;
+vm.runInContext(`activeDesktopRelay=currentRelay;desktopRelayGeneration=generationBefore;
+  stopDesktopRelay(oldRelay);globalThis.cleanupResult={active:activeDesktopRelay,
+    generation:desktopRelayGeneration};`,context);
+assert.equal(context.cleanupResult.active,currentRelay,
+  'cleaning a stale relay must not detach the current microphone session');
+assert.equal(context.cleanupResult.generation,before,
+  'cleaning a stale relay must not invalidate the current start attempt');
+assert.equal(oldStopped,1);assert.equal(currentStopped,0);
+""")
+
+
+def test_unrelated_composer_actions_cannot_stop_or_steal_the_active_relay():
+    run_node(r"""
+(async()=>{
+const instances=new Map();let activeInstance;
+React.useRef=value=>{
+  const state=instances.get(activeInstance),index=state.refIndex++;
+  if(!state.refs[index])state.refs[index]={current:value};
+  return state.refs[index];
+};
+React.useState=initial=>[typeof initial==='function'?initial():initial,()=>{}];
+React.useEffect=effect=>instances.get(activeInstance).effects.push(effect);
+let composer;
+HermesSDK.useComposerVoiceController=()=>composer;
+const render=instance=>{
+  if(!instances.has(instance))instances.set(instance,{refs:[],refIndex:0,effects:[]});
+  activeInstance=instance;
+  const state=instances.get(instance);state.refIndex=0;state.effects=[];
+  const tree=context.DesktopRealtimeAction();
+  return {button:tree.children[0],effects:[...state.effects]};
+};
+const makeComposer=()=>({owner:{connectionId:'connection-a',profile:'profile-a',
+  sessionId:'pane-a',storedSessionId:'stored-a'},async acquire(){return {release(){releases++;}};},
+  submitText:()=>true,subscribeAssistant:()=>()=>{},latestAssistant:()=>null,interrupt:()=>true});
+let releases=0,trackStops=0;
+const track={enabled:true,stop(){trackStops++;}};
+context.RTCPeerConnection=class {
+  constructor(){this.connectionState='connected';}
+  addEventListener(){} addTrack(){}
+  createDataChannel(){return {readyState:'connecting',addEventListener(type,listener){
+    if(type==='open')queueMicrotask(()=>listener());},send(){},close(){}};}
+  async createOffer(){return {sdp:'local-sdp'};}
+  async setLocalDescription(){} async setRemoteDescription(){}
+  close(){this.connectionState='closed';}
+};
+context.navigator={mediaDevices:{async getUserMedia(){return {getTracks:()=>[track],
+  getAudioTracks:()=>[track]};}}};
+context.document={body:{appendChild(){}},createElement(){return {style:{},remove(){}};}};
+context.fetch=async()=>({ok:true,text:async()=>'remote-sdp'});
+host.rest=async()=>({mode:'desktop-relay',clientSecret:'ephemeral',
+  offerUrl:'https://relay.invalid',voice:'cedar'});
+context.plugin.register(host);
+
+composer=makeComposer();
+const first=render('first');
+const firstCleanups=first.effects.map(effect=>effect());
+first.button.props.onClick();
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(trackStops,0);assert.equal(releases,0);
+
+composer=makeComposer();
+let second=render('second');
+const secondCleanups=second.effects.map(effect=>effect());
+assert.equal(trackStops,0,'mounting a same-owner action cannot stop the active relay');
+assert.equal(releases,0);
+
+composer=makeComposer();
+second=render('second');second.effects.at(-1)();
+second.button.props.onClick();
+assert.equal(trackStops,0,'refreshing and starting another action cannot steal the microphone');
+assert.equal(releases,0);
+secondCleanups[2]();
+assert.equal(trackStops,0,'unmounting an unrelated action leaves capture active');
+assert.equal(releases,0);
+
+first.button.props.onClick();
+assert.equal(trackStops,1,'the action that acquired the relay can stop its capture');
+assert.equal(releases,1,'the owning action releases the Core lease');
+firstCleanups[2]?.();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
 @pytest.mark.parametrize("status", [401, 403, 503])
 def test_desktop_exposes_http_status_inside_electron_errors(status):
     run_node(r"""
@@ -205,7 +522,7 @@ HermesSDK.useComposerVoiceController=()=>controller;
 HermesSDK.Popover='popover';HermesSDK.PopoverTrigger='popover-trigger';
 HermesSDK.PopoverContent='popover-content';
 const tree=context.DesktopTalkAction();
-const popover=tree.children[0];
+const popover=tree.children[0].children[0];
 assert.equal(popover.type,'popover');assert.equal(popover.props.modal,false);
 assert.equal(popover.children[0].children[0].props.type,'button');
 popover.props.onOpenChange(true);assert.equal(calls.length,0);assert.equal(acquires,0);
