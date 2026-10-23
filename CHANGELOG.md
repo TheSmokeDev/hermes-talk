@@ -38,8 +38,8 @@ named rather than smoothed.
 
 ### Fixed
 - Background announcements wait while provider speech events mark the operator
-  as speaking, including an atomic send-lock re-check. Matching stops release
-  the gate; a 120-second stale-event bound prevents a missing stop from holding
+  as speaking, including an atomic send-lock re-check. Matching stops, or the next
+  response opening, release the gate; a 120-second stale-event bound prevents a missing stop from holding
   updates forever (#90). See the operating guide for the long-utterance tradeoff.
 - Capability-catalog and CLI prompt tests isolate ambient Hermes registries and
   restore import state after explicit test fakes, so an installed host cannot

@@ -156,3 +156,31 @@ def test_missing_stop_event_cannot_hold_an_announcement_forever(monkeypatch):
                 await pump
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_gemini_shaped_stream_releases_speech_when_the_next_response_starts(wire):
+    """Start, no stop, then a response: the missing stop cannot outlast the turn."""
+    now = [0.0]
+    relay = talk_relay.RealtimeRelay(speech_clock=lambda: now[0])
+    if wire:
+        relay.handle_event({"type": "input_audio_buffer.speech_started", "item_id": "turn-1"})
+    else:
+        relay.handle_realtime_event(rt.SpeechStarted(input_id="turn-1"))
+    assert relay.operator_speaking
+    now[0] = 5.0  # well inside the stale window: only the response start can release it
+    if wire:
+        relay.handle_event({"type": "response.created", "response": {"id": "resp-1"}})
+    else:
+        relay.handle_realtime_event(rt.ResponseStarted(response_id="resp-1"))
+    assert not relay.operator_speaking
+
+
+def test_replayed_settled_response_does_not_release_operator_speech():
+    relay = talk_relay.RealtimeRelay()
+    relay.handle_realtime_event(rt.ResponseStarted(response_id="old"))
+    relay.handle_realtime_event(rt.SpeechStarted(input_id="turn"))  # barge-in cancels "old"
+    assert relay.operator_speaking
+    relay.handle_realtime_event(rt.ResponseStarted(response_id="old"))  # replayed start
+    assert relay.operator_speaking
+

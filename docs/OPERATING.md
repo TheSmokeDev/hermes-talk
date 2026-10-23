@@ -930,7 +930,9 @@ stuck or playback is wedged, because a pump that never opens is otherwise
 indistinguishable from a quiet session.
 
 Operator speech is tracked for both provider-neutral and legacy wire events.
-A matching speech-stop releases it; a late stop for an older named utterance
+A matching speech-stop releases it, and so does the next response opening
+(not every provider sends a stop: Gemini reports a start on an interruption and
+never a stop); a late stop for an older named utterance
 does not clear a newer one. A missing stop cannot hold updates forever:
 `OPERATOR_SPEECH_STALE_S` in `talk_relay.py` bounds this state to 120 seconds,
 without extending the deadline for duplicate starts of the same utterance.

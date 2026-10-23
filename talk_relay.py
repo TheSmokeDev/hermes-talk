@@ -334,6 +334,11 @@ class RealtimeRelay:
         self._unnamed_response_cancelled = False
         self._response_in_flight = True
         self._active_response_id = response_id
+        # A response opening means the turn the operator was speaking in is
+        # over. Not every provider sends a speech stop (Gemini emits
+        # SpeechStarted on an interruption and never SpeechStopped), so a
+        # missing stop must not outlast the turn.
+        self._clear_operator_speech()
 
     def _cancel_active_response(self) -> bool:
         """Settle the response a barge-in interrupts; False if there is none.
