@@ -41,6 +41,9 @@ named rather than smoothed.
   as speaking, including an atomic send-lock re-check. Matching stops release
   the gate; a 120-second stale-event bound prevents a missing stop from holding
   updates forever (#90). See the operating guide for the long-utterance tradeoff.
+- Capability-catalog and CLI prompt tests isolate ambient Hermes registries and
+  restore import state after explicit test fakes, so an installed host cannot
+  supply unexpected catalog results (#93). Production discovery is unchanged.
 - `hermes plugins enable hermes-talk` no longer fails with a
   `DependencyConflict` on current Hermes. Hermes locks every extra of a plugin
   in its own workspace, so the exact `ruff==0.16.10` in the dev extra had to
@@ -48,6 +51,14 @@ named rather than smoothed.
   pin moved to `requirements-lint.txt`, which only CI and contributors
   install, and a hygiene test now refuses an exact pin in any extra. Thanks
   to the reporters on #180.
+- State-changing voice tools such as `delegate_task` work again on the Grok
+  lane in Discord. xAI's `response.created` never echoes the speaker-binding
+  metadata, so every such call was denied as an unbound response. On Grok the
+  ledger now binds the one response it asked for, by order, and only when
+  exactly one binding is outstanding and the event carries no metadata at
+  all. An unknown echoed token or an ambiguous second binding still fails
+  closed, and providers that echo are unchanged. Thanks to the reporter on
+  #178.
 
 ## [0.21.1] — 2026-09-26
 

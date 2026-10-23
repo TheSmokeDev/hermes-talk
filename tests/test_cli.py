@@ -259,7 +259,7 @@ def test_a_multi_speaker_transport_without_a_ledger_is_refused(monkeypatch, caps
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("TALK_VOICE", raising=False)
     monkeypatch.setattr(
-        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda: None
+        talk_cli.talk_operator_auth, "DiscordToolAuthorizationLedger", lambda **_kw: None
     )
 
     def never():  # pragma: no cover - must not be reached
@@ -2279,13 +2279,15 @@ def _capture_instructions(monkeypatch, tmp_path):
     return seen
 
 
-def test_the_cli_lane_and_host_summary_ride_the_minted_prompt(monkeypatch, tmp_path):
+def test_the_cli_lane_and_host_summary_ride_the_minted_prompt(
+    monkeypatch, tmp_path, isolated_capability_catalog
+):
     seen = _capture_instructions(monkeypatch, tmp_path)
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
     assert seen["lane"] == "cli"
-    # Under pytest the catalog's REST lane is inert, so the cold cache has no
-    # answer — and no line — rather than a stalled session start.
+    # The fixture isolates in-process discovery, and pytest keeps REST inert:
+    # no ambient Hermes installation can contribute a host-summary line.
     assert seen["host_summary"] is None
     assert talk_identity.LANE_LINES["cli"] in seen["instructions"]
 

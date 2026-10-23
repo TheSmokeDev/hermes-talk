@@ -512,7 +512,7 @@ def test_malformed_response_id_consumes_echoed_authority_before_terminal_failure
     monkeypatch.setattr(
         talk_cli.talk_operator_auth,
         "DiscordToolAuthorizationLedger",
-        lambda: ledger,
+        lambda **_kw: ledger,
     )
 
     result, _audio = _run(fake, audio)
@@ -566,7 +566,7 @@ def test_cancellation_during_connect_closes_every_session_owned_resource(monkeyp
         monkeypatch.setattr(
             talk_cli.talk_operator_auth,
             "DiscordToolAuthorizationLedger",
-            lambda: ledger,
+            lambda **_kw: ledger,
         )
         monkeypatch.setattr(
             talk_cli.talk_transcript,

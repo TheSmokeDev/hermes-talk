@@ -10,6 +10,37 @@ import threading
 import pytest
 import wallclock
 
+
+@pytest.fixture
+def isolated_capability_catalog(monkeypatch):
+    """Keep ambient Hermes registries out of tests that own catalog discovery.
+
+    In-process tests can replace these entries with their own fake modules.
+    Restrict this fixture to catalog consumers that request it; other host
+    integration tests retain their own discovery setup.
+    """
+    import talk_capabilities
+
+    for name in (
+        "hermes_cli",
+        "hermes_cli.config",
+        "hermes_cli.tools_config",
+        "tools",
+        "tools.skills_tool",
+        "toolsets",
+        "model_tools",
+    ):
+        # Use the same monkeypatch stack as each test's explicit fake modules.
+        # Nested contexts would restore in the wrong order at fixture teardown.
+        monkeypatch.setitem(sys.modules, name, None)
+    talk_capabilities.reset_for_tests()
+    try:
+        yield
+    finally:
+        # Invalidate pending writes before monkeypatch restores ambient modules.
+        talk_capabilities.reset_for_tests()
+
+
 # Tests that assert ORDERING UNDER A REAL WALL-CLOCK DEADLINE against a scripted local peer:
 # a liveness probe racing a subprocess RPC, a cancel or approval deadline, a 25 s decision
 # window, a late receipt after a switch. They pass on every Linux job and on every developer

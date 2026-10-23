@@ -1632,7 +1632,10 @@ async def run_talk_session(
         getattr(audio, "discord_speaker_authorization", False)
     )
     authorization_ledger = (
-        talk_operator_auth.DiscordToolAuthorizationLedger()
+        talk_operator_auth.DiscordToolAuthorizationLedger(
+            # xAI's response.created never echoes the metadata we send.
+            echoes_response_metadata=provider != "grok",
+        )
         if discord_authorization
         else None
     )
