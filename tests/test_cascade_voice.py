@@ -947,11 +947,28 @@ def _doctor_cascade(report: dict) -> dict:
     return {check["id"]: check for check in report["checks"]}["cascade"]
 
 
-def test_doctor_cascade_native_is_inactive_pass(monkeypatch):
+@pytest.mark.parametrize("mode", [None, "native", "live"])
+def test_doctor_cascade_is_inactive_outside_cascade_mode(monkeypatch, mode):
     _scrub_elevenlabs_env(monkeypatch)
+    if mode is not None:
+        monkeypatch.setenv("TALK_VOICE_MODE", mode)
     check = _doctor_cascade(talk_doctor.collect_report())
     assert check["status"] == "pass"
-    assert check["details"]["voice_mode"] == "native"
+    assert check["details"]["voice_mode"] == (mode or "native")
+    assert "cascade lane is inactive" in check["summary"]
+    assert check["remediation"] == []
+
+
+@pytest.mark.parametrize("mode", ["native", "live"])
+def test_doctor_ignores_unused_cascade_settings(monkeypatch, mode):
+    _scrub_elevenlabs_env(monkeypatch)
+    monkeypatch.setenv("TALK_VOICE_MODE", mode)
+    monkeypatch.setenv("TALK_CASCADE_TTS", "unsupported")
+    monkeypatch.setenv("TALK_ELEVENLABS_API_KEY", "  ")
+    check = _doctor_cascade(talk_doctor.collect_report())
+    assert check["status"] == "pass"
+    assert check["details"]["voice_mode"] == mode
+    assert check["remediation"] == []
 
 
 def test_doctor_cascade_rejects_unknown_voice_mode(monkeypatch):

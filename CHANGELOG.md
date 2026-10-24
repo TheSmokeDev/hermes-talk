@@ -37,6 +37,10 @@ named rather than smoothed.
   [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
 ### Fixed
+- `hermes talk doctor` no longer requires ElevenLabs credentials when
+  `TALK_VOICE_MODE=live`. Only cascade mode validates the ElevenLabs settings;
+  native and GPT-Live modes report that the cascade lane is inactive. Thanks
+  to @Sterling-Automation for reporting #198.
 - Capability-catalog and CLI prompt tests isolate ambient Hermes registries and
   restore import state after explicit test fakes, so an installed host cannot
   supply unexpected catalog results (#93). Production discovery is unchanged.

@@ -693,11 +693,11 @@ def _cascade_check() -> dict[str, Any]:
             {"voice_mode": (raw_mode or "").strip().lower() or None, "source": source},
             (f"Set TALK_VOICE_MODE to {' or '.join(talk_config.TALK_VOICE_MODES)}, or unset it.",),
         )
-    if mode == "native":
+    if mode != "cascade":
         return _check(
             "cascade",
             "pass",
-            "voice mode is native; the cascade lane is inactive",
+            f"voice mode is {mode}; the cascade lane is inactive",
             {"voice_mode": mode, "source": source},
         )
 

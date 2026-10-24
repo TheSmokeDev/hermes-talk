@@ -1100,6 +1100,40 @@ def test_cli_parser_passes_the_probe_flag(monkeypatch):
     assert seen == [{"json_output": False, "probe": True}]
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+def test_live_doctor_succeeds_without_elevenlabs(monkeypatch, tmp_path, capsys, json_output):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_LIVE_AUTH", "subscription")
+    monkeypatch.setenv("TALK_LIVE_SUBSCRIPTION_MODEL", "gpt-live-1-codex")
+    monkeypatch.setenv("TALK_LIVE_SUBSCRIPTION_VOICE", "cove")
+    for name in (
+        "TALK_LIVE_MODEL",
+        "TALK_LIVE_VOICE",
+        "TALK_ELEVENLABS_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "TALK_ELEVENLABS_VOICE_ID",
+        "TALK_CASCADE_TTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+    parser = argparse.ArgumentParser()
+    talk_cli.setup_cli(parser)
+    args = parser.parse_args(["doctor", "--json"] if json_output else ["doctor"])
+
+    assert talk_cli.cli_entry(args) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        report = json.loads(output)
+        assert report["ok"] is True
+        assert _checks(report)["cascade"]["status"] == "pass"
+        assert _checks(report)["cascade"]["details"]["voice_mode"] == "live"
+    else:
+        assert "[PASS] cascade: voice mode is live; the cascade lane is inactive" in output
+    assert "ElevenLabs" not in output
+
+
 def test_live_mode_reports_the_live_model_not_talk_model(monkeypatch):
     monkeypatch.setenv("TALK_VOICE_MODE", "live")
     monkeypatch.setenv("TALK_MODEL", "gpt-realtime-2.1")
