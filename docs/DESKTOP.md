@@ -63,8 +63,10 @@ dashboard's legacy Talk does, on either Desktop lane:
   session rather than inside this conversation's history.
 - **GPT-Live does not.** It always runs on an attached task, so the panel refuses
   it before connecting and names the missing host support.
-- **Other recipients are unavailable.** The panel says so instead of reporting a
-  failed request, and the conversation list under Advanced stays empty.
+- **The canonical task-recipient picker is unavailable.** The panel says so
+  instead of reporting a failed request, and the task list under Advanced stays
+  empty. The Desktop session controls below use the host SDK separately and can
+  still create, inspect, message and steer Desktop conversations by voice.
 
 Desktop plugin requests travel over IPC, so they never appear in the devtools
 Network tab. A refused request shows its status and error code in the panel and

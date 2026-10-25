@@ -38,6 +38,31 @@ approval — once, this session, or no?" While that question is open the
 generic "waiting on an approval" milestone stays silent — the question is
 the actionable sentence.
 
+## Desktop session control (0.22.0)
+
+These tools are available in an unbound OpenAI Realtime call in Desktop when
+the public host SDK supports them. They stay on the call's captured connection
+and profile; they are not advertised to Discord or terminal callers. The
+canonical recipient picker is a separate host capability.
+
+| Say something like | Tool fired | What the receipt proves |
+|---|---|---|
+| "What projects can I work in?" | `desktop_projects` | Registered project folders, or clearly labelled directories from saved sessions on hosts without a project catalog |
+| "Show my sessions" / "Find the session named Website" | `desktop_list_sessions` | Scoped saved conversations with IDs; duplicate titles require choosing a specific ID |
+| "Start a session in that project and run its tests" | `desktop_create_session` | A new session and an admitted opening turn; the chosen directory must come from the project inventory |
+| "How is that agent getting on?" | `desktop_session_status` | Saved replies, bounded in-progress text, tasks and approval waits; unfinished output is labelled unfinished |
+| "Tell that session to check the parser next" | `desktop_message_session` with `queue` | A queued or started follow-up, not proof the work has finished |
+| "Steer that running session toward the smaller fix" | `desktop_message_session` with `steer` | The steering note was queued, not proof it was consumed; a later progress read can establish the result |
+| "Check my Desktop capabilities" | `desktop_capabilities` | Enabled/configured toolsets and installed skills from the host's actual catalog |
+| "What scheduled jobs do I have?" | `desktop_scheduled_jobs` | The current profile's job report, including paused jobs; nothing is created or run |
+| "Check messaging setup" | `desktop_messaging` | Hermes's common platform configuration report, not all connectors or a delivery test |
+
+Creating or addressing another session keeps the current voice owner unchanged.
+New sessions use Standard speed and the owning profile's model/reasoning defaults.
+An empty-session request gets a brief opening message so the new conversation
+appears in Desktop's sidebar. External messaging sends, job writes and arbitrary
+screen control are outside these tools. See [Desktop setup](DESKTOP.md).
+
 ## Steer vs redirect vs stop — three sentences
 
 - **Steer** queues a note the agent reads at its next natural step; its

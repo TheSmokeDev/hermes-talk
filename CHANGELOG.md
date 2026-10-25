@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-10-25
+
+Run your Desktop sessions by voice: choose a project directory, start work in a
+new conversation, check another agent's progress, and send or steer instructions
+without leaving the call. Verified end to end over a real Desktop SSH connection.
+
 ### Added
 - OpenAI Realtime calls in Desktop can list conversations, create a new
   conversation with an opening message, read Desktop capabilities, and inspect

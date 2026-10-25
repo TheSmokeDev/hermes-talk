@@ -11,7 +11,7 @@
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
 
-Hermes Talk is a realtime voice plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): you speak, it answers out loud, and it calls the agent's own tools without leaving the conversation. It runs in the terminal (`hermes talk`), in a Discord voice channel (`/talk join`), and in the Hermes dashboard **Talk** tab.
+Hermes Talk is a realtime voice plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): you speak, it answers out loud, and it calls the agent's own tools without leaving the conversation. It runs in the terminal (`hermes talk`), in a Discord voice channel (`/talk join`), in the Hermes dashboard **Talk** tab, and in [Hermes Desktop](docs/DESKTOP.md).
 
 **It rides your ChatGPT or SuperGrok subscription. No API key required.**
 
@@ -38,13 +38,19 @@ different shape, and a good one.
 ## Install
 
 ```bash
-hermes plugins install TheSmokeDev/hermes-talk --enable
+hermes plugins install --ref v0.22.0 TheSmokeDev/hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 ```
 
 Needs Python ≥ 3.11 and a Hermes host ≥ v0.17. GPT-Live, shared task attachment
 and Codex workers need additional host capabilities; the full list is in
 [Prerequisites](docs/OPERATING.md#prerequisites).
+
+The explicit release ref matters: Hermes's community catalog may still pin an
+older version. For an existing pinned install, preserve local plugin edits,
+then reinstall with `hermes plugins install --force --ref v0.22.0 --enable
+TheSmokeDev/hermes-talk`. Restart the gateway/dashboard and Desktop afterward.
+An unpinned Git install can use `hermes plugins update hermes-talk`.
 
 ## Quickstart
 
@@ -77,14 +83,34 @@ hermes dashboard    # then open the Talk tab and hit Start
 Allow the microphone and talk. You see the live transcript plus a list of
 background runs. → [Dashboard tab](docs/OPERATING.md#dashboard-tab)
 
-## New in 0.20.0
+## New in 0.22.0: run your Desktop sessions by voice
 
-- A floating Talk panel shared by the dashboard tab and the Desktop Talk view, with a runtime that survives collapsing the controls and browsing other tasks.
-- `POST /text/input` and a `textInput` descriptor on `GET /status`: one authenticated route for explicit operations from the panel.
-- Live replay — `POST /live/speech` with `replay:true` re-announces a terminal result into the exact bound Live session.
-- `POST /native/attach` accepts `input_mode:"typed"` for microphone-off use that mints no voice credentials, plus read-only recipient catalog, history, status and selection routes.
-- Result presentation across transports: result ready, context submitted, playback started, playback finished, interrupted and unknown stay separate facts; native terminal and Discord gain `/replay EVENT_ID`.
-- Talk inside the current Desktop conversation, plug-and-play: open a conversation, **Talk**, **Connect**.
+With **OpenAI Realtime** in Desktop, you can now say:
+
+- “Start a new session for this project and run its tests.”
+- “Check what the other agent is working on.”
+- “Tell that session to check the failing test next.”
+- “Steer the running session toward this approach.”
+- “Show my capabilities, scheduled jobs, and messaging status.”
+
+Talk discovers the actual project directories and saved conversations on the
+current connection/profile. It creates a separate session with your opening
+task, reads live progress and recent replies, and queues or steers your
+instructions while the original call stays connected. Local and SSH backends
+use their own supported session contracts. A queued message is reported as
+accepted, not completed.
+
+Also fixed: Stop → Connect in the same conversation, Hermes-managed ChatGPT
+login detection, the current Hermes capability catalog, and typed input during
+unbound realtime calls. Grok's expanded built-in voice list and a speech-tag
+reference are included too.
+
+Tested on stock Hermes **v0.22.5** over SSH, including creating a session in a
+chosen directory, a real `pwd` tool call, a follow-up to another session, and
+steering a running task. These Desktop controls stay within the selected
+connection/profile. They do not add arbitrary screen control or external
+message sending. GPT-Live and shared voice-history attachment still require
+the additional host support described in the [Desktop guide](docs/DESKTOP.md).
 
 Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 
