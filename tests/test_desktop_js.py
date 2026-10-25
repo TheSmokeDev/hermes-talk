@@ -330,8 +330,10 @@ const result=lostMethod==='session.create'
     session_id:'stored-a',text:'Next instruction',
     mode:lostMethod==='session.steer'?'steer':'queue'},{callId:'lost-1'});
 assert.equal(writes,1);assert.equal(result.ok,false);
-assert.equal(lostMethod==='session.create' ? result.creation_uncertain : result.delivery_uncertain,true);
-assert(result.note.includes('unconfirmed'));assert(result.note.includes('Do not automatically repeat'));
+assert.equal(lostMethod==='session.create'
+ ? result.creation_uncertain : result.delivery_uncertain,true);
+assert(result.note.includes('unconfirmed'));
+assert(result.note.includes('Do not automatically repeat'));
 if(lostMethod!=='session.create') assert.equal(result.session_id,'stored-a');
 })();
 """)
