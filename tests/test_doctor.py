@@ -52,6 +52,7 @@ def _write_oauth(home: Path, *, access: str, refresh: str = "refresh-secret") ->
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-missing"))
     for name in (
@@ -86,6 +87,27 @@ def _hermetic(monkeypatch, tmp_path):
 
 def _checks(report: dict) -> dict[str, dict]:
     return {check["id"]: check for check in report["checks"]}
+
+
+def test_doctor_accepts_hermes_managed_codex_login(monkeypatch, capsys):
+    token = _jwt_with_exp(time.time() + 3600)
+    module = types.ModuleType("hermes_cli.auth_codex")
+
+    def resolve(*, read_only=False):
+        assert read_only is True
+        return {"api_key": token}
+
+    module.resolve_codex_runtime_credentials = resolve
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+    monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
+    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
+
+    assert talk_doctor.cli_entry(json_output=True) == 0
+    output = capsys.readouterr().out
+    auth = _checks(json.loads(output))["auth"]
+    assert auth["status"] == "pass"
+    assert auth["details"]["winning_lane"] == "codex-oauth"
+    assert token not in output
 
 
 def test_json_shape_is_stable_and_machine_readable(monkeypatch):

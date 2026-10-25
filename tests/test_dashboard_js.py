@@ -906,6 +906,56 @@ def test_dashboard_task_picker_rendering_and_page_generation_fences():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_native_typed_message_item_id_fits_provider_limit():
+    script = TASK_HARNESS + r"""
+(async()=>{
+window.crypto.randomUUID=()=> '01234567-89ab-4cde-8f01-23456789abcd';
+const t=new Transport({},callbacks);
+t.channel={readyState:'open',send:s=>sent.push(JSON.parse(s))};
+assert.equal(await t.sendTyped('Use my Desktop tools'),true);
+const item=sent.find(event=>event.type==='conversation.item.create').item;
+assert.equal(item.id.length,32);
+assert.equal(item.content[0].text,'Use my Desktop tools');
+})();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_desktop_tools_require_provider_ack_and_deduplicate_calls():
+    script = TASK_HARNESS + r"""
+(async()=>{
+const sdk=window.__HERMES_PLUGIN_SDK__;
+let writes=0;
+sdk.realtimeSessionPatch=session=>({type:'realtime',tools:[...session.tools,
+ {type:'function',name:'desktop_create_session',parameters:{type:'object',properties:{}}}]});
+sdk.executeLocalTool=async()=>{writes++;return {ok:true,session_id:'new-1'};};
+const t=new Transport({},callbacks);
+t.channel={readyState:'open',send:s=>sent.push(JSON.parse(s))};
+const event={name:'desktop_create_session',call_id:'call-1',arguments:'{}'};
+emit(t,{type:'session.created',session:{tools:[{name:'delegate_task'}]}});
+assert.equal(sent[0].type,'session.update');
+const refused=await t.handleFunctionCall(event);
+assert(refused.output.includes('not enabled')); assert.equal(writes,0);
+emit(t,{type:'session.updated',session:{tools:sent[0].session.tools}});
+const first=await t.handleFunctionCall(event);
+const retry=await t.handleFunctionCall(event);
+assert.equal(writes,1); assert.equal(first.output,retry.output);
+const conflict=await t.handleFunctionCall({...event,arguments:'{"title":"different"}'});
+assert(conflict.output.includes('Conflicting')); assert.equal(writes,1);
+assert.equal(requests.length,0,'local controls must not go to the Python tool endpoint');
+const bound=make();
+const count=sent.length;
+emit(bound,{type:'session.created',session:{tools:[]}});
+assert.equal(sent.length,count,'bound task must not gain unjournaled local tools');
+})();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_dashboard_serializes_tool_calls_and_continues_once_after_response_done():
     script = r"""
 const fs = require("fs");

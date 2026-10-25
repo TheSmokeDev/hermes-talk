@@ -141,13 +141,23 @@ def _catalog_from_host_modules() -> dict | None:
             _toolset_has_keys,
             get_nous_subscription_features,
         )
-        from tools.skills_tool import _find_all_skills, _sort_skills
+        from tools import skills_tool
         from toolsets import resolve_toolset
+
+        # Hermes 0.22 exposes these builders publicly. Older hosts used the
+        # underscored names; keep their catalog working without requiring an
+        # unrelated HTTP API server just to discover local capabilities.
+        find_skills = getattr(skills_tool, "find_all_skills", None)
+        sort_skills = getattr(skills_tool, "sort_skills", None)
+        if not callable(find_skills):
+            find_skills = skills_tool._find_all_skills
+        if not callable(sort_skills):
+            sort_skills = skills_tool._sort_skills
     except Exception as exc:  # noqa: BLE001 — no host registries in this process
         _log.debug("in-process catalog modules unavailable: %s: %s", type(exc).__name__, exc)
         return None
     try:
-        skills = _sort_skills(_find_all_skills(skip_disabled=False))
+        skills = sort_skills(find_skills(skip_disabled=False))
         config = load_config()
         enabled_toolsets = _get_platform_tools(
             config, "api_server", include_default_mcp_servers=False

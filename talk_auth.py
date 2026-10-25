@@ -8,10 +8,9 @@ order, fail-closed at every step:
    blank fails closed: no silent fall-through past an operator's explicit
    configuration.
 2. ``OPENAI_API_KEY`` — the shared environment key.
-3. External Codex CLI login (``$CODEX_HOME/auth.json`` or
-   ``~/.codex/auth.json`` in ChatGPT token mode) — the operator's ChatGPT
-   subscription. Expired access tokens refresh against the official OAuth
-   endpoint and write back atomically so the Codex CLI keeps working.
+3. Hermes-managed Codex OAuth, then the external Codex CLI login
+   (``$CODEX_HOME/auth.json`` or ``~/.codex/auth.json`` in ChatGPT token mode).
+   Hermes owns refreshes of its own store. Vendor CLI files remain read-only.
 
 API keys win by default to preserve the original contract. An explicit
 ``TALK_PREFER_CODEX_OAUTH=true`` reverses that choice and refuses key fallback
@@ -23,6 +22,7 @@ never log it.
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import time
@@ -296,6 +296,29 @@ def _resolve_codex_oauth(codex_home: Path | None = None) -> TalkAuth | None:
     )
 
 
+def _hermes_codex_oauth_state(now_s: float) -> str | None:
+    """Inspect the host's OAuth store only through its explicit read-only API."""
+
+    try:
+        from hermes_cli.auth_codex import resolve_codex_runtime_credentials
+
+        if "read_only" not in inspect.signature(resolve_codex_runtime_credentials).parameters:
+            return None
+        creds = resolve_codex_runtime_credentials(read_only=True)
+    except Exception:  # noqa: BLE001 - unavailable host auth keeps the vendor-file fallback
+        return None
+    token = creds.get("api_key") if isinstance(creds, dict) else None
+    if not isinstance(token, str) or not token:
+        return None
+    _payload, malformed_jwt = _decode_jwt_payload(token)
+    if malformed_jwt:
+        return None
+    expires_s = _decode_jwt_expiry_s(token)
+    if expires_s is not None and expires_s <= now_s + _REFRESH_MARGIN_S:
+        return "expired"
+    return "valid"
+
+
 def resolve_auth(
     *,
     env: Mapping[str, str] | None = None,
@@ -382,19 +405,21 @@ def auth_diagnostic(
     )
     metered_key_present = "present" in {scoped_state, shared_state}
 
-    auth_path = _codex_auth_path(codex_home)
-    oauth_state = "missing"
-    data = _read_codex_auth_json(auth_path)
-    if auth_path.exists() and data is None:
-        oauth_state = "invalid"
-    elif data is not None:
-        credential = _parse_codex_oauth_credential(data, _fallback_expiry_s(auth_path))
-        if credential is None:
+    oauth_state = _hermes_codex_oauth_state(now)
+    if oauth_state is None:
+        auth_path = _codex_auth_path(codex_home)
+        oauth_state = "missing"
+        data = _read_codex_auth_json(auth_path)
+        if auth_path.exists() and data is None:
             oauth_state = "invalid"
-        elif credential.expires_s <= now + _REFRESH_MARGIN_S:
-            oauth_state = "expired"
-        else:
-            oauth_state = "valid"
+        elif data is not None:
+            credential = _parse_codex_oauth_credential(data, _fallback_expiry_s(auth_path))
+            if credential is None:
+                oauth_state = "invalid"
+            elif credential.expires_s <= now + _REFRESH_MARGIN_S:
+                oauth_state = "expired"
+            else:
+                oauth_state = "valid"
 
     winning_lane: str | None = None
     blocked_by: str | None = None

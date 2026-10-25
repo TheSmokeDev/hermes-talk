@@ -103,7 +103,10 @@ function createTalkSurface(SDK) {
   }
 
   function clientId(prefix) {
-    return prefix + window.crypto.randomUUID().replace(/-/g, "");
+    const id = prefix + window.crypto.randomUUID().replace(/-/g, "");
+    // Realtime item IDs accept at most 32 characters. Prefixing a full UUID
+    // produced 37, so typed input was rejected before the model could read it.
+    return prefix === "item_" ? id.slice(0, 32) : id;
   }
 
   function taskTabId() {
@@ -887,6 +890,9 @@ function createTalkSurface(SDK) {
       this.continuationPending = false;
       this.toolBatch = null;
       this.toolTail = Promise.resolve();
+      this.localTools = new Set();
+      this.pendingLocalTools = null;
+      this.localToolCalls = new Map();
       this.cascade = session && session.voiceMode === "cascade";
       // Every response gets its own relay stream; a tool-call continuation
       // can start streaming while the previous answer's PCM still drains, so
@@ -1142,6 +1148,28 @@ function createTalkSurface(SDK) {
       if (this.task) this.task.timing.observe(event);
       if (this.task && this.task.presentation.handle(event)) return;
       switch (event.type) {
+        case "session.created": {
+          // Only the unbound native Desktop lane owns these local controls.
+          // Bound-task tools keep their canonical authorization/journaling path.
+          if (this.task || this.live || this.cascade || !SDK.realtimeSessionPatch) break;
+          try {
+            const patch = SDK.realtimeSessionPatch(event.session);
+            if (!patch || !Array.isArray(patch.tools)) break;
+            this.pendingLocalTools = new Set(patch.tools.filter(tool =>
+              tool.name?.startsWith("desktop_")).map(tool => tool.name));
+            this.send({ type: "session.update", session: patch });
+          } catch (_) { this.cb.onStatus("Desktop controls unavailable; voice remains connected."); }
+          break;
+        }
+        case "session.updated": {
+          if (!this.pendingLocalTools || !Array.isArray(event.session?.tools)) break;
+          const names = new Set(event.session.tools.map(tool => tool.name));
+          if ([...this.pendingLocalTools].every(name => names.has(name))) {
+            this.localTools = this.pendingLocalTools;
+            this.pendingLocalTools = null;
+          }
+          break;
+        }
         case "input_audio_buffer.committed":
           if (this.task && event.item_id) {
             this.task.committed.add(event.item_id);
@@ -1234,7 +1262,15 @@ function createTalkSurface(SDK) {
       // A cancel that lost the race with response.done is not actionable —
       // same suppression talk_relay applies.
       if (detail.toLowerCase().indexOf("no active response") !== -1) return;
-      this.cb.onError(detail ? "Realtime error: " + detail : "Realtime error.");
+      // Desktop notices intentionally hide free-form provider errors. Keep a
+      // credential-free diagnostic in DevTools so failures remain actionable.
+      const diagnostic = value => typeof value === "string" && /^[a-zA-Z0-9_.\[\]-]{1,96}$/.test(value)
+        ? value : "unknown";
+      globalThis.console?.warn?.("[hermes-talk] realtime error", {
+        code: diagnostic(error?.code), param: diagnostic(error?.param),
+      });
+      const code = diagnostic(error?.code), param = diagnostic(error?.param);
+      this.cb.onError(detail ? "Realtime error [" + code + ";" + param + "]: " + detail : "Realtime error.");
     }
 
     // -- cascade relay (custom voice; the server speaks, the page plays) -----
@@ -1555,9 +1591,30 @@ function createTalkSurface(SDK) {
       this.cb.onStatus("Using " + name + "…");
       let output, selection;
       try {
-        const body = Object.assign({ name: name, arguments: args }, binding || {});
-        const res = binding ? await this.task.request("/tool", body)
-          : await apiPost("/tool", body, TOOL_TIMEOUT_MS);
+        let res;
+        if (!binding && name.startsWith("desktop_")) {
+          if (this.closed || !this.localTools.has(name) || !SDK.executeLocalTool) {
+            throw new Error("Desktop tool was not enabled for this call.");
+          }
+          const fingerprint = JSON.stringify([name, args]);
+          let saved = this.localToolCalls.get(callId);
+          if (saved && saved.fingerprint !== fingerprint) throw new Error("Conflicting tool call replay.");
+          if (!saved) {
+            if (this.localToolCalls.size >= 128) throw new Error("Reconnect before using more Desktop controls.");
+            const promise = Promise.resolve().then(() => {
+              if (this.closed) throw new Error("Voice call ended before the Desktop action started.");
+              return SDK.executeLocalTool(name, args, { callId,
+                signal: this.microphoneLease?.signal || this.startAbort?.signal });
+            });
+            saved = { fingerprint, promise };
+            this.localToolCalls.set(callId, saved);
+          }
+          res = { output: JSON.stringify(await saved.promise) };
+        } else {
+          const body = Object.assign({ name: name, arguments: args }, binding || {});
+          res = binding ? await this.task.request("/tool", body)
+            : await apiPost("/tool", body, TOOL_TIMEOUT_MS);
+        }
         if (this.closed) return null;
         output = res && res.output ? String(res.output) : "(no output)";
         if (binding && res && res.ok !== false && res.selection) selection = res.selection;
@@ -2732,9 +2789,12 @@ function createTalkSurface(SDK) {
       setInputError("");
       let sent = false;
       try {
-        const transport = legacyText && !ownerMessageSupported ? transportRef.current : await ensureTextBinding();
+        // A published text-input descriptor does not create a task binding.
+        // An active unbound Realtime call accepts text on its data channel.
+        const directVoiceText = legacyText && (!transportRef.current?.task || !ownerMessageSupported);
+        const transport = directVoiceText ? transportRef.current : await ensureTextBinding();
         if (!current()) return false;
-        if (legacyText && !ownerMessageSupported) {
+        if (directVoiceText) {
           sent = await transport.sendTyped(draft.text);
         } else if (ownerText && !ownerMessageSupported) {
           const signature = JSON.stringify([draft.revision, transport.task.context]);

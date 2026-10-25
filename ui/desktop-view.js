@@ -58,6 +58,11 @@ function desktopTalkErrorCode(message) {
 }
 
 function desktopTalkNoticeText(message, needsToken, lane) {
+  const realtime = /^Realtime error \[([a-zA-Z0-9_.\[\]-]{1,96});([a-zA-Z0-9_.\[\]-]{1,96})\]:/.exec(message);
+  if (realtime) {
+    return { text: 'The voice provider rejected a request (' + realtime[1] +
+      (realtime[2] === 'unknown' ? '' : ', ' + realtime[2]) + '). Retry, or include this code in your bug report.', retry: true };
+  }
   // Sentences Talk writes for the operator are already the notice.
   if (/^GPT-Live needs a Hermes host with task context support/.test(message)) {
     return { text: message, retry: false };

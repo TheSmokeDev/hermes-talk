@@ -96,6 +96,27 @@ assert(!requests.some(row=>row.url.endsWith('/session')||row.url.endsWith('/live
 """)
 
 
+def test_unbound_realtime_text_ignores_unusable_task_message_descriptor(source_bundle):
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message']};
+const base=fetchOverride;
+fetchOverride=(url,body,options)=>{
+ if(url.endsWith('/status')) return {configured:true,voiceMode:'native',textInput:capabilities,
+  taskContinuity:{supported:false}};
+ if(url.endsWith('/session')) return {voiceMode:'native'};
+ return base(url,body,options);
+};
+let props=await boot();await props.startTalk();props=present();
+assert.equal(props.active,true);
+props.setTyped('Read my sessions');props=present();
+assert.equal(await props.sendTyped(),true);
+assert(sent.some(event=>event.type==='conversation.item.create' &&
+ event.item.content[0].text==='Read my sessions'));
+assert(!requests.some(row=>row.url.endsWith('/native/attach')||row.url.endsWith('/text/input')));
+assert.equal(present().typed,'');
+""")
+
+
 def test_owner_message_through_text_input_settles_via_operation_polling(source_bundle):
     """With the explicit-operation descriptor present, an owner message rides /text/input;
     its async admission names an operation, and the panel settles it through the same

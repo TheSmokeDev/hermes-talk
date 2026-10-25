@@ -68,6 +68,78 @@ def _hermetic_lanes(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TALK_PREFER_CODEX_OAUTH", raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", None)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_diagnostic_reads_hermes_login_without_refresh(monkeypatch, expired):
+    token = _jwt_with_exp(time.time() + (-3600 if expired else 3600))
+    calls = []
+    module = types.ModuleType("hermes_cli.auth_codex")
+
+    def resolve(*, read_only=False):
+        assert read_only is True, "diagnostics must not resolve mutable credentials"
+        calls.append(read_only)
+        return {"api_key": token}
+
+    module.resolve_codex_runtime_credentials = resolve
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+
+    receipt = talk_auth.auth_diagnostic(env={"TALK_PREFER_CODEX_OAUTH": "true"})
+
+    assert receipt["configured"] is True
+    assert receipt["winning_lane"] == talk_auth.SOURCE_CODEX_OAUTH
+    assert receipt["codex_oauth"] == ("expired" if expired else "valid")
+    assert receipt["refresh_required"] is expired
+    assert calls == [True]
+    assert token not in json.dumps(receipt)
+
+
+def test_diagnostic_prefers_hermes_login_over_invalid_vendor_file(monkeypatch, tmp_path):
+    module = types.ModuleType("hermes_cli.auth_codex")
+    module.resolve_codex_runtime_credentials = lambda *, read_only=False: {
+        "api_key": _jwt_with_exp(time.time() + 3600)
+    }
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+    vendor_home = tmp_path / "vendor"
+    vendor_home.mkdir()
+    (vendor_home / "auth.json").write_text("invalid json", encoding="utf-8")
+
+    receipt = talk_auth.auth_diagnostic(env={}, codex_home=vendor_home)
+
+    assert receipt["configured"] is True
+    assert receipt["codex_oauth"] == "valid"
+
+
+def test_diagnostic_never_calls_host_without_explicit_read_only_support(monkeypatch, tmp_path):
+    module = types.ModuleType("hermes_cli.auth_codex")
+
+    def mutable_resolver(**kwargs):
+        raise AssertionError("legacy resolver might refresh or write credentials")
+
+    module.resolve_codex_runtime_credentials = mutable_resolver
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+    vendor_home = tmp_path / "vendor"
+    _write_codex_auth(vendor_home, access=_jwt_with_exp(time.time() + 3600))
+
+    receipt = talk_auth.auth_diagnostic(env={}, codex_home=vendor_home)
+
+    assert receipt["configured"] is True
+    assert receipt["codex_oauth"] == "valid"
+
+
+@pytest.mark.parametrize("value", [None, {}, {"api_key": ""}, {"api_key": "bad.jwt.value"}])
+def test_diagnostic_unusable_host_login_preserves_vendor_fallback(monkeypatch, tmp_path, value):
+    module = types.ModuleType("hermes_cli.auth_codex")
+    module.resolve_codex_runtime_credentials = lambda *, read_only=False: value
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+    vendor_home = tmp_path / "vendor"
+    _write_codex_auth(vendor_home, access=_jwt_with_exp(time.time() + 3600))
+
+    receipt = talk_auth.auth_diagnostic(env={}, codex_home=vendor_home)
+
+    assert receipt["configured"] is True
+    assert receipt["codex_oauth"] == "valid"
 
 
 def test_scoped_key_wins_over_everything(monkeypatch, tmp_path):

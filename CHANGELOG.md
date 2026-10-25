@@ -14,6 +14,16 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- OpenAI Realtime calls in Desktop can list conversations, create a new
+  conversation with an opening message, read Desktop capabilities, and inspect
+  scheduled jobs and common messaging-platform configuration through the public
+  host SDK. Controls stay on the call's connection/profile; creating a session
+  preserves the current voice conversation and uses Standard speed.
+- Desktop voice can choose discovered project directories, inspect another
+  session's saved and in-progress work, queue instructions, and explicitly steer
+  a running session. Local canonical and SSH legacy contracts are detected with
+  a read-only probe; identity checks and replay protection prevent accidental
+  cross-profile targeting and duplicate writes.
 - Grok realtime accepts all 28 built-in voices documented by xAI, adding
   `carina`, `zagan`, `helix`, `orion`, `luna`, `iris`, `altair`, `zenith`,
   `perseus`, `helios`, `lux`, `kepler`, `rigel`, `cosmo`, `celeste`, `ursa`,
@@ -37,6 +47,23 @@ named rather than smoothed.
   [@gabrieljudah](https://github.com/gabrieljudah). (#171)
 
 ### Fixed
+- Typed text in an active unbound Realtime call stays on that call's data
+  channel even when the backend advertises task-only text routes. Provider
+  item IDs fit Realtime's 32-character limit, so text is no longer rejected
+  before the model reads it. Desktop shows safe provider error codes instead
+  of hiding every provider refusal behind a generic retry notice.
+- Capability discovery supports Hermes's public skill-catalog functions as well
+  as older underscored names. Current hosts no longer fall back to an unavailable
+  HTTP catalog simply because those functions were renamed.
+- Stock Desktop Talk can reconnect after Stop in the same conversation.
+  Stopping a call releases its microphone lease without permanently aborting
+  the conversation controller; navigation and unmount still dispose it, and
+  a stopped pending microphone request cannot reopen the old call.
+- Doctor and Desktop readiness recognize Hermes-managed Codex OAuth logins,
+  including credential-pool logins, through the host's explicit read-only API.
+  They no longer require a separate Codex CLI login when Hermes is already
+  signed in. Unsupported host readers retain the vendor-file fallback, and
+  diagnostics never request a token refresh or credential-store write.
 - `hermes talk doctor` no longer requires ElevenLabs credentials when
   `TALK_VOICE_MODE=live`. Only cascade mode validates the ElevenLabs settings;
   native and GPT-Live modes report that the cascade lane is inactive. Thanks

@@ -213,6 +213,22 @@ def test_in_process_toolset_flags_follow_the_host_builders(monkeypatch, rest_lan
     assert by_name["email"]["configured"] is False
 
 
+def test_public_skill_builders_work_without_legacy_aliases(monkeypatch, rest_lane_on):
+    _install_fake_host(monkeypatch)
+    skills = sys.modules["tools.skills_tool"]
+    skills.find_all_skills = skills._find_all_skills
+    skills.sort_skills = skills._sort_skills
+    del skills._find_all_skills
+    del skills._sort_skills
+    _no_rest(monkeypatch)
+
+    snapshot = talk_capabilities.warm()
+
+    assert snapshot.source == talk_capabilities.SOURCE_IN_PROCESS
+    assert snapshot.skills == tuple(FAKE_SKILLS)
+    assert snapshot.tools_resolved is True
+
+
 def test_no_host_modules_falls_through_to_the_api_server(monkeypatch, rest_lane_on):
     """A process without Hermes's registries has no in-process answer."""
 

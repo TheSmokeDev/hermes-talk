@@ -63,6 +63,254 @@ def run_node(script, *, source="desktop/plugin.js"):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+DESKTOP_TOOLS = r"""
+const rpc = [];
+let serial = 0;
+const gateway = {async request(method,params) {
+  rpc.push({method,params});
+  if(method==='session.create') return {session_id:'new-'+(++serial)};
+  if(method==='prompt.submit') return {admission_id:'admit-1',status:'queued',
+    ref:{session_id:params.session_id}};
+  if(method==='session.list') return {scope:params.scope,
+    sessions:[{session_id:'stored-a',title:'A',secret:'hidden'}]};
+  if(method==='slash.exec') return {type:'exec',output:'No scheduled jobs.'};
+  return {ok:true};
+}};
+HermesSDK.host.getGateway=()=>gateway;
+HermesSDK.host.toolsets={list:async scope=>[{name:'terminal',enabled:true,api_key:'sk-secret'}]};
+HermesSDK.host.skills={list:async scope=>[{name:'example',enabled:true}]};
+"""
+
+
+def test_desktop_voice_preserves_server_tools_and_uses_scoped_catalog():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+const patch=sdk.realtimeSessionPatch({instructions:'Existing rules',
+ tools:[{name:'delegate_task'}]});
+assert.equal(patch.tools.length,9);
+assert(patch.instructions.startsWith('Existing rules'));
+assert.equal(patch.tools[0].name,'delegate_task');
+let seen;
+HermesSDK.host.toolsets.list=async scope=>{seen=scope;
+ return [{name:'terminal',enabled:true,api_key:'sk-secret'}];};
+const output=await sdk.executeLocalTool('desktop_capabilities',{});
+assert.deepEqual(JSON.parse(JSON.stringify(seen)),{connectionId:'connection-a',profile:'profile-a'});
+assert.equal(output.toolsets[0].name,'terminal');
+assert(!JSON.stringify(output).includes('secret'));
+assert.equal(rpc.length,0);
+})();
+""")
+
+
+def test_desktop_create_uses_new_session_and_reports_admission_not_completion():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+const result=await sdk.executeLocalTool('desktop_create_session',{
+ title:'Same title',initial_message:'Wait for my next message.'},{callId:'call-1'});
+assert.equal(result.ok,true); assert.equal(result.session_id,'new-1');
+assert.equal(result.admission.status,'queued');
+assert.deepEqual(rpc.map(r=>r.method),
+ ['session.list','session.create','session.title','prompt.submit']);
+assert(!Object.hasOwn(rpc[1].params,'title'));
+assert(!Object.hasOwn(rpc[1].params,'model'));
+assert.equal(rpc[1].params.service_tier,'normal');
+assert(rpc.every(r=>r.params.profile==='profile-a'));
+assert.equal(rpc[3].params.submission_id,'talk-opening-call-1');
+assert.equal(hostState.focusedSessionId.get(),'pane-a');
+})();
+""")
+
+
+def test_desktop_tools_refuse_scope_drift_and_cancelled_calls():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), abort=new AbortController(); abort.abort();
+await assert.rejects(sdk.executeLocalTool('desktop_list_sessions',{},
+ {signal:abort.signal}),/cancelled/);
+hostState.connectionId.set('connection-b');
+await assert.rejects(sdk.executeLocalTool('desktop_create_session',{
+ title:'No',initial_message:'No'},{callId:'call-2'}),/active profile/);
+assert.equal(rpc.length,0);
+})();
+""")
+
+
+def test_desktop_partial_creation_retains_id_without_retrying():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), original=gateway.request;
+gateway.request=async (method,params)=>method==='prompt.submit'
+ ? {admission_id:'uncertain',status:'unknown',ref:{session_id:params.session_id}}
+ : original(method,params);
+const result=await sdk.executeLocalTool('desktop_create_session',{
+ title:'Partial',initial_message:'Wait'},{callId:'call-3'});
+assert.equal(result.ok,false); assert.equal(result.created,true);
+assert.equal(result.session_id,'new-1'); assert.equal(serial,1);
+})();
+""")
+
+
+def test_desktop_inventory_uses_only_fixed_read_commands():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+await sdk.executeLocalTool('desktop_scheduled_jobs',{command:'/cron remove all'});
+await sdk.executeLocalTool('desktop_messaging',{});
+assert.deepEqual(rpc.map(r=>r.params.command),['/cron list --all','/platforms']);
+assert(rpc.every(r=>r.params.session_id==='pane-a'));
+gateway.request=async()=>({type:'send',message:'Do work'});
+await assert.rejects(sdk.executeLocalTool('desktop_messaging',{}),/read-only/);
+})();
+""")
+
+
+def test_desktop_session_inventory_includes_closed_conversations():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+gateway.request=async(method,params)=>({scope:params.scope,sessions: params.scope==='live'
+ ? [{id:'live-1',title:'Live',started_at:2}]
+ : [{id:'old-1',title:'Historical',started_at:1},{id:'live-1',title:'Live',started_at:2}]});
+const result=await sdk.executeLocalTool('desktop_list_sessions',{});
+assert.equal(result.sessions.length,2);
+assert.equal(result.sessions[1].title,'Historical');
+})();
+""")
+
+
+def test_ssh_legacy_protocol_uses_advertised_shapes_without_retrying_writes():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+gateway.request=async(method,params)=>{
+ rpc.push({method,params});
+ if(method==='session.list' && params.scope) {
+  const error=new Error('invalid params for session.list: scope: Extra inputs are not permitted');
+  error.code=4000;throw error;
+ }
+ if(method==='session.list') return {sessions:[{id:'old-1',title:'Saved'}]};
+ if(method==='session.create') return {session_id:'runtime-1',stored_session_id:'stored-1'};
+ if(method==='prompt.submit') return {status:'streaming',user_row_id:12};
+ if(method==='slash.exec') return {output:'No jobs'};
+ return {ok:true};
+};
+const listed=await sdk.executeLocalTool('desktop_list_sessions',{});
+assert.equal(listed.sessions[0].title,'Saved');
+const created=await sdk.executeLocalTool('desktop_create_session',{
+ title:'SSH',initial_message:'Wait for my next message.'},{callId:'ssh-1'});
+assert.equal(created.ok,true); assert.equal(created.session_id,'stored-1');
+const create=rpc.find(row=>row.method==='session.create').params;
+assert.equal(create.idempotency_key,'talk-ssh-1');assert(!('request_id' in create));
+const submit=rpc.find(row=>row.method==='prompt.submit').params;
+assert(!('submission_id' in submit));
+assert.equal((await sdk.executeLocalTool('desktop_scheduled_jobs',{})).report,'No jobs');
+})();
+""")
+
+
+def test_project_directory_must_come_from_the_scoped_inventory():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), base=gateway.request;
+gateway.request=async(method,params)=>{
+ if(method==='session.list' && params.scope) {
+  const e=new Error('invalid params for session.list: scope: Extra inputs');e.code=4000;throw e;
+ }
+ if(method==='projects.list') return {projects:[{name:'Canary',primary_path:'/srv/canary',
+  folders:[{path:'/srv/canary'}]}]};
+ if(method==='prompt.submit') return {status:'streaming',user_row_id:1};
+ return base(method,params);
+};
+const args={title:'Canary',initial_message:'Wait.',project_directory:'/srv/canary'};
+await assert.rejects(sdk.executeLocalTool('desktop_create_session',args,{callId:'p1'}),
+ /desktop_projects/);
+assert.equal(rpc.length,0);
+const listed=await sdk.executeLocalTool('desktop_projects',{});
+assert.equal(listed.projects[0].primary_path,'/srv/canary');
+await sdk.executeLocalTool('desktop_create_session',args,{callId:'p2'});
+const create=rpc.find(row=>row.method==='session.create');
+assert.equal(create.params.cwd,'/srv/canary');assert.equal(create.params.cwd_explicit,true);
+})();
+""")
+
+
+def test_session_progress_and_messages_stay_on_verified_target():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), base=gateway.request;
+gateway.request=async(method,params)=>{
+ if(method==='session.resume') {rpc.push({method,params});return {
+  session_id:'stored-a',stored_session_id:'stored-a',running:false,execution_generation:7,
+  info:{cwd:'/srv/project',provider:'openai-codex'}};}
+ if(method==='session.history') return {messages:[{role:'user',content:'Question'},
+  {role:'tool',content:'Do not expose this tool dump'},
+  {role:'assistant',content:'DONE'}]};
+ if(method==='session.steer') {rpc.push({method,params});return {status:'queued'};}
+ return base(method,params);
+};
+await assert.rejects(sdk.executeLocalTool('desktop_message_session',{
+ session_id:'foreign-profile',text:'bad'},{callId:'foreign'}),/current catalog/);
+assert(!rpc.some(row=>row.method==='session.resume'));
+const status=await sdk.executeLocalTool('desktop_session_status',{session_id:'stored-a'});
+assert.equal(status.running,false);assert.equal(status.messages.length,2);
+assert.equal(status.messages[1].text,'DONE');
+const queued=await sdk.executeLocalTool('desktop_message_session',{
+ session_id:'stored-a',text:'Next task'},{callId:'message-1'});
+assert.equal(queued.ok,true);
+const submit=rpc.find(row=>row.method==='prompt.submit').params;
+assert.equal(submit.queued,true);assert.equal(submit.session_id,'stored-a');
+assert.equal(submit.submission_id,'talk-message-message-1');
+await sdk.executeLocalTool('desktop_message_session',{
+ session_id:'stored-a',text:'Change direction',mode:'steer'},{callId:'steer-1'});
+assert.equal(rpc.find(row=>row.method==='session.steer').params.execution_generation,7);
+assert.equal(hostState.focusedSessionId.get(),'pane-a');
+})();
+""")
+
+
+def test_session_identity_mismatch_refuses_message_and_failed_probe_never_creates():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), base=gateway.request;
+gateway.request=async(method,params)=>method==='session.resume'
+ ? {session_id:'wrong',stored_session_id:'wrong'} : base(method,params);
+await assert.rejects(sdk.executeLocalTool('desktop_message_session',{
+ session_id:'stored-a',text:'Do not send'},{callId:'bad-id'}),/identity/);
+assert(!rpc.some(row=>row.method==='prompt.submit'));
+gateway.request=async()=>{throw new Error('Disconnected');};
+await assert.rejects(sdk.executeLocalTool('desktop_create_session',{
+ title:'No duplicate',initial_message:'Wait'},{callId:'no-create'}),/Disconnected/);
+assert.equal(serial,0);
+})();
+""")
+
+
+def test_old_exact_title_target_reports_inflight_progress():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK();
+gateway.request=async(method,params)=>{
+ if(method==='session.list') return {scope:params.scope,sessions: params.title==='Old project'
+  ? [{id:'old-250',title:'Old project'}] : []};
+ if(method==='session.resume') return {session_id:'old-250',stored_session_id:'old-250',
+  running:true,inflight:{assistant:'Running the checks now',streaming:true},
+  todo_state:{todos:[{content:'Check tests',status:'in_progress'}]},
+  pending:[{id:'pending'}],prompts:[{kind:'approval'}]};
+ if(method==='session.history') return {messages:[{role:'assistant',content:'Previous turn'}]};
+ throw new Error(method);
+};
+await sdk.executeLocalTool('desktop_list_sessions',{exact_title:'Old project'});
+const result=await sdk.executeLocalTool('desktop_session_status',{session_id:'old-250'});
+assert.equal(result.running,true);
+assert.equal(result.in_progress.assistant,'Running the checks now');
+assert.equal(result.todos[0].status,'in_progress');
+assert.equal(result.queued_count,1); assert.equal(result.waiting_for_approval,true);
+})();
+""")
+
+
 def test_desktop_pins_route_token_and_late_receipt():
     run_node(r"""
 (async()=>{
@@ -452,6 +700,49 @@ assert.equal(calls.length,0);assert.equal(acquires,0);
 """.replace("__ATOM__", atom_name).replace("__EXPECTED__", expected))
 
 
+def test_stock_lane_reconnects_after_stop_without_changing_conversation():
+    run_node(r"""
+(async()=>{
+stockHooks();
+let prompts=0;
+context.window.hermesDesktop={requestMicrophoneAccess:async()=>{prompts++;}};
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const first=await sdk.acquireMicrophone();
+sdk.stopHost();
+assert.equal(first.signal.aborted,true,'Stop invalidates the old microphone lease');
+assert.equal(stock.signal.aborted,false,'Stop must not dispose the conversation controller');
+const second=await sdk.acquireMicrophone();
+assert.equal(second.signal.aborted,false);
+assert.notEqual(second.signal,first.signal);
+assert.equal(prompts,2);
+second.release();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_stop_cancels_pending_acquisition_but_allows_retry():
+    run_node(r"""
+(async()=>{
+stockHooks();
+let finishPrompt;
+context.window.hermesDesktop={requestMicrophoneAccess:()=>new Promise(resolve=>{
+  finishPrompt=resolve;
+})};
+const stock=context.useStockVoiceController();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const pending=sdk.acquireMicrophone();
+sdk.stopHost();
+finishPrompt();
+await assert.rejects(pending,{name:'AbortError'});
+context.window.hermesDesktop.requestMicrophoneAccess=async()=>{};
+const retry=await sdk.acquireMicrophone();
+assert.equal(retry.signal.aborted,false);
+retry.release();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
 def test_stock_lane_grants_a_release_only_microphone_lease():
     run_node(r"""
 (async()=>{
@@ -463,13 +754,35 @@ const stock=context.useStockVoiceController();
 const sdk=context.createDesktopTalkSDK(host,()=>stock);
 const lease=await sdk.acquireMicrophone();
 assert.equal(prompts,1,'a stock host is still asked for system microphone access');
-assert.equal(lease.signal,stock.signal);
+assert.notEqual(lease.signal,stock.signal);
 lease.release();
+assert.equal(lease.signal.aborted,true);
 assert.equal(stock.signal.aborted,false,'releasing a stock lease cannot end the session');
 sdk.stopHost();
+assert.equal(stock.signal.aborted,false,'manual Stop preserves the mounted conversation');
+stock.dispose();
 assert.equal(stock.signal.aborted,true);
 await assert.rejects(sdk.acquireMicrophone(),{name:'AbortError'});
 assert.equal(prompts,1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_stock_lane_unmount_disposes_controller_and_active_lease():
+    run_node(r"""
+(async()=>{
+stockHooks();
+const effects=[];
+React.useEffect=effect=>effects.push(effect);
+const stock=context.useStockVoiceController();
+const cleanup=effects[1]();
+const sdk=context.createDesktopTalkSDK(host,()=>stock);
+const lease=await sdk.acquireMicrophone();
+cleanup();
+assert.equal(stock.signal.aborted,true);
+assert.equal(lease.signal.aborted,true);
+await assert.rejects(sdk.acquireMicrophone(),{name:'AbortError'});
+cleanup();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
 

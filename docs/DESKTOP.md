@@ -71,6 +71,53 @@ Network tab. A refused request shows its status and error code in the panel and
 in the devtools console, for example
 `[hermes-talk] POST /targets failed: 503 context_unavailable`.
 
+### Desktop controls during OpenAI Realtime calls
+
+On hosts with the public gateway and capability SDK, an unbound **OpenAI
+Realtime** call can use Desktop controls even when task-context support is
+absent. Ask Talk to:
+
+- list saved conversations in the current connection and profile;
+- create a new conversation with a title and opening message;
+- choose a directory from the current profile's projects, or from its saved
+  conversations when the host does not expose a project catalog;
+- check another conversation's recent messages, live output, task list and
+  approval waits;
+- queue a follow-up in a selected conversation, or explicitly steer its
+  currently running work;
+- read enabled toolsets and installed skills from Desktop's Capabilities view;
+- read scheduled jobs, including paused jobs;
+- read Hermes's common messaging-platform status report.
+
+Creating a conversation starts one normal assistant turn. If you only ask for
+an empty session, Talk sends a brief opening message asking it to wait, because
+Desktop's sidebar hides sessions with no messages. Creation keeps the current
+voice owner unchanged. A queued opening turn is reported as admitted, not
+finished. A partial failure returns the created session ID instead of silently
+creating another conversation.
+
+Use the exact session ID returned by the conversation list when names overlap.
+An exact-title lookup can find an older conversation outside the recent list.
+Queueing a message does not interrupt the agent's current turn; a steering
+receipt confirms queueing, not that the agent has consumed the change. Neither
+operation automatically retries an uncertain write.
+
+These controls stay on the connection and profile captured by the call. They
+stop on navigation or connection drift, preserve Standard speed for new
+conversations, and inherit that profile's model and reasoning settings. An
+explicit project directory must first be returned by the scoped project
+inventory. They do not grant arbitrary computer control, send external messages, modify jobs,
+or attach voice history to other conversations. The platform report covers
+Telegram, Discord, Slack and WhatsApp configuration; it is not a complete
+connector inventory or a live delivery test. GPT-Live and bound-task calls keep
+their existing task-context tool contract.
+
+Desktop adds these tools through the documented Realtime
+[`session.update` event](https://developers.openai.com/api/reference/resources/realtime/client-events),
+preserving the backend's tools and instructions. Calls are dispatched locally
+only after the provider acknowledges the tool set. Repeated function-call IDs
+reuse their original result rather than creating duplicate sessions.
+
 ## Open Talk
 
 1. Install the matching host build and this plugin candidate in the Hermes home
