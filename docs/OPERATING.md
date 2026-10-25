@@ -694,6 +694,12 @@ endpoint's named key takes precedence over `data`, even when empty; otherwise
 a `data` list is used. Entries that are not objects are ignored. Unrecognized
 response shapes remain errors, rather than reporting an empty catalog.
 
+In-process registry discovery waits at most `TALK_API_SERVER_PROBE_TIMEOUT_S`
+before falling through to the API-server catalog. This also bounds the
+background-refresh path. A timed-out registry read continues on one daemon
+worker; repeated probes share that pending read rather than spawning more
+workers while it is stuck. A later probe can retry once that read completes.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_CAPABILITY_CATALOG_TTL_S` | `30.0` | How long a resolved `talk_capabilities` snapshot (skills, toolsets, capabilities, health) is trusted before a background refresh, whichever source answered it. Junk or ≤0 silently takes the default. |
