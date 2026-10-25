@@ -38,7 +38,7 @@ different shape, and a good one.
 ## Install
 
 ```bash
-hermes plugins install --ref v0.22.0 TheSmokeDev/hermes-talk --enable
+hermes plugins install --ref 7ad833e4fcedb2c9a9947d84d7fd89bdbd15d256 TheSmokeDev/hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 ```
 
@@ -46,11 +46,17 @@ Needs Python ≥ 3.11 and a Hermes host ≥ v0.17. GPT-Live, shared task attachm
 and Codex workers need additional host capabilities; the full list is in
 [Prerequisites](docs/OPERATING.md#prerequisites).
 
-The explicit release ref matters: Hermes's community catalog may still pin an
-older version. For an existing pinned install, preserve local plugin edits,
-then reinstall with `hermes plugins install --force --ref v0.22.0 --enable
-TheSmokeDev/hermes-talk`. Restart the gateway/dashboard and Desktop afterward.
-An unpinned Git install can use `hermes plugins update hermes-talk`.
+The commit above is the published **v0.22.0** source. Hermes v0.22.5 requires a
+full 40-character commit SHA for `--ref`; it does not accept a tag there. This
+also avoids an older community-catalog pin. For an existing pinned install,
+preserve local plugin edits, then run:
+
+```bash
+hermes plugins install --force --ref 7ad833e4fcedb2c9a9947d84d7fd89bdbd15d256 --enable TheSmokeDev/hermes-talk
+```
+
+Restart the gateway/dashboard and Desktop afterward. An unpinned Git install can
+use `hermes plugins update hermes-talk`.
 
 ## Quickstart
 
