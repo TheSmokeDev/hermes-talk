@@ -6,9 +6,10 @@ import asyncio
 
 import pytest
 from test_dashboard_tasks import environment as base_environment
-from test_live_browser import delegate, wait_for
+from test_live_browser import delegate
 from test_live_browser_repair import quiet
-from test_live_routes import application, create
+from test_live_routes import application as live_application
+from test_live_routes import create
 
 import talk_realtime as rt
 from talk_dashboard_store import DashboardStages
@@ -22,12 +23,34 @@ def environment(tmp_path):
     return base_environment.__wrapped__(tmp_path)
 
 
+def application(environment):
+    """Replay assertions do not measure authentication time.
+
+    These fixtures have no browser heartbeat. A real monotonic lease could
+    expire while a slow Windows runner performs SQLite work, turning a replay
+    test into an accidental expiry test. Explicit clock-driven lease expiry
+    and revocation coverage remains in test_live_browser.
+    """
+    return live_application(environment, clock=lambda: 100.0)
+
+
+async def delivered_job(client, fixture):
+    """Wait for the durable delivery receipt, not merely the fake socket send."""
+    body = await create(client, fixture)
+    binding = fixture.registry.bindings[body["binding_id"]]
+    await delegate(fixture)
+    # This is a scheduling allowance, not a product deadline. conftest applies
+    # the suite's existing Windows CI scale; no production timeout is changed.
+    async with asyncio.timeout(30):
+        while not any(event["type"] == "delivery" for event, _ in binding.events):
+            assert not binding.closed, binding.failure
+            await asyncio.sleep(0.005)
+    return body, binding
+
+
 async def finished_job(client, fixture):
     """A bound Live session whose one delegated job has completed and is announceable."""
-    body = await create(client, fixture)
-    await delegate(fixture)
-    await wait_for(lambda: bool(fixture.browser.session.commands))
-    binding = fixture.registry.bindings[body["binding_id"]]
+    body, binding = await delivered_job(client, fixture)
     manager = fixture.registry.manager
     await asyncio.to_thread(manager.state, binding.lease, fixture.context)
     fixture.host.jobs["remote-1"].update(
@@ -154,10 +177,7 @@ def test_live_replay_rejects_foreign_binding_and_stale_generation(environment):
 def test_live_replay_refuses_non_terminal_or_active_attempt(environment):
     async def run():
         async with application(environment) as (client, fixture):
-            body = await create(client, fixture)
-            await delegate(fixture)
-            await wait_for(lambda: bool(fixture.browser.session.commands))
-            binding = fixture.registry.bindings[body["binding_id"]]
+            body, binding = await delivered_job(client, fixture)
             manager = fixture.registry.manager
             state = await asyncio.to_thread(manager.state, binding.lease, fixture.context)
             running = state["events"]["events"][-1]

@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Live replay tests use a controlled authentication-lease clock and wait for the
+  durable delivery receipt, preventing slow Windows CI runners from expiring an
+  unrefreshed test lease or racing receipt persistence. Production timeouts and
+  explicit lease-expiry/revocation coverage are unchanged.
+
 ## [0.22.0] — 2026-10-25
 
 Run your Desktop sessions by voice: choose a project directory, start work in a
