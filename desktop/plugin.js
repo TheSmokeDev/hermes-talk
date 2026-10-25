@@ -4102,12 +4102,22 @@ function createDesktopVoiceTools(scope, assertOwner) {
         // Title-on-create can resolve an existing conversation with that title.
         // Create without it, then use the host's revision-fenced title mutation.
         const protocol = await sessionProtocol();
-        const created = await request('session.create', {
-          ...(protocol === 'canonical' ? { request_id: 'talk-' + callId } : { idempotency_key: 'talk-' + callId }),
-          source: 'gui', follow_profile_config: true, service_tier: 'normal',
-          ...(cwd ? { cwd, cwd_explicit: true } : {}) });
+        let created;
+        try {
+          created = await request('session.create', {
+            ...(protocol === 'canonical' ? { request_id: 'talk-' + callId } : { idempotency_key: 'talk-' + callId }),
+            source: 'gui', follow_profile_config: true, service_tier: 'normal',
+            ...(cwd ? { cwd, cwd_explicit: true } : {}) });
+        } catch (error) {
+          return { ok: false, creation_uncertain: true, request_id: 'talk-' + callId,
+            title, error: safeText(error.message),
+            note: 'Session creation is unconfirmed; the reply may have been lost after creation. Inspect the session list before retrying. Do not automatically repeat this action.' };
+        }
         const sessionId = created?.session_id;
-        if (typeof sessionId !== 'string' || !sessionId) throw new Error('No session creation receipt received.');
+        if (typeof sessionId !== 'string' || !sessionId) {
+          return { ok: false, creation_uncertain: true, request_id: 'talk-' + callId,
+            title, note: 'No valid session creation receipt received. Inspect the session list before retrying. Do not automatically repeat this action.' };
+        }
         try {
           await request('session.title', { session_id: sessionId, title });
           const admission = await request('prompt.submit', { session_id: sessionId,
@@ -4184,12 +4194,19 @@ function createDesktopVoiceTools(scope, assertOwner) {
         if (!text || text.length > 8000 || !callId || !['queue', 'steer'].includes(mode)) {
           throw new Error('A message and queue or steer mode are required.');
         }
-        const receipt = await request(mode === 'steer' ? 'session.steer' : 'prompt.submit', {
-          session_id: runtimeId, text,
-          ...(mode === 'queue' ? { queued: true,
-            ...(protocol === 'canonical' ? { submission_id: 'talk-message-' + callId } : {}) }
-            : protocol === 'canonical' ? { execution_generation: snapshot.execution_generation } : {}),
-        });
+        let receipt;
+        try {
+          receipt = await request(mode === 'steer' ? 'session.steer' : 'prompt.submit', {
+            session_id: runtimeId, text,
+            ...(mode === 'queue' ? { queued: true,
+              ...(protocol === 'canonical' ? { submission_id: 'talk-message-' + callId } : {}) }
+              : protocol === 'canonical' ? { execution_generation: snapshot.execution_generation } : {}),
+          });
+        } catch (error) {
+          return { ok: false, delivery_uncertain: true, session_id: id, title: selected.title,
+            mode, error: safeText(error.message),
+            note: 'Delivery is unconfirmed; the reply may have been lost after acceptance. Inspect progress before retrying. Do not automatically repeat this instruction.' };
+        }
         const accepted = mode === 'steer' ? receipt?.status === 'queued'
           : protocol === 'canonical' ? receipt?.admission_id && receipt?.ref?.session_id === runtimeId &&
             ['queued', 'started', 'terminal'].includes(receipt.status)

@@ -944,6 +944,11 @@ const retry=await t.handleFunctionCall(event);
 assert.equal(writes,1); assert.equal(first.output,retry.output);
 const conflict=await t.handleFunctionCall({...event,arguments:'{"title":"different"}'});
 assert(conflict.output.includes('Conflicting')); assert.equal(writes,1);
+sdk.executeLocalTool=async()=>{writes++;return {ok:false,delivery_uncertain:true,
+ note:'Inspect before retrying; do not repeat.'};};
+const uncertain=await t.handleFunctionCall({...event,call_id:'uncertain-1'});
+const uncertainReplay=await t.handleFunctionCall({...event,call_id:'uncertain-1'});
+assert.equal(writes,2);assert.equal(uncertainReplay.output,uncertain.output);
 assert.equal(requests.length,0,'local controls must not go to the Python tool endpoint');
 const bound=make();
 const count=sent.length;

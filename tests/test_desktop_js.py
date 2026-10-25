@@ -311,6 +311,32 @@ assert.equal(result.queued_count,1); assert.equal(result.waiting_for_approval,tr
 """)
 
 
+@pytest.mark.parametrize("method", ["session.create", "prompt.submit", "session.steer"])
+def test_lost_write_reply_reports_uncertainty_without_dispatching_again(method):
+    run_node(DESKTOP_TOOLS + "\nconst lostMethod=" + json.dumps(method) + r""";
+(async()=>{
+const sdk=createSDK(), base=gateway.request;
+let writes=0;
+gateway.request=async(method,params)=>{
+ if(method===lostMethod) {writes++;throw new Error('Reply lost after acceptance');}
+ if(method==='session.resume') return {session_id:'stored-a',stored_session_id:'stored-a',
+  execution_generation:4};
+ return base(method,params);
+};
+const result=lostMethod==='session.create'
+ ? await sdk.executeLocalTool('desktop_create_session',{
+    title:'Uncertain',initial_message:'Wait'},{callId:'lost-1'})
+ : await sdk.executeLocalTool('desktop_message_session',{
+    session_id:'stored-a',text:'Next instruction',
+    mode:lostMethod==='session.steer'?'steer':'queue'},{callId:'lost-1'});
+assert.equal(writes,1);assert.equal(result.ok,false);
+assert.equal(lostMethod==='session.create' ? result.creation_uncertain : result.delivery_uncertain,true);
+assert(result.note.includes('unconfirmed'));assert(result.note.includes('Do not automatically repeat'));
+if(lostMethod!=='session.create') assert.equal(result.session_id,'stored-a');
+})();
+""")
+
+
 def test_desktop_pins_route_token_and_late_receipt():
     run_node(r"""
 (async()=>{
