@@ -23,9 +23,11 @@ recipients and recovery behavior are described in
 - Codex CLI **0.154.0** for Codex workers. This is the adapter's verified version,
   not a floating latest-version requirement. Worker configuration and Codex
   authentication belong on the host that will execute the job.
-- A valid Codex OAuth login with its account ID for Live subscription, or an
-  explicitly selected API key for Live API. Provider entitlement is checked when
-  connecting; installing the code does not grant access.
+- For Live subscription, the Codex CLI signed in with ChatGPT
+  (`npm install -g @openai/codex`, then `codex login`); Talk drives it through
+  `codex app-server`. For Live API, an explicitly selected API key. Provider
+  entitlement is checked when connecting; installing the code does not grant
+  access.
 
 | Surface | Subscription audio | API audio | Dependencies |
 |---|---|---|---|
@@ -54,10 +56,29 @@ TALK_LIVE_API_MODEL=gpt-live-1
 TALK_LIVE_API_VOICE=marin
 ```
 
-Run `codex login` as the account running Talk for subscription authentication.
-`CODEX_HOME` may point to that account's alternate Codex store. Live requires the
-OAuth account identity as well as the access token. A missing, expired or rejected
-subscription fails in that lane; **it never falls back to a paid API key**.
+Run `codex login` (ChatGPT, not an API key) as the account running Talk for
+subscription authentication. Talk finds `codex` on `PATH`; `TALK_CODEX_BINARY`
+points at a specific binary. A missing CLI, a Codex login that is not ChatGPT, or
+a rejected call fails in that lane; **it never falls back to a paid API key**.
+
+### How a subscription call works
+
+Talk never holds the subscription token. For each call it starts one
+`codex app-server` child (API-key variables removed from its environment),
+checks the login is ChatGPT, and asks it to negotiate the WebRTC call; the Codex
+CLI owns the token and the call's server connection. Talk reads the call's
+transcripts and delegation requests from the app-server's notifications and
+sends delegation results and context (`delegation.context.append`,
+`session.context.append`) over the call's own `oai-events` data channel, which
+carries no credential. The child stops when the call ends.
+
+The app-server also hands each voice request to a Codex thread as a turn. That
+thread is fenced off: ephemeral, no environment, read-only sandbox, every
+approval declined, apps, shell, web search, plugins, sub-agents and each of your
+configured MCP servers disabled (Talk reads only their names), and instructed
+to reply only `skip`. Its replies never reach the voice. Each turn uses a small
+amount of your subscription quota; Hermes does the actual work under its own
+approvals.
 
 For API billing, explicitly set `TALK_LIVE_AUTH=api` and provide
 `TALK_OPENAI_API_KEY` or `OPENAI_API_KEY` through the private environment. The
@@ -81,9 +102,11 @@ unsupported combinations and blank configured values refuse. `TALK_MODEL`,
 `TALK_VOICE` and `TALK_PREFER_CODEX_OAUTH` retain their Realtime meanings and do
 not select Live billing. `TALK_PROVIDER` continues to select the legacy provider.
 
-The dashboard receives an opaque task/audio binding and SDP answer. Provider
-credentials, account IDs and provider session IDs stay on the server. The server
-owns Live delegation decisions; browser data-channel events do not authorize work.
+The dashboard receives an opaque task/audio binding and SDP answer. API keys stay
+on the server and the subscription token stays in the Codex CLI. The server owns
+Live delegation decisions; browser data-channel events do not authorize work. On
+subscription calls the browser only relays server-authored delegation results
+and context onto the call's data channel.
 Native transports use the same task coordinator through authenticated host routes.
 
 ## Configure a Codex worker

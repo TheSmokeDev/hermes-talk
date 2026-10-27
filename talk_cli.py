@@ -1252,6 +1252,7 @@ def _mint_session(
     try:
         return talk_wire.mint_ephemeral_session(
             auth_token=auth.token,
+            hermes_signed=auth.source == talk_auth.SOURCE_CODEX_OAUTH,
             model=model,
             voice=voice,
             instructions=instructions,
@@ -1263,8 +1264,8 @@ def _mint_session(
     except talk_wire.TalkUpstreamError as exc:
         if "(401)" in str(exc):
             remediation = (
-                "the Codex OAuth token was rejected — run `codex login` to refresh "
-                "your ChatGPT sign-in"
+                "the ChatGPT sign-in was rejected — sign in to Codex in Hermes again "
+                f"(`{talk_auth.CODEX_SIGN_IN_COMMAND}`)"
                 if auth.source == talk_auth.SOURCE_CODEX_OAUTH
                 else "the configured OpenAI API key was rejected"
             )
@@ -1294,7 +1295,7 @@ def _gemini_auth() -> talk_auth.TalkAuth:
     receipts name lanes, never keys.
     """
 
-    scoped = (os.environ.get("TALK_GEMINI_API_KEY") or "").strip()
+    scoped = (talk_config.secret("TALK_GEMINI_API_KEY") or "").strip()
     token = talk_config.resolve_gemini_key()
     if scoped:
         return talk_auth.TalkAuth(

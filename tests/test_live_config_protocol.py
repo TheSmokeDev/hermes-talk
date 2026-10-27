@@ -8,18 +8,19 @@ from dataclasses import replace
 import pytest
 
 import talk_auth
+import talk_live_codex
 import talk_live_config as config
 import talk_live_protocol as protocol
 import talk_realtime as rt
 
 
 def fake_auth(mode="subscription"):
-    return talk_auth.TalkAuth(
-        token="fake-sub-token" if mode == "subscription" else "fake-api-key",
-        source=talk_auth.SOURCE_CODEX_OAUTH if mode == "subscription" else talk_auth.SOURCE_ENV,
-        detail="test credential",
-        account_id="test-account" if mode == "subscription" else None,
-    )
+    """Subscription carries no token: the Codex CLI's app-server holds the login."""
+    if mode == "subscription":
+        return talk_auth.TalkAuth(
+            token="", source=config.SOURCE_CODEX_APP_SERVER, detail="test codex lane"
+        )
+    return talk_auth.TalkAuth(token="fake-api-key", source=talk_auth.SOURCE_ENV, detail="test")
 
 
 def setup_for(settings=None, **overrides):
@@ -56,9 +57,8 @@ def test_invalid_configuration_fails_closed(values):
         config.resolve_live_config(values)
 
 
-def test_subscription_ignores_all_api_keys_and_legacy_preference(monkeypatch):
-    credential = fake_auth()
-    monkeypatch.setattr(talk_auth, "_resolve_codex_oauth", lambda path: credential)
+def test_subscription_uses_codex_cli_and_ignores_all_api_keys(monkeypatch):
+    monkeypatch.setattr(talk_live_codex.shutil, "which", lambda name: "C:/bin/codex.cmd")
     result = config.resolve_live_auth(
         env={
             "TALK_OPENAI_API_KEY": "",
@@ -66,33 +66,30 @@ def test_subscription_ignores_all_api_keys_and_legacy_preference(monkeypatch):
             "TALK_PREFER_CODEX_OAUTH": "invalid",
         }
     )
-    assert result is credential
-    assert result.account_id == "test-account"
-    assert result.token not in repr(result)
-    assert result.account_id not in repr(result)
+    assert result.source == config.SOURCE_CODEX_APP_SERVER
+    assert result.token == ""
+    assert "paid" not in repr(result)
 
 
-def test_missing_subscription_never_uses_available_key(monkeypatch):
-    monkeypatch.setattr(talk_auth, "_resolve_codex_oauth", lambda path: None)
-    with pytest.raises(talk_auth.TalkAuthError, match="API credentials were not used"):
+def test_explicit_codex_binary_wins_over_path(monkeypatch):
+    monkeypatch.setattr(talk_live_codex.shutil, "which", lambda name: None)
+    result = config.resolve_live_auth(env={"TALK_CODEX_BINARY": "D:/tools/codex.exe"})
+    assert result.source == config.SOURCE_CODEX_APP_SERVER
+
+
+def test_missing_codex_cli_never_uses_available_key(monkeypatch):
+    monkeypatch.setattr(talk_live_codex.shutil, "which", lambda name: None)
+    with pytest.raises(talk_auth.TalkAuthError, match="API credentials were not used") as exc:
         config.resolve_live_auth(env={"OPENAI_API_KEY": "paid"})
+    assert "codex login" in str(exc.value)
 
 
-def test_failed_refresh_cannot_choose_api_key(monkeypatch):
-    def fail(_):
-        raise talk_auth.TalkAuthError("private provider detail")
-
-    monkeypatch.setattr(talk_auth, "_resolve_codex_oauth", fail)
-    with pytest.raises(talk_auth.TalkAuthError, match="subscription authentication failed") as exc:
-        config.resolve_live_auth(env={"OPENAI_API_KEY": "paid"})
-    assert "private" not in str(exc.value)
-
-
-def test_api_auth_never_consults_oauth_and_preserves_scoped_key_precedence(monkeypatch):
-    def forbid(_):
-        pytest.fail("API mode consulted OAuth")
+def test_api_auth_never_consults_codex_and_preserves_scoped_key_precedence(monkeypatch):
+    def forbid(*_args, **_kwargs):
+        pytest.fail("API mode consulted the Codex lane")
 
     monkeypatch.setattr(talk_auth, "_resolve_codex_oauth", forbid)
+    monkeypatch.setattr(talk_live_codex, "codex_binary", forbid)
     result = config.resolve_live_auth(
         env={
             "TALK_LIVE_AUTH": "api",
@@ -103,7 +100,6 @@ def test_api_auth_never_consults_oauth_and_preserves_scoped_key_precedence(monke
     )
     assert result.source == talk_auth.SOURCE_CONFIGURED
     assert result.token == "scoped"
-    assert result.account_id is None
     with pytest.raises(talk_auth.TalkAuthError, match="set but empty"):
         config.resolve_live_auth(
             env={"TALK_LIVE_AUTH": "api", "TALK_OPENAI_API_KEY": "", "OPENAI_API_KEY": "shared"}
@@ -117,10 +113,10 @@ def test_api_auth_never_consults_oauth_and_preserves_scoped_key_precedence(monke
     [
         (fake_auth("api"), config.LiveConfig()),
         (fake_auth(), config.LiveConfig("api")),
-        (replace(fake_auth(), account_id=None), config.LiveConfig()),
-        (replace(fake_auth(), account_id=" "), config.LiveConfig()),
-        (replace(fake_auth(), account_id="a\nb"), config.LiveConfig()),
-        (replace(fake_auth(), token="a\nb"), config.LiveConfig()),
+        (replace(fake_auth(), token="held-token"), config.LiveConfig()),
+        (replace(fake_auth(), source=talk_auth.SOURCE_CODEX_OAUTH), config.LiveConfig()),
+        (replace(fake_auth("api"), source=config.SOURCE_CODEX_APP_SERVER), config.LiveConfig()),
+        (replace(fake_auth("api"), token="a" + chr(10) + "b"), config.LiveConfig("api")),
     ],
 )
 def test_injected_credentials_cannot_cross_auth_modes_or_headers(credential, settings):
@@ -289,6 +285,32 @@ def test_public_context_commands_require_nullable_delegation_id(kind, wire):
     assert protocol.encode_command(rt.AppendLiveContext("hello", kind=kind)) == (
         {"type": f"session.{wire}.append", "content": "hello", "delegation_id": None},
     )
+
+
+@pytest.mark.parametrize(
+    "kind,channel,prefix",
+    [
+        ("instructions", "commentary", "hello"),
+        ("context", "commentary", "Verified context data"),
+        ("message", "speakable", "Tell the user"),
+    ],
+)
+def test_subscription_context_uses_v3_session_context_append(kind, channel, prefix):
+    events = protocol.encode_command(rt.AppendLiveContext("hello", kind=kind), subscription=True)
+    assert [event["type"] for event in events] == ["session.context.append"]
+    assert events[0]["channel"] == channel
+    assert events[0]["content"][0]["type"] == "input_text"
+    assert events[0]["content"][0]["text"].startswith(prefix)
+    assert "session.update" not in str(events)
+
+
+def test_subscription_context_chunks_stay_within_v3_append_limit():
+    events = protocol.encode_command(
+        rt.AppendLiveContext("🌳" * 400, kind="instructions"), subscription=True
+    )
+    chunks = [event["content"][0]["text"] for event in events]
+    assert len(events) > 1 and "".join(chunks) == "🌳" * 400
+    assert all(len(chunk.encode()) <= 500 for chunk in chunks)
 
 
 @pytest.mark.parametrize(

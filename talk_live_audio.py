@@ -1,5 +1,9 @@
 """Optional aiortc media transport for GPT-Live subscription sessions.
 
+The Codex CLI's app-server negotiates the call (Talk holds no subscription
+token); events come from its notifications, and Talk's client events go out on
+the call's own ``oai-events`` data channel.
+
 aiortc owns RTP, Opus, jitter handling and its outbound PyAV resampling.
 This adapter supplies paced mono PCM16 frames and resamples received frames
 back to the existing Talk 24-kHz mono PCM contract.
@@ -9,22 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from fractions import Fraction
 
 try:
     from . import talk_realtime as rt
-    from .talk_live_transport import (
-        CONNECT_TIMEOUT_S,
-        LiveWebSocketTransport,
-        negotiate_live_browser,
-    )
+    from .talk_live_codex import CodexLiveTransport
+    from .talk_live_transport import CONNECT_TIMEOUT_S, negotiate_live_browser
 except ImportError:  # pragma: no cover - flat-module fallback
     import talk_realtime as rt
-    from talk_live_transport import (
-        CONNECT_TIMEOUT_S,
-        LiveWebSocketTransport,
-        negotiate_live_browser,
-    )
+    from talk_live_codex import CodexLiveTransport
+    from talk_live_transport import CONNECT_TIMEOUT_S, negotiate_live_browser
 
 PCM_RATE = 24000
 FRAME_SAMPLES = 480
@@ -115,6 +114,7 @@ class LiveWebRTCTransport:
         aiohttp_module=None,
         rtc_module=None,
         av_module=None,
+        codex_server=None,
     ):
         self.auth = auth
         self.config = config
@@ -122,8 +122,10 @@ class LiveWebRTCTransport:
         self._aiohttp = aiohttp_module
         self._rtc = rtc_module
         self._av = av_module
+        self._codex_server = codex_server
         self._peer = None
         self._track = None
+        self._channel = None
         self._sideband = None
         self._tasks = set()
         self._queue = asyncio.Queue(maxsize=256)
@@ -153,6 +155,7 @@ class LiveWebRTCTransport:
         self._peer = self._rtc.RTCPeerConnection()
         self._track = create_pcm_audio_track(rtc_module=self._rtc, av_module=self._av)
         self._peer.addTrack(self._track)
+        self._channel = self._peer.createDataChannel("oai-events")
         connected = asyncio.Event()
 
         @self._peer.on("connectionstatechange")
@@ -179,16 +182,11 @@ class LiveWebRTCTransport:
                     self.config,
                     http_client=self._http,
                     aiohttp_module=self._aiohttp,
+                    codex_server=self._codex_server,
                 )
                 self.session_id = negotiated.session_id
-                self._sideband = LiveWebSocketTransport(
-                    auth=self.auth,
-                    config=self.config,
-                    aiohttp_module=self._aiohttp,
-                )
-                await self._sideband.open(
-                    url=negotiated.sideband_url,
-                    headers=negotiated.request_headers,
+                self._sideband = CodexLiveTransport(
+                    negotiated.codex_call, outbound=self._send_channel
                 )
                 self._spawn(self._read_sideband())
                 await self._peer.setRemoteDescription(
@@ -240,9 +238,14 @@ class LiveWebRTCTransport:
             raise rt.RealtimeSessionError("GPT-Live media transport is closed")
         self._track.append(data)
 
+    def _send_channel(self, event: dict) -> None:
+        if self._channel is None or self._channel.readyState != "open":
+            raise rt.RealtimeSessionError("GPT-Live data channel is not open")
+        self._channel.send(json.dumps(event))
+
     async def send_json(self, event: dict):
         if self._sideband is None or self._closed:
-            raise rt.RealtimeSessionError("GPT-Live sideband is closed")
+            raise rt.RealtimeSessionError("GPT-Live call is closed")
         await self._sideband.send_json(event)
 
     def __aiter__(self):

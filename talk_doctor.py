@@ -204,8 +204,8 @@ def _provider_check() -> dict[str, Any]:
         return _check("provider", "pass", "openai is the selected realtime provider", details)
 
     if provider == "gemini":
-        scoped = os.environ.get("TALK_GEMINI_API_KEY")
-        shared = os.environ.get("GEMINI_API_KEY")
+        scoped = talk_config.secret("TALK_GEMINI_API_KEY")
+        shared = talk_config.secret("GEMINI_API_KEY")
         keys = {
             "scoped": _key_presence(scoped),
             "shared": _key_presence(shared),
@@ -268,8 +268,8 @@ def _provider_check() -> dict[str, Any]:
             details,
         )
 
-    scoped = os.environ.get("TALK_XAI_API_KEY")
-    shared = os.environ.get("XAI_API_KEY")
+    scoped = talk_config.secret("TALK_XAI_API_KEY")
+    shared = talk_config.secret("XAI_API_KEY")
     keys = {
         "scoped": _key_presence(scoped),
         "shared": _key_presence(shared),
@@ -310,12 +310,9 @@ def _provider_check() -> dict[str, Any]:
         return _check(
             "provider",
             "fail",
-            "provider grok is selected but no xAI key or xAI OAuth login is configured",
+            "provider grok is selected but no xAI key is configured",
             details,
-            (
-                "Set TALK_XAI_API_KEY or XAI_API_KEY, or run `hermes auth add xai-oauth` "
-                "(SuperGrok / X Premium+ subscription).",
-            ),
+            ("Set TALK_XAI_API_KEY or XAI_API_KEY.",),
         )
     if not voice_valid:
         return _check(
@@ -346,8 +343,6 @@ def _grok_auth_check() -> dict[str, Any]:
     details = dict(receipt)
     lane = receipt["winning_lane"]
     remediation: list[str] = []
-    relogin = f"Run `{talk_grok_auth.RELOGIN_COMMAND}`"
-
     if receipt["blocked_by"] == "invalid-preference":
         remediation.append("Set TALK_PREFER_XAI_OAUTH to true or false, or unset it.")
         return _check(
@@ -365,27 +360,18 @@ def _grok_auth_check() -> dict[str, Any]:
             remediation.append("Set a real XAI_API_KEY or unset it.")
             summary = "XAI_API_KEY is set but blank and blocks xAI OAuth"
         elif receipt["preference"] == "enabled":
-            remediation.append(f"{relogin} or unset TALK_PREFER_XAI_OAUTH.")
-            summary = "xAI OAuth is required but no usable login was found; API keys are ignored"
-        elif receipt["xai_oauth"] in ("invalid", "expired"):
-            remediation.append(f"{relogin} to replace the {receipt['xai_oauth']} login.")
-            summary = f"the xAI OAuth login is {receipt['xai_oauth']} and no API key is set"
+            remediation.append(
+                "Unset TALK_PREFER_XAI_OAUTH and set TALK_XAI_API_KEY or XAI_API_KEY."
+            )
+            summary = (
+                "xAI OAuth is required, but Hermes does not yet sign xAI requests for "
+                "plugins; API keys are ignored"
+            )
         else:
-            remediation.append(f"Set TALK_XAI_API_KEY or XAI_API_KEY, or {relogin.lower()}.")
+            remediation.append("Set TALK_XAI_API_KEY or XAI_API_KEY.")
             summary = "no usable Grok authentication lane was found"
         return _check("auth", "fail", summary, details, remediation)
 
-    if receipt["refresh_required"]:
-        remediation.append(
-            f"{relogin} if the host's session-start OAuth refresh does not succeed."
-        )
-        return _check(
-            "auth",
-            "warn",
-            "xAI OAuth wins but needs a refresh; doctor did not refresh or write it",
-            details,
-            remediation,
-        )
     if receipt["metered_key_wins_over_oauth"]:
         remediation.append(
             "Set TALK_PREFER_XAI_OAUTH=true to require the xAI subscription login and "
@@ -410,8 +396,8 @@ def _selected_provider() -> str | None:
 def _gemini_auth_check() -> dict[str, Any]:
     """Use session-time key precedence without network access or foreign auth stores."""
 
-    scoped = os.environ.get("TALK_GEMINI_API_KEY")
-    shared = os.environ.get("GEMINI_API_KEY")
+    scoped = talk_config.secret("TALK_GEMINI_API_KEY")
+    shared = talk_config.secret("GEMINI_API_KEY")
     source = (
         "TALK_GEMINI_API_KEY" if scoped is not None
         else "GEMINI_API_KEY" if shared is not None else None
@@ -448,7 +434,65 @@ def _gemini_auth_check() -> dict[str, Any]:
     )
 
 
+def _live_auth_check() -> dict[str, Any] | None:
+    """The GPT-Live lane's credential, when that lane is selected; ``None`` otherwise.
+
+    Subscription calls run on the Codex CLI's own login through ``codex
+    app-server``, so the receipt is the CLI's presence; the ChatGPT sign-in is
+    confirmed by the app-server when a call starts. Doctor never reads it.
+    """
+
+    try:
+        if talk_config.voice_mode() != "live":
+            return None
+    except talk_config.TalkConfigError:
+        return None
+    try:
+        from .talk_live_codex import INSTALL_HINT, codex_binary
+        from .talk_live_config import LiveConfigError, resolve_live_config
+    except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
+        from talk_live_codex import INSTALL_HINT, codex_binary
+        from talk_live_config import LiveConfigError, resolve_live_config
+    try:
+        live = resolve_live_config()
+    except LiveConfigError:
+        return None  # The model check already reports this configuration error.
+    details: dict[str, Any] = {"provider": "live", "validation_scope": "configuration-only"}
+    if live.auth_mode == "subscription":
+        found = bool(codex_binary())
+        details.update(configured=found, winning_lane="codex-app-server")
+        if not found:
+            return _check(
+                "auth", "fail", "GPT-Live subscription needs the Codex CLI", details,
+                (INSTALL_HINT + ".",),
+            )
+        return _check(
+            "auth",
+            "pass",
+            "GPT-Live subscription runs through the Codex CLI; its ChatGPT login is "
+            "confirmed when a call starts",
+            details,
+        )
+    scoped = talk_config.secret("TALK_OPENAI_API_KEY")
+    shared = talk_config.secret("OPENAI_API_KEY")
+    key = scoped if scoped is not None else shared
+    lane = (
+        talk_auth.SOURCE_CONFIGURED if scoped is not None
+        else talk_auth.SOURCE_ENV if shared is not None else None
+    )
+    details.update(configured=bool(key and key.strip()), winning_lane=lane)
+    if not details["configured"]:
+        return _check(
+            "auth", "fail", "GPT-Live API mode has no usable OpenAI key", details,
+            ("Set TALK_OPENAI_API_KEY or OPENAI_API_KEY; API mode never uses a subscription.",),
+        )
+    return _check("auth", "pass", f"GPT-Live API mode uses {lane}", details)
+
+
 def _auth_check() -> dict[str, Any]:
+    live = _live_auth_check()
+    if live is not None:
+        return live
     provider = _selected_provider()
     if provider == "gemini":
         return _gemini_auth_check()
@@ -478,36 +522,27 @@ def _auth_check() -> dict[str, Any]:
             remediation.append("Set a real OPENAI_API_KEY or unset it.")
             summary = "OPENAI_API_KEY is set but blank and blocks Codex OAuth"
         elif receipt["preference"] == "enabled":
-            remediation.append("Run `codex login` or unset TALK_PREFER_CODEX_OAUTH.")
-            summary = "Codex OAuth is required but no usable login was found; API keys are ignored"
+            remediation.append(
+                "Update Hermes Agent to 0.21.7 or newer, or unset TALK_PREFER_CODEX_OAUTH."
+            )
+            summary = (
+                "Codex OAuth is required but this Hermes cannot sign Codex requests; "
+                "API keys are ignored"
+            )
         else:
-            remediation.append("Set TALK_OPENAI_API_KEY or OPENAI_API_KEY, or run `codex login`.")
+            remediation.append(
+                "Set TALK_OPENAI_API_KEY or OPENAI_API_KEY, or update Hermes Agent to 0.21.7+ "
+                f"and run `{talk_auth.CODEX_SIGN_IN_COMMAND}`."
+            )
             summary = "no usable Realtime authentication lane was found"
         return _check("auth", "fail", summary, details, remediation)
 
-    if receipt["refresh_required"]:
-        remediation.append(
-            "Run `codex login` if the normal session-time OAuth refresh does not succeed."
-        )
-        return _check(
-            "auth",
-            "warn",
-            "Codex OAuth wins but is expired; doctor did not refresh or write it",
-            details,
-            remediation,
-        )
     if receipt["metered_key_wins_over_codex"]:
         remediation.append(
             "Set TALK_PREFER_CODEX_OAUTH=true to require Codex OAuth and "
             "refuse metered key fallback."
         )
-        if receipt["codex_oauth"] == "expired":
-            summary = (
-                f"{lane} wins by legacy precedence while Codex OAuth is expired "
-                "and requires a successful refresh before use"
-            )
-        else:
-            summary = f"{lane} wins by legacy precedence while usable Codex OAuth is available"
+        summary = f"{lane} wins by legacy precedence while usable Codex OAuth is available"
         return _check(
             "auth",
             "warn",
@@ -1007,13 +1042,14 @@ def render_human(report: dict[str, Any]) -> str:
                 f"winner={details.get('winning_lane') or 'none'}, "
                 f"source={details.get('source') or 'none'}, validation=presence-only"
             )
+        elif check["id"] == "auth" and details.get("provider") == "live":
+            lines.append(
+                "  receipt: provider=live, "
+                f"winner={details.get('winning_lane') or 'none'}, validation=configuration-only"
+            )
         elif check["id"] == "auth":
             if "xai_oauth" in details:
                 oauth = f"xai-oauth={details['xai_oauth']}"
-                # Name the store shape that answered, so a "missing" verdict
-                # can be told apart from a login the parse never reached.
-                if details.get("xai_oauth_source"):
-                    oauth += f" (via {details['xai_oauth_source']})"
             else:
                 oauth = f"codex={details['codex_oauth']}"
             lines.append(

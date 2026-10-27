@@ -55,6 +55,10 @@ class FakeBrowser:
         self.closed = False
         self.release = None
         self.opening = asyncio.Event()
+        self.outbound = None
+
+    def attach_outbound(self, outbound):
+        self.outbound = outbound
 
     async def open_session(self):
         self.opening.set()
@@ -162,6 +166,26 @@ def test_answer_waits_for_sideband_and_descriptor_excludes_credentials(environme
         assert fixture.observed[0][1].tools == ()
         await fixture.registry.close_all()
         assert fixture.browser.closed and not binding.tasks
+
+    asyncio.run(run())
+
+
+def test_subscription_client_events_reach_the_browser_only_as_relay_events(environment):
+    async def run():
+        fixture = registry_for(environment)
+        _, binding = await start(fixture)
+        assert fixture.browser.outbound is not None
+        wire = {
+            "type": "delegation.context.append",
+            "delegation_item_id": "del-1",
+            "channel": "speakable",
+            "content": [{"type": "input_text", "text": "done"}],
+        }
+        fixture.browser.outbound(wire)
+        reply = await binding.poll(0)
+        relays = [event for event in reply["events"] if event["type"] == "provider"]
+        assert relays == [{"sequence": relays[0]["sequence"], "type": "provider", "event": wire}]
+        await binding.close()
 
     asyncio.run(run())
 

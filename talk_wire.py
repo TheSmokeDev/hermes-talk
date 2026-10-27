@@ -10,7 +10,8 @@ Invariants carried from the source system:
 - Fail-closed on upstream errors — a mint failure is an exception with a
   bounded upstream excerpt, never a silent fallback.
 - The raw API key is used exactly once (the Authorization header here) and
-  never appears in any returned descriptor.
+  never appears in any returned descriptor. On the ChatGPT-subscription lane
+  there is no key at all: Hermes signs the mint (``talk_auth.codex_request``).
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ from dataclasses import dataclass
 import httpx
 
 try:
+    from . import talk_auth
     from . import talk_realtime as rt
     from .talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
+    import talk_auth
     import talk_realtime as rt
     from talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 
@@ -141,8 +144,20 @@ def build_session_payload(
     return payload
 
 
+def _client_secret_payload(status: int, text: str, decode) -> dict:
+    if status != 200:
+        raise TalkUpstreamError(f"OpenAI Realtime client secret failed ({status}): {text[:300]}")
+    try:
+        payload = decode()
+    except Exception as exc:
+        raise TalkUpstreamError("OpenAI Realtime client secret returned non-JSON") from exc
+    if not isinstance(payload, dict):
+        raise TalkUpstreamError("OpenAI Realtime client secret returned invalid payload")
+    return payload
+
+
 def post_client_secret(auth_token: str, session: dict) -> dict:
-    """POST the session to the client_secrets endpoint. Isolated for tests."""
+    """POST the session to the client_secrets endpoint with an API key. Isolated for tests."""
 
     response = httpx.post(
         CLIENT_SECRETS_URL,
@@ -153,18 +168,22 @@ def post_client_secret(auth_token: str, session: dict) -> dict:
         },
         timeout=MINT_TIMEOUT_S,
     )
-    if response.status_code != 200:
-        raise TalkUpstreamError(
-            f"OpenAI Realtime client secret failed ({response.status_code}): "
-            f"{response.text[:300] or response.reason_phrase}"
-        )
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise TalkUpstreamError("OpenAI Realtime client secret returned non-JSON") from exc
-    if not isinstance(payload, dict):
-        raise TalkUpstreamError("OpenAI Realtime client secret returned invalid payload")
-    return payload
+    return _client_secret_payload(
+        response.status_code, response.text or response.reason_phrase, response.json
+    )
+
+
+def post_signed_client_secret(session: dict) -> dict:
+    """Mint on the profile's Codex sign-in: Hermes attaches the credential, Talk never sees it."""
+
+    signed = talk_auth.codex_request(
+        "POST",
+        CLIENT_SECRETS_URL,
+        json={"session": session},
+        headers={"Content-Type": "application/json"},
+        timeout=MINT_TIMEOUT_S,
+    )
+    return _client_secret_payload(signed.status, signed.text, signed.json)
 
 
 def parse_client_secret(payload: dict) -> tuple[str, int | None]:
@@ -193,6 +212,7 @@ def mint_ephemeral_session(
     automatic_response: bool = True,
     turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
+    hermes_signed: bool = False,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
 
@@ -210,7 +230,11 @@ def mint_ephemeral_session(
         text_output=text_output,
         turn_detection=turn_detection,
     )
-    payload = post_client_secret(auth_token, session)
+    payload = (
+        post_signed_client_secret(session)
+        if hermes_signed
+        else post_client_secret(auth_token, session)
+    )
     secret, expires_at_ms = parse_client_secret(payload)
     return TalkSessionDescriptor(
         client_secret=secret,
@@ -234,4 +258,5 @@ __all__ = [
     "mint_ephemeral_session",
     "parse_client_secret",
     "post_client_secret",
+    "post_signed_client_secret",
 ]

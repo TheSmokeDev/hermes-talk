@@ -13,9 +13,9 @@
 
 Hermes Talk is a realtime voice plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): you speak, it answers out loud, and it calls the agent's own tools without leaving the conversation. It runs in the terminal (`hermes talk`), in a Discord voice channel (`/talk join`), in the Hermes dashboard **Talk** tab, and in [Hermes Desktop](docs/DESKTOP.md).
 
-**It rides your ChatGPT or SuperGrok subscription. No API key required.**
+**It rides your ChatGPT subscription. No API key required.**
 
-The realtime lanes are **OpenAI Realtime** (`gpt-realtime-2.1`, on your ChatGPT subscription through `codex login`), **xAI Grok Voice** (on an X Premium or SuperGrok login, no key), and **Gemini Live** (which does need a `GEMINI_API_KEY` — free-tier AI Studio keys work); **GPT-Live** is selected separately by `TALK_VOICE_MODE=live` and runs `gpt-live-1-codex` on the Codex subscription or `gpt-live-1` on explicitly chosen API billing.
+The realtime lanes are **OpenAI Realtime** (`gpt-realtime-2.1`, on your ChatGPT subscription through your Hermes Codex sign-in, `hermes auth add openai-codex`), **xAI Grok Voice** (`XAI_API_KEY`), and **Gemini Live** (which does need a `GEMINI_API_KEY` — free-tier AI Studio keys work); **GPT-Live** is selected separately by `TALK_VOICE_MODE=live` and runs `gpt-live-1-codex` on the ChatGPT subscription through the Codex CLI (`codex login`) or `gpt-live-1` on explicitly chosen API billing. Talk never holds a subscription token: Hermes signs the Realtime requests, and the Codex CLI owns the GPT-Live call.
 
 Talk calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below.
 
@@ -124,9 +124,9 @@ Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 
 | Lane | How it authenticates | Default model | Surfaces |
 |---|---|---|---|
-| OpenAI Realtime (`TALK_PROVIDER=openai`, default) | ChatGPT subscription through `codex login`, or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | `gpt-realtime-2.1` | every surface |
-| GPT-Live (`TALK_VOICE_MODE=live`) | `TALK_LIVE_AUTH=subscription` (the default, on the Codex subscription) or explicitly chosen `api` billing; no automatic paid fallback | `gpt-live-1-codex` (subscription) / `gpt-live-1` (API) | terminal, Discord, dashboard, Desktop — on an explicit task |
-| xAI Grok Voice (`TALK_PROVIDER=grok`) | an X Premium or SuperGrok login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | `grok-voice-latest` | terminal + Discord |
+| OpenAI Realtime (`TALK_PROVIDER=openai`, default) | ChatGPT subscription through the Hermes Codex sign-in (`hermes auth add openai-codex`; Hermes signs the request), or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | `gpt-realtime-2.1` | every surface |
+| GPT-Live (`TALK_VOICE_MODE=live`) | `TALK_LIVE_AUTH=subscription` (the default: the Codex CLI's own ChatGPT login through `codex app-server`; needs `npm install -g @openai/codex` and `codex login`) or explicitly chosen `api` billing; no automatic paid fallback | `gpt-live-1-codex` (subscription) / `gpt-live-1` (API) | terminal, Discord, dashboard, Desktop — on an explicit task |
+| xAI Grok Voice (`TALK_PROVIDER=grok`) | `TALK_XAI_API_KEY` / `XAI_API_KEY` (the SuperGrok / X Premium login returns once Hermes signs xAI requests for plugins) | `grok-voice-latest` | terminal + Discord |
 | Gemini Live (`TALK_PROVIDER=gemini`) | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | `gemini-3.1-flash-live-preview` | terminal + `hermes realtime`; Discord refuses it for now |
 | Cascade voice (`TALK_VOICE_MODE=cascade`) | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY`, on top of the OpenAI Realtime lane | `eleven_flash_v2_5` | terminal, Discord, dashboard |
 
@@ -137,6 +137,30 @@ Per-lane detail and the credential order: [docs/PROVIDERS.md](docs/PROVIDERS.md)
 Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
 Experimental xAI speech effects and phrase wrappers, including how native Talk
 differs from verbatim TTS: [docs/XAI-SPEECH-TAGS.md](docs/XAI-SPEECH-TAGS.md).
+
+## What Talk touches
+
+What you would want to know before installing (catalog rule 13):
+
+- **Network:** your voice and the conversation context go to the provider you
+  select — OpenAI (`api.openai.com`, and `chatgpt.com` for subscription calls),
+  xAI, Google, and optionally ElevenLabs for cascade speech.
+- **Credentials:** API keys are read through Hermes's profile-scoped secret
+  route. The ChatGPT subscription is used only through Hermes-signed requests
+  (`requires_auth: [openai-codex]`) or the Codex CLI's own login; Talk never
+  reads, refreshes or stores a subscription token, and never reads
+  `~/.codex/auth.json` or Hermes's `auth.json`.
+- **Background processes:** live voice keeps WebSocket/WebRTC connections open
+  for the call. GPT-Live on the subscription starts one `codex app-server`
+  child per call (stopped when the call ends) with the API-key variables
+  removed from its environment. Talk reads only the names of your Codex MCP
+  servers so it can switch them off for that call's fenced Codex thread; that
+  thread runs a small Codex turn for each voice request (subscription quota),
+  replies only `skip`, and cannot run tools.
+- **Work on your behalf:** spoken requests are handed to your Hermes agent,
+  whose tools can run shell commands under Hermes's own approvals.
+- **Local data:** run history and voice-session state under Hermes's home. No
+  telemetry.
 
 ## Surfaces
 

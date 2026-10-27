@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Literal
 
 try:
-    from . import talk_config, talk_doctor
+    from . import talk_auth, talk_config, talk_doctor
 except ImportError:  # pragma: no cover - flat-module fallback (pip -e install)
+    import talk_auth
     import talk_config
     import talk_doctor
 
@@ -1201,7 +1202,10 @@ def _auth_changes(
             input_fn,
         )
         if lane == "codex":
-            output_fn("Run `codex login`, then rerun `hermes talk setup`; no file was changed.")
+            output_fn(
+                f"Run `{talk_auth.CODEX_SIGN_IN_COMMAND}`, then rerun `hermes talk setup`; "
+                "no file was changed."
+            )
             return []
         changes: list[EnvChange] = []
         if not metered_present:

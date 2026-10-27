@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from test_live_config_protocol import fake_auth, setup_for
 from test_live_transport import SDP, Socket, aiohttp_peer
 
+import talk_live_codex
 import talk_live_realtime as live
 import talk_realtime as rt
 from talk_live_config import LiveConfig
@@ -174,9 +176,11 @@ def test_no_commands_escape_invalid_batch_or_mutate_subscription_context():
             await session.send([rt.AppendLiveContext("not sent"), rt.StartResponse()])
         assert not wire.sent
         await session.send([rt.AppendLiveContext("now sent")])
-        assert "not sent" not in wire.sent[0]["session"]["instructions"]
-        assert "Host policy" in wire.sent[0]["session"]["instructions"]
-        assert "now sent" in wire.sent[0]["session"]["instructions"]
+        # Codex v3 calls refuse instruction updates; context is appended, never re-sent.
+        assert [event["type"] for event in wire.sent] == ["session.context.append"]
+        assert wire.sent[0]["content"][0]["text"] == "now sent"
+        assert "not sent" not in json.dumps(wire.sent)
+        assert all(event["type"] != "session.update" for event in wire.sent)
         await session.close()
 
     asyncio.run(run())
@@ -310,24 +314,51 @@ def test_close_during_connect_cancels_pending_connection_and_never_reopens():
     asyncio.run(run())
 
 
-def test_subscription_browser_accepts_idless_started_event_using_negotiated_identity():
+class FakeCodexServer:
+    def __init__(self):
+        self.notifications = asyncio.Queue()
+        self.requests = []
+        self.closed = 0
+
+    async def request(self, method, params, **_kwargs):
+        self.requests.append((method, params))
+        return {}
+
+    async def close(self):
+        self.closed += 1
+        self.notifications.put_nowait(None)
+
+
+def test_subscription_browser_reads_codex_events_and_relays_client_events():
     async def run():
-        module, _, socket = aiohttp_peer()
+        server = FakeCodexServer()
+        call = talk_live_codex.CodexLiveCall(server, "thread-1", SDP, "rts_test")
         broker = LiveBrowserSession(
             answer_sdp=SDP,
-            session_id="rtc_test",
-            sideband_url="wss://api.openai.com/v1/live/rtc_test",
+            session_id="rts_test",
+            sideband_url=None,
             auth=fake_auth(),
             config=LiveConfig(),
             setup=setup_for(),
-            aiohttp_module=module,
+            codex_call=call,
         )
         session = await broker.open_session()
-        await anext(session)
-        socket.emit({"type": "session.started", "session": {"expires_at": 9000}})
-        socket.emit({"type": "input_transcript.added", "item": {"text": "hello"}})
-        assert isinstance(await anext(session), rt.Transcript)
+        relayed = []
+        broker.attach_outbound(relayed.append)
+        assert (await anext(session)).session_id == "rts_test"
+        server.notifications.put_nowait(
+            {
+                "method": "thread/realtime/transcript/delta",
+                "params": {"threadId": "thread-1", "role": "user", "delta": "hello"},
+            }
+        )
+        heard = await anext(session)
+        assert isinstance(heard, rt.Transcript) and heard.text == "hello"
+        await session.send([rt.AppendLiveContext("note", kind="context")])
+        assert [event["type"] for event in relayed] == ["session.context.append"]
         await broker.close()
+        assert ("thread/realtime/stop", {"threadId": "thread-1"}) in server.requests
+        assert server.closed >= 1
         with pytest.raises(rt.RealtimeSessionError, match="binding is closed"):
             await broker.open_session()
 

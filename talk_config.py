@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
@@ -191,6 +192,41 @@ _MAX_DISCORD_USER_ID = (1 << 64) - 1
 
 class TalkConfigError(Exception):
     """A Talk configuration value is unusable."""
+
+
+def secret(name: str) -> str | None:
+    """A credential or setting by env-var name, through Hermes's profile scope.
+
+    ``agent.secret_scope.get_secret`` honours the active profile, so a gateway
+    multiplexing several profiles never hands Talk another profile's key
+    (catalog admission rule 11). Standalone, without Hermes, it is the process
+    environment.
+    """
+
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.environ.get(name)
+    return get_secret(name)
+
+
+class _SecretEnv(Mapping):
+    """Read-only mapping view of :func:`secret`, for resolvers written over ``env``."""
+
+    def __getitem__(self, name: str) -> str:
+        value = secret(name)
+        if value is None:
+            raise KeyError(name)
+        return value
+
+    def __iter__(self):
+        return iter(os.environ)
+
+    def __len__(self) -> int:
+        return len(os.environ)
+
+
+SECRET_ENV: Mapping[str, str] = _SecretEnv()
 
 
 def get_hermes_home() -> Path:
@@ -563,14 +599,14 @@ def resolve_openai_key() -> str:
     scoped a key expects that key to be used or the surface to say why not.
     """
 
-    scoped = os.environ.get("TALK_OPENAI_API_KEY")
+    scoped = secret("TALK_OPENAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_OPENAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("OPENAI_API_KEY")
+    shared = secret("OPENAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("OPENAI_API_KEY is set but empty — set a real key or unset it")
@@ -589,14 +625,14 @@ def resolve_xai_key() -> str:
     the subscription lane lives in ``talk_grok_auth.resolve_grok_auth``.
     """
 
-    scoped = os.environ.get("TALK_XAI_API_KEY")
+    scoped = secret("TALK_XAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_XAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("XAI_API_KEY")
+    shared = secret("XAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("XAI_API_KEY is set but empty — set a real key or unset it")
@@ -614,14 +650,14 @@ def resolve_gemini_key() -> str:
     logged, and scrubbed out of transport errors before they surface.
     """
 
-    scoped = os.environ.get("TALK_GEMINI_API_KEY")
+    scoped = secret("TALK_GEMINI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_GEMINI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("GEMINI_API_KEY")
+    shared = secret("GEMINI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("GEMINI_API_KEY is set but empty — set a real key or unset it")
@@ -683,14 +719,14 @@ def resolve_elevenlabs_key() -> str:
     ``xi-api-key`` WebSocket header — never the URL, never a log line.
     """
 
-    scoped = os.environ.get("TALK_ELEVENLABS_API_KEY")
+    scoped = secret("TALK_ELEVENLABS_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_ELEVENLABS_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("ELEVENLABS_API_KEY")
+    shared = secret("ELEVENLABS_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError(
@@ -857,10 +893,10 @@ def api_server_key() -> str | None:
     so "no key" is a real, reachable configuration rather than a broken one.
     """
 
-    scoped = os.environ.get("TALK_API_SERVER_KEY")
+    scoped = secret("TALK_API_SERVER_KEY")
     if scoped is not None:
         return scoped.strip() or None
-    return (os.environ.get("API_SERVER_KEY") or "").strip() or None
+    return (secret("API_SERVER_KEY") or "").strip() or None
 
 
 def api_server_probe_timeout_s() -> float:

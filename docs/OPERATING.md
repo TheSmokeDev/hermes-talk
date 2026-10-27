@@ -31,8 +31,9 @@ provider checks below are not acceptance proof for those new capabilities.
   instead and needs nothing installed locally.
 - **One credential, any of three lanes**: a Talk-scoped key
   (`TALK_OPENAI_API_KEY`), a shared key (`OPENAI_API_KEY`), or a ChatGPT
-  subscription via Codex CLI OAuth (`codex login`). No key is required if
-  the third lane is signed in.
+  subscription through the Hermes Codex sign-in (`hermes auth add
+  openai-codex`, Hermes 0.21.7+), which Hermes signs for Talk. No key is
+  required if the third lane is signed in.
 
 ## Install
 
@@ -173,7 +174,7 @@ receipt as its verification/exit result. API-key input is hidden and never
 echoed. If an existing metered key is blocked only by
 `TALK_PREFER_CODEX_OAUTH=true`, choosing the key reuses it and separately asks
 to write the required `false` policy transition. If the only missing action is
-`codex login`, setup names it and writes nothing.
+`hermes auth add openai-codex`, setup names it and writes nothing.
 
 Dotenv setting names follow the target platform: Windows matching is
 case-insensitive and collapses duplicate case variants to one canonical entry;
@@ -192,8 +193,8 @@ identity section counts plus active profile/root provenance, Discord operator
 configuration, and host capability surfaces. The JSON envelope is versioned
 with `schema_version: 1` and marks `read_only: true`.
 
-Doctor performs no setup or repair. In particular it does not refresh expired
-OAuth, rewrite `auth.json`, create Hermes state directories, open audio devices,
+Doctor performs no setup or repair. In particular it does not read or refresh
+any sign-in, create Hermes state directories, open audio devices,
 start services, or probe an api-server sidecar. Remediations are instructions
 only. Identity content, credentials, and Discord IDs are never included; only
 section/operator counts and lane/state receipts are emitted.
@@ -357,7 +358,7 @@ one of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
 | `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
 | `TALK_GROK_VOICE` | `ara` | **Fail-closed** against all 28 built-in [Grok voices](PROVIDERS.md#provider-details--openai-default-grok-or-gemini), including `carina`, `zagan`, `luna`, and `liora`. Case-insensitive friendly names only — the wire prefix is the adapter's job. |
-| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. Unset both to ride the host's `xai-oauth` login (`hermes auth add xai-oauth`, a SuperGrok / X Premium+ subscription). |
+| `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. The `xai-oauth` subscription login is not used until Hermes signs xAI requests for plugins. |
 | `TALK_PREFER_XAI_OAUTH` | unset | Absent/`false` keeps keys ahead of the xAI login. `true` requires the login and ignores keys; a missing/unusable login refuses. Blank or invalid values refuse. |
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model. Configure the bare id — the adapter adds the `models/` wire prefix. Fallback line: `gemini-2.5-flash-native-audio-latest`. |
 | `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
@@ -680,21 +681,17 @@ see [Live billing](GPT-LIVE.md#choose-billing-and-voice).
 |---|---|---|
 | `TALK_OPENAI_API_KEY` | unset | Talk-scoped key, first in order. **Set-but-empty is a hard refusal, never a fall-through.** |
 | `OPENAI_API_KEY` | unset | Shared key, second in order. Same set-but-empty refusal. |
-| `CODEX_HOME` | `~/.codex` | Where the Codex OAuth lane (third in order) reads `auth.json` from. |
-| `TALK_PREFER_CODEX_OAUTH` | unset | Absent/`false` preserves the order above. `true` requires Codex OAuth and ignores API keys; missing/unusable OAuth refuses. Blank or invalid values also refuse. |
+| `TALK_PREFER_CODEX_OAUTH` | unset | Absent/`false` preserves the order above. `true` requires the Hermes-signed Codex lane and ignores API keys; a host that cannot sign Codex requests refuses. Blank or invalid values also refuse. |
+| `TALK_CODEX_BINARY` | `codex` on `PATH` | The Codex CLI that GPT-Live subscription calls drive through `codex app-server`. |
 
-Grok (`TALK_PROVIDER=grok`) resolves its own bearer the same shape:
-`TALK_PREFER_XAI_OAUTH` → `TALK_XAI_API_KEY` → `XAI_API_KEY` → the host
-`xai-oauth` login. When the host is importable its resolver owns refresh
-and quarantine; otherwise `HERMES_HOME/auth.json` is parsed read-only.
-That parse reads both shapes the host keeps a login in, in the host's own
-order: a `providers` block with the tokens under `tokens`, then the
-`credential_pool` list — where a current host writes a device-code login,
-with the tokens flat on the row. Both tokens are required either way, which
-is also what rejects a quarantined login.
-Talk never writes either store. Doctor's auth check names the winning lane
-(`xai-oauth=valid|expired|invalid|missing`, plus `(via providers)` or
-`(via credential_pool)` when a login was found) without refreshing anything;
+The third lane is the profile's Hermes Codex sign-in, used only through
+Hermes-signed requests (`credentialed_provider_request`); Talk never reads a
+token file. Keys are read through Hermes's profile-scoped secret route.
+
+Grok (`TALK_PROVIDER=grok`) uses `TALK_XAI_API_KEY` → `XAI_API_KEY`.
+`TALK_PREFER_XAI_OAUTH=true` refuses: the `xai-oauth` login is not used, and
+Talk never reads Hermes's credential store. Doctor's auth check names the
+winning key lane (`xai-oauth=unsupported`);
 `hermes talk doctor --probe` is the one opt-in network call — a `POST
 /v1/realtime/client_secrets` plus a socket handshake against `api.x.ai`
 that prints status codes and the first event type, never the token.
@@ -885,15 +882,16 @@ spawned without a model config because yours lives in a profile. Set
 `TALK_AGENT_PROFILE=<name>`, or check why auto-detection didn't find it.
 [Full story in BACKGROUND-WORK.md.](BACKGROUND-WORK.md#talk_agent_profile--which-profile-the-background-agent-runs-under)
 
-**"OpenAI Realtime auth failed (401)" on the Codex lane** — the OAuth
-token expired. Run `codex login` to refresh the ChatGPT sign-in, then
-start the session again.
+**"OpenAI Realtime auth failed (401)" on the Codex lane** — the ChatGPT
+sign-in was rejected. Run `hermes auth add openai-codex` (or sign in to Codex
+in Hermes Desktop), then start the session again.
 
-**"xAI OAuth token rejected" on the Grok lane** — the subscription login
-expired or was revoked. Run `hermes auth add xai-oauth` and start again.
-**"your xAI subscription tier does not include realtime API access"** —
-the login is valid but xAI answered 403 on the realtime surface; set
-`XAI_API_KEY` for Grok voice, or use another provider.
+**"Not signed in to Codex in Hermes"** — the profile has no Codex sign-in; run
+the command the message names.
+
+**GPT-Live subscription: "install it … and sign in with `codex login`"** —
+the Codex CLI is missing from `PATH` or is not signed in with ChatGPT. Install
+it, run `codex login`, or set `TALK_CODEX_BINARY`.
 
 **"401" with a key configured** — the key itself was rejected. Remember
 the order: `TALK_OPENAI_API_KEY` beats `OPENAI_API_KEY` beats Codex OAuth,

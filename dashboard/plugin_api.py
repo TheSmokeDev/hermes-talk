@@ -205,7 +205,7 @@ TOOL_EXECUTION_WAIT_S = talk_relay.TOOL_EXECUTION_WAIT_S
 def dashboard_token() -> str | None:
     """The configured token, resolved at CALL time. Set-but-blank reads as unset."""
 
-    return (os.environ.get(DASHBOARD_TOKEN_ENV) or "").strip() or None
+    return (talk_config.secret(DASHBOARD_TOKEN_ENV) or "").strip() or None
 
 
 def _presented_token(request) -> str:
@@ -245,7 +245,7 @@ def _has_desktop_auth(request, presented: str) -> bool:
 
     if not _is_loopback(request):
         return False
-    configured = (os.environ.get(DESKTOP_TOKEN_ENV) or "").strip()
+    configured = (talk_config.secret(DESKTOP_TOKEN_ENV) or "").strip()
     if not configured or not presented or not hmac.compare_digest(
         presented.encode("utf-8"), configured.encode("utf-8")
     ):
@@ -371,8 +371,18 @@ def _session_tools(bound=None):
     return tools
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
+def _mint(
+    auth_token: str,
+    voice: str,
+    *,
+    text_output: bool = False,
+    bound=None,
+    hermes_signed: bool = False,
+):
     """Assemble instructions and mint. Blocking — called on a worker thread.
+
+    ``hermes_signed`` is the ChatGPT-subscription lane: Hermes signs the mint
+    and ``auth_token`` is empty.
 
     ``text_output`` is the cascade lane: the minted session asks the provider
     for TEXT output instead of synthesized audio, and the browser streams the
@@ -382,6 +392,7 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
     tools = _session_tools(bound)
     return talk_wire.mint_ephemeral_session(
         auth_token=auth_token,
+        hermes_signed=hermes_signed,
         model=talk_config.talk_model(),
         voice=voice,
         instructions=talk_identity.build_instructions(
@@ -559,8 +570,13 @@ async def create_session(request: Request) -> dict:
             auth.token,
             voice,
             text_output=text_output,
+            hermes_signed=auth.source == talk_auth.SOURCE_CODEX_OAUTH,
             **({"bound": bound} if bound is not None else {}),
         )
+    except talk_auth.TalkAuthError as exc:
+        if bound is not None:
+            await _task_call(TASKS.close, request, TASKS.descriptor(bound))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except talk_wire.TalkWireError as exc:
         if bound is not None:
             await _task_call(TASKS.close, request, TASKS.descriptor(bound))
@@ -999,7 +1015,12 @@ async def _target_session(request, body, *, initial=False):
     activated = False
     try:
         descriptor = await asyncio.to_thread(
-            _mint, auth.token, voice, text_output=text_output, bound=prepared.bound
+            _mint,
+            auth.token,
+            voice,
+            text_output=text_output,
+            bound=prepared.bound,
+            hermes_signed=auth.source == talk_auth.SOURCE_CODEX_OAUTH,
         )
         if hasattr(request, "is_disconnected") and await request.is_disconnected():
             raise HTTPException(
@@ -1022,6 +1043,8 @@ async def _target_session(request, body, *, initial=False):
             "task": TASKS.descriptor(prepared.bound),
             "selection": selection,
         }
+    except talk_auth.TalkAuthError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except talk_wire.TalkWireError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:

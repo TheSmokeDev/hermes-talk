@@ -52,7 +52,8 @@ def _write_oauth(home: Path, *, access: str, refresh: str = "refresh-secret") ->
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "hermes_constants", None)
-    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", None)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", None)
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-missing"))
     for name in (
@@ -89,16 +90,8 @@ def _checks(report: dict) -> dict[str, dict]:
     return {check["id"]: check for check in report["checks"]}
 
 
-def test_doctor_accepts_hermes_managed_codex_login(monkeypatch, capsys):
-    token = _jwt_with_exp(time.time() + 3600)
-    module = types.ModuleType("hermes_cli.auth_codex")
-
-    def resolve(*, read_only=False):
-        assert read_only is True
-        return {"api_key": token}
-
-    module.resolve_codex_runtime_credentials = resolve
-    monkeypatch.setitem(sys.modules, "hermes_cli.auth_codex", module)
+def test_doctor_accepts_the_hermes_signed_codex_lane(monkeypatch, capsys):
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: True)
     monkeypatch.setenv("TALK_PREFER_CODEX_OAUTH", "true")
     monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
 
@@ -107,7 +100,7 @@ def test_doctor_accepts_hermes_managed_codex_login(monkeypatch, capsys):
     auth = _checks(json.loads(output))["auth"]
     assert auth["status"] == "pass"
     assert auth["details"]["winning_lane"] == "codex-oauth"
-    assert token not in output
+    assert auth["details"]["codex_oauth"] == "hermes"
 
 
 def test_json_shape_is_stable_and_machine_readable(monkeypatch):
@@ -147,24 +140,24 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
     json.dumps(report)
 
 
-def test_doctor_is_read_only_even_when_oauth_is_expired(monkeypatch, tmp_path):
-    auth_path = _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() - 60))
+def test_doctor_never_reads_or_writes_the_vendor_codex_store(monkeypatch, tmp_path):
+    """Rule 11: a Codex CLI login on disk is not a Talk auth lane, and doctor leaves it alone."""
+
+    auth_path = _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     before = auth_path.read_bytes()
     before_mtime = auth_path.stat().st_mtime_ns
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("doctor tried to refresh or write OAuth")
+    payload = json.dumps(talk_doctor.collect_report())
+    auth = _checks(json.loads(payload))["auth"]
 
-    monkeypatch.setattr(talk_auth, "_post_token_form", forbidden, raising=False)
-    monkeypatch.setattr(talk_auth, "_write_auth_json", forbidden, raising=False)
-
-    auth = _checks(talk_doctor.collect_report())["auth"]
-
-    assert auth["status"] == "warn"
-    assert auth["details"]["codex_oauth"] == "expired"
+    assert auth["status"] == "fail"
+    assert auth["details"]["codex_oauth"] == "missing"
+    assert auth["details"]["refresh_required"] is False
     assert auth_path.read_bytes() == before
     assert auth_path.stat().st_mtime_ns == before_mtime
+    assert "refresh-secret" not in payload
+    assert "account-secret" not in payload
 
 
 def test_doctor_does_not_create_missing_home_or_codex_directories(monkeypatch, tmp_path):
@@ -180,37 +173,8 @@ def test_doctor_does_not_create_missing_home_or_codex_directories(monkeypatch, t
     assert not codex_home.exists()
 
 
-def test_blank_oauth_is_reported_without_tokens(monkeypatch, tmp_path):
-    access = ""
-    _write_oauth(tmp_path / "codex", access=access)
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-
-    payload = json.dumps(talk_doctor.collect_report())
-    auth = _checks(json.loads(payload))["auth"]
-
-    assert auth["status"] == "fail"
-    assert auth["details"]["codex_oauth"] == "invalid"
-    assert access not in payload or not access
-    assert "refresh-secret" not in payload
-    assert "account-secret" not in payload
-
-
-@pytest.mark.parametrize("jwt_payload", [[], None, "not-an-object", 7])
-def test_malformed_non_object_jwt_preserves_doctor_schema(monkeypatch, tmp_path, jwt_payload):
-    _write_oauth(tmp_path / "codex", access=_jwt_with_payload(jwt_payload))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-
-    report = talk_doctor.collect_report()
-    payload = json.loads(json.dumps(report))
-
-    assert payload["schema_version"] == 1
-    assert set(payload) == {"schema_version", "command", "read_only", "ok", "summary", "checks"}
-    assert _checks(payload)["auth"]["details"]["codex_oauth"] == "invalid"
-
-
-def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(monkeypatch, tmp_path):
-    _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(monkeypatch):
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: True)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
 
     auth = _checks(talk_doctor.collect_report())["auth"]
@@ -221,25 +185,8 @@ def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(monkey
     assert "TALK_PREFER_CODEX_OAUTH=true" in " ".join(auth["remediation"])
 
 
-def test_metered_key_winner_describes_expired_oauth_truthfully(monkeypatch, tmp_path):
-    _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() - 60))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-secret")
-
-    auth = _checks(talk_doctor.collect_report())["auth"]
-
-    assert auth["status"] == "warn"
-    assert auth["details"]["winning_lane"] == talk_auth.SOURCE_ENV
-    assert auth["details"]["codex_oauth"] == "expired"
-    assert auth["details"]["metered_key_wins_over_codex"] is True
-    assert "expired" in auth["summary"].lower()
-    assert "refresh" in auth["summary"].lower()
-    assert "usable" not in auth["summary"].lower()
-
-
-def test_blank_shared_key_blocks_oauth_with_specific_remediation(monkeypatch, tmp_path):
-    _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+def test_blank_shared_key_blocks_oauth_with_specific_remediation(monkeypatch):
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: True)
     monkeypatch.setenv("OPENAI_API_KEY", "   ")
 
     auth = _checks(talk_doctor.collect_report())["auth"]
@@ -259,6 +206,7 @@ def test_preferred_missing_oauth_fails_closed_and_reports_ignored_key(monkeypatc
     assert auth["details"]["winning_lane"] is None
     assert auth["details"]["codex_oauth"] == "missing"
     assert auth["details"]["metered_keys_ignored"] is True
+    assert "0.21.7" in " ".join(auth["remediation"])
 
 
 def test_identity_profile_home_collapses_to_root_without_duplicate_profile(monkeypatch, tmp_path):
@@ -737,55 +685,24 @@ def _write_xai_oauth(home: Path, *, access: str, refresh: str = XAI_REFRESH) -> 
     return path
 
 
-def _write_xai_pool(home: Path, *, access: str, refresh: str = XAI_REFRESH) -> Path:
-    """The other shape: a device-code login in the pool, tokens flat on the row."""
-
-    home.mkdir(parents=True, exist_ok=True)
-    path = home / "auth.json"
-    path.write_text(
-        json.dumps(
-            {
-                "providers": {},
-                "credential_pool": {
-                    "xai-oauth": [
-                        {
-                            "id": "cce4f6",
-                            "label": "xai-oauth-oauth-1",
-                            "auth_type": "oauth",
-                            "priority": 0,
-                            "source": "manual:device_code",
-                            "access_token": access,
-                            "refresh_token": refresh,
-                            "base_url": "https://api.x.ai/v1",
-                        }
-                    ]
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
 @pytest.fixture
 def _no_host(monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_cli", None)
     monkeypatch.setitem(sys.modules, "hermes_cli.auth", None)
 
 
-def test_grok_provider_and_auth_pass_on_a_valid_xai_oauth_login(monkeypatch, tmp_path, _no_host):
+def test_grok_doctor_ignores_a_stored_xai_oauth_login(monkeypatch, tmp_path, _no_host):
+    """Rule 11: Hermes's store is never read, so a login there is not a lane."""
+
     monkeypatch.setenv("TALK_PROVIDER", "grok")
     store = _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
     before = store.read_bytes()
 
     checks = _checks(talk_doctor.collect_report())
 
-    assert checks["provider"]["status"] == "pass"
-    assert checks["provider"]["details"]["auth_lane"] == "xai-oauth"
-    assert checks["provider"]["details"]["xai_oauth"] == "valid"
-    assert checks["auth"]["status"] == "pass"
-    assert checks["auth"]["details"]["winning_lane"] == "xai-oauth"
-    assert checks["auth"]["summary"] == "xai-oauth is the winning auth lane"
+    assert checks["auth"]["status"] == "fail"
+    assert checks["auth"]["details"]["xai_oauth"] == "unsupported"
+    assert checks["auth"]["details"]["winning_lane"] is None
     assert store.read_bytes() == before
     dumped = json.dumps(checks)
     assert XAI_ACCESS not in dumped
@@ -799,26 +716,26 @@ def test_grok_provider_check_fails_without_a_key_or_a_login(monkeypatch, _no_hos
     checks = _checks(talk_doctor.collect_report())
 
     assert checks["provider"]["status"] == "fail"
-    assert "no xAI key or xAI OAuth login" in checks["provider"]["summary"]
-    assert "hermes auth add xai-oauth" in " ".join(checks["provider"]["remediation"])
+    assert "no xAI key is configured" in checks["provider"]["summary"]
+    assert "xai-oauth" not in " ".join(checks["provider"]["remediation"])
     assert checks["auth"]["status"] == "fail"
     assert checks["auth"]["details"]["blocked_by"] == "no-usable-auth"
 
 
-def test_grok_auth_warns_when_a_metered_key_outranks_a_valid_login(monkeypatch, tmp_path, _no_host):
+def test_grok_key_passes_without_an_oauth_comparison(monkeypatch, tmp_path, _no_host):
     monkeypatch.setenv("TALK_PROVIDER", "grok")
     monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
     _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
 
     check = _checks(talk_doctor.collect_report())["auth"]
 
-    assert check["status"] == "warn"
+    assert check["status"] == "pass"
     assert check["details"]["winning_lane"] == "env"
-    assert check["details"]["metered_key_wins_over_oauth"] is True
-    assert "TALK_PREFER_XAI_OAUTH=true" in " ".join(check["remediation"])
+    assert check["details"]["metered_key_wins_over_oauth"] is False
+    assert check["details"]["refresh_required"] is False
 
 
-def test_grok_auth_fails_closed_on_a_preferred_but_missing_login(monkeypatch, _no_host):
+def test_grok_auth_fails_closed_on_a_preferred_but_unsupported_login(monkeypatch, _no_host):
     monkeypatch.setenv("TALK_PROVIDER", "grok")
     monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
     monkeypatch.setenv("TALK_PREFER_XAI_OAUTH", "true")
@@ -828,55 +745,19 @@ def test_grok_auth_fails_closed_on_a_preferred_but_missing_login(monkeypatch, _n
     assert check["status"] == "fail"
     assert check["details"]["winning_lane"] is None
     assert "API keys are ignored" in check["summary"]
-    assert "hermes auth add xai-oauth" in " ".join(check["remediation"])
+    assert "Unset TALK_PREFER_XAI_OAUTH" in " ".join(check["remediation"])
 
 
-def test_grok_auth_warns_when_the_login_needs_a_refresh(monkeypatch, tmp_path, _no_host):
+def test_human_report_renders_the_unsupported_xai_oauth_receipt(monkeypatch, _no_host):
     monkeypatch.setenv("TALK_PROVIDER", "grok")
-    # 50 minutes left: inside the host's one-hour refresh skew for a normal-lifetime token.
-    _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 50 * 60))
-
-    check = _checks(talk_doctor.collect_report())["auth"]
-
-    assert check["status"] == "warn"
-    assert check["details"]["refresh_required"] is True
-    assert "did not refresh or write it" in check["summary"]
-
-
-def test_human_report_renders_the_xai_oauth_receipt(monkeypatch, tmp_path, _no_host):
-    monkeypatch.setenv("TALK_PROVIDER", "grok")
-    _write_xai_oauth(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
+    monkeypatch.setenv("XAI_API_KEY", "xai-shared-test")
     monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
 
     rendered = talk_doctor.render_human(talk_doctor.collect_report())
 
-    assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
-    assert (
-        "receipt: winner=xai-oauth, xai-oauth=valid (via providers), preference=absent"
-        in rendered
-    )
-    assert XAI_ACCESS not in rendered
-
-
-def test_human_report_names_the_credential_pool_as_the_source(monkeypatch, tmp_path, _no_host):
-    """A device-code login lives in the pool; the receipt says so.
-
-    Before the pool was read at all this store rendered
-    ``xai-oauth=missing`` while the lane worked.
-    """
-
-    monkeypatch.setenv("TALK_PROVIDER", "grok")
-    _write_xai_pool(tmp_path / "hermes", access=_jwt_with_exp(time.time() + 6 * 3600))
-    monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
-
-    rendered = talk_doctor.render_human(talk_doctor.collect_report())
-
-    assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
-    assert (
-        "receipt: winner=xai-oauth, xai-oauth=valid (via credential_pool), preference=absent"
-        in rendered
-    )
-    assert XAI_ACCESS not in rendered
+    assert "[PASS] auth: env is the winning auth lane" in rendered
+    assert "receipt: winner=env, xai-oauth=unsupported, preference=absent" in rendered
+    assert "xai-shared-test" not in rendered
 
 
 def test_doctor_never_probes_unless_asked(monkeypatch, capsys):
@@ -1066,7 +947,7 @@ def test_probe_reports_a_missing_lane_without_going_live(monkeypatch, _no_host):
     result = talk_doctor._probe_grok()
 
     assert result["ok"] is False
-    assert "hermes auth add xai-oauth" in result["error"]
+    assert "XAI_API_KEY" in result["error"]
 
 
 def test_cli_entry_merges_the_probe_into_json_and_the_exit_code(monkeypatch, capsys):
@@ -1137,8 +1018,7 @@ def test_live_doctor_succeeds_without_elevenlabs(monkeypatch, tmp_path, capsys, 
         "TALK_CASCADE_TTS",
     ):
         monkeypatch.delenv(name, raising=False)
-    _write_oauth(tmp_path / "codex", access=_jwt_with_exp(time.time() + 3600))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: True)
     monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
     parser = argparse.ArgumentParser()
     talk_cli.setup_cli(parser)
@@ -1180,3 +1060,42 @@ def test_live_mode_reports_a_refused_live_configuration(monkeypatch):
     assert check["status"] == "fail"
     assert check["details"]["provider"] == "live"
     assert "TALK_LIVE_MODEL" in check["summary"]
+
+
+def test_live_subscription_auth_names_the_codex_cli_lane(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_LIVE_AUTH", "subscription")
+    monkeypatch.setenv("TALK_CODEX_BINARY", "codex-test-binary")
+    monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: False)
+
+    check = _checks(talk_doctor.collect_report())["auth"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["provider"] == "live"
+    assert check["details"]["winning_lane"] == "codex-app-server"
+
+
+def test_live_subscription_auth_fails_without_the_codex_cli(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_LIVE_AUTH", "subscription")
+    monkeypatch.delenv("TALK_CODEX_BINARY", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    check = _checks(talk_doctor.collect_report())["auth"]
+
+    assert check["status"] == "fail"
+    assert "codex login" in " ".join(check["remediation"])
+
+
+def test_live_api_auth_requires_an_openai_key(monkeypatch, _no_host):
+    monkeypatch.setenv("TALK_VOICE_MODE", "live")
+    monkeypatch.setenv("TALK_LIVE_AUTH", "api")
+    monkeypatch.delenv("TALK_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert _checks(talk_doctor.collect_report())["auth"]["status"] == "fail"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    check = _checks(talk_doctor.collect_report())["auth"]
+    assert check["status"] == "pass"
+    assert check["details"]["winning_lane"] == "env"

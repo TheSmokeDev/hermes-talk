@@ -18,16 +18,13 @@ knob is fail-closed and never inferred from which keys exist — an operator
 holding several gets the provider they named or an error, not a silent
 switch.
 
-The Grok lane runs on an **X subscription** — no key: `hermes auth add
-xai-oauth` once, then `TALK_PROVIDER=grok`. Verified live on X Premium (the
-$8 tier); a tier without realtime access is told so in one line rather than
-a traceback. Talk consumes
-the host's `xai-oauth` login the way the OpenAI lane consumes the Codex
-CLI's (the host refreshes and stores; Talk never writes an auth store).
-Bring an xAI key instead if you'd rather (`TALK_XAI_API_KEY`, falling back
-to `XAI_API_KEY`; set-but-blank refuses). Keys win over the login unless
-`TALK_PREFER_XAI_OAUTH=true`, which requires the subscription and refuses
-metered fallback, fail-closed like its Codex twin. A rejected or
+The Grok lane runs on an xAI key: `TALK_XAI_API_KEY`, falling back to
+`XAI_API_KEY` (set-but-blank refuses). The SuperGrok / X Premium login
+(`xai-oauth`) is not used in this release: the plugin catalog allows a
+subscription sign-in only through Hermes-signed requests, and Hermes signs
+only Codex requests for plugins today. Talk does not read Hermes's credential
+store, so `TALK_PREFER_XAI_OAUTH=true` refuses with that reason instead of
+spending a key. A rejected or
 tier-denied token gets a one-line remediation at connect, never a
 traceback; `hermes talk doctor --probe` makes two live calls to
 `api.x.ai` to prove the resolved bearer reaches realtime before you sit
@@ -75,29 +72,34 @@ experimental observations, not automatic tag support in every provider lane.
 This section describes **OpenAI Realtime**. GPT-Live uses the independent
 `TALK_LIVE_AUTH` selection described [here](GPT-LIVE.md#choose-billing-and-voice).
 
-Signed into the [Codex CLI](https://github.com/openai/codex) (`codex login`)?
-Talk runs on your own ChatGPT subscription's Realtime entitlement — no key, no
-per-minute API bill. Bring a key instead if you'd rather.
+Signed in to Codex in Hermes (`hermes auth add openai-codex`, or the Codex
+sign-in in Hermes Desktop)? Talk runs on your own ChatGPT subscription's
+Realtime entitlement — no key, no per-minute API bill. Bring a key instead if
+you'd rather.
 
 Resolved fail-closed in this order:
 
 1. `TALK_OPENAI_API_KEY` — a Talk-scoped API key (set-but-empty refuses, never
    falls through)
 2. `OPENAI_API_KEY` — the shared environment key
-3. **Codex OAuth** — no key at all: if you're signed into the
-   [Codex CLI](https://github.com/openai/codex) (`codex login`), Talk rides
-   your own ChatGPT subscription's Realtime entitlement. If Hermes itself is
-   logged in (`hermes auth login openai-codex`) that login is borrowed first,
-   with the host handling refresh. Talk reads `~/.codex/auth.json` but never
-   refreshes or rewrites it; an expired token asks you to `codex login` again.
+3. **Codex sign-in, signed by Hermes** — no key at all. Talk asks Hermes to make
+   the one request that needs the subscription (the Realtime client-secret
+   mint) through `credentialed_provider_request`; Hermes attaches and refreshes
+   the profile's Codex sign-in and Talk never sees the token. Talk does not read
+   `~/.codex/auth.json` or Hermes's `auth.json`. Needs Hermes Agent 0.21.7 or
+   newer; `plugin.yaml` declares `requires_auth: [openai-codex]`.
+
+Keys are read through Hermes's profile-scoped secret route, so a gateway
+serving several profiles never hands Talk another profile's key.
 
 That historical order remains unchanged when `TALK_PREFER_CODEX_OAUTH` is
 absent or explicitly false. Set `TALK_PREFER_CODEX_OAUTH=true` to require the
 subscription lane even when API keys exist. The preference is fail-closed: a
-missing/unusable Codex login refuses instead of spending a metered key, and a
-blank or invalid preference refuses until corrected. `hermes talk doctor`
-names the winning lane and distinguishes valid OAuth from an expired credential
-that needs a fresh `codex login`; it never prints the key or token.
+host that cannot sign Codex requests refuses instead of spending a metered key,
+and a blank or invalid preference refuses until corrected. `hermes talk doctor`
+names the winning lane and whether this Hermes can sign Codex requests; whether
+the profile is signed in is Hermes's answer when the call starts. It never
+prints a key or token.
 When setup offers the API-key lane under an enabled OAuth preference, it reuses
 an existing metered key when present and separately confirms the required
 `TALK_PREFER_CODEX_OAUTH=false` policy transition.

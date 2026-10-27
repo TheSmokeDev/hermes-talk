@@ -13,6 +13,44 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.22.1] — 2026-10-27
+
+Talk on your ChatGPT subscription without the plugin ever holding a token.
+Realtime voice now asks Hermes to sign its Codex requests, and GPT-Live on the
+subscription runs through the Codex CLI's own `codex app-server`. This is the
+release that meets the current Hermes plugin catalog rules.
+
+### Changed
+- **Realtime on the subscription goes through Hermes.** The client-secret mint
+  uses `credentialed_provider_request` with `requires_auth: [openai-codex]`, so
+  Hermes attaches and refreshes the Codex sign-in and Talk never sees it. Talk
+  no longer reads `~/.codex/auth.json`, `$CODEX_HOME`, or Hermes's `auth.json`,
+  and no longer imports `hermes_cli.auth_codex`. Sign in with
+  `hermes auth add openai-codex` (or the Codex sign-in in Hermes Desktop).
+- **GPT-Live on the subscription runs through `codex app-server`.** The Codex
+  CLI negotiates the WebRTC call on its own ChatGPT login; Talk reads the
+  call's events from the app-server and sends delegation results and context
+  over the call's `oai-events` data channel. The Codex thread the app-server
+  needs is ephemeral and fenced off: no environment, read-only sandbox, every
+  approval declined, apps, shell, web search, plugins, sub-agents and every
+  configured MCP server disabled, and told to reply only `skip`. Hermes still
+  does the work. Requires the Codex CLI (`npm install -g @openai/codex`,
+  `codex login`); `TALK_CODEX_BINARY` points at a specific binary.
+- GPT-Live subscription context uses the v3 `session.context.append` event;
+  mid-call `session.update` is refused by v3 calls.
+- API keys (`TALK_*_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`,
+  `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`) and the dashboard tokens are read
+  through Hermes's profile-scoped `agent.secret_scope.get_secret`.
+- Runtime dependencies have upper bounds (`httpx<1`, `aiohttp<4`, and the
+  `audio` extra). `plugin.yaml` declares `requires_hermes: ">=0.21.7"`, the
+  first Hermes that signs Codex requests for plugins.
+
+### Removed
+- The Grok subscription lane (`xai-oauth`). It read Hermes's credential store
+  directly, which the catalog no longer allows, and Hermes does not yet sign
+  xAI requests for plugins. Grok keeps working with `TALK_XAI_API_KEY` or
+  `XAI_API_KEY`; `TALK_PREFER_XAI_OAUTH=true` now refuses with that reason.
+
 ### Fixed
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an

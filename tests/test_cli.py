@@ -51,8 +51,8 @@ def test_session_update_carries_tools():
 def test_missing_credentials_exit_one_without_opening_audio(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("TALK_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    # Hermetic OAuth lane: a dev box's real ~/.codex login must not leak in.
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    # Hermetic Codex lane: a dev box with Hermes installed must not sign for this test.
+    monkeypatch.setattr(talk_cli.talk_auth, "hermes_signs_codex", lambda: False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     swept = []
     monkeypatch.setattr(talk_cli.talk_transcript, "sweep_transcripts", swept.append)
@@ -64,7 +64,7 @@ def test_missing_credentials_exit_one_without_opening_audio(monkeypatch, tmp_pat
 
     assert asyncio.run(talk_cli.run_talk_session()) == 1
     assert swept == [tmp_path / "home"]
-    assert "codex login" in capsys.readouterr().err
+    assert "hermes auth add openai-codex" in capsys.readouterr().err
 
 
 def test_unusable_voice_exits_one(monkeypatch, capsys):

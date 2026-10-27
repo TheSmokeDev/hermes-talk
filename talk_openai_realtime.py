@@ -11,9 +11,10 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 try:
+    from . import talk_auth, talk_wire
     from . import talk_realtime as rt
-    from . import talk_wire
 except ImportError:  # pragma: no cover - flat-module fallback
+    import talk_auth
     import talk_realtime as rt
     import talk_wire
 
@@ -372,6 +373,7 @@ class _OpenAIWireSession:
             automatic_response=configuration["automatic_response"],
             turn_detection=configuration["turn_detection"],
             text_output=configuration.get("text_output", False),
+            hermes_signed=self._auth_source == talk_auth.SOURCE_CODEX_OAUTH,
         )
 
     async def connect(

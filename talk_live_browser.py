@@ -764,6 +764,9 @@ class LiveBrowserRegistry:
                     self.bindings.pop(key, None)
             key = secrets.token_hex(24)
             binding = BrowserBinding(self, key, request, context, browser, session)
+            # Subscription calls: the server authors every data-channel event and the
+            # browser only relays it, so provider events never gain authority there.
+            browser.attach_outbound(lambda event: binding.emit("provider", event=event))
             self.bindings[key] = binding
             binding.start()
             return {"ok": True, **browser.public_response(key)}

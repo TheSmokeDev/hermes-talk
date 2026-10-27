@@ -32,6 +32,7 @@ function createTalkSurface(SDK) {
   const RUN_POLL_MS = 5000;
   const IDLE_POLL_MS = 20000;
   const LIVE_POLL_MS = 250;
+  const LIVE_RELAY_TYPES = ["delegation.context.append", "session.context.append"];
   /** How long to watch each run kind before letting go. The work continues. */
   const RUN_POLL_CAPS_MS = { agent: 2700000, skill: 600000 };
   const DEFAULT_RUN_CAP_MS = 600000;
@@ -1888,6 +1889,17 @@ function createTalkSurface(SDK) {
               if (this.closed) return;
             }
             void this.task.refresh();
+          } else if (event.type === "provider") {
+            // Subscription calls: the server authored this client event; relay it as-is
+            // onto the call's data channel. Nothing from the channel flows back here.
+            const wire = event.event;
+            if (!wire || typeof wire !== "object" || !LIVE_RELAY_TYPES.includes(wire.type)) {
+              throw new Error("Invalid Live relay event.");
+            }
+            if (!this.channel || this.channel.readyState !== "open") {
+              throw new Error("Live audio channel is not open. Rejoin the task to reconnect.");
+            }
+            this.channel.send(JSON.stringify(wire));
           } else if (event.type === "error") {
             throw new Error(typeof event.message === "string" ? event.message : "Live session failed.");
           }

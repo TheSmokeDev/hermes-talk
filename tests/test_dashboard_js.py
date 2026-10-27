@@ -2072,6 +2072,34 @@ t.stop();
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_live_relays_only_server_authored_data_channel_events():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+const wire={type:'delegation.context.append',delegation_item_id:'del-1',channel:'speakable',
+  content:[{type:'input_text',text:'done'}]};
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:2,events:[
+  {sequence:1,type:'provider',event:wire},
+  {sequence:2,type:'provider',event:{type:'session.context.append',channel:'commentary',
+    content:[{type:'input_text',text:'note'}]}}]} : undefined;
+await pollNow(t);
+assert.deepEqual(sent,[wire,{type:'session.context.append',channel:'commentary',
+  content:[{type:'input_text',text:'note'}]}]);
+assert.equal(t.liveCursor,2);
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:3,events:[
+  {sequence:3,type:'provider',
+   event:{type:'session.update',session:{instructions:'x'}}}]} : undefined;
+await pollNow(t);
+assert.equal(sent.length,2,'a non-relay event type reached the data channel');
+assert(errors.length>=1);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("failure", [
     "throw new Error('403 stale task connection')",
     "return {ok:false,events:[],cursor:0}",

@@ -1,9 +1,8 @@
 """Server-owned Live negotiation and JSON transports.
 
-Subscription call/header/location handling is adapted from OpenClaw
-76378ddb777eacbe2c7f65c4247692b2f5830e97, extensions/openai/
-realtime-quicksilver-wire.ts and realtime-quicksilver-sideband.ts (MIT).
-The public API uses its separately documented /v1/live/sessions protocol.
+API mode uses the documented /v1/live/sessions protocol with the user's key.
+Subscription mode negotiates through the Codex CLI's app-server
+(``talk_live_codex``); Talk never holds the subscription token.
 """
 
 from __future__ import annotations
@@ -11,36 +10,30 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import uuid
 from collections import deque
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
-from urllib.parse import urlparse
 
 import httpx
 
 try:
     from . import talk_realtime as rt
+    from .talk_live_codex import CodexLiveTransport, negotiate_codex_call
     from .talk_live_config import LiveConfig, validate_live_auth
     from .talk_live_protocol import build_live_session
 except ImportError:  # pragma: no cover - flat-module fallback
     import talk_realtime as rt
+    from talk_live_codex import CodexLiveTransport, negotiate_codex_call
     from talk_live_config import LiveConfig, validate_live_auth
     from talk_live_protocol import build_live_session
 
 API_SESSIONS_URL = "https://api.openai.com/v1/live/sessions"
 API_WEBSOCKET_URL = "wss://api.openai.com/v1/live/sessions"
-SUBSCRIPTION_CALL_URL = (
-    "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
-)
 CONNECT_TIMEOUT_S = 30.0
 MAX_SDP_BYTES = 256 * 1024
 MAX_WIRE_BYTES = 2 * 1024 * 1024
 MAX_STARTUP_EVENTS = 128
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
-_CALL_ID = re.compile(
-    r"^(?:rtc_[A-Za-z0-9_-]{1,128}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
-)
 
 
 def validate_sdp(sdp: str) -> str:
@@ -56,47 +49,18 @@ def validate_sdp(sdp: str) -> str:
 
 
 def auth_headers(auth, config: LiveConfig) -> dict[str, str]:
+    """Headers for API mode only; the subscription lane never sees a token."""
+
     validate_live_auth(auth, config)
-    headers = {"Authorization": f"Bearer {auth.token}"}
-    if config.auth_mode == "subscription":
-        headers.update(
-            {
-                "OpenAI-Alpha": "quicksilver=v2",
-                "chatgpt-account-id": auth.account_id,
-                "session-id": str(uuid.uuid4()),
-                "thread-id": str(uuid.uuid4()),
-                "x-session-id": str(uuid.uuid4()),
-            }
-        )
-    return headers
+    if config.auth_mode != "api":
+        raise rt.RealtimeSessionError("Subscription GPT-Live negotiates through Codex")
+    return {"Authorization": f"Bearer {auth.token}"}
 
 
 def _session_id(value) -> str:
     if not isinstance(value, str) or not _ID.fullmatch(value):
         raise rt.RealtimeSessionError("GPT-Live returned an invalid session identifier")
     return value
-
-
-def _subscription_call_id(headers: Mapping) -> str:
-    session_id = headers.get("openai-session-id", "")
-    location = headers.get("location", "")
-    if location:
-        if len(location) > 512:
-            raise rt.RealtimeSessionError("GPT-Live returned an invalid call location")
-        parsed = urlparse(location)
-        if parsed.netloc and parsed.netloc not in {"api.openai.com", "chatgpt.com"}:
-            raise rt.RealtimeSessionError("GPT-Live returned an unexpected call location")
-        if parsed.query or parsed.fragment or parsed.scheme not in {"", "https"}:
-            raise rt.RealtimeSessionError("GPT-Live returned an invalid call location")
-        candidates = [part for part in parsed.path.split("/") if _CALL_ID.fullmatch(part)]
-        if candidates:
-            call_id = candidates[-1]
-            if session_id and session_id != call_id:
-                raise rt.RealtimeSessionError("GPT-Live returned conflicting call identifiers")
-            return call_id
-    if isinstance(session_id, str) and _CALL_ID.fullmatch(session_id):
-        return session_id
-    raise rt.RealtimeSessionError("GPT-Live call response is missing a valid call identifier")
 
 
 async def _post_json(client, url: str, headers: dict, payload: dict) -> tuple[bytes, dict]:
@@ -244,11 +208,14 @@ class LiveBrowserSession:
         setup,
         aiohttp_module=None,
         request_headers=None,
+        codex_call=None,
     ):
         self.answer_sdp = answer_sdp
         self.session_id = session_id
         self.sideband_url = sideband_url
         self.request_headers = request_headers
+        self.codex_call = codex_call
+        self._codex_transport = None
         self.auth = auth
         self.config = config
         self.setup = setup
@@ -260,6 +227,12 @@ class LiveBrowserSession:
 
     def public_response(self, binding_id: str) -> dict:
         return {"binding_id": _session_id(binding_id), "sdp": self.answer_sdp}
+
+    def attach_outbound(self, outbound) -> None:
+        """Route client events to the browser's data channel (subscription calls only)."""
+
+        if self._codex_transport is not None:
+            self._codex_transport.attach_outbound(outbound)
 
     async def open_session(self):
         if self._closed:
@@ -274,16 +247,20 @@ class LiveBrowserSession:
             from .talk_live_realtime import LiveRealtimeSession
         except ImportError:  # pragma: no cover - flat-module fallback
             from talk_live_realtime import LiveRealtimeSession
-        transport = LiveWebSocketTransport(
-            auth=self.auth,
-            config=self.config,
-            aiohttp_module=self._aiohttp,
-        )
-        try:
-            await transport.open(
-                url=self.sideband_url,
-                headers=self.request_headers or auth_headers(self.auth, self.config),
+        if self.codex_call is not None:
+            transport = self._codex_transport = CodexLiveTransport(self.codex_call)
+        else:
+            transport = LiveWebSocketTransport(
+                auth=self.auth,
+                config=self.config,
+                aiohttp_module=self._aiohttp,
             )
+        try:
+            if self.codex_call is None:
+                await transport.open(
+                    url=self.sideband_url,
+                    headers=self.request_headers or auth_headers(self.auth, self.config),
+                )
             transport.session_id = self.session_id
             session = LiveRealtimeSession(auth=self.auth, config=self.config)
             session.attach_transport(transport, self.setup, session_id=self.session_id, media=False)
@@ -304,6 +281,8 @@ class LiveBrowserSession:
             await asyncio.gather(pending, return_exceptions=True)
         if self._session is not None:
             await self._session.close()
+        elif self.codex_call is not None:
+            await self.codex_call.stop()
 
 
 async def negotiate_live_browser(
@@ -314,47 +293,50 @@ async def negotiate_live_browser(
     *,
     http_client=None,
     aiohttp_module=None,
+    codex_server=None,
 ) -> LiveBrowserSession:
     validate_live_auth(auth, config)
     validate_sdp(sdp)
+    if config.auth_mode == "subscription":
+        build_live_session(setup, config, webrtc=True)
+        call = await negotiate_codex_call(sdp, setup, config, server=codex_server)
+        try:
+            validate_sdp(call.answer_sdp)
+        except BaseException:
+            await call.stop()
+            raise
+        return LiveBrowserSession(
+            answer_sdp=call.answer_sdp,
+            session_id=_session_id(call.session_id),
+            sideband_url=None,
+            auth=auth,
+            config=config,
+            setup=setup,
+            codex_call=call,
+        )
     session = build_live_session(setup, config, webrtc=True)
-    subscription = config.auth_mode == "subscription"
-    url = SUBSCRIPTION_CALL_URL if subscription else API_SESSIONS_URL
-    payload = (
-        {"sdp": sdp, "session": session}
-        if subscription
-        else {"session": session, "transport": {"type": "webrtc", "sdp": sdp}}
-    )
+    payload = {"session": session, "transport": {"type": "webrtc", "sdp": sdp}}
     headers = auth_headers(auth, config)
     if http_client is None:
         async with httpx.AsyncClient(timeout=CONNECT_TIMEOUT_S) as client:
-            body, response_headers = await _post_json(client, url, headers, payload)
+            body, _response_headers = await _post_json(client, API_SESSIONS_URL, headers, payload)
     else:
-        body, response_headers = await _post_json(http_client, url, headers, payload)
-    if subscription:
-        try:
-            answer = body.decode("utf-8")
-        except UnicodeError as exc:
-            raise rt.RealtimeSessionError("GPT-Live returned an invalid SDP answer") from exc
-        session_id = _subscription_call_id(response_headers)
-        sideband = f"wss://api.openai.com/v1/live/{session_id}"
-    else:
-        try:
-            result = json.loads(body)
-            session_id = _session_id(result["session"]["id"])
-            if result["transport"]["type"] != "webrtc":
-                raise ValueError("wrong transport")
-            answer = result["transport"]["sdp"]
-        except (KeyError, ValueError, TypeError) as exc:
-            raise rt.RealtimeSessionError("GPT-Live returned an invalid session response") from exc
-        sideband = f"{API_WEBSOCKET_URL}/{session_id}/attach"
+        body, _response_headers = await _post_json(http_client, API_SESSIONS_URL, headers, payload)
+    try:
+        result = json.loads(body)
+        session_id = _session_id(result["session"]["id"])
+        if result["transport"]["type"] != "webrtc":
+            raise ValueError("wrong transport")
+        answer = result["transport"]["sdp"]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise rt.RealtimeSessionError("GPT-Live returned an invalid session response") from exc
     validate_sdp(answer)
-    if any(secret and secret in answer for secret in (auth.token, auth.account_id)):
+    if auth.token and auth.token in answer:
         raise rt.RealtimeSessionError("GPT-Live SDP response reflected private credentials")
     return LiveBrowserSession(
         answer_sdp=answer,
         session_id=session_id,
-        sideband_url=sideband,
+        sideband_url=f"{API_WEBSOCKET_URL}/{session_id}/attach",
         auth=auth,
         config=config,
         setup=setup,
@@ -367,7 +349,6 @@ __all__ = [
     "API_SESSIONS_URL",
     "API_WEBSOCKET_URL",
     "CONNECT_TIMEOUT_S",
-    "SUBSCRIPTION_CALL_URL",
     "LiveBrowserSession",
     "LiveWebSocketTransport",
     "auth_headers",

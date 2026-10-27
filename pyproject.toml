@@ -1,15 +1,15 @@
 [project]
 name = "hermes-talk"
-version = "0.22.0"
+version = "0.22.1"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "SmokeDev" }]
-dependencies = ["httpx>=0.27", "aiohttp>=3.9"]
+dependencies = ["httpx>=0.27,<1", "aiohttp>=3.9,<4"]
 
 [project.optional-dependencies]
-audio = ["sounddevice>=0.4.6", "numpy>=1.26"]
+audio = ["sounddevice>=0.4.6,<0.6", "numpy>=1.26,<3"]
 live = ["aiortc>=1.14,<2"]
 # starlette is a TEST dependency, never a runtime one: the dashboard relay's
 # streaming response is a starlette response, and its ASGI behavior differs by
@@ -43,6 +43,7 @@ py-modules = [
   "talk_config",
   "talk_live_audio",
   "talk_live_browser",
+  "talk_live_codex",
   "talk_live_config",
   "talk_live_coordinator",
   "talk_live_protocol",
@@ -162,6 +163,7 @@ known-first-party = [
   "talk_config",
   "talk_live_audio",
   "talk_live_browser",
+  "talk_live_codex",
   "talk_live_config",
   "talk_live_coordinator",
   "talk_live_protocol",
