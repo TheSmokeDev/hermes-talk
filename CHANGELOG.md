@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- `TALK_PROVIDER=local`: run the voice lane on your own GPU against any
+  self-hosted server that speaks the OpenAI Realtime protocol, such as
+  huggingface/speech-to-speech with an Ollama LLM, on the terminal lane.
+  Hermes tools, barge-in, `hermes talk doctor` and `hermes talk check` work
+  as on the hosted lanes; no API key is needed, and plain `ws://` is refused
+  off loopback. Setup, measured VRAM and
+  latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
+
 ### Fixed
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an

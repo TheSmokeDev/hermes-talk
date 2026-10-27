@@ -56,6 +56,7 @@ try:
         talk_host,
         talk_identity,
         talk_lifecycle,
+        talk_local_realtime,
         talk_openai_realtime,
         talk_operator_auth,
         talk_pause,
@@ -86,6 +87,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_host
     import talk_identity
     import talk_lifecycle
+    import talk_local_realtime
     import talk_openai_realtime
     import talk_operator_auth
     import talk_pause
@@ -1286,6 +1288,21 @@ def _grok_auth() -> talk_auth.TalkAuth:
     return talk_grok_auth.resolve_grok_auth()
 
 
+def _local_auth() -> talk_auth.TalkAuth:
+    """The optional bearer for a self-hosted Realtime server.
+
+    Most local servers run without auth, so an unset ``TALK_LOCAL_API_KEY``
+    is a valid empty token and the socket carries no Authorization header.
+    """
+
+    token = talk_config.resolve_local_key()
+    return talk_auth.TalkAuth(
+        token=token,
+        source=talk_auth.SOURCE_CONFIGURED if token else talk_auth.SOURCE_ENV,
+        detail="TALK_LOCAL_API_KEY (local server key)" if token else "no key (local server)",
+    )
+
+
 def _gemini_auth() -> talk_auth.TalkAuth:
     """The Gemini credential for the Gemini Live lane, in the factory's shape.
 
@@ -1351,6 +1368,14 @@ def resolve_provider_lane() -> ProviderLane:
             model=talk_config.talk_grok_model(),
             voice=talk_config.talk_grok_voice(),
         )
+    if provider == "local":
+        talk_config.talk_local_url()
+        return ProviderLane(
+            provider=provider,
+            auth=_local_auth(),
+            model=talk_config.talk_local_model(),
+            voice=talk_config.talk_local_voice(),
+        )
     if provider == "gemini":
         return ProviderLane(
             provider=provider,
@@ -1390,6 +1415,13 @@ def _realtime_session(
         return talk_grok_realtime.GrokRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
+            aiohttp_module=_import_aiohttp(),
+        )
+    if provider == "local":
+        return talk_local_realtime.LocalRealtimeSession(
+            auth_token=auth.token,
+            auth_source=auth.source,
+            ws_url=talk_config.talk_local_url(),
             aiohttp_module=_import_aiohttp(),
         )
     if provider == "gemini":
