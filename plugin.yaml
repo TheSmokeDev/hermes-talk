@@ -7,6 +7,10 @@ description: "OpenAI Realtime speech-to-speech voice for Hermes: duplex talk wit
 author: SmokeDev (TheSmokeDev)
 license: MIT
 provides_tools: []
+# The ChatGPT subscription is used only through Hermes-signed requests
+# (credentialed_provider_request); Talk never holds the token.
+requires_auth:
+  - openai-codex
 provides_hooks:
   - on_session_end
   - subagent_start

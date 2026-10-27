@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -347,3 +349,10 @@ def test_explicit_env_mapping_is_used_verbatim(monkeypatch):
 
     assert auth.token == "mapped-value"
     assert "mapped-value" not in repr(auth)
+
+
+def test_manifest_declares_the_codex_sign_in_hermes_signs():
+    """Hermes refuses signed requests for a plugin that does not declare the provider."""
+
+    manifest = (Path(__file__).parents[1] / "plugin.yaml").read_text("utf-8")
+    assert re.search(r"(?m)^requires_auth:\r?\n  - openai-codex\r?$", manifest)
