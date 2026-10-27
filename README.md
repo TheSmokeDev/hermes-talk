@@ -37,86 +37,20 @@ different shape, and a good one.
 
 ## Install
 
+This is the **Hermes plugin catalog build** of Hermes Talk (branch
+[`catalog`](https://github.com/TheSmokeDev/hermes-talk/tree/catalog)). It meets the
+catalog's admission rules: the ChatGPT subscription is used only through
+Hermes-signed requests or the Codex CLI's own login. Install it by name:
+
 ```bash
-hermes plugins install --ref 7ad833e4fcedb2c9a9947d84d7fd89bdbd15d256 TheSmokeDev/hermes-talk --enable
+hermes plugins install hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 ```
 
-Needs Python ≥ 3.11 and a Hermes host ≥ v0.17. GPT-Live, shared task attachment
-and Codex workers need additional host capabilities; the full list is in
-[Prerequisites](docs/OPERATING.md#prerequisites).
-
-The commit above is the published **v0.22.0** source. Hermes v0.22.5 requires a
-full 40-character commit SHA for `--ref`; it does not accept a tag there. This
-also avoids an older community-catalog pin. For an existing pinned install,
-preserve local plugin edits, then run:
-
-```bash
-hermes plugins install --force --ref 7ad833e4fcedb2c9a9947d84d7fd89bdbd15d256 --enable TheSmokeDev/hermes-talk
-```
-
-Restart the gateway/dashboard and Desktop afterward. An unpinned Git install can
-use `hermes plugins update hermes-talk`.
-
-## Quickstart
-
-**Terminal** — start here:
-
-```bash
-hermes talk
-```
-
-You are live: speak, and it answers out loud in the same breath. Ctrl+C hangs
-up. → [Use](docs/OPERATING.md#use)
-
-**Discord** — the call happens inside a voice channel, not in chat:
-
-```
-/voice join     # put Hermes in the voice channel first
-/talk join      # Talk borrows that connection — it never opens a second one
-```
-
-Talk answers in the room everyone can hear; `/talk leave` ends it. Mutating
-tools stay denied until you set `TALK_DISCORD_OPERATOR_USER_IDS`.
-→ [Discord voice](docs/OPERATING.md#discord-voice--talking-in-the-channel-hermes-is-already-in)
-
-**Dashboard** — browser audio, no local mic drivers:
-
-```bash
-hermes dashboard    # then open the Talk tab and hit Start
-```
-
-Allow the microphone and talk. You see the live transcript plus a list of
-background runs. → [Dashboard tab](docs/OPERATING.md#dashboard-tab)
-
-## New in 0.22.0: run your Desktop sessions by voice
-
-With **OpenAI Realtime** in Desktop, you can now say:
-
-- “Start a new session for this project and run its tests.”
-- “Check what the other agent is working on.”
-- “Tell that session to check the failing test next.”
-- “Steer the running session toward this approach.”
-- “Show my capabilities, scheduled jobs, and messaging status.”
-
-Talk discovers the actual project directories and saved conversations on the
-current connection/profile. It creates a separate session with your opening
-task, reads live progress and recent replies, and queues or steers your
-instructions while the original call stays connected. Local and SSH backends
-use their own supported session contracts. A queued message is reported as
-accepted, not completed.
-
-Also fixed: Stop → Connect in the same conversation, Hermes-managed ChatGPT
-login detection, the current Hermes capability catalog, and typed input during
-unbound realtime calls. Grok's expanded built-in voice list and a speech-tag
-reference are included too.
-
-Tested on stock Hermes **v0.22.5** over SSH, including creating a session in a
-chosen directory, a real `pwd` tool call, a follow-up to another session, and
-steering a running task. These Desktop controls stay within the selected
-connection/profile. They do not add arbitrary screen control or external
-message sending. GPT-Live and shared voice-history attachment still require
-the additional host support described in the [Desktop guide](docs/DESKTOP.md).
+Needs Python ≥ 3.11 and Hermes Agent ≥ 0.21.7. GPT-Live on the subscription also
+needs the Codex CLI (`npm install -g @openai/codex`, then `codex login`). The
+standalone build on the `main` branch keeps every subscription lane, including
+the Grok subscription, and installs from GitHub as described in its README.
 
 Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 

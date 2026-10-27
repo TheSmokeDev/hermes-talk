@@ -13,7 +13,10 @@ named rather than smoothed.
 
 ## [Unreleased]
 
-## [0.22.1] — 2026-10-27
+## [0.22.1] — 2026-10-27 (catalog build)
+
+This is the Hermes plugin catalog build, published from the `catalog` branch.
+The standalone build on `main` keeps 0.22.0's subscription lanes unchanged.
 
 Talk on your ChatGPT subscription without the plugin ever holding a token.
 Realtime voice now asks Hermes to sign its Codex requests, and GPT-Live on the

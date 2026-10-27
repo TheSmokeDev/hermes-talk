@@ -1018,6 +1018,8 @@ def test_live_doctor_succeeds_without_elevenlabs(monkeypatch, tmp_path, capsys, 
         "TALK_CASCADE_TTS",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The subscription lane needs the Codex CLI; CI runners have none on PATH.
+    monkeypatch.setenv("TALK_CODEX_BINARY", "codex-test-binary")
     monkeypatch.setattr(talk_auth, "hermes_signs_codex", lambda: True)
     monkeypatch.setattr(talk_doctor.talk_audio, "audio_available", lambda: True)
     parser = argparse.ArgumentParser()
