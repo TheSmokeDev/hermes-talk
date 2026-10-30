@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Opt-in call journal (`TALK_CALL_JOURNAL=1`): an unbound dashboard or Desktop
+  call leaves an owner-only, text-only JSONL record on the Hermes host —
+  final utterances on both sides, barge-ins, tool calls and results, the
+  sessions it created, errors and the hang-up — written as the call happens.
+  `hermes talk journal` lists calls and prints one as Markdown. Retention is
+  bounded (`TALK_CALL_JOURNAL_DAYS`, default 30). Off by default; the mint
+  response is unchanged when off. Contributed by @Philibergus.
+
 ### Fixed
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an

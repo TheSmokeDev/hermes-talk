@@ -55,6 +55,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 import talk_apiserver  # noqa: E402
 import talk_auth  # noqa: E402
+import talk_call_journal  # noqa: E402
 import talk_capabilities  # noqa: E402
 import talk_cascade_voice  # noqa: E402
 import talk_config  # noqa: E402
@@ -547,6 +548,12 @@ async def create_session(request: Request) -> dict:
     else:
         voice = _resolve_voice(body.get("voice"))
     try:
+        # Resolved before the mint so a malformed switch refuses without
+        # spending a credential. Bound calls keep their canonical history.
+        journal = bound is None and talk_call_journal.enabled()
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         auth = talk_auth.resolve_auth()
     except talk_auth.TalkAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -601,7 +608,7 @@ async def create_session(request: Request) -> dict:
         operator=f"dashboard:{auth.source}",
         profile=talk_config.agent_profile(),
     )
-    return {
+    response = {
         "ok": True,
         **descriptor.to_wire(),
         "authSource": auth.source,
@@ -610,6 +617,49 @@ async def create_session(request: Request) -> dict:
         # and plays the PCM that comes back.
         "voiceMode": voice_mode,
     }
+    if journal:
+        surface = body.get("surface")
+        engine = {
+            "provider": talk_config.talk_provider(),
+            "model": descriptor.model,
+            "voice": descriptor.voice or None,
+            "voice_mode": voice_mode,
+            "auth": auth.source,
+        }
+        try:
+            call_id = await asyncio.to_thread(
+                talk_call_journal.start,
+                engine=engine,
+                lane=surface if surface in {"desktop", "dashboard"} else "browser",
+                host_session_id=body.get("host_session_id"),
+            )
+        except OSError:
+            # The call itself is healthy; say plainly that it is not journaled.
+            _log.warning("Talk call journal could not be created; this call is not journaled")
+            response["journal"] = {"enabled": True, "callId": None}
+        else:
+            response["journal"] = {"enabled": True, "callId": call_id}
+    return response
+
+
+@router.post("/journal")
+async def journal_events(request: Request) -> dict:
+    """Append page-reported events to a journal the mint created (opt-in)."""
+
+    require_dashboard_auth(request)
+    body = await _json_body(request)
+    try:
+        if not talk_call_journal.enabled():
+            raise HTTPException(status_code=409, detail="TALK_CALL_JOURNAL is off")
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        written = await asyncio.to_thread(
+            talk_call_journal.record, body.get("call_id"), body.get("events")
+        )
+    except talk_call_journal.JournalError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"ok": True, "written": written}
 
 
 @router.post("/tool")
@@ -1192,6 +1242,7 @@ TEXT_INPUT_ROUTE_HANDLERS = talk_text_input.mount_text_input_routes(
 ROUTE_HANDLERS = (
     talk_status,
     create_session,
+    journal_events,
     run_tool,
     cascade_tts,
     list_runs,

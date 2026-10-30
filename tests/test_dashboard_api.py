@@ -659,3 +659,51 @@ def test_bad_endpointing_refuses_before_dashboard_provider_auth(monkeypatch):
         call(api.create_session, FakeRequest(body={}))
     assert exc.value.status_code == 400
     assert "TALK_TURN_DETECTION" in str(exc.value.detail)
+
+
+# -- opt-in call journal ------------------------------------------------------
+
+
+def test_journal_off_leaves_the_mint_response_unchanged(minted, monkeypatch):
+    monkeypatch.delenv("TALK_CALL_JOURNAL", raising=False)
+    body = call(api.create_session, FakeRequest(body={"surface": "desktop"}))
+    assert "journal" not in body
+
+
+def test_journal_on_returns_a_call_id_and_accepts_events(minted, monkeypatch, tmp_path):
+    import talk_call_journal
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    body = call(api.create_session, FakeRequest(body={"surface": "desktop"}))
+    call_id = body["journal"]["callId"]
+    assert body["journal"]["enabled"] is True and call_id.startswith("call_")
+    start = talk_call_journal.read(call_id)[0]
+    assert start["lane"] == "desktop" and start["engine"]["auth"] == "configured"
+    assert RAW_KEY not in serialized(start)
+
+    events = [{"kind": "user", "seq": 1, "text": "Bonjour"}]
+    answer = call(
+        api.journal_events, FakeRequest(body={"call_id": call_id, "events": events})
+    )
+    assert answer == {"ok": True, "written": 1}
+    assert talk_call_journal.read(call_id)[-1]["text"] == "Bonjour"
+
+
+def test_journal_route_refuses_when_off_and_requires_dashboard_auth(monkeypatch):
+    monkeypatch.delenv("TALK_CALL_JOURNAL", raising=False)
+    with pytest.raises(api.HTTPException) as off:
+        call(api.journal_events, FakeRequest(body={"call_id": "x", "events": []}))
+    assert off.value.status_code == 409
+    monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    with pytest.raises(api.HTTPException) as remote:
+        call(api.journal_events, FakeRequest(host="100.64.0.9", body={}))
+    assert remote.value.status_code == 403
+
+
+def test_a_malformed_journal_switch_refuses_before_the_mint(minted, monkeypatch):
+    monkeypatch.setenv("TALK_CALL_JOURNAL", "maybe")
+    with pytest.raises(api.HTTPException) as raised:
+        call(api.create_session, FakeRequest(body={}))
+    assert raised.value.status_code == 400
+    assert "auth_token" not in minted
