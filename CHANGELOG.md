@@ -34,6 +34,14 @@ named rather than smoothed.
   prompt byte-identical when unset. `hermes talk doctor` gains a `language`
   check that reports the prompt's length, never its text. Contributed by @Philibergus.
 
+### Changed
+- In gated mode (dashboard sign-in engaged), a request the dashboard's own
+  sign-in already verified no longer needs `TALK_DASHBOARD_TOKEN`: the Talk
+  tab works right after signing in, on any browser of a private network, with
+  nothing to paste per tab. Cross-site requests (`Sec-Fetch-Site: cross-site`)
+  are still refused; loopback and token behaviour without a gate are unchanged.
+  Contributed by @Philibergus.
+
 ## [0.23.1] — 2026-11-17
 
 Fix the intermittent CI failure caused by a test worker finishing after its
