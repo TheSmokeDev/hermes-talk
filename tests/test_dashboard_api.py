@@ -659,3 +659,54 @@ def test_bad_endpointing_refuses_before_dashboard_provider_auth(monkeypatch):
         call(api.create_session, FakeRequest(body={}))
     assert exc.value.status_code == 400
     assert "TALK_TURN_DETECTION" in str(exc.value.detail)
+
+
+# -- dashboard sign-in as the Talk credential ----------------------------------
+
+
+class _State:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+_VERIFIED = object()
+
+
+def _gated(request, *, auth_required=True, session=_VERIFIED):
+    request.app = _State(state=_State(auth_required=auth_required))
+    request.state = _State(session=session)
+    return request
+
+
+def test_a_session_verified_by_the_dashboard_gate_needs_no_talk_token(monkeypatch):
+    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    api.require_dashboard_auth(_gated(FakeRequest(host="100.64.0.9")))
+
+
+@pytest.mark.parametrize(
+    ("auth_required", "session", "headers"),
+    [
+        (False, object(), {}),
+        (True, None, {}),
+        (True, object(), {"Sec-Fetch-Site": "cross-site"}),
+    ],
+)
+def test_the_gate_session_is_accepted_only_when_real_and_same_site(
+    monkeypatch, auth_required, session, headers
+):
+    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    request = _gated(
+        FakeRequest(host="100.64.0.9", headers=headers),
+        auth_required=auth_required,
+        session=session,
+    )
+    with pytest.raises(api.HTTPException) as refused:
+        api.require_dashboard_auth(request)
+    assert refused.value.status_code == 401
+
+
+def test_without_a_gate_a_remote_browser_still_needs_the_token(monkeypatch):
+    monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV, raising=False)
+    with pytest.raises(api.HTTPException) as refused:
+        api.require_dashboard_auth(FakeRequest(host="100.64.0.9"))
+    assert refused.value.status_code == 403

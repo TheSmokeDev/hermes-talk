@@ -13,6 +13,14 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Changed
+- In gated mode (dashboard sign-in engaged), a request the dashboard's own
+  sign-in already verified no longer needs `TALK_DASHBOARD_TOKEN`: the Talk
+  tab works right after signing in, on any browser of a private network, with
+  nothing to paste per tab. Cross-site requests (`Sec-Fetch-Site: cross-site`)
+  are still refused; loopback and token behaviour without a gate are unchanged.
+  Contributed by @Philibergus.
+
 ### Fixed
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an

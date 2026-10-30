@@ -257,12 +257,40 @@ def _has_desktop_auth(request, presented: str) -> bool:
     return True
 
 
+def _has_verified_dashboard_session(request) -> bool:
+    """True when the dashboard's own sign-in gate already verified this request.
+
+    In gated mode (a non-loopback bind or a public URL), Hermes's
+    ``gated_auth_middleware`` verifies the session cookie or bearer with the
+    configured sign-in provider before any plugin route runs, and only then
+    sets ``request.state.session``; a request without a valid session never
+    reaches this code. That operator is already authenticated by the host, so
+    asking for a second, Talk-only token adds friction without adding a
+    principal. The state is server-set, never read from the client.
+
+    Cross-site requests are refused even with a session: the session cookie
+    is ``SameSite=Lax``, and ``Sec-Fetch-Site: cross-site`` is an explicit
+    second fence for any route a top-level navigation could reach.
+    """
+
+    app = getattr(request, "app", None)
+    if getattr(getattr(app, "state", None), "auth_required", False) is not True:
+        return False
+    if getattr(getattr(request, "state", None), "session", None) is None:
+        return False
+    getter = getattr(getattr(request, "headers", None), "get", None)
+    site = (getter("sec-fetch-site") or "").strip().lower() if getter else ""
+    return site != "cross-site"
+
+
 def require_dashboard_auth(request) -> None:
     """Gate one request. Returns on success, raises otherwise — never a bool.
 
     A bool would let a handler forget to check it; a raise cannot be ignored.
     """
 
+    if _has_verified_dashboard_session(request):
+        return
     configured = dashboard_token()
     if configured is not None:
         presented = _presented_token(request)
