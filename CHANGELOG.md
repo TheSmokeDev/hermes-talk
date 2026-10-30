@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Opt-in call journal (`TALK_CALL_JOURNAL=1`). A dashboard or Desktop Realtime
+  call without a bound task leaves a text-only JSONL record on the Hermes host:
+  final utterances on both sides, barge-ins, tool calls and results, the
+  sessions it created, errors and the hang-up — written as the call happens.
+  `hermes talk journal` lists calls and prints one as Markdown. Retention is
+  bounded (`TALK_CALL_JOURNAL_DAYS`, default 30). Off by default.
+  Contributed by @Philibergus.
+
 ## [0.23.1] — 2026-11-17
 
 Fix the intermittent CI failure caused by a test worker finishing after its
