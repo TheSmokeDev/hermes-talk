@@ -14,6 +14,11 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Fixed
+- The dashboard Talk tab shows the `TALK_DASHBOARD_TOKEN` field again on
+  current Hermes dashboards. Their `fetchJSON` throws an `ApiError` whose
+  message is the route's detail alone, with the HTTP code on `status`; the tab
+  only matched a `401`/`403` prefix in the message, so a browser off loopback
+  got the refusal and no way to answer it. Contributed by @Philibergus.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and

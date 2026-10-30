@@ -840,7 +840,18 @@ function createTalkSurface(SDK) {
   }
 
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
+  /**
+   * True for a refusal that a pasted TALK_DASHBOARD_TOKEN can fix.
+   *
+   * The dashboard's `fetchJSON` throws an `ApiError` whose message is the
+   * route's `detail` text alone, with the HTTP code on `err.status`; only
+   * older hosts (and the Desktop IPC bridge) prefix the code to the message.
+   * Reading the message alone hid the token field on current dashboards, so a
+   * browser off loopback showed the refusal and no way to answer it.
+   */
   function isAuthError(err) {
+    const status = err && err.status;
+    if (status === 401 || status === 403) return true;
     return /^(401|403)\b/.test(String((err && err.message) || ""));
   }
 
