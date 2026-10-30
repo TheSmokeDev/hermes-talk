@@ -148,6 +148,9 @@ CHECK_DETAILS_ALLOWLIST: dict[str, dict[str, Any]] = {
         "validation_scope": "token",
     },
     "voice": {"provider": "token", "voice": "token", "source": "token", "valid": "bool"},
+    # Language codes and names stay out of a support bundle; only the size
+    # of the free-text transcription prompt (which may hold names) travels.
+    "language": {"transcription_prompt_chars": "int"},
     "cascade": {
         "voice_mode": "token",
         "source": "token",

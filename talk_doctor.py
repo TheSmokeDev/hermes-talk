@@ -48,6 +48,7 @@ CHECK_ORDER = (
     "auth",
     "model",
     "voice",
+    "language",
     "cascade",
     "audio",
     "identity",
@@ -673,6 +674,50 @@ def _voice_check() -> dict[str, Any]:
     )
 
 
+def _language_check() -> dict[str, Any]:
+    """Spoken-language knobs: transcription hints and the reply language.
+
+    The transcription prompt can hold names, so only its LENGTH enters the
+    report; language codes and the reply-language name are not sensitive.
+    """
+
+    details: dict[str, Any] = {}
+    problems: list[str] = []
+    for key, resolve in (
+        ("transcription_languages", talk_config.transcription_languages),
+        ("transcription_prompt", talk_config.transcription_prompt),
+        ("reply_language", talk_config.reply_language),
+    ):
+        try:
+            value = resolve()
+        except talk_config.TalkConfigError as exc:
+            problems.append(str(exc))
+            details[key] = "invalid"
+            continue
+        if key == "transcription_languages":
+            details[key] = list(value)
+        elif key == "transcription_prompt":
+            details["transcription_prompt_chars"] = len(value) if value else 0
+        else:
+            details[key] = value
+    if problems:
+        return _check(
+            "language",
+            "fail",
+            "a spoken-language setting is invalid; OpenAI sessions refuse to start",
+            details,
+            tuple(problems),
+        )
+    if not details["transcription_languages"] and not details["reply_language"]:
+        return _check(
+            "language",
+            "pass",
+            "no spoken-language hint; the model infers the language from the first words",
+            details,
+        )
+    return _check("language", "pass", "spoken-language hints are valid", details)
+
+
 def _cascade_check() -> dict[str, Any]:
     """The custom-voice cascade lane: mode, TTS provider, key and voice presence.
 
@@ -972,6 +1017,7 @@ def collect_report() -> dict[str, Any]:
         _auth_check(),
         _model_check(),
         _voice_check(),
+        _language_check(),
         _cascade_check(),
         _audio_check(),
         _identity_check(),

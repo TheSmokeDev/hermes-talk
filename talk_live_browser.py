@@ -10,7 +10,7 @@ import time
 from collections import deque
 
 try:
-    from . import talk_capabilities, talk_identity
+    from . import talk_capabilities, talk_config, talk_identity
     from . import talk_realtime as rt
     from .talk_dashboard_gateway import DashboardTaskError
     from .talk_live_config import resolve_live_auth, resolve_live_config
@@ -19,6 +19,7 @@ try:
     from .talk_passive import digest
 except ImportError:  # pragma: no cover - flat plugin load
     import talk_capabilities
+    import talk_config
     import talk_identity
     import talk_realtime as rt
     from talk_dashboard_gateway import DashboardTaskError
@@ -710,6 +711,7 @@ class LiveBrowserRegistry:
                 lane="dashboard",
                 capabilities=self.capabilities(bound),
                 task_context=self.task_context(bound),
+                reply_language=talk_config.reply_language(),
             ),
         )
 

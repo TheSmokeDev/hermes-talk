@@ -134,6 +134,7 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
         "auth",
         "model",
         "voice",
+        "language",
         "cascade",
         "audio",
         "identity",
@@ -1180,3 +1181,23 @@ def test_live_mode_reports_a_refused_live_configuration(monkeypatch):
     assert check["status"] == "fail"
     assert check["details"]["provider"] == "live"
     assert "TALK_LIVE_MODEL" in check["summary"]
+
+
+def test_language_check_reports_hints_without_the_prompt_text(monkeypatch):
+    monkeypatch.setenv("TALK_TRANSCRIPTION_LANGUAGES", "fr,en")
+    monkeypatch.setenv("TALK_TRANSCRIPTION_PROMPT", "Mostly French. Names: Example Clinic.")
+    monkeypatch.setenv("TALK_REPLY_LANGUAGE", "French")
+    check = talk_doctor._language_check()
+    assert check["status"] == "pass"
+    assert check["details"]["transcription_languages"] == ["fr", "en"]
+    assert check["details"]["reply_language"] == "French"
+    assert "Example Clinic" not in str(check)
+
+
+def test_language_check_fails_on_an_invalid_setting(monkeypatch):
+    monkeypatch.delenv("TALK_TRANSCRIPTION_PROMPT", raising=False)
+    monkeypatch.delenv("TALK_REPLY_LANGUAGE", raising=False)
+    monkeypatch.setenv("TALK_TRANSCRIPTION_LANGUAGES", "french")
+    check = talk_doctor._language_check()
+    assert check["status"] == "fail"
+    assert check["details"]["transcription_languages"] == "invalid"

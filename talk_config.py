@@ -654,6 +654,86 @@ def voice_mode() -> str:
     return raw
 
 
+#: ISO 639-1 (two letters) or ISO 639-3 (three letters), lower case: the
+#: formats the OpenAI Realtime transcription field accepts. Anything else
+#: refuses here, at mint, instead of failing the session update upstream.
+_LANGUAGE_CODE_RE = re.compile(r"^[a-z]{2,3}$")
+MAX_TRANSCRIPTION_LANGUAGES = 8
+MAX_TRANSCRIPTION_PROMPT_CHARS = 1000
+MAX_REPLY_LANGUAGE_CHARS = 40
+_REPLY_LANGUAGE_RE = re.compile(r"^[^\W\d_]+(?:[ '\-][^\W\d_]+)*$")
+
+
+def transcription_languages() -> tuple[str, ...]:
+    """Expected spoken languages for input transcription (``TALK_TRANSCRIPTION_LANGUAGES``).
+
+    Comma-separated ISO codes, for example ``fr`` or ``fr,en``. Unset sends no
+    language hint at all, exactly the pre-knob payload. **Fail-closed**: a
+    malformed code refuses with the expected format instead of being dropped,
+    because a silently ignored hint looks exactly like a working one.
+    """
+
+    raw = os.environ.get("TALK_TRANSCRIPTION_LANGUAGES") or ""
+    codes = tuple(dict.fromkeys(part.strip().lower() for part in raw.split(",") if part.strip()))
+    invalid = [code for code in codes if not _LANGUAGE_CODE_RE.match(code)]
+    if invalid:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_LANGUAGES has invalid code(s) {', '.join(invalid)}: "
+            "use comma-separated ISO 639-1 or 639-3 codes, e.g. 'fr' or 'fr,en'"
+        )
+    if len(codes) > MAX_TRANSCRIPTION_LANGUAGES:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_LANGUAGES lists {len(codes)} languages; "
+            f"at most {MAX_TRANSCRIPTION_LANGUAGES} are accepted"
+        )
+    return codes
+
+
+def transcription_prompt() -> str | None:
+    """Free-text context for input transcription (``TALK_TRANSCRIPTION_PROMPT``).
+
+    Vocabulary, names or "mostly French, sometimes English" help the
+    transcription model; they are hints, never required output. Unset or blank
+    sends nothing. Control characters and over-long values refuse.
+    """
+
+    raw = (os.environ.get("TALK_TRANSCRIPTION_PROMPT") or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_TRANSCRIPTION_PROMPT_CHARS:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_PROMPT is {len(raw)} characters; "
+            f"at most {MAX_TRANSCRIPTION_PROMPT_CHARS} are accepted"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise TalkConfigError(
+            "TALK_TRANSCRIPTION_PROMPT must be one line without control characters"
+        )
+    return raw
+
+
+def reply_language() -> str | None:
+    """Language the voice speaks to the operator in (``TALK_REPLY_LANGUAGE``).
+
+    A language NAME (``French``, ``français``), not a code: it is rendered into
+    the session prompt as written. Unset leaves the prompt byte-identical to a
+    session that never had the knob, and the model keeps guessing from the
+    first words it hears. Tool arguments and delegation briefs are not
+    constrained by it.
+    """
+
+    raw = (os.environ.get("TALK_REPLY_LANGUAGE") or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_REPLY_LANGUAGE_CHARS or not _REPLY_LANGUAGE_RE.match(raw):
+        raise TalkConfigError(
+            "TALK_REPLY_LANGUAGE must be a language name such as 'French' "
+            "(letters, spaces, apostrophes or hyphens; "
+            f"at most {MAX_REPLY_LANGUAGE_CHARS} characters)"
+        )
+    return raw
+
+
 def cascade_tts() -> str:
     """Cascade TTS provider, resolved at call time. Fail-closed.
 
@@ -1067,6 +1147,7 @@ __all__ = [
     "memory_search_timeout_s",
     "realtime_model_compatibility",
     "realtime_model_valid",
+    "reply_language",
     "resolve_elevenlabs_key",
     "resolve_gemini_key",
     "resolve_openai_key",
@@ -1079,6 +1160,8 @@ __all__ = [
     "talk_model",
     "talk_provider",
     "talk_voice",
+    "transcription_languages",
+    "transcription_prompt",
     "trust_declared_read_only",
     "turn_detection",
     "voice_mode",

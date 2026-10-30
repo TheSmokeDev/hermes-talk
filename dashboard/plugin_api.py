@@ -396,6 +396,7 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
                 if bound is not None
                 else talk_capabilities.instruction_section()
             ),
+            reply_language=talk_config.reply_language(),
         )
         + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
         tools=tools,
@@ -1089,11 +1090,13 @@ async def native_task_attach(request: Request):
                 None, lane=surface_context["surface"],
                 capabilities=TASKS.live_capabilities(bound),
                 task_context=TASKS.live_instructions(bound),
+                reply_language=talk_config.reply_language(),
             )
         else:
             instructions = talk_identity.build_instructions(
                 None, tools=tools, lane=surface_context["surface"], canonical_task=True,
                 capabilities="Canonical task tools and linked child work are available.",
+                reply_language=talk_config.reply_language(),
             ) + "\n\n" + TASKS.instructions(bound)
         return {**result, "instructions": instructions, "tools": tools}
     finally:

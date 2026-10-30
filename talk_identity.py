@@ -259,11 +259,33 @@ def live_capabilities(snapshot):
             "Use client delegation for the current full catalog or to request their use.")
 
 
+def reply_language_line(language: str | None) -> str | None:
+    """One sentence pinning the spoken language, or ``None`` when unset.
+
+    Rendered right after the preamble: the preamble is English, so without
+    it the model answers in whatever language it guesses from the first
+    words it hears (a short greeting is easily misheard as English or
+    Spanish). Tool arguments and delegation briefs stay unconstrained.
+    """
+
+    if not language:
+        return None
+    return (
+        f"Always speak to the user in {language}, unless they clearly switch to another "
+        "language for a whole turn; then answer in that language. Function-call arguments "
+        "and briefs written for other agents may use any language."
+    )
+
+
 def build_live_instructions(
     host_sections=None, *, lane=None, host_summary=None, capabilities=None, task_context=None,
+    reply_language=None,
 ):
     """Build the client-delegation persona without Realtime function-tool instructions."""
     sections = [LIVE_PREAMBLE]
+    language_line = reply_language_line(reply_language)
+    if language_line:
+        sections.append(language_line)
     for name in ("PERSONA", "USER"):
         value = next((value for key, value in (host_sections or {}).items()
                       if key.upper() == name), None)
@@ -290,6 +312,7 @@ def build_instructions(
     lane: str | None = None,
     host_summary: str | None = None,
     capabilities: str | None = None,
+    reply_language: str | None = None,
 ) -> str:
     """Assemble the Realtime session prompt.
 
@@ -348,6 +371,9 @@ def build_instructions(
         if canonical_task
         else (_HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT),
     ]
+    language_line = reply_language_line(reply_language)
+    if language_line:
+        contracts.insert(0, language_line)
     return VOICE_PREAMBLE + "\n\n" + "\n\n".join([*contracts, *sections])
 
 
@@ -371,4 +397,5 @@ __all__ = [
     "current_moment",
     "lane_line",
     "live_capabilities",
+    "reply_language_line",
 ]

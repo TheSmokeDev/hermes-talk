@@ -1613,6 +1613,7 @@ async def run_talk_session(
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
         capabilities=talk_capabilities.instruction_section(catalog_snapshot),
+        reply_language=talk_config.reply_language(),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by

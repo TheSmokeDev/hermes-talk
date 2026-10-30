@@ -13,6 +13,15 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Spoken-language knobs for OpenAI sessions: `TALK_TRANSCRIPTION_LANGUAGES`
+  (ISO codes for the input transcriber), `TALK_TRANSCRIPTION_PROMPT` (one-line
+  transcription context) and `TALK_REPLY_LANGUAGE` (the language the voice
+  answers in). A short greeting no longer gets answered in a guessed language.
+  All three are fail-closed, resolved at call time, and leave the wire and the
+  prompt byte-identical when unset. `hermes talk doctor` gains a `language`
+  check that reports the prompt's length, never its text. Contributed by @Philibergus.
+
 ### Fixed
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
