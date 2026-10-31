@@ -340,11 +340,13 @@ class _OpenAIWireSession:
         auth_source: str,
         aiohttp_module=None,
         mint_session: Callable[..., Any] | None = None,
+        ws_url: str | None = None,
     ) -> None:
         self._auth_token: str | None = auth_token
         self._auth_source: str | None = auth_source
         self._aiohttp = aiohttp_module
         self._mint_session = mint_session or self._mint
+        self._ws_url = ws_url or talk_wire.OPENAI_REALTIME_WS_URL
         self._stack: AsyncExitStack | None = None
         self._ws = None
         self._iterator = None
@@ -405,10 +407,16 @@ class _OpenAIWireSession:
                 self._clear_raw_credentials()
             aiohttp = self._aiohttp or _import_aiohttp()
             http = await stack.enter_async_context(aiohttp.ClientSession())
+            # A local server may run without auth: no secret, no header.
+            headers = (
+                {"Authorization": f"Bearer {descriptor.client_secret}"}
+                if descriptor.client_secret
+                else {}
+            )
             ws = await stack.enter_async_context(
                 http.ws_connect(
-                    f"{talk_wire.OPENAI_REALTIME_WS_URL}?model={model}",
-                    headers={"Authorization": f"Bearer {descriptor.client_secret}"},
+                    f"{self._ws_url}?model={model}",
+                    headers=headers,
                     timeout=CONNECT_TIMEOUT_S,
                     heartbeat=20.0,
                 )
@@ -547,6 +555,7 @@ class OpenAIRealtimeSession:
         auth_source: str,
         aiohttp_module=None,
         mint_session: Callable[[rt.SessionSetup], Any] | None = None,
+        ws_url: str | None = None,
     ) -> None:
         self.auth_token = auth_token
         self.auth_source = auth_source
@@ -557,6 +566,7 @@ class OpenAIRealtimeSession:
             auth_source=auth_source,
             aiohttp_module=aiohttp_module,
             mint_session=None,
+            ws_url=ws_url,
         )
         self._terminal_emitted = False
 
@@ -577,7 +587,7 @@ class OpenAIRealtimeSession:
                 tools=tools,
                 automatic_response=setup.automatic_response,
                 turn_detection=setup.turn_detection,
-                session_update=build_session_update(setup),
+                session_update=self._session_update(setup),
                 text_output=setup.text_output,
             )
         except asyncio.CancelledError:
@@ -589,6 +599,11 @@ class OpenAIRealtimeSession:
                 raise
             raise rt.RealtimeSessionError(str(exc)) from exc
         self.state = rt.SessionState.CONNECTED
+
+    def _session_update(self, setup: rt.SessionSetup) -> dict[str, Any]:
+        """The first wire message; a compatible-server subclass may reshape it."""
+
+        return build_session_update(setup)
 
     async def send(self, commands: Sequence[rt.RealtimeCommand]) -> None:
         clean_eof_flush = self.state is rt.SessionState.CLOSED and self._terminal_emitted

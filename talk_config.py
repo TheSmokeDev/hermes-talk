@@ -27,8 +27,18 @@ DEFAULT_AGENT_TIMEOUT_S = 1_800
 #: Realtime voice providers selectable through ``TALK_PROVIDER``. The list is
 #: fail-closed on purpose: a provider knob that guesses silently would spend
 #: the wrong metered key, which is a billing error, not a UX nicety.
-TALK_PROVIDERS = ("openai", "grok", "gemini")
+TALK_PROVIDERS = ("openai", "grok", "gemini", "local")
 DEFAULT_TALK_PROVIDER = "openai"
+#: A self-hosted server speaking the OpenAI Realtime protocol, e.g.
+#: huggingface/speech-to-speech (``speech-to-speech serve``). Plain ``ws://``
+#: is accepted only for loopback hosts; anything else must be ``wss://``.
+DEFAULT_LOCAL_URL = "ws://127.0.0.1:8765/v1/realtime"
+#: Sent as the ``?model=`` query; local servers pick their own models.
+DEFAULT_LOCAL_MODEL = "local"
+#: Sentinel voice: the session omits ``audio.output.voice`` so the server keeps
+#: its own default speaker.
+DEFAULT_LOCAL_VOICE = "default"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 #: xAI Grok Voice model alias, handshake-verified against the live endpoint
 #: 2026-08-28 (the alias resolved to a concrete voice model at session
 #: create). The model rides the socket URL query, never the session update.
@@ -429,6 +439,7 @@ def turn_detection(provider: str | None = None):
         "openai": {"provider_native", "server_vad", "semantic_vad"},
         "grok": {"provider_native", "server_vad"},
         "gemini": {"provider_native"},
+        "local": {"provider_native", "server_vad"},
     }
     if raw not in supported.get(provider, set()):
         raise TalkConfigError(f"TALK_TURN_DETECTION is invalid or unsupported for {provider}")
@@ -488,6 +499,69 @@ def talk_grok_voice() -> str:
             f"({', '.join(GROK_REALTIME_VOICES)})"
         )
     return raw
+
+
+def talk_local_url() -> str:
+    """Local Realtime server URL (``TALK_LOCAL_URL``). Fail-closed.
+
+    Plain ``ws://`` is refused off loopback: the tool loop and transcripts
+    would cross the network unencrypted.
+    """
+
+    from urllib.parse import urlsplit
+
+    raw = (os.environ.get("TALK_LOCAL_URL") or DEFAULT_LOCAL_URL).strip() or DEFAULT_LOCAL_URL
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        parts, host = None, ""
+    if parts is None or parts.scheme not in ("ws", "wss") or not host:
+        raise TalkConfigError(
+            f"TALK_LOCAL_URL '{raw}' must be a ws:// or wss:// URL with a host"
+        )
+    if parts.query or parts.fragment:
+        raise TalkConfigError("TALK_LOCAL_URL must not carry a query or fragment")
+    if parts.scheme == "ws" and host not in _LOOPBACK_HOSTS:
+        raise TalkConfigError(
+            f"TALK_LOCAL_URL uses plain ws:// to '{host}'; use wss:// off loopback"
+        )
+    return raw.rstrip("/")
+
+
+def talk_local_model() -> str:
+    """Model id sent to the local server (``TALK_LOCAL_MODEL``)."""
+
+    raw = (os.environ.get("TALK_LOCAL_MODEL") or DEFAULT_LOCAL_MODEL).strip()
+    return raw or DEFAULT_LOCAL_MODEL
+
+
+def talk_local_voice() -> str:
+    """Local server voice (``TALK_LOCAL_VOICE``); ``default`` keeps the server's.
+
+    Voice names belong to whichever TTS the server runs, so there is no
+    closed list to validate against here.
+    """
+
+    raw = (os.environ.get("TALK_LOCAL_VOICE") or DEFAULT_LOCAL_VOICE).strip()
+    return raw or DEFAULT_LOCAL_VOICE
+
+
+def resolve_local_key() -> str:
+    """Optional bearer for the local server (``TALK_LOCAL_API_KEY``).
+
+    Unset means no Authorization header. Set-but-blank refuses, like every
+    other Talk key: a blank value is a mistake, not a choice.
+    """
+
+    raw = os.environ.get("TALK_LOCAL_API_KEY")
+    if raw is None:
+        return ""
+    if not raw.strip():
+        raise TalkConfigError(
+            "TALK_LOCAL_API_KEY is set but empty — set a real key or unset it"
+        )
+    return raw.strip()
 
 
 def talk_gemini_model() -> str:
@@ -1025,6 +1099,9 @@ __all__ = [
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
     "DEFAULT_GROK_VOICE",
+    "DEFAULT_LOCAL_MODEL",
+    "DEFAULT_LOCAL_URL",
+    "DEFAULT_LOCAL_VOICE",
     "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_PROVIDER",
@@ -1069,6 +1146,7 @@ __all__ = [
     "realtime_model_valid",
     "resolve_elevenlabs_key",
     "resolve_gemini_key",
+    "resolve_local_key",
     "resolve_openai_key",
     "resolve_xai_key",
     "state_dir",
@@ -1076,6 +1154,9 @@ __all__ = [
     "talk_gemini_voice",
     "talk_grok_model",
     "talk_grok_voice",
+    "talk_local_model",
+    "talk_local_url",
+    "talk_local_voice",
     "talk_model",
     "talk_provider",
     "talk_voice",

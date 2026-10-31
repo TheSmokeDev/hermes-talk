@@ -128,11 +128,13 @@ Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 | GPT-Live (`TALK_VOICE_MODE=live`) | `TALK_LIVE_AUTH=subscription` (the default, on the Codex subscription) or explicitly chosen `api` billing; no automatic paid fallback | `gpt-live-1-codex` (subscription) / `gpt-live-1` (API) | terminal, Discord, dashboard, Desktop — on an explicit task |
 | xAI Grok Voice (`TALK_PROVIDER=grok`) | an X Premium or SuperGrok login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | `grok-voice-latest` | terminal + Discord |
 | Gemini Live (`TALK_PROVIDER=gemini`) | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | `gemini-3.1-flash-live-preview` | terminal + `hermes realtime`; Discord refuses it for now |
+| Local models (`TALK_PROVIDER=local`) | none by default — any self-hosted OpenAI-Realtime-compatible server, e.g. [speech-to-speech](https://github.com/huggingface/speech-to-speech) with an Ollama LLM | the server's own | terminal (Discord not yet verified) |
 | Cascade voice (`TALK_VOICE_MODE=cascade`) | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY`, on top of the OpenAI Realtime lane | `eleven_flash_v2_5` | terminal, Discord, dashboard |
 
 The provider knob is fail-closed and never inferred from which keys exist.
 Grok supports all 28 documented built-in voices through `TALK_GROK_VOICE`
 (for example, `carina`); see the [voice list](docs/PROVIDERS.md#provider-details--openai-default-grok-or-gemini).
+Running fully local on your own GPU: [docs/LOCAL.md](docs/LOCAL.md).
 Per-lane detail and the credential order: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 Speaking in a voice of your own: [docs/CASCADE.md](docs/CASCADE.md).
 Experimental xAI speech effects and phrase wrappers, including how native Talk

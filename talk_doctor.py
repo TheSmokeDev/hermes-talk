@@ -196,12 +196,15 @@ def _provider_check() -> dict[str, Any]:
             "fail",
             "configured realtime provider is not supported",
             {"provider": (raw or "").strip().lower() or None, "source": source},
-            ("Set TALK_PROVIDER to openai, grok, or gemini, or unset it.",),
+            ("Set TALK_PROVIDER to openai, grok, gemini, or local, or unset it.",),
         )
     details: dict[str, Any] = {"provider": provider, "source": source}
     if provider == "openai":
         # The auth/model/voice checks below carry the OpenAI lane as before.
         return _check("provider", "pass", "openai is the selected realtime provider", details)
+
+    if provider == "local":
+        return _local_provider_check(details)
 
     if provider == "gemini":
         scoped = os.environ.get("TALK_GEMINI_API_KEY")
@@ -334,6 +337,72 @@ def _provider_check() -> dict[str, Any]:
     )
 
 
+def _local_provider_check(details: dict[str, Any]) -> dict[str, Any]:
+    """A self-hosted Realtime server: URL policy and optional key presence. Offline."""
+
+    url_raw = os.environ.get("TALK_LOCAL_URL")
+    details.update(
+        {
+            "key": _key_presence(os.environ.get("TALK_LOCAL_API_KEY")),
+            "model": talk_config.talk_local_model(),
+            "voice": talk_config.talk_local_voice(),
+            "url_source": "TALK_LOCAL_URL" if (url_raw or "").strip() else "default",
+            "validation_scope": "configuration-only",
+        }
+    )
+    try:
+        details["url"] = talk_config.talk_local_url()
+    except talk_config.TalkConfigError as exc:
+        details["url"] = None
+        return _check(
+            "provider",
+            "fail",
+            "TALK_LOCAL_URL is not an allowed local Realtime URL",
+            details,
+            (str(exc),),
+        )
+    if details["key"] == "blank":
+        return _check(
+            "provider",
+            "fail",
+            "TALK_LOCAL_API_KEY is set but blank and refuses closed",
+            details,
+            ("Set a real key in TALK_LOCAL_API_KEY, or unset it for a keyless server.",),
+        )
+    return _check(
+        "provider",
+        "pass",
+        f"local realtime server is configured at {details['url']}; "
+        "reachability was not checked",
+        details,
+    )
+
+
+def _local_auth_check() -> dict[str, Any]:
+    """Local servers usually run keyless; a key, when set, is presence-only."""
+
+    key = _key_presence(os.environ.get("TALK_LOCAL_API_KEY"))
+    details = {
+        "provider": "local",
+        "configured": key != "blank",
+        "winning_lane": talk_auth.SOURCE_CONFIGURED if key == "present" else None,
+        "keys": {"local": key},
+        "blocked_by": "blank-local-key" if key == "blank" else None,
+        "validation_scope": "presence-only",
+    }
+    if key == "blank":
+        return _check(
+            "auth", "fail", "TALK_LOCAL_API_KEY is set but blank and blocks the local lane",
+            details, ("Set a real TALK_LOCAL_API_KEY, or unset it for a keyless server.",),
+        )
+    summary = (
+        "TALK_LOCAL_API_KEY is configured for the local server"
+        if key == "present"
+        else "local server lane runs without a key"
+    )
+    return _check("auth", "pass", summary, details)
+
+
 def _grok_auth_check() -> dict[str, Any]:
     """The Grok lane's auth verdict, in the same envelope as the OpenAI one.
 
@@ -454,6 +523,8 @@ def _auth_check() -> dict[str, Any]:
         return _gemini_auth_check()
     if provider == "grok":
         return _grok_auth_check()
+    if provider == "local":
+        return _local_auth_check()
     receipt = talk_auth.auth_diagnostic()
     # Keep the complete diagnostic only because every field is a lane/state
     # receipt. It intentionally contains no paths, tokens, IDs, or env values.
@@ -591,6 +662,23 @@ def _model_check() -> dict[str, Any]:
                 "validation_scope": "configuration-only",
             },
         )
+    if _selected_provider() == "local":
+        model = talk_config.talk_local_model()
+        return _check(
+            "model",
+            "pass",
+            f"local model id {model} is sent to the server, which picks its own models",
+            {
+                "provider": "local",
+                "model": model,
+                "source": (
+                    "TALK_LOCAL_MODEL"
+                    if (os.environ.get("TALK_LOCAL_MODEL") or "").strip() else "default"
+                ),
+                "compatibility": "server-defined",
+                "validation_scope": "configuration-only",
+            },
+        )
     model = talk_config.talk_model()
     source = "TALK_MODEL" if (os.environ.get("TALK_MODEL") or "").strip() else "default"
     compatibility = talk_config.realtime_model_compatibility(model)
@@ -652,6 +740,21 @@ def _voice_check() -> dict[str, Any]:
         return _check(
             "voice", "pass", f"Gemini voice {voice} is valid",
             {"provider": "gemini", "voice": voice, "source": source, "valid": True},
+        )
+    if _selected_provider() == "local":
+        voice = talk_config.talk_local_voice()
+        return _check(
+            "voice", "pass",
+            f"local voice {voice} is passed to the server, which owns its voice list",
+            {
+                "provider": "local",
+                "voice": voice,
+                "source": (
+                    "TALK_LOCAL_VOICE"
+                    if (os.environ.get("TALK_LOCAL_VOICE") or "").strip() else "default"
+                ),
+                "valid": True,
+            },
         )
     source = "TALK_VOICE" if (os.environ.get("TALK_VOICE") or "").strip() else "default"
     try:
@@ -1007,6 +1110,11 @@ def render_human(report: dict[str, Any]) -> str:
                 f"winner={details.get('winning_lane') or 'none'}, "
                 f"source={details.get('source') or 'none'}, validation=presence-only"
             )
+        elif check["id"] == "auth" and details.get("provider") == "local":
+            lines.append(
+                "  receipt: provider=local, "
+                f"key={details.get('keys', {}).get('local')}, validation=presence-only"
+            )
         elif check["id"] == "auth":
             if "xai_oauth" in details:
                 oauth = f"xai-oauth={details['xai_oauth']}"
@@ -1027,6 +1135,12 @@ def render_human(report: dict[str, Any]) -> str:
                 "  receipt: "
                 f"model={details.get('model')}, voice={details.get('voice')}, "
                 f"key-scoped={keys.get('scoped')}, key-shared={keys.get('shared')}"
+            )
+        elif check["id"] == "provider" and details.get("provider") == "local":
+            lines.append(
+                "  receipt: "
+                f"url={details.get('url')}, model={details.get('model')}, "
+                f"voice={details.get('voice')}, key={details.get('key')}"
             )
         elif check["id"] == "cascade" and details.get("voice_mode") == "cascade":
             keys = details.get("keys", {})
