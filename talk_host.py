@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,9 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
 
 _log = logging.getLogger(__name__)
 
+_CATALOG_PROBE_LOCK = threading.Lock()
+_CATALOG_PROBE_FUTURE: Future[dict | None] | None = None
+
 #: How long a stop verb politely waits for its confirmation before detaching
 #: (hermes-talk#2). Long enough that the common fast path (an HTTP 2xx or a
 #: child dying on SIGTERM) speaks the REAL result; short enough that a wedged
@@ -96,6 +100,33 @@ def _spawn_daemon(fn, *args, name: str = "talk-stop") -> None:
     joined at shutdown — exactly the wrong contract for this)."""
 
     threading.Thread(target=fn, args=args, daemon=True, name=name).start()
+
+def _catalog_probe_bounded() -> dict | None:
+    """Bound registry discovery without spawning more readers while one is stuck."""
+    global _CATALOG_PROBE_FUTURE
+
+    with _CATALOG_PROBE_LOCK:
+        if _CATALOG_PROBE_FUTURE is None or _CATALOG_PROBE_FUTURE.done():
+            pending: Future[dict | None] = Future()
+            _CATALOG_PROBE_FUTURE = pending
+
+            def read() -> None:
+                try:
+                    pending.set_result(_catalog_from_host_modules())
+                except Exception as exc:  # noqa: BLE001 — propagate through the bounded result
+                    pending.set_exception(exc)
+
+            _spawn_daemon(read, name="talk-catalog-probe")
+        future = _CATALOG_PROBE_FUTURE
+
+    try:
+        return future.result(timeout=talk_config.api_server_probe_timeout_s())
+    except TimeoutError:
+        return None
+    except Exception as exc:  # noqa: BLE001 — an unreadable catalog falls through to REST
+        _log.debug("host catalog probe failed: %s", type(exc).__name__)
+        return None
+
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -931,7 +962,7 @@ class HostAdapter:
         one.
         """
 
-        payload = _catalog_from_host_modules()
+        payload = _catalog_probe_bounded()
         if payload is None:
             return None
         try:
