@@ -186,7 +186,7 @@ def _provider_check() -> dict[str, Any]:
     model/voice validity against the local fail-closed lists. No live probe.
     """
 
-    raw = _talk_env_get("TALK_PROVIDER")
+    raw = talk_config._talk_env_get("TALK_PROVIDER")
     source = "TALK_PROVIDER" if (raw or "").strip() else "default"
     try:
         provider = talk_config.talk_provider()
@@ -207,14 +207,14 @@ def _provider_check() -> dict[str, Any]:
         return _local_provider_check(details)
 
     if provider == "gemini":
-        scoped = _talk_env_get("TALK_GEMINI_API_KEY")
+        scoped = talk_config._talk_env_get("TALK_GEMINI_API_KEY")
         shared = os.environ.get("GEMINI_API_KEY")
         keys = {
             "scoped": _key_presence(scoped),
             "shared": _key_presence(shared),
         }
-        voice_raw = _talk_env_get("TALK_GEMINI_VOICE")
-        model_raw = _talk_env_get("TALK_GEMINI_MODEL")
+        voice_raw = talk_config._talk_env_get("TALK_GEMINI_VOICE")
+        model_raw = talk_config._talk_env_get("TALK_GEMINI_MODEL")
         details.update(
             {
                 "keys": keys,
@@ -271,14 +271,14 @@ def _provider_check() -> dict[str, Any]:
             details,
         )
 
-    scoped = _talk_env_get("TALK_XAI_API_KEY")
+    scoped = talk_config._talk_env_get("TALK_XAI_API_KEY")
     shared = os.environ.get("XAI_API_KEY")
     keys = {
         "scoped": _key_presence(scoped),
         "shared": _key_presence(shared),
     }
-    voice_raw = _talk_env_get("TALK_GROK_VOICE")
-    model_raw = _talk_env_get("TALK_GROK_MODEL")
+    voice_raw = talk_config._talk_env_get("TALK_GROK_VOICE")
+    model_raw = talk_config._talk_env_get("TALK_GROK_MODEL")
     details.update(
         {
             "keys": keys,
@@ -340,10 +340,10 @@ def _provider_check() -> dict[str, Any]:
 def _local_provider_check(details: dict[str, Any]) -> dict[str, Any]:
     """A self-hosted Realtime server: URL policy and optional key presence. Offline."""
 
-    url_raw = _talk_env_get("TALK_LOCAL_URL")
+    url_raw = talk_config._talk_env_get("TALK_LOCAL_URL")
     details.update(
         {
-            "key": _key_presence(_talk_env_get("TALK_LOCAL_API_KEY")),
+            "key": _key_presence(talk_config._talk_env_get("TALK_LOCAL_API_KEY")),
             "model": talk_config.talk_local_model(),
             "voice": talk_config.talk_local_voice(),
             "url_source": "TALK_LOCAL_URL" if (url_raw or "").strip() else "default",
@@ -381,7 +381,7 @@ def _local_provider_check(details: dict[str, Any]) -> dict[str, Any]:
 def _local_auth_check() -> dict[str, Any]:
     """Local servers usually run keyless; a key, when set, is presence-only."""
 
-    key = _key_presence(_talk_env_get("TALK_LOCAL_API_KEY"))
+    key = _key_presence(talk_config._talk_env_get("TALK_LOCAL_API_KEY"))
     details = {
         "provider": "local",
         "configured": key != "blank",
@@ -479,7 +479,7 @@ def _selected_provider() -> str | None:
 def _gemini_auth_check() -> dict[str, Any]:
     """Use session-time key precedence without network access or foreign auth stores."""
 
-    scoped = _talk_env_get("TALK_GEMINI_API_KEY")
+    scoped = talk_config._talk_env_get("TALK_GEMINI_API_KEY")
     shared = os.environ.get("GEMINI_API_KEY")
     source = (
         "TALK_GEMINI_API_KEY" if scoped is not None
@@ -632,7 +632,7 @@ def _live_model_check() -> dict[str, Any] | None:
             "voice": live.voice,
             "source": (
                 "TALK_LIVE_MODEL"
-                if (_talk_env_get("TALK_LIVE_MODEL") or "").strip()
+                if (talk_config._talk_env_get("TALK_LIVE_MODEL") or "").strip()
                 else "default"
             ),
             "validation_scope": "configuration-only",
@@ -656,7 +656,7 @@ def _model_check() -> dict[str, Any]:
                 "model": model,
                 "source": (
                     "TALK_GEMINI_MODEL"
-                    if (_talk_env_get("TALK_GEMINI_MODEL") or "").strip() else "default"
+                    if (talk_config._talk_env_get("TALK_GEMINI_MODEL") or "").strip() else "default"
                 ),
                 "compatibility": "known-default" if known_default else "unknown",
                 "validation_scope": "configuration-only",
@@ -673,14 +673,14 @@ def _model_check() -> dict[str, Any]:
                 "model": model,
                 "source": (
                     "TALK_LOCAL_MODEL"
-                    if (_talk_env_get("TALK_LOCAL_MODEL") or "").strip() else "default"
+                    if (talk_config._talk_env_get("TALK_LOCAL_MODEL") or "").strip() else "default"
                 ),
                 "compatibility": "server-defined",
                 "validation_scope": "configuration-only",
             },
         )
     model = talk_config.talk_model()
-    source = "TALK_MODEL" if (_talk_env_get("TALK_MODEL") or "").strip() else "default"
+    source = "TALK_MODEL" if (talk_config._talk_env_get("TALK_MODEL") or "").strip() else "default"
     compatibility = talk_config.realtime_model_compatibility(model)
     details = {
         "model": model,
@@ -721,7 +721,7 @@ def _voice_check() -> dict[str, Any]:
     if _selected_provider() == "gemini":
         source = (
             "TALK_GEMINI_VOICE"
-            if (_talk_env_get("TALK_GEMINI_VOICE") or "").strip() else "default"
+            if (talk_config._talk_env_get("TALK_GEMINI_VOICE") or "").strip() else "default"
         )
         try:
             voice = talk_config.talk_gemini_voice()
@@ -730,7 +730,7 @@ def _voice_check() -> dict[str, Any]:
                 "voice", "fail", "configured Gemini voice is not a built-in Gemini Live voice",
                 {
                     "provider": "gemini",
-                    "voice": (_talk_env_get("TALK_GEMINI_VOICE") or "").strip() or None,
+                    "voice": (talk_config._talk_env_get("TALK_GEMINI_VOICE") or "").strip() or None,
                     "source": source,
                     "valid": False,
                 },
@@ -751,16 +751,16 @@ def _voice_check() -> dict[str, Any]:
                 "voice": voice,
                 "source": (
                     "TALK_LOCAL_VOICE"
-                    if (_talk_env_get("TALK_LOCAL_VOICE") or "").strip() else "default"
+                    if (talk_config._talk_env_get("TALK_LOCAL_VOICE") or "").strip() else "default"
                 ),
                 "valid": True,
             },
         )
-    source = "TALK_VOICE" if (_talk_env_get("TALK_VOICE") or "").strip() else "default"
+    source = "TALK_VOICE" if (talk_config._talk_env_get("TALK_VOICE") or "").strip() else "default"
     try:
         voice = talk_config.talk_voice()
     except talk_config.TalkConfigError:
-        raw = (_talk_env_get("TALK_VOICE") or "").strip().lower()
+        raw = (talk_config._talk_env_get("TALK_VOICE") or "").strip().lower()
         return _check(
             "voice",
             "fail",
@@ -784,7 +784,7 @@ def _cascade_check() -> dict[str, Any]:
     id as the semi-public identifier it is, and no live ElevenLabs probe.
     """
 
-    raw_mode = _talk_env_get("TALK_VOICE_MODE")
+    raw_mode = talk_config._talk_env_get("TALK_VOICE_MODE")
     source = "TALK_VOICE_MODE" if (raw_mode or "").strip() else "default"
     try:
         mode = talk_config.voice_mode()
@@ -804,10 +804,10 @@ def _cascade_check() -> dict[str, Any]:
             {"voice_mode": mode, "source": source},
         )
 
-    scoped = _talk_env_get("TALK_ELEVENLABS_API_KEY")
+    scoped = talk_config._talk_env_get("TALK_ELEVENLABS_API_KEY")
     shared = os.environ.get("ELEVENLABS_API_KEY")
     keys = {"scoped": _key_presence(scoped), "shared": _key_presence(shared)}
-    voice_id_raw = _talk_env_get("TALK_ELEVENLABS_VOICE_ID")
+    voice_id_raw = talk_config._talk_env_get("TALK_ELEVENLABS_VOICE_ID")
     voice_id = (voice_id_raw or "").strip() or None
     details: dict[str, Any] = {
         "voice_mode": mode,
@@ -819,7 +819,7 @@ def _cascade_check() -> dict[str, Any]:
     try:
         details["tts"] = talk_config.cascade_tts()
     except talk_config.TalkConfigError:
-        details["tts"] = (_talk_env_get("TALK_CASCADE_TTS") or "").strip().lower() or None
+        details["tts"] = (talk_config._talk_env_get("TALK_CASCADE_TTS") or "").strip().lower() or None
         return _check(
             "cascade",
             "fail",
@@ -943,7 +943,7 @@ def _home_receipt() -> dict[str, Any]:
         profile_source = "resolved-profile-home"
     else:
         root = home
-        explicit = _talk_env_get("TALK_AGENT_PROFILE")
+        explicit = talk_config._talk_env_get("TALK_AGENT_PROFILE")
         if explicit is not None:
             profile = explicit.strip() or None
             profile_source = "TALK_AGENT_PROFILE" if profile else "TALK_AGENT_PROFILE-root"
@@ -1007,7 +1007,7 @@ def _identity_check() -> dict[str, Any]:
 
 
 def _discord_check() -> dict[str, Any]:
-    raw = _talk_env_get("TALK_DISCORD_OPERATOR_USER_IDS")
+    raw = talk_config._talk_env_get("TALK_DISCORD_OPERATOR_USER_IDS")
     configured = raw is not None and bool(raw.strip())
     operator_ids = talk_config.discord_operator_user_ids()
     valid = not configured or bool(operator_ids)
