@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+import talk_config
+
 
 class NativeTaskError(RuntimeError):
     def __init__(self, message, *, status=None, category=None, superseded=False):
@@ -63,15 +65,15 @@ class NativeTaskAPI:
 
     @classmethod
     def configured(cls, origin=None, *, client=None):
-        origin = origin or os.environ.get("TALK_TASK_API_URL", "")
+        origin = origin or _talk_env_get("TALK_TASK_API_URL", "")
         if not origin:
             raise NativeTaskError(
                 "Set TALK_TASK_API_URL to the authenticated Hermes dashboard origin"
             )
         return cls(
             origin,
-            session_token=os.environ.get("TALK_TASK_SESSION_TOKEN", ""),
-            talk_token=os.environ.get("TALK_DASHBOARD_TOKEN", ""),
+            session_token=_talk_env_get("TALK_TASK_SESSION_TOKEN", ""),
+            talk_token=_talk_env_get("TALK_DASHBOARD_TOKEN", ""),
             client=client,
         )
 

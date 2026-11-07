@@ -75,7 +75,7 @@ def _env_float(name: str, default: float) -> float:
 def _echo_gate_settings() -> tuple[bool, float, float, float]:
     """(enabled, output_active_level, min_barge_in_level, echo_ratio) from env."""
 
-    raw = (os.environ.get("TALK_ECHO_GATE") or "").strip().lower()
+    raw = (talk_config._talk_env_get("TALK_ECHO_GATE") or "").strip().lower()
     enabled = raw not in {"0", "off", "false", "no", "disabled"}
     return (
         enabled,
