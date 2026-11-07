@@ -6,9 +6,31 @@ import asyncio
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 import wallclock
+from run_workers import RunWorkers
+
+
+@pytest.fixture
+def run_workers(monkeypatch):
+    """Opt-in ownership of run threads; callers drain BEFORE registry reset.
+
+    Replace only talk_runs' module reference, leaving unrelated thread users
+    alone. All patches stay installed until the dependent fixture has joined
+    its workers, including the terminal history write after finish_run.
+    """
+    import talk_runs
+
+    workers = RunWorkers()
+    monkeypatch.setattr(talk_runs, "threading", SimpleNamespace(
+        **{**vars(threading), "Thread": workers.thread},
+    ))
+    try:
+        yield workers
+    finally:
+        workers.join_all()
 
 
 @pytest.fixture

@@ -27,7 +27,7 @@ pytestmark = pytest.mark.usefixtures("_registry")
 
 
 @pytest.fixture
-def _registry(monkeypatch):
+def _registry(monkeypatch, run_workers):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
     talk_runs.attach_owner(
@@ -39,19 +39,23 @@ def _registry(monkeypatch):
     )
     monkeypatch.delenv("TALK_TRUST_DECLARED_READ_ONLY", raising=False)
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: None)
-    yield
-    talk_host.bind_ctx(None)
-    talk_runs.reset_for_tests()
+    try:
+        yield
+    finally:
+        run_workers.join_all()
+        talk_host.bind_ctx(None)
+        talk_runs.reset_for_tests()
 
 
 class _Gate:
     """Workers that stay running until released, so admission has something to hit."""
 
-    def __init__(self):
+    def __init__(self, run_workers):
         self.release = threading.Event()
+        run_workers.release_on_exit(self.release)
 
     def worker(self, _run_id: int) -> str:
-        self.release.wait(5.0)
+        assert self.release.wait(5.0), "test did not release its admission gate"
         return "done"
 
 
@@ -68,8 +72,8 @@ def _wait_terminal(run_id: int, timeout: float = 3.0) -> dict:
 # -- the fence ----------------------------------------------------------------
 
 
-def test_disjoint_keys_run_together():
-    gate = _Gate()
+def test_disjoint_keys_run_together(run_workers):
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "audit", gate.worker, resource_keys=["/repo/a"])
     second = talk_runs.start_run("agent", "deploy", gate.worker, resource_keys=["/repo/b"])
 
@@ -80,8 +84,8 @@ def test_disjoint_keys_run_together():
     _wait_terminal(second)
 
 
-def test_shared_keys_serialize_until_the_holder_finishes():
-    gate = _Gate()
+def test_shared_keys_serialize_until_the_holder_finishes(run_workers):
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "audit the repo", gate.worker, resource_keys=["/repo/a"])
 
     with pytest.raises(talk_runs.AdmissionRefused) as refused:
@@ -92,7 +96,7 @@ def test_shared_keys_serialize_until_the_holder_finishes():
     gate.release.set()
     _wait_terminal(first)
     # A terminal holder holds nothing: the same declaration is admitted now.
-    second_gate = _Gate()
+    second_gate = _Gate(run_workers)
     second = talk_runs.start_run(
         "agent", "deploy", second_gate.worker, resource_keys=["/repo/a"]
     )
@@ -100,8 +104,8 @@ def test_shared_keys_serialize_until_the_holder_finishes():
     second_gate.release.set()
 
 
-def test_the_refusal_names_the_run_and_the_key_and_what_to_do():
-    gate = _Gate()
+def test_the_refusal_names_the_run_and_the_key_and_what_to_do(run_workers):
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "audit the repo", gate.worker, resource_keys=["/repo/a"])
 
     with pytest.raises(talk_runs.AdmissionRefused) as refused:
@@ -114,8 +118,8 @@ def test_the_refusal_names_the_run_and_the_key_and_what_to_do():
     gate.release.set()
 
 
-def test_two_shared_keys_are_plural_in_the_refusal():
-    gate = _Gate()
+def test_two_shared_keys_are_plural_in_the_refusal(run_workers):
+    gate = _Gate(run_workers)
     talk_runs.start_run("agent", "a", gate.worker, resource_keys=["x", "y", "z"])
     # Named in the order the REFUSED run declared them — the model reads its
     # own declaration back, not the holder's.
@@ -124,8 +128,8 @@ def test_two_shared_keys_are_plural_in_the_refusal():
     gate.release.set()
 
 
-def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
-    gate = _Gate()
+def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch, run_workers):
+    gate = _Gate(run_workers)
     talk_runs.start_run(
         "agent", "read a", gate.worker,
         execution_mode="parallel_read_only", resource_keys=["/repo/a"],
@@ -138,6 +142,7 @@ def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
             execution_mode="parallel_read_only", resource_keys=["/repo/a"],
         )
     gate.release.set()
+    run_workers.join_all()
     talk_runs.reset_for_tests()
     talk_runs.attach_owner(
         talk_session_id="ts-test", generation_id="g", hermes_session_id="s",
@@ -145,7 +150,7 @@ def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
     )
 
     monkeypatch.setenv("TALK_TRUST_DECLARED_READ_ONLY", "true")
-    gate = _Gate()
+    gate = _Gate(run_workers)
     first = talk_runs.start_run(
         "agent", "read a", gate.worker,
         execution_mode="parallel_read_only", resource_keys=["/repo/a"],
@@ -162,8 +167,8 @@ def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
     gate.release.set()
 
 
-def test_the_declaration_is_downgraded_not_dropped_when_untrusted():
-    gate = _Gate()
+def test_the_declaration_is_downgraded_not_dropped_when_untrusted(run_workers):
+    gate = _Gate(run_workers)
     run_id = talk_runs.start_run(
         "agent", "read", gate.worker,
         execution_mode="parallel_read_only", resource_keys=["/repo/a"],
@@ -173,13 +178,13 @@ def test_the_declaration_is_downgraded_not_dropped_when_untrusted():
     gate.release.set()
 
 
-def test_turning_the_knob_off_closes_overlaps_it_had_allowed(monkeypatch):
+def test_turning_the_knob_off_closes_overlaps_it_had_allowed(monkeypatch, run_workers):
     """A holder admitted as read-only under an earlier configuration is judged
     under the knob as it stands NOW — the safer default cannot be escaped by
     state minted before it was set."""
 
     monkeypatch.setenv("TALK_TRUST_DECLARED_READ_ONLY", "1")
-    gate = _Gate()
+    gate = _Gate(run_workers)
     talk_runs.start_run(
         "agent", "read a", gate.worker,
         execution_mode="parallel_read_only", resource_keys=["/repo/a"],
@@ -237,10 +242,10 @@ def test_keys_are_normalized_and_capped():
         talk_runs.normalize_resource_keys({"a": 1})
 
 
-def test_case_folded_keys_collide_on_purpose():
+def test_case_folded_keys_collide_on_purpose(run_workers):
     """Two spellings of one path are one key — the fence errs toward refusal."""
 
-    gate = _Gate()
+    gate = _Gate(run_workers)
     talk_runs.start_run("agent", "a", gate.worker, resource_keys=["C:\\Repo"])
     with pytest.raises(talk_runs.AdmissionRefused, match="'c:\\\\repo'"):
         talk_runs.start_run("agent", "b", gate.worker, resource_keys=["c:\\REPO"])
@@ -256,12 +261,12 @@ def test_an_unknown_mode_is_a_caller_bug():
 # -- byte-for-byte compatibility ----------------------------------------------
 
 
-def test_undeclared_runs_are_exactly_yesterdays_runs(monkeypatch, tmp_path: Path):
+def test_undeclared_runs_are_exactly_yesterdays_runs(monkeypatch, tmp_path: Path, run_workers):
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(talk_runs, "_history_path", lambda: state / "talk-runs.jsonl")
     monkeypatch.setattr(talk_runs, "_history_enabled", lambda: True)
-    gate = _Gate()
+    gate = _Gate(run_workers)
 
     first = talk_runs.start_run("agent", "a", gate.worker)
     second = talk_runs.start_run("agent", "b", gate.worker)
@@ -284,12 +289,14 @@ def test_undeclared_runs_are_exactly_yesterdays_runs(monkeypatch, tmp_path: Path
     gate.release.set()
 
 
-def test_a_refusal_burns_no_run_id_and_writes_no_history_row(monkeypatch, tmp_path: Path):
+def test_a_refusal_burns_no_run_id_and_writes_no_history_row(
+    monkeypatch, tmp_path: Path, run_workers,
+):
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(talk_runs, "_history_path", lambda: state / "talk-runs.jsonl")
     monkeypatch.setattr(talk_runs, "_history_enabled", lambda: True)
-    gate = _Gate()
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "a", gate.worker, resource_keys=["/repo"])
     lines_before = (state / "talk-runs.jsonl").read_text(encoding="utf-8").splitlines()
 
@@ -307,7 +314,7 @@ def test_a_refusal_burns_no_run_id_and_writes_no_history_row(monkeypatch, tmp_pa
 # -- the reservation ----------------------------------------------------------
 
 
-def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch):
+def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch, run_workers):
     """Two tool-pool workers admitted in the gap between the check and the
     registry insert would both start. The first holds its keys from the
     moment it passes the check, even while its acceptance write is in
@@ -315,6 +322,7 @@ def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch):
 
     entered = threading.Event()
     proceed = threading.Event()
+    run_workers.release_on_exit(proceed)
     real_accept = talk_runs._accept_run
     outcome: dict = {}
 
@@ -325,7 +333,7 @@ def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch):
         return real_accept(entry)
 
     monkeypatch.setattr(talk_runs, "_accept_run", slow_accept)
-    gate = _Gate()
+    gate = _Gate(run_workers)
 
     def start_slow():
         try:
@@ -335,7 +343,7 @@ def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch):
         except Exception as exc:  # noqa: BLE001 — recorded for the assertion
             outcome["slow"] = exc
 
-    slow = threading.Thread(target=start_slow)
+    slow = run_workers.track(threading.Thread(target=start_slow))
     slow.start()
     assert entered.wait(2.0)
     # Mid-acceptance: not yet in the registry, but already holding the key.
@@ -346,16 +354,17 @@ def test_the_reservation_closes_the_check_then_accept_gap(monkeypatch):
 
     proceed.set()
     slow.join(2.0)
+    assert not slow.is_alive()
     assert isinstance(outcome["slow"], int)
     assert talk_runs._RESERVATIONS == {}
     gate.release.set()
 
 
-def test_a_failed_acceptance_releases_its_reservation():
+def test_a_failed_acceptance_releases_its_reservation(run_workers):
     def failing_accept(_entry):
         raise talk_runs.RoutingUnavailable("disk on fire")
 
-    gate = _Gate()
+    gate = _Gate(run_workers)
     # Scoped so the real acceptance path is back for the second call.
     with pytest.MonkeyPatch.context() as failing:
         failing.setattr(talk_runs, "_accept_run", failing_accept)
@@ -369,8 +378,8 @@ def test_a_failed_acceptance_releases_its_reservation():
     gate.release.set()
 
 
-def test_snapshots_carry_the_admission_and_check_work_reads_it_out():
-    gate = _Gate()
+def test_snapshots_carry_the_admission_and_check_work_reads_it_out(run_workers):
+    gate = _Gate(run_workers)
     run_id = talk_runs.start_run("agent", "audit", gate.worker, resource_keys=["/repo", "prod"])
 
     listed = next(run for run in talk_runs.list_runs() if run["runId"] == run_id)
@@ -453,15 +462,15 @@ class _StubCtx:
         return self.result
 
 
-def test_the_registry_lanes_speak_the_refusal(monkeypatch):
+def test_the_registry_lanes_speak_the_refusal(monkeypatch, run_workers):
     """Tier 2/3: the refusal is spoken in the same shape as a routing refusal —
     nothing was accepted, so nothing is in flight to check on."""
 
     monkeypatch.setattr(talk_host.talk_apiserver, "is_available", lambda: True)
     monkeypatch.setattr(
-        talk_host, "_api_server_worker", lambda prompt, session_id=None: _Gate().worker
+        talk_host, "_api_server_worker", lambda prompt, session_id=None: _Gate(run_workers).worker
     )
-    gate = _Gate()
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "audit the repo", gate.worker, resource_keys=["/repo"])
 
     spoken = talk_host.host().run_agent("deploy the repo", resource_keys=["/repo"])
@@ -489,14 +498,14 @@ def test_the_registry_lanes_admit_and_record_the_declaration(monkeypatch):
     _wait_terminal(run_id)
 
 
-def test_the_host_loop_lane_is_checked_but_says_it_holds_nothing():
+def test_the_host_loop_lane_is_checked_but_says_it_holds_nothing(run_workers):
     """Tier 1 hands the child to Hermes's own delegation registry: it is never
     started on top of a registry holder, and the receipt says the fence does
     not hold it afterwards — never silently unfenced."""
 
     ctx = _StubCtx(json.dumps({"success": True, "result": "subagent 4 started"}))
     talk_host.bind_ctx(ctx)
-    gate = _Gate()
+    gate = _Gate(run_workers)
     first = talk_runs.start_run("agent", "audit", gate.worker, resource_keys=["/repo"])
 
     refused = talk_host.host().run_agent("deploy", resource_keys=["/repo"])
