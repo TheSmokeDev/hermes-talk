@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import shlex
 
 try:
@@ -314,7 +313,8 @@ def _canonical_discord_command(raw, invocation):
         profile = arguments[2] if len(arguments) == 3 else context.get("profile", "default")
         task = {
             "target_id": (arguments[0] if arguments else
-                          talk_config._talk_env_get("TALK_TASK_TARGET") or context["anchor_session_id"]),
+                          talk_config._talk_env_get("TALK_TASK_TARGET")
+                          or context["anchor_session_id"]),
             "peer_id": peer, "profile": profile,
             "tab_id": "discord-" + "-".join(str(value) for value in identifiers.values()),
             "surface_context": {

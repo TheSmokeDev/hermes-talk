@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from urllib.parse import urlsplit
 
 import httpx
