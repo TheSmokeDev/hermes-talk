@@ -33,7 +33,7 @@ from pathlib import Path
 # install, isolated tests) we fall through to plain ``os.environ``.
 _hermes_get_secret = None
 try:
-    from agent.secret_scope import get_secret as _hgs  # noqa: F401
+    from agent.secret_scope import get_secret as _hgs
     _hermes_get_secret = _hgs
 except ImportError:
     pass
