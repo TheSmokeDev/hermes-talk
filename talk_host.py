@@ -49,6 +49,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +97,9 @@ def _spawn_daemon(fn, *args, name: str = "talk-stop") -> None:
     never stall process exit (ThreadPoolExecutor threads are non-daemon and
     joined at shutdown — exactly the wrong contract for this)."""
 
-    threading.Thread(target=fn, args=args, daemon=True, name=name).start()
+    # Capture at dispatch: a worker may outlive the invoking profile's turn.
+    context = copy_context()
+    threading.Thread(target=context.run, args=(fn, *args), daemon=True, name=name).start()
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
