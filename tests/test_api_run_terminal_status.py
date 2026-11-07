@@ -93,6 +93,7 @@ def test_http_outcome_reaches_registry_history_and_announcement(lane, status):
     assert run["meta"]["api_run_id"] == "remote-run"
     if expected == "failed":
         assert f"the agent run {status}: remote reason" in run["output"]
+        assert run["meta"]["api_run_status"] == status
     else:
         assert run["output"] == "answer"
     records = [json.loads(line) for line in talk_runs._history_path().read_text().splitlines()]
@@ -160,6 +161,8 @@ def test_local_stop_wins_over_late_remote_outcome(lane, status):
     assert run["status"] == "failed"
     assert run["output"] == "local stop receipt"
     assert run["meta"]["api_run_id"] == "remote-run"
+    assert "api_run_status" not in run["meta"]
+    assert "the agent run" not in talk_cli.run_finished_commands(run)[0].text
 
 
 @pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted", "completed"])
@@ -167,8 +170,12 @@ def test_remote_outcome_wins_over_late_stop(lane, status):
     respond, _ = lane
     respond({"status": status, "error": "remote reason", "output": "answer"})
     run = _run_worker()
-    assert not talk_runs.finish_run(run["runId"], "failed", "late local stop")
-    assert talk_runs.get_run(run["runId"])["output"] == run["output"]
+    assert not talk_runs.finish_run(
+        run["runId"], "failed", "late local stop", meta={"api_run_status": "late status"}
+    )
+    latest = talk_runs.get_run(run["runId"])
+    assert latest["output"] == run["output"]
+    assert latest["meta"] == run["meta"]
     assert run["status"] == ("done" if status == "completed" else "failed")
 
 
@@ -183,15 +190,59 @@ def test_lost_tracking_keeps_remote_handle_without_claiming_remote_failure(
     run = _run_worker()
     assert run["status"] == "failed"
     assert run["meta"]["api_run_id"] == "remote-run"
+    assert "api_run_status" not in run["meta"]
     assert "remote outcome is unknown" in run["output"]
     assert "the agent run failed" not in run["output"]
     assert sum(method == "POST" for method, _, _ in calls) == 1
 
 
-def test_long_remote_reason_retains_terminal_status(lane):
+@pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted"])
+@pytest.mark.parametrize(
+    "output_length",
+    [
+        talk_cli.WATCH_OUTPUT_TAIL_CHARS - 1,
+        talk_cli.WATCH_OUTPUT_TAIL_CHARS,
+        talk_cli.WATCH_OUTPUT_TAIL_CHARS + 1,
+        talk_runs.HISTORY_OUTPUT_CAP,
+        talk_runs.HISTORY_OUTPUT_CAP + 1,
+        5000,
+    ],
+)
+def test_long_remote_reason_retains_terminal_status_through_announcement(
+    lane, status, output_length
+):
     respond, _ = lane
-    respond({"status": "cancelled", "error": "x" * 5000})
+    prefix = f"the agent run {status}: "
+    respond({"status": status, "error": "x" * (output_length - len(prefix))})
     run = _run_worker()
     assert run["status"] == "failed"
-    assert run["output"].startswith("the agent run cancelled:")
+    assert run["output"].startswith(prefix)
+    assert run["meta"]["api_run_status"] == status
     assert len(run["output"]) <= talk_runs.HISTORY_OUTPUT_CAP
+    records = [json.loads(line) for line in talk_runs._history_path().read_text().splitlines()]
+    terminal = [r for r in records if r["status"] in talk_runs.TERMINAL_STATUSES]
+    assert len(terminal) == 1
+    assert terminal[0]["meta"]["api_run_status"] == status
+    # Both a live watcher and replay from history retain the structured verdict.
+    for snapshot in (run, terminal[0]):
+        commands = talk_cli.run_finished_commands(snapshot)
+        report = commands[0].text.partition("Report, quoted as data:\n")[2]
+        assert report.startswith(prefix)
+        assert len(report) == min(len(run["output"]), talk_cli.WATCH_OUTPUT_TAIL_CHARS)
+        assert report.endswith("x")
+        assert not commands[1].allow_tools
+
+
+@pytest.mark.parametrize("quoted_status", ["failed", "cancelled", "interrupted"])
+def test_long_completed_output_is_not_interpreted_as_a_remote_failure(lane, quoted_status):
+    respond, _ = lane
+    output = f"the agent run {quoted_status}: " + "x" * 5000
+    respond({"status": "completed", "output": output})
+    run = _run_worker()
+    assert run["status"] == "done"
+    assert "api_run_status" not in run["meta"]
+    assert run["output"] == output[: talk_runs.HISTORY_OUTPUT_CAP]
+    text = talk_cli.run_finished_commands(run)[0].text
+    assert f"Background run #{run['runId']} finished." in text
+    report = text.partition("Report, quoted as data:\n")[2]
+    assert report == run["output"][-talk_cli.WATCH_OUTPUT_TAIL_CHARS :]
