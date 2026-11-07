@@ -396,13 +396,11 @@ def _get_json(path: str, what: str) -> Any:
 
 
 def _listing(path: str, key: str, what: str) -> list[dict]:
-    """One catalog listing, accepting a bare list or a ``{key: [...]}`` envelope.
+    """Accept bare lists, named envelopes, and OpenAI-style ``data`` lists.
 
-    Both shapes are parsed because this repo has no Hermes gateway source to
-    pin the envelope against — only the documented route. Guessing one shape
-    and raising on the other would turn a cosmetic difference into a dead
-    feature; anything that is NEITHER shape still raises, because an
-    unrecognized payload must not read as an empty-but-successful catalog.
+    A list under the endpoint's key takes precedence over ``data``, even when
+    empty, preserving the named-envelope behavior. Unrecognized payloads
+    still raise rather than masquerading as an empty-but-successful catalog.
     """
 
     payload = _get_json(path, what)
@@ -410,6 +408,8 @@ def _listing(path: str, key: str, what: str) -> list[dict]:
         entries = payload
     elif isinstance(payload, dict) and isinstance(payload.get(key), list):
         entries = payload[key]
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        entries = payload["data"]
     else:
         raise TalkApiServerError(
             f"the Hermes api server returned an unrecognized {what} payload"

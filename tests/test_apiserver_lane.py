@@ -537,6 +537,68 @@ def test_an_unrecognized_listing_envelope_raises(monkeypatch):
         talk_apiserver.list_skills()
 
 
+@pytest.fixture(params=[("skills", SKILL), ("toolsets", TOOLSET)], ids=["skills", "toolsets"])
+def catalog_read(request):
+    key, entry = request.param
+    return key, entry, getattr(talk_apiserver, f"list_{key}")
+
+
+@pytest.mark.parametrize("shape", ["bare", "named", "data", "openai"])
+@pytest.mark.parametrize("empty", [False, True], ids=["mixed-entries", "empty"])
+def test_catalog_listing_shapes(monkeypatch, catalog_read, shape, empty):
+    key, entry, read = catalog_read
+    entries = [] if empty else ["not-an-object", entry, None, 7, []]
+    payload = {
+        "bare": entries,
+        "named": {key: entries},
+        "data": {"data": entries},
+        "openai": {"object": "list", "data": entries},
+    }[shape]
+    urls = _pin_get(monkeypatch, FakeResponse(200, payload))
+
+    assert read() == ([] if empty else [entry])
+    assert urls == [talk_config.api_server_url() + f"/v1/{key}"]
+
+
+@pytest.mark.parametrize(
+    ("named", "data", "expected"),
+    [
+        ([{"name": "preferred"}], [{"name": "fallback"}], [{"name": "preferred"}]),
+        ([], [{"name": "fallback"}], []),
+        (["filtered"], [{"name": "fallback"}], []),
+        ([{"name": "preferred"}], None, [{"name": "preferred"}]),
+        (None, [{"name": "fallback"}], [{"name": "fallback"}]),
+    ],
+    ids=["named-first", "empty-named", "filtered-named", "invalid-data", "invalid-named"],
+)
+def test_catalog_listing_envelope_priority(monkeypatch, catalog_read, named, data, expected):
+    key, _entry, read = catalog_read
+    _pin_get(monkeypatch, FakeResponse(200, {key: named, "object": "list", "data": data}))
+
+    assert read() == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"object": "list"},
+        {"data": None},
+        {"data": "not-a-list"},
+        {"data": {"skills": [SKILL], "toolsets": [TOOLSET]}},
+        {"skills": {}, "toolsets": {}, "data": 7},
+        "not-an-envelope",
+        7,
+    ],
+)
+def test_catalog_listing_rejects_invalid_shapes(monkeypatch, catalog_read, payload):
+    key, _entry, read = catalog_read
+    _pin_get(monkeypatch, FakeResponse(200, payload))
+
+    with pytest.raises(talk_apiserver.TalkApiServerError, match=f"unrecognized {key} payload"):
+        read()
+
+
 def test_capabilities_payload_returns_the_raw_document(monkeypatch):
     """Distinct from probe(), which collapses this same path to a yes/no."""
 
