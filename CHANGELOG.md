@@ -26,7 +26,8 @@ named rather than smoothed.
 - API-server runs reported as `failed`, `cancelled`, or `interrupted` now
   remain failures in Talk's registry and completion announcements. Memory
   handoffs use the same typed outcome instead of interpreting answer text;
-  lost tracking reports an unknown remote outcome. Contributed by @tancou.
+  lost tracking reports an unknown remote outcome. Remote terminal statuses
+  survive long reasons and bounded spoken reports. Contributed by @tancou.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and

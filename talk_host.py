@@ -530,9 +530,11 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 on_event=_on_poll,
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
+            terminal_meta = None
             if isinstance(exc, talk_apiserver.TalkApiRunError):
                 # Keep the status prefix even when the server's reason is long.
                 message = str(exc)[: talk_runs.HISTORY_OUTPUT_CAP]
+                terminal_meta = {"api_run_status": exc.status}
             elif remote.get("api_run_id"):
                 # A local tracking failure is not a verdict on remote execution.
                 message = (
@@ -540,7 +542,7 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 )[: talk_runs.HISTORY_OUTPUT_CAP]
             else:
                 message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
-            talk_runs.finish_run(run_id, "failed", message)
+            talk_runs.finish_run(run_id, "failed", message, meta=terminal_meta)
             return message
 
     return worker

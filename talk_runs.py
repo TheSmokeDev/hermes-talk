@@ -806,12 +806,14 @@ def _run_worker(run_id: int, worker: Callable[[int], str]) -> None:
         finish_run(run_id, "failed", f"{type(exc).__name__}: {exc}")
 
 
-def finish_run(run_id: int, status: str, output: str) -> bool:
+def finish_run(run_id: int, status: str, output: str, *, meta: dict | None = None) -> bool:
     """Mark a run terminal. Unknown ids and double-finishes are no-ops.
 
     Terminal transitions are compare-and-set under ``_RUN_LOCK`` — FIRST
     WRITER WINS, so a later finish from any path can never overwrite the
-    status or output. Returns True when THIS call performed the transition.
+    status, output, or terminal metadata. ``meta`` records terminal facts in
+    the same transition, so a losing worker cannot relabel the winner's result.
+    Returns True when THIS call performed the transition.
     """
 
     if status not in TERMINAL_STATUSES:
@@ -822,6 +824,8 @@ def finish_run(run_id: int, status: str, output: str) -> bool:
             return False
         run["status"] = status
         run["output"] = output
+        if meta:
+            run["meta"].update(meta)
         run["updated"] = time.time()
         tee = _terminal_tee_locked(run_id, run)
     _append_history(tee)

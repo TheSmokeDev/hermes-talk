@@ -660,6 +660,11 @@ Completion announcements use the recorded local outcome and claim delivery
 once. If a local terminal transition races a remote result, the first recorded
 transition wins.
 
+The confirmed remote failure status is stored as terminal metadata in that
+same transition and retained in history. Spoken reports keep that status even
+when a long reason is shortened to the 1,500-character announcement budget;
+successful answer text is never interpreted as a remote failure status.
+
 A connection loss or polling deadline ends local tracking as `failed`, with
 an explicit unknown remote outcome; it does not prove the remote work stopped.
 The API run id remains in the run metadata for addressing that same run.
