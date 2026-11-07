@@ -28,7 +28,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import re
 import sys
 import threading
@@ -2798,7 +2797,9 @@ async def run_native_talk_session(
             raise NativeTaskError("Canonical native surfaces require provider voice output")
         if pick.provider == "live":
             if (talk_config._talk_env_get("TALK_TURN_DETECTION", "provider_native").strip().lower()
-                    != "provider_native" or talk_config._talk_env_get("TALK_SEMANTIC_EAGERNESS") is not None):
+                    != "provider_native"
+                    or talk_config._talk_env_get("TALK_SEMANTIC_EAGERNESS") is not None
+                ):
                 raise NativeTaskError("Live requires provider_native turn detection")
             turn_detection = talk_realtime.RealtimeTurnDetection()
         else:

@@ -819,7 +819,9 @@ def _cascade_check() -> dict[str, Any]:
     try:
         details["tts"] = talk_config.cascade_tts()
     except talk_config.TalkConfigError:
-        details["tts"] = (talk_config._talk_env_get("TALK_CASCADE_TTS") or "").strip().lower() or None
+        details["tts"] = (
+            (talk_config._talk_env_get("TALK_CASCADE_TTS") or "").strip().lower() or None
+        )
         return _check(
             "cascade",
             "fail",
