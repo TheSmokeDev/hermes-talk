@@ -73,7 +73,7 @@ TOOLSETS_PATH = "/v1/toolsets"
 HEALTH_DETAILED_PATH = "/health/detailed"
 
 #: api_server run statuses that will never change again (api_server.py:4377-4404).
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 
 #: Why the lane is unusable, in the words the model should say.
 REASON_OK = "ok"
@@ -85,7 +85,17 @@ MAX_OUTPUT_CHARS = 4_000
 
 
 class TalkApiServerError(Exception):
-    """The api_server was reachable but the run could not be completed."""
+    """Submission or tracking failed; the remote outcome may be unknown."""
+
+
+class TalkApiRunError(TalkApiServerError):
+    """The server confirmed a non-success terminal outcome for this run."""
+
+    def __init__(self, run_id: str, status: str, detail: str):
+        self.run_id = run_id
+        self.status = status
+        self.detail = detail
+        super().__init__(f"the agent run {status}: {detail}"[:MAX_OUTPUT_CHARS])
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +479,10 @@ def run_to_completion(
     same ``TALK_AGENT_TIMEOUT_S`` that bounds a detached spawn — one budget
     for "how long may work run", whichever lane carries it.
 
+    Only ``completed`` returns text. A confirmed failed/cancelled/interrupted
+    run raises :class:`TalkApiRunError` with its remote id and status. Other
+    :class:`TalkApiServerError` failures do not prove the remote run failed.
+
     ``on_event`` is the progress tap (hermes-talk#33): it is handed each
     poll's raw status payload — which carries the host-stamped ``last_event``
     — so the caller can project bounded phases onto its own bookkeeping. Like
@@ -502,7 +516,7 @@ def run_to_completion(
             ]
         error = run.get("error")
         detail = str(error) if error else "no reason given"
-        return f"the agent run {state}: {detail}"[:MAX_OUTPUT_CHARS]
+        raise TalkApiRunError(run_id, state, detail)
     raise TalkApiServerError(
         "the agent run is still going after its whole time budget — it may "
         "still finish, but I stopped waiting"
@@ -688,6 +702,7 @@ __all__ = [
     "TOOLSETS_PATH",
     "ApiServerStatus",
     "ApprovalGoneError",
+    "TalkApiRunError",
     "TalkApiServerError",
     "capabilities_payload",
     "get_run",

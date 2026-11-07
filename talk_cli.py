@@ -849,7 +849,19 @@ def run_finished_messages(run: dict) -> list[dict]:
 def run_finished_commands(run: dict) -> list[talk_realtime.RealtimeCommand]:
     """Provider-neutral commands that make the model speak a finished run."""
 
-    tail = str(run.get("output") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
+    output = str(run.get("output") or "").strip()
+    tail = output[-WATCH_OUTPUT_TAIL_CHARS:]
+    meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+    remote_status = meta.get("api_run_status")
+    if (
+        len(output) > WATCH_OUTPUT_TAIL_CHARS
+        and run.get("status") == "failed"
+        and remote_status in ("failed", "cancelled", "interrupted")
+    ):
+        # The output's prefix may be outside the spoken tail. Restore the
+        # structured verdict within that same budget, without parsing output.
+        prefix = f"the agent run {remote_status}: "
+        tail = prefix + tail[-(WATCH_OUTPUT_TAIL_CHARS - len(prefix)) :]
     verb = "finished" if run.get("status") == "done" else "failed"
     headline = f"Background run #{run.get('runId')} {verb}" + (
         "." if tail else " with no output."
