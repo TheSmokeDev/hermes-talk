@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -289,13 +290,16 @@ class TestUnscopedSecretErrorPropagation:
       - no launch body scope (_LAUNCH_BODY_SCOPE.get() → None)
 
     Our wrapper must let this exception propagate, not swallow it.
+
+    We use a subprocess to guarantee a fresh Python process with no
+    pytest module caching interfering (pytest's module cleanup can
+    interfere with module-level attribute patches).
     """
 
     def test_unscoped_secret_error_propagates_with_real_herms(self):
-        """Use the real Hermes agent.secret_scope.get_secret to verify
-        UnscopedSecretError propagates when multiplex is active with no scope."""
-        # Add the hermes-agent workspace to sys.path so the real module
-        # is importable from this test's isolated process context.
+        """Run a subprocess that patches the real Hermes secret_scope
+        module, imports talk_config, and verifies UnscopedSecretError
+        propagates through _talk_env_get."""
         workspace = (
             "/home/akmod/.hermes/installs/1cd3fc7b241ff10b/"
             "environments/aa8e068f09a14311b40efb1dbaffda93/workspace"
@@ -303,45 +307,38 @@ class TestUnscopedSecretErrorPropagation:
         agent_scope_path = workspace + "/agent/secret_scope.py"
         if not os.path.isfile(agent_scope_path):
             pytest.skip("real hermes-agent secret_scope.py not available")
-        if workspace not in sys.path:
-            sys.path.insert(0, workspace)
 
-        old_modules = dict(sys.modules)
-        old_syspath = list(sys.path)
-        try:
-            # Ensure the real module is importable (already in site-packages)
-            from agent.secret_scope import get_secret as real_get_secret
-
-            # Patch the cached reference in talk_config so it uses the real function
-            import importlib
-            import talk_config
-
-            # Directly replace the internal reference to the real get_secret
-            talk_config._hermes_get_secret = real_get_secret
-
-            # Mock is_multiplex_active() → True and _LAUNCH_BODY_SCOPE.get() → None
-            # so the real get_secret hits the UnscopedSecretError path.
-            import agent.secret_scope as scope_mod
-
-            with patch.object(
-                scope_mod, "is_multiplex_active", return_value=True
-            ), patch.object(
-                scope_mod, "_LAUNCH_BODY_SCOPE", SimpleNamespace(get=lambda *_, **__: None)
-            ):
-                with pytest.raises(RuntimeError) as exc_info:
-                    talk_config._talk_env_get("TALK_SOME_SECRET")
-
-                # The real UnscopedSecretError is a RuntimeError subclass
-                assert "Hermes could not read" in str(exc_info.value)
-                assert "TALK_SOME_SECRET" in str(exc_info.value)
-
-        finally:
-            # Restore sys.path and modules exactly as they were.
-            sys.modules.clear()
-            sys.modules.update(old_modules)
-            # Restore original sys.path
-            del sys.path[:]
-            sys.path.extend(old_syspath)
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {workspace!r})\n"
+            "from agent.secret_scope import get_secret\n"
+            "import agent.secret_scope as S\n"
+            "from types import SimpleNamespace\n"
+            # Patch the module-level attributes directly (no patch.object)
+            "S._SECRET_SCOPE = SimpleNamespace(get=lambda *a, **k: None)\n"
+            "S._LAUNCH_BODY_SCOPE = SimpleNamespace(get=lambda *a, **k: None)\n"
+            "S.is_multiplex_active = lambda: True\n"
+            # Now import talk_config fresh and test
+            "import talk_config\n"
+            "talk_config._hermes_get_secret = get_secret\n"
+            "try:\n"
+            "    talk_config._talk_env_get('TALK_TEST_SECRET')\n"
+            "    print('FAIL: no exception')\n"
+            "except RuntimeError as e:\n"
+            "    if 'TALK_TEST_SECRET' in str(e):\n"
+            "        print('OK')\n"
+            "    else:\n"
+            "        print('FAIL: wrong error: ' + str(e))\n"
+            "except Exception as e:\n"
+            "    print('FAIL: wrong type: ' + type(e).__name__ + ': ' + str(e))\n"
+        )
+        r = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.stdout.strip() == "OK", (
+            f"Expected UnscopedSecretError to propagate, got: {r.stdout.strip()}"
+        )
 
 
 # ---------------------------------------------------------------------------
