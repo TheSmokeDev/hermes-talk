@@ -247,6 +247,27 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     }
 
 
+class _FinalAudio(bytes):
+    """The last admitted PCM chunk of one provider response."""
+
+
+class _PlaybackQueue(queue.Queue):
+    """Bounded PCM queue whose response boundary never needs a free slot."""
+
+    def finish_response(self) -> None:
+        # Queue's mutex also serializes put/get. Mark the last admitted chunk
+        # in place, so saturation cannot lose the boundary or drop any audio.
+        # If the player already took it, an empty marker follows its carry.
+        with self.not_empty:
+            if self.queue:
+                if not isinstance(self.queue[-1], _FinalAudio):
+                    self.queue[-1] = _FinalAudio(self.queue[-1])
+            else:
+                self._put(_FinalAudio())
+                self.unfinished_tasks += 1
+                self.not_empty.notify()
+
+
 class _RealtimeSource:
     """The host's outbound audio, fed live instead of from a finished file.
 
@@ -261,6 +282,7 @@ class _RealtimeSource:
     def __init__(self, frames: queue.Queue) -> None:
         self._frames = frames
         self._carry = bytearray()
+        self._response_finished = False
         # read() runs on the host's player thread; cleanup() runs on the
         # event loop during barge-in — which is exactly when both fire at
         # once. An unguarded bytearray tears there, and an exception inside
@@ -288,17 +310,24 @@ class _RealtimeSource:
             self.discard_pending()
             return SILENCE_FRAME
         with self._carry_lock:
-            while len(self._carry) < DISCORD_FRAME_BYTES:
+            while len(self._carry) < DISCORD_FRAME_BYTES and not self._response_finished:
                 try:
-                    self._carry += self._frames.get_nowait()
+                    chunk = self._frames.get_nowait()
                 except queue.Empty:
                     break
+                self._carry += chunk
+                self._response_finished = isinstance(chunk, _FinalAudio) or not chunk
+            if self._response_finished and 0 < len(self._carry) < DISCORD_FRAME_BYTES:
+                self._carry.extend(bytes(DISCORD_FRAME_BYTES - len(self._carry)))
             if len(self._carry) >= DISCORD_FRAME_BYTES:
                 frame = bytes(self._carry[:DISCORD_FRAME_BYTES])
                 del self._carry[:DISCORD_FRAME_BYTES]
+                if not self._carry:
+                    self._response_finished = False
                 with self._served_lock:
                     self._frames_served += 1
                 return frame
+            self._response_finished = False
         # Underrun: silence, never b"". An empty read retires the player
         # thread and the call goes permanently mute.
         return SILENCE_FRAME
@@ -310,11 +339,13 @@ class _RealtimeSource:
         with self._carry_lock:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
+            self._response_finished = False
 
     def discard_pending(self) -> None:
         with self._carry_lock:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
+            self._response_finished = False
             while True:
                 try:
                     self._discarded_bytes += len(self._frames.get_nowait())
@@ -400,7 +431,7 @@ class DiscordAudio:
         self._bridge: dict[str, Any] | None = None
         self._source: _RealtimeSource | None = None
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
-        self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
+        self._outbound = _PlaybackQueue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
         # Serialize every externally visible lifecycle mutation, including
         # the host listener registry calls below. Reentrant because startup
@@ -1320,6 +1351,11 @@ class DiscordAudio:
             with self._lock:
                 self._discarded_playback_bytes += len(converted)
             _log.debug("discord playback queue full — dropping a chunk")
+
+    def finish_playback(self) -> None:
+        """Flush a final partial Discord frame once provider output is complete."""
+        if not self._capture_only:
+            self._outbound.finish_response()
 
     def drain_playback(self) -> None:
         """Barge-in: drop everything not yet spoken."""

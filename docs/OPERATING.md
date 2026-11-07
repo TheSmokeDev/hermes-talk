@@ -786,6 +786,14 @@ Use Discord's numeric user ID, not a username or display name. With the variable
 unset, every participant can converse and use read-only tools, while every
 mutating tool is denied.
 
+Native Discord replies finish on a 20 ms playback frame: when provider output
+ends, Talk pads any final partial frame with silence. The response boundary is
+preserved even when the playback queue is full, and queued announcements can
+resume once the admitted audio drains. Canonical native and Live sessions use
+their output-completion events too. Barge-in discards pending audio and its
+boundary. Cascade TTS runs asynchronously: the provider's text-completion event
+does not signal that its audio has finished.
+
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we
 borrow it, so it is one bot, one connection, and the host's own E2EE.
