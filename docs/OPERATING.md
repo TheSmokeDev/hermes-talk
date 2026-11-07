@@ -664,6 +664,13 @@ none itself afterwards. Model-facing contract:
 
 ### Capability catalog
 
+The REST fallback for `/v1/skills` and `/v1/toolsets` accepts bare lists,
+named envelopes (`{"skills": [...]}` / `{"toolsets": [...]}`), and `data`
+envelopes, including `{"object": "list", "data": [...]}`. A list under the
+endpoint's named key takes precedence over `data`, even when empty; otherwise
+a `data` list is used. Entries that are not objects are ignored. Unrecognized
+response shapes remain errors, rather than reporting an empty catalog.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_CAPABILITY_CATALOG_TTL_S` | `30.0` | How long a resolved `talk_capabilities` snapshot (skills, toolsets, capabilities, health) is trusted before a background refresh, whichever source answered it. Junk or ≤0 silently takes the default. |
