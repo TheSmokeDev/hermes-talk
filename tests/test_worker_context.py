@@ -281,7 +281,8 @@ def test_transcript_handoff_keeps_scope_and_releases_claim(
     SCOPE.set("beta")
     drain()
     assert seen == ["alpha"]
-    assert not talk_transcript._ACTIVE_TRANSCRIPTS
+    # Other tests/calls may still own captures elsewhere in the global set.
+    assert not any(path.is_relative_to(tmp_path) for path in talk_transcript._ACTIVE_TRANSCRIPTS)
     root = tmp_path / "state" / "talk-transcripts"
     assert not list(root.glob("*.claimed-*"))
     if deferred:
