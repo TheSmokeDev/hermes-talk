@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Delegation and admission tests release their gates and join owned workers
+  before resetting run IDs or removing mocks. Deterministic neighboring-test
+  regressions cover stale completion, mock teardown, and failed-test cleanup.
+  Contributed by @tancou in #220.
+
 ## [0.23.0] — 2026-11-17
 
 Continue your Hermes conversation over an optional Dograh phone call, using its
