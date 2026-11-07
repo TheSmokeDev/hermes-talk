@@ -18,7 +18,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # talk_config._talk_env_get  (profile-scoped env resolution)
 # ---------------------------------------------------------------------------
@@ -33,6 +32,7 @@ class TestTalkEnvGet:
         sys.modules.pop("agent.secret_scope", None)
         try:
             import importlib
+
             import talk_config
             importlib.reload(talk_config)
             os.environ["TALK_TEST_MARKER"] = "hello-from-env"
@@ -53,6 +53,7 @@ class TestTalkEnvGet:
         """resolve_openai_key falls back from TALK_OPENAI_API_KEY to OPENAI_API_KEY,
         both profile-scoped."""
         import importlib
+
         import talk_config
         importlib.reload(talk_config)
         os.environ.pop("TALK_OPENAI_API_KEY", None)
@@ -72,7 +73,7 @@ class TestTalkEnvGet:
 
 class _DiscordKey:
     """Hashable mock for an enum value used as dict key."""
-    __slots__ = ("value", "name")
+    __slots__ = ("name", "value")
     def __init__(self, value: str, name: str = "") -> None:
         self.value = value
         self.name = name

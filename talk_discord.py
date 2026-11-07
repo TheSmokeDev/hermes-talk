@@ -240,10 +240,7 @@ def _resolve_discord_adapter_for_profile(runner, profile_name: str | None) -> An
 
     # 1. Trivial cases: no profile name, or the canonical default name.
     clean_name = (profile_name or "").strip() or None
-    if clean_name is None or clean_name == "default":
-        adapters_map = getattr(runner, "adapters", {}) or {}
-    # 2. Legacy standalone: no _profile_adapters at all → everything is primary.
-    elif profile_adapters is None:
+    if clean_name is None or clean_name == "default" or profile_adapters is None:
         adapters_map = getattr(runner, "adapters", {}) or {}
     # 3. Secondary profile with an explicit map.
     elif clean_name in profile_adapters:
