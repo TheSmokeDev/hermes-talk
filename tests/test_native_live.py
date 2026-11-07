@@ -10,6 +10,7 @@ import httpx
 import pytest
 from test_native_controller import Audio, Session
 
+import talk_discord
 import talk_live_protocol
 import talk_realtime as rt
 from talk_native_api import NativeTaskAPI, NativeTaskError
@@ -56,6 +57,32 @@ async def connected(*, held=None, supports_context=True, speech=None, response_c
 async def close(handle):
     await handle.controller.close()
     await handle.client.aclose()
+
+
+def test_live_discord_output_completion_flushes_partial_audio_after_interruption():
+    async def scenario():
+        h = await connected()
+        audio = talk_discord.DiscordAudio()
+        audio._source = talk_discord._RealtimeSource(audio._outbound)
+        h.controller.audio = audio
+        try:
+            pcm = b"\x01\x00" * 5
+            await h.controller.handle(rt.OutputAudio(pcm))
+            await h.controller.handle(rt.OutputInterrupted())
+            await h.controller.handle(rt.OutputTurnCompleted())
+            assert not audio.playback_pending
+            await h.controller.handle(rt.OutputAudio(pcm))
+            assert audio._source.read() == talk_discord.SILENCE_FRAME
+            await h.controller.handle(rt.OutputTurnCompleted())
+            expected, _ = talk_discord.session_to_discord(pcm)
+            assert audio._source.read() == expected + bytes(3840 - len(expected))
+            assert not audio.playback_pending
+            await h.controller.handle(rt.OutputTurnCompleted())
+            assert not audio.playback_pending
+        finally:
+            await close(h)
+
+    asyncio.run(scenario())
 
 
 def test_partial_live_transcripts_keep_wire_finality_and_original_source_text():
