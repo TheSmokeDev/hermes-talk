@@ -1311,7 +1311,7 @@ def _gemini_auth() -> talk_auth.TalkAuth:
     receipts name lanes, never keys.
     """
 
-    scoped = (os.environ.get("TALK_GEMINI_API_KEY") or "").strip()
+    scoped = (_talk_env_get("TALK_GEMINI_API_KEY") or "").strip()
     token = talk_config.resolve_gemini_key()
     if scoped:
         return talk_auth.TalkAuth(
@@ -2511,7 +2511,7 @@ def cli_entry(
 
     if keyboard_control is None:
         keyboard_control = args is not None
-    target = getattr(args, "task_target", None) or os.environ.get("TALK_TASK_TARGET")
+    target = getattr(args, "task_target", None) or _talk_env_get("TALK_TASK_TARGET")
     native = None
     if target or getattr(args, "targets", False) or getattr(args, "task_api", None):
         native = {
@@ -2797,8 +2797,8 @@ async def run_native_talk_session(
         if talk_config.voice_mode() not in {"native", "live"}:
             raise NativeTaskError("Canonical native surfaces require provider voice output")
         if pick.provider == "live":
-            if (os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
-                    != "provider_native" or os.environ.get("TALK_SEMANTIC_EAGERNESS") is not None):
+            if (_talk_env_get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+                    != "provider_native" or _talk_env_get("TALK_SEMANTIC_EAGERNESS") is not None):
                 raise NativeTaskError("Live requires provider_native turn detection")
             turn_detection = talk_realtime.RealtimeTurnDetection()
         else:
