@@ -138,6 +138,15 @@ production discovery is unchanged. Keep using a project-local environment
 for dependency isolation, and request this fixture for tests that require
 an absent catalog rather than relying on Hermes not being installed.
 
+**Run-worker tests own their threads.** Tests of delegation or admission that
+reset the registry use the opt-in `run_workers` fixture. Register blocking events
+with `release_on_exit`, then call `join_all` before resetting the registry or
+removing host/Popen/history mocks, including a reset in the middle of a test.
+Track any additional dispatch thread with `track`. Cleanup releases every
+registered event even after a failed assertion and joins the actual threads with
+a bounded deadline. A terminal registry status alone is insufficient: the worker
+can still be writing its terminal history record.
+
 ### The live proof — `hermes talk check`
 
 Green tests prove the policy; they cannot prove a wire. Anything that
