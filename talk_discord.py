@@ -178,20 +178,30 @@ def session_to_discord(pcm24_mono: bytes, *, carry: int | None = None) -> tuple[
 
 
 def _resolve_discord_adapter_for_profile(runner, profile_name: str | None) -> Any:
-    """Find the Discord adapter, preferring the invoking profile's map.
+    """Find the Discord adapter, respecting the profile's adapter map.
 
-    In a multiplexed gateway the adapter map is keyed by profile name
-    (``runner._profile_adapters[profile]``); in standalone mode only the
-    launch profile's ``runner.adapters`` exists.
+    Hermes v0.22.6+ multiplexed gateways expose:
+      - ``runner._primary_profile_name`` — the profile that owns ``runner.adapters``.
+        Under multiplexing this is always ``"default"``, under standalone it is the
+        actual launch profile name.
+      - ``runner._profile_adapters`` — dict mapping *secondary* profile names to
+        their own adapter maps.  The primary profile is NOT in this dict.
 
-    Rules:
-      - When *profile_name* is known and ``_profile_adapters`` has it, resolve
-        only from that profile's map.  A missing entry is a hard failure —
-        never silently fall back to the default profile's Discord bot.
-      - When *profile_name* is ``None`` or not in ``_profile_adapters`` (standalone
-        or legacy host), fall back to ``runner.adapters``.
-
-    Returns the Discord adapter or ``None``.
+    Rules (mirrors ``authz_mixin.py:_adapters_for_profile``):
+      - ``profile_name`` is ``None`` or ``"default"`` → use the primary map
+        (``runner.adapters``).
+      - ``profile_name`` is in ``_profile_adapters`` → resolve only from that
+        profile's map.  A missing Discord adapter is a **hard error** — never
+        silently fall back to the default bot (issue #185).
+      - ``profile_name`` is not in ``_profile_adapters`` but equals
+        ``_primary_profile_name`` → the caller identified the primary by name;
+        use ``runner.adapters``.
+      - ``profile_name`` is not in ``_profile_adapters`` and does NOT equal
+        ``_primary_profile_name`` → it is an unknown secondary profile.  **Fail
+        closed**: return ``None`` so the caller reports "no Discord adapter on
+        this profile".
+      - No ``_profile_adapters`` attribute (standalone/legacy host) → use
+        ``runner.adapters``.
     """
 
     def _find_in_map(adapter_map: dict) -> Any:
@@ -219,24 +229,53 @@ def _resolve_discord_adapter_for_profile(runner, profile_name: str | None) -> An
                     break
         return adapter
 
-    # 1. Try the profile-specific adapter map (multiplexed path).
-    profile_adapters = getattr(runner, "_profile_adapters", None)
-    if profile_name and profile_adapters is not None:
-        profile_map = profile_adapters.get(profile_name)
-        if profile_map is not None:
-            adapter = _find_in_map(profile_map)
-            if adapter is not None:
-                return adapter
-            # Profile map exists but no Discord adapter — fail closed rather
-            # than falling back to another profile's bot (issue #185).
-            raise TalkDiscordError(
-                f"Discord adapter is not loaded on profile {profile_name!r}; "
-                "this profile does not have a Discord bot."
-            )
+    # --- Determine which adapter map to use -----------------------------------
+    adapters_map: dict = {}  # always set before use
+    # Track whether the profile had an explicit map entry (even if empty).
+    # This distinguishes "known profile that simply has no Discord adapter"
+    # from "unknown profile / no map available" so we can produce the right error.
+    profile_has_explicit_map: bool = False
 
-    # 2. Fall back to the default/launch profile's adapter map
-    # (standalone or legacy host with no _profile_adapters).
-    return _find_in_map(getattr(runner, "adapters", {}) or {})
+    profile_adapters = getattr(runner, "_profile_adapters", None)
+
+    # 1. Trivial cases: no profile name, or the canonical default name.
+    clean_name = (profile_name or "").strip() or None
+    if clean_name is None or clean_name == "default":
+        adapters_map = getattr(runner, "adapters", {}) or {}
+    # 2. Legacy standalone: no _profile_adapters at all → everything is primary.
+    elif profile_adapters is None:
+        adapters_map = getattr(runner, "adapters", {}) or {}
+    # 3. Secondary profile with an explicit map.
+    elif clean_name in profile_adapters:
+        adapters_map = profile_adapters[clean_name]
+        profile_has_explicit_map = True
+    # 4. Named profile not in _profile_adapters — check _primary_profile_name.
+    else:
+        primary = getattr(runner, "_primary_profile_name", None)
+        if primary and clean_name == primary:
+            # The caller identified the primary by its real name.
+            adapters_map = getattr(runner, "adapters", {}) or {}
+        else:
+            # Unknown secondary profile under multiplexing: fail closed.
+            # Return empty map; let resolve_voice_bridge produce the generic
+            # "adapter isn't loaded on this gateway" error — we do NOT borrow
+            # the default profile's Discord bot (issue #185).
+            adapters_map = {}
+
+    # --- Search the chosen map ------------------------------------------------
+    adapter = _find_in_map(adapters_map)
+    if adapter is not None:
+        return adapter
+
+    # A known profile with an explicit adapter map entry was queried but has no
+    # Discord adapter.  Raise a specific error so the operator knows which
+    # profile is misconfigured rather than getting a misleading "gateway" error.
+    if profile_name and profile_has_explicit_map:
+        raise TalkDiscordError(
+            f"Discord adapter is not loaded on profile {profile_name!r}; "
+            "this profile does not have a Discord bot."
+        )
+    return None
 
 
 def _resolve_current_profile() -> str | None:
