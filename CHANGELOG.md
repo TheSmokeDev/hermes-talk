@@ -87,6 +87,10 @@ named rather than smoothed.
   preserving response boundaries even with a full queue so queued announcements
   can resume after playback drains. Canonical native and Live output also signal
   completion; interrupted audio is discarded. Thanks to @tancou.
+- API-server runs reported as `failed`, `cancelled`, or `interrupted` now
+  remain failures in Talk's registry and completion announcements. Memory
+  handoffs use the same typed outcome instead of interpreting answer text;
+  lost tracking reports an unknown remote outcome. Contributed by @tancou.
 
 ## [0.23.1] — 2026-11-17
 
