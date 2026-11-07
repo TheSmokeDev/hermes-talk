@@ -2527,3 +2527,33 @@ def test_live_start_on_a_host_without_task_context_names_the_missing_support():
     assert result["prepareCalls"] == 0
     assert result["sessionRequests"] == []
     assert "GPT-Live needs a Hermes host with task context support" in result["text"]
+
+
+def test_a_structured_401_from_the_dashboard_host_still_offers_the_token_field():
+    """Current dashboards throw an ApiError whose message is the route's
+    detail alone and whose HTTP code rides on `status`. The token field must
+    appear for that shape too, or a browser off loopback has no way in."""
+
+    script = PAGE_HARNESS + r"""
+(async()=>{
+const tokens=new Map();
+window.sessionStorage={getItem:key=>tokens.get(key)||'',
+  setItem:(key,value)=>tokens.set(key,value),removeItem:key=>tokens.delete(key)};
+fetchOverride=()=>{
+  const err=new Error('hermes-talk dashboard routes require the TALK_DASHBOARD_TOKEN token');
+  err.name='ApiError'; err.status=401; throw err;
+};
+render(); await drain();
+const tree=render();
+assert(button(tree,'Use token'),'A structured 401 must expose token entry');
+assert(nodes(tree).find(node=>node.props.placeholder==='TALK_DASHBOARD_TOKEN'));
+process.exit(0);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
