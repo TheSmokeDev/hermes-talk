@@ -462,7 +462,7 @@ def test_run_to_completion_returns_the_agents_answer(monkeypatch):
     )
 
 
-def test_a_failed_run_is_spoken_not_raised(monkeypatch):
+def test_a_failed_run_raises_a_speakable_terminal_error(monkeypatch):
     monkeypatch.setattr(talk_apiserver, "start_run", lambda *a, **k: "run_abc")
     monkeypatch.setattr(
         talk_apiserver,
@@ -471,10 +471,11 @@ def test_a_failed_run_is_spoken_not_raised(monkeypatch):
     )
     monkeypatch.setenv("TALK_API_SERVER_POLL_S", "0.01")
 
-    out = talk_apiserver.run_to_completion("go")
+    with pytest.raises(talk_apiserver.TalkApiRunError) as caught:
+        talk_apiserver.run_to_completion("go")
 
-    assert "failed" in out
-    assert "model refused" in out
+    assert "failed" in str(caught.value)
+    assert "model refused" in str(caught.value)
 
 
 # -- catalog reads ------------------------------------------------------------

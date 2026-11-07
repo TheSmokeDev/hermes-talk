@@ -652,6 +652,23 @@ none itself afterwards. Model-facing contract:
 
 ### api-server lane
 
+Only a remote `completed` status produces a successful Talk result. Remote
+`failed`, `cancelled`, and `interrupted` statuses map to Talk's local `failed`
+state with the remote status and reason in the report. Memory handoffs also
+require `completed`; a failed handoff keeps its transcript for a later retry.
+Completion announcements use the recorded local outcome and claim delivery
+once. If a local terminal transition races a remote result, the first recorded
+transition wins.
+
+A connection loss or polling deadline ends local tracking as `failed`, with
+an explicit unknown remote outcome; it does not prove the remote work stopped.
+The API run id remains in the run metadata for addressing that same run.
+Automatic reconnection is not added. A terminal parent does not prove its
+delegated children finished or stopped. Existing result truncation still
+applies (4,000 characters from the API lane, 2,000 in Talk's run history).
+These rules use the existing run endpoints without a new capability or
+submission field; they do not require an inline-delegation host contract.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Gateway base URL; trailing slash stripped. |

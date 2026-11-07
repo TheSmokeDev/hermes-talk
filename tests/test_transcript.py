@@ -811,8 +811,9 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
 
+@pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted"])
 def test_an_api_server_flush_failure_keeps_the_transcript(
-    tmp_path, monkeypatch, flush_lanes
+    tmp_path, monkeypatch, flush_lanes, status
 ):
     """WORK_STARTED-then-dead was the drop class: the api-server tier now
     completes synchronously, and a failed run keeps the only copy for the
@@ -823,7 +824,7 @@ def test_an_api_server_flush_failure_keeps_the_transcript(
     capture = _finished_capture(tmp_path, "failed flush")
 
     def failing_run(prompt, *, session_id, session_key):
-        return "the agent run failed: model overloaded"
+        raise talk_apiserver.TalkApiRunError("remote-run", status, "model overloaded")
 
     monkeypatch.setattr(talk_apiserver, "is_available", lambda: True)
     monkeypatch.setattr(talk_apiserver, "run_to_completion", failing_run)

@@ -530,7 +530,16 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 on_event=_on_poll,
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
-            message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
+            if isinstance(exc, talk_apiserver.TalkApiRunError):
+                # Keep the status prefix even when the server's reason is long.
+                message = str(exc)[: talk_runs.HISTORY_OUTPUT_CAP]
+            elif remote.get("api_run_id"):
+                # A local tracking failure is not a verdict on remote execution.
+                message = (
+                    f"I stopped tracking the run; its remote outcome is unknown — {exc}"
+                )[: talk_runs.HISTORY_OUTPUT_CAP]
+            else:
+                message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
             talk_runs.finish_run(run_id, "failed", message)
             return message
 
@@ -1221,12 +1230,15 @@ class HostAdapter:
                 outcome = talk_apiserver.run_to_completion(
                     prompt, session_id=None, session_key=session_key
                 )
+            except talk_apiserver.TalkApiRunError as exc:
+                return f"I couldn't finish that work — {exc}"
+            except talk_apiserver.TalkApiServerError as exc:
+                return (
+                    "I couldn't confirm that work finished; its remote outcome "
+                    f"is unknown — {exc}"
+                )
             except Exception as exc:  # noqa: BLE001 — the flush did not land
                 return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
-            # run_to_completion's documented failure shape is returned text,
-            # not an exception: "the agent run failed/cancelled: ...".
-            if outcome.startswith("the agent run "):
-                return f"I couldn't finish that work — {outcome}"
             _log.info("transcript memory handoff completed: %.200s", outcome)
             return "FLUSH_DONE — memory review completed through the api server"
 
