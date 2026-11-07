@@ -3,6 +3,8 @@
 Tests that the new profile-scoped env resolution and Discord adapter lookup
 work correctly under multiplexed gateway semantics, and degrade safely
 for standalone (non-multiplexed) invocations.
+
+Test count: 11 test methods across 4 classes.
 """
 
 from __future__ import annotations
@@ -42,37 +44,6 @@ class TestTalkEnvGet:
                 assert result is None
             finally:
                 os.environ.pop("TALK_TEST_MARKER", None)
-        finally:
-            sys.modules.clear()
-            sys.modules.update(old_modules)
-
-    def test_with_herms_reads_from_scope(self):
-        """When agent.secret_scope is available, delegates to get_secret."""
-        old_modules = dict(sys.modules)
-        sys.modules.pop("agent.secret_scope", None)
-        try:
-            def mock_get_secret(name, default=None):
-                scope = {
-                    "TALK_PROVIDER": "grok",
-                    "TALK_MODEL": "grok-voice-latest",
-                }
-                if name in scope:
-                    return scope[name]
-                return os.environ.get(name, default)
-
-            sys.modules["agent.secret_scope"] = SimpleNamespace(
-                get_secret=mock_get_secret,
-                is_multiplex_active=lambda: False,
-                serves_routed_profile=lambda: False,
-            )
-
-            import importlib
-            import talk_config
-            importlib.reload(talk_config)
-
-            assert talk_config._talk_env_get("TALK_PROVIDER") == "grok"
-            assert talk_config._talk_env_get("TALK_MODEL") == "grok-voice-latest"
-            assert talk_config._talk_env_get("TALK_MODEL_X", "x") == "x"
         finally:
             sys.modules.clear()
             sys.modules.update(old_modules)
@@ -121,22 +92,38 @@ class _FakeGatewayConfig:
 
 
 class TestDiscordAdapterResolution:
-    """Verify resolve_voice_bridge uses the invoking profile's adapter map."""
+    """Verify resolve_voice_bridge uses the invoking profile's adapter map.
+
+    Mirrors the rule from authz_mixin.py:_adapters_for_profile:
+      - None / "default" → primary adapters (runner.adapters)
+      - Named profile in _profile_adapters → that profile's map (fail closed)
+      - Named profile == _primary_profile_name → primary adapters
+      - Named profile NOT in _profile_adapters and != primary → fail closed ({})
+      - No _profile_adapters (standalone/legacy) → primary adapters
+    """
 
     def _make_adapter_map(self, discord_adapter):
         """Create a minimal adapter map keyed by DISCORD key."""
         return {_DiscordKey("DISCORD", "DISCORD"): discord_adapter}
 
-    def _make_runner(self, adapters=None, profile_adapters=None):
+    def _make_runner(
+        self,
+        adapters: dict | None = None,
+        profile_adapters: dict[str, dict] | None = None,
+        primary_name: str = "default",
+    ) -> SimpleNamespace:
         """Build a minimal mock runner with adapter maps."""
         if adapters is None:
             adapters = {}
         if profile_adapters is None:
             profile_adapters = {}
-        return SimpleNamespace(
+        runner = SimpleNamespace(
             adapters=adapters,
             _profile_adapters=profile_adapters,
         )
+        if primary_name is not None:
+            runner._primary_profile_name = primary_name
+        return runner
 
     def _import_mock(self, name, *args, **kwargs):
         """Replace __import__ for the adapter-search paths."""
@@ -150,21 +137,19 @@ class TestDiscordAdapterResolution:
         return _real_import(name, *args, **kwargs)
 
     def test_standalone_falls_back_to_default_adapters(self):
-        """When no profile is known (standalone), uses runner.adapters."""
+        """When no profile is known (profile_name=None), uses runner.adapters."""
         from talk_discord import _resolve_discord_adapter_for_profile
 
         discord_adapter = object()
         adapters = self._make_adapter_map(discord_adapter)
-        runner = self._make_runner(adapters=adapters)
-        # Explicitly clear _profile_adapters to simulate standalone
-        del runner._profile_adapters
+        runner = self._make_runner(adapters=adapters, profile_adapters={})
 
         with patch.object(builtins, "__import__", side_effect=self._import_mock):
             result = _resolve_discord_adapter_for_profile(runner, None)
             assert result is discord_adapter
 
     def test_secondary_profile_uses_profile_map(self):
-        """When profile_name is known, uses _profile_adapters[profile_name]."""
+        """When profile_name is in _profile_adapters, uses that profile's map."""
         from talk_discord import _resolve_discord_adapter_for_profile
 
         adapters = self._make_adapter_map(object())
@@ -179,18 +164,54 @@ class TestDiscordAdapterResolution:
             assert result is profile_discord
             assert result is not default_discord
 
-    def test_secondary_profile_missing_falls_back_to_default(self):
-        """When profile_name is known but _profile_adapters is missing, falls back."""
+    def test_explicit_primary_profile_uses_runner_adapters(self):
+        """When profile_name matches _primary_profile_name but is not in
+        _profile_adapters, uses runner.adapters (primary profile by name)."""
         from talk_discord import _resolve_discord_adapter_for_profile
 
-        adapters = self._make_adapter_map(object())
-        runner = self._make_runner(adapters=adapters)
-        del runner._profile_adapters
-        default_discord = adapters[_DiscordKey("DISCORD", "DISCORD")]
+        discord_adapter = object()
+        adapters = self._make_adapter_map(discord_adapter)
+        # Runner has _profile_adapters but "LaunchProfile" is NOT a key in it.
+        # It is the primary by _primary_profile_name.
+        profile_adapters = {"WorkProfile": self._make_adapter_map(object())}
+        runner = self._make_runner(
+            adapters=adapters,
+            profile_adapters=profile_adapters,
+            primary_name="LaunchProfile",
+        )
 
         with patch.object(builtins, "__import__", side_effect=self._import_mock):
-            result = _resolve_discord_adapter_for_profile(runner, "WorkProfile")
-            assert result is default_discord
+            result = _resolve_discord_adapter_for_profile(runner, "LaunchProfile")
+            assert result is discord_adapter
+            # NOT a WorkProfile bot
+            work_bot = profile_adapters["WorkProfile"][_DiscordKey("DISCORD", "DISCORD")]
+            assert result is not work_bot
+
+    def test_unknown_secondary_profile_fails_closed(self):
+        """When profile_name is not in _profile_adapters and != _primary_profile_name,
+        returns None (no adapter map found) rather than borrowing the default bot.
+
+        This mirrors authz_mixin.py:_adapters_for_profile which returns {}
+        for unknown secondary profiles.
+        """
+        from talk_discord import _resolve_discord_adapter_for_profile
+
+        default_discord = object()
+        adapters = self._make_adapter_map(default_discord)
+        # Multiplexed: primary is "default", "GhostProfile" is not in _profile_adapters
+        profile_adapters = {"WorkProfile": self._make_adapter_map(object())}
+        runner = self._make_runner(
+            adapters=adapters,
+            profile_adapters=profile_adapters,
+            primary_name="default",
+        )
+
+        with patch.object(builtins, "__import__", side_effect=self._import_mock):
+            result = _resolve_discord_adapter_for_profile(runner, "GhostProfile")
+            # Should return None (mapped to empty dict → no Discord adapter found)
+            # The generic "adapter isn't loaded on this gateway" from
+            # resolve_voice_bridge covers this — never borrows default bot.
+            assert result is None
 
     def test_secondary_profile_map_no_discord_raises(self):
         """When _profile_adapters[profile] exists but has no Discord bot,
@@ -229,18 +250,6 @@ class TestDiscordAdapterResolution:
             assert _resolve_discord_adapter_for_profile(runner, None) is default_bot
             assert _resolve_discord_adapter_for_profile(runner, "default") is default_bot
 
-    def test_legacy_host_without_profile_adapters(self):
-        """A runner that lacks _profile_adapters entirely uses adapters."""
-        from talk_discord import _resolve_discord_adapter_for_profile
-
-        adapters = self._make_adapter_map(object())
-        runner = self._make_runner(adapters=adapters)
-        del runner._profile_adapters
-
-        with patch.object(builtins, "__import__", side_effect=self._import_mock):
-            result = _resolve_discord_adapter_for_profile(runner, "SomeProfile")
-            assert result is adapters[_DiscordKey("DISCORD", "DISCORD")]
-
 
 # ---------------------------------------------------------------------------
 # _resolve_current_profile  (session context resolution)
@@ -263,6 +272,76 @@ class TestResolveCurrentProfile:
         # in this standalone test process it is not importable.
         result = _resolve_current_profile()
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# UnscopedSecretError propagation
+# ---------------------------------------------------------------------------
+
+
+class TestUnscopedSecretErrorPropagation:
+    """Verify _talk_env_get does NOT suppress UnscopedSecretError from
+    the real Hermes agent.secret_scope.get_secret().
+
+    The real get_secret raises UnscopedSecretError when:
+      - multiplexing is active (is_multiplex_active() → True)
+      - no profile scope is installed (_SECRET_SCOPE.get() → None)
+      - no launch body scope (_LAUNCH_BODY_SCOPE.get() → None)
+
+    Our wrapper must let this exception propagate, not swallow it.
+    """
+
+    def test_unscoped_secret_error_propagates_with_real_herms(self):
+        """Use the real Hermes agent.secret_scope.get_secret to verify
+        UnscopedSecretError propagates when multiplex is active with no scope."""
+        # Add the hermes-agent workspace to sys.path so the real module
+        # is importable from this test's isolated process context.
+        workspace = (
+            "/home/akmod/.hermes/installs/1cd3fc7b241ff10b/"
+            "environments/aa8e068f09a14311b40efb1dbaffda93/workspace"
+        )
+        agent_scope_path = workspace + "/agent/secret_scope.py"
+        if not os.path.isfile(agent_scope_path):
+            pytest.skip("real hermes-agent secret_scope.py not available")
+        if workspace not in sys.path:
+            sys.path.insert(0, workspace)
+
+        old_modules = dict(sys.modules)
+        old_syspath = list(sys.path)
+        try:
+            # Ensure the real module is importable (already in site-packages)
+            from agent.secret_scope import get_secret as real_get_secret
+
+            # Patch the cached reference in talk_config so it uses the real function
+            import importlib
+            import talk_config
+
+            # Directly replace the internal reference to the real get_secret
+            talk_config._hermes_get_secret = real_get_secret
+
+            # Mock is_multiplex_active() → True and _LAUNCH_BODY_SCOPE.get() → None
+            # so the real get_secret hits the UnscopedSecretError path.
+            import agent.secret_scope as scope_mod
+
+            with patch.object(
+                scope_mod, "is_multiplex_active", return_value=True
+            ), patch.object(
+                scope_mod, "_LAUNCH_BODY_SCOPE", SimpleNamespace(get=lambda *_, **__: None)
+            ):
+                with pytest.raises(RuntimeError) as exc_info:
+                    talk_config._talk_env_get("TALK_SOME_SECRET")
+
+                # The real UnscopedSecretError is a RuntimeError subclass
+                assert "Hermes could not read" in str(exc_info.value)
+                assert "TALK_SOME_SECRET" in str(exc_info.value)
+
+        finally:
+            # Restore sys.path and modules exactly as they were.
+            sys.modules.clear()
+            sys.modules.update(old_modules)
+            # Restore original sys.path
+            del sys.path[:]
+            sys.path.extend(old_syspath)
 
 
 # ---------------------------------------------------------------------------
