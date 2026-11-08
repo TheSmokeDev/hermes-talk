@@ -111,3 +111,21 @@ The persona split matters more than it looks: a stranger gets the profile in
 `~/.hermes/data/talk-public-profile.md` and a tool list with `lookup_memory`
 removed entirely. Undeclared tools cannot be called, so that is a real boundary
 rather than a prompt instruction the model could ignore.
+
+## The demo switch
+
+`/demo` is a password-only page (a single field, cookie session valid 12 hours,
+`scrypt` hash in `TALK_DEMO_PASSWORD_HASH`, HMAC-signed cookie from
+`TALK_DEMO_COOKIE_SECRET`). It is deliberately in the app rather than at the
+proxy so it can be opened from a phone and shared by password alone.
+
+Turning it on admits strangers for 45 minutes and then closes itself. Turn it
+off when the demo ends; a line left open is a line anyone can talk to.
+
+## Asking the real assistant
+
+`ask_hermes` has an honest budget: it answers from long-term memory when memory
+already knows, and otherwise queues the question (to
+`~/.hermes/data/phone/questions.jsonl`) and tells the caller Shaan will get back
+to them. It does **not** block the call waiting for a live agent — dead air
+mid-conversation is worse than a tidy deferral.

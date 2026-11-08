@@ -173,7 +173,7 @@ def test_stranger_gets_public_persona_and_no_memory_tools(monkeypatch, tmp_path)
     names = [tool.name for tool in setup.tools]
     assert "lookup_memory" not in names
     assert "take_message" not in names
-    assert "handover_to_stranger" in names
+    assert "ask_hermes" in names
     assert "QMUL" in setup.instructions
     assert "public" in setup.instructions.lower()
 
@@ -200,3 +200,49 @@ def test_demo_page_shows_state():
     off = server.demo_page({"until": None}, False)
     assert "ON - strangers can call" in on
     assert "OFF - only you get through" in off
+
+
+# --- demo page authentication --------------------------------------------
+
+_PASSWORD = "letsdemo123"
+
+
+def _stored(password: str = _PASSWORD) -> str:
+    import hashlib
+
+    salt = b"0123456789abcdef"
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def test_password_check_accepts_only_the_right_password():
+    stored = _stored()
+    assert server.password_matches("letsdemo123", stored)
+    assert not server.password_matches("wrong", stored)
+    assert not server.password_matches("letsdemo123", "garbage")
+    assert not server.password_matches("letsdemo123", "")
+
+
+def test_session_cookie_round_trip_and_tamper():
+    secret = "test-secret"
+    cookie = server.issue_session(secret)
+    assert server.session_valid(secret, cookie)
+    assert not server.session_valid(secret, cookie + "0")
+    assert not server.session_valid("other-secret", cookie)
+    assert not server.session_valid(secret, None)
+    assert not server.session_valid(secret, "not-a-cookie")
+
+
+def test_expired_session_is_rejected():
+    import hashlib
+    import hmac
+
+    secret = "test-secret"
+    expiry = "1000000000"
+    signature = hmac.new(secret.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    assert not server.session_valid(secret, f"{expiry}.{signature}")
+
+
+def test_pages_render():
+    assert "Password" in server.login_page()
+    assert "Wrong password" in server.login_page(error=True)

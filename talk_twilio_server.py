@@ -9,17 +9,15 @@ Only the Gemini Live lane is wired up, because its server-side endpointing is
 what makes a phone line work without local VAD. Other providers raise a clear
 error instead of half-working.
 
-Two callers exist, and they get different agents:
+One assistant, two scopes. The owner (numbers in ``TALK_OWNER_NUMBERS``) always
+gets through with the private briefing and the full toolset. Anyone else is
+refused unless demo mode is on, and then gets the same assistant with public
+facts only and no memory or message tools.
 
-* **the owner** (numbers in ``TALK_OWNER_NUMBERS``) gets the real assistant: the
-  operator briefing plus the full toolset.
-* **a stranger** is refused unless demo mode is on, and then gets the demo
-  persona with public facts only and no memory tools.
+Demo mode is a switch, not a config edit: it is a JSON file flipped from the
+``/demo`` page - password-only, cookie-backed - and it expires on its own.
 
-Demo mode is a switch, not a config edit: a JSON file flipped from the ``/demo``
-page (put behind basic auth at the proxy) that expires on its own.
-
-    TWILIO_AUTH_TOKEN=... TALK_PUBLIC_BASE_URL=https://voice.example.com \
+    TWILIO_AUTH_TOKEN=... TALK_PUBLIC_BASE_URL=https://voice.example.com \\
     GEMINI_API_KEY=... python -m talk_twilio_server --port 8767
 """
 
@@ -27,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -50,30 +50,22 @@ DEFAULT_GREETING = (
     "(The caller has just been connected. Greet them in one short sentence and ask what they need.)"
 )
 
-OWNER_INSTRUCTIONS = (
-    "You are Hermes, Shaan's AI assistant, speaking on a phone call. Say you are an AI "
-    "assistant in your first sentence. This line is 8 kHz: keep replies short, concrete "
-    "and spoken-friendly, one idea per sentence, and never read out lists, URLs or code. "
-    "You have real tools: use check_time when the date or time matters, take_message to "
-    "record something Shaan should act on, remember to store a durable note, and "
-    "lookup_memory before claiming you don't know something about Shaan. Only state "
-    "facts a tool gave you or the briefing below contains; if you don't know, say so "
-    "plainly instead of guessing. You cannot send email, submit forms or move money on "
-    "this call - say you will follow up in chat instead. If Shaan hands the phone to "
-    "someone else, call handover_to_stranger immediately and then treat everything you "
-    "know about Shaan as private."
+ASSISTANT_INSTRUCTIONS = (
+    "You are Shaan's Personal Assistant, speaking on a phone call. Introduce yourself "
+    "as his AI assistant in your first sentence. This line is 8 kHz: keep replies "
+    "short, concrete and spoken-friendly, one idea per sentence, and never read out "
+    "lists, URLs or code. Only state facts a tool gave you or the briefing below "
+    "contains; if you don't know, say so plainly instead of guessing. You cannot send "
+    "email, submit forms or move money on this call - say you will follow up instead. "
+    "If Shaan hands the phone to someone else, call handover_to_stranger immediately, "
+    "and from then on treat everything you know about him as private."
 )
 
-STRANGER_INSTRUCTIONS = (
-    "You are Angel, a personal AI assistant, speaking on a phone call to someone you "
-    "have just met. Open by greeting them warmly and introducing yourself in one short "
-    "sentence. You are charming, quick and a little playful, never salesy and never "
-    "creepy. This line is 8 kHz: keep replies short and spoken, one idea per sentence, "
-    "never lists, URLs or code. You may only use the public facts in the profile below; "
-    "you do not know anything private about Shaan and must never invent anything - if "
-    "you are asked something outside the profile, say you don't know or offer to have "
-    "Shaan follow up. You cannot take actions, send messages or book anything; if asked, "
-    "say Shaan will sort it out."
+STRANGER_SCOPE = (
+    "You are speaking to someone Shaan has just met, so only the public facts below may "
+    "be used. You have no memory tools and no way to look things up about him: if you "
+    "are asked something outside the profile, use ask_hermes to pass the question on, "
+    "or say you don't know. Never invent anything and never ask for personal details."
 )
 
 TIMEZONE = "Europe/London"
@@ -82,6 +74,8 @@ BRIEFING_FILE = pathlib.Path.home() / ".hermes" / "data" / "talk-briefing.md"
 PUBLIC_PROFILE_FILE = pathlib.Path.home() / ".hermes" / "data" / "talk-public-profile.md"
 DEMO_STATE_FILE = DATA_DIR / "demo.json"
 DEMO_MINUTES = 45
+DEMO_COOKIE = "talk_demo"
+DEMO_SESSION_HOURS = 12
 HINDSIGHT_URL = os.environ.get("TALK_HINDSIGHT_URL", "http://10.8.0.2:8888")
 HINDSIGHT_BANK = os.environ.get("TALK_HINDSIGHT_BANK", "shaan-shared")
 
@@ -123,17 +117,30 @@ LOOKUP_MEMORY = rt.ToolDefinition(
         "required": ["query"],
     },
 )
+ASK_HERMES = rt.ToolDefinition(
+    name="ask_hermes",
+    description=(
+        "Ask Shaan directly when the answer is not in memory or the briefing. The reply "
+        "is not instant: if nothing comes back immediately, tell the caller Shaan will "
+        "get back to them. The question is always queued for him either way."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"question": {"type": "string"}},
+        "required": ["question"],
+    },
+)
 HANDOVER = rt.ToolDefinition(
     name="handover_to_stranger",
     description=(
         "Call this the moment Shaan says he is handing the phone to someone else, or a "
-        "new voice joins. It switches you to stranger rules: public facts only."
+        "new voice joins. It switches you to public-facts-only rules."
     ),
     parameters={"type": "object", "properties": {}, "required": []},
 )
 
-OWNER_TOOLS = (CHECK_TIME, TAKE_MESSAGE, REMEMBER, LOOKUP_MEMORY, HANDOVER)
-STRANGER_TOOLS = (CHECK_TIME, HANDOVER)
+OWNER_TOOLS = (CHECK_TIME, TAKE_MESSAGE, REMEMBER, LOOKUP_MEMORY, ASK_HERMES, HANDOVER)
+STRANGER_TOOLS = (CHECK_TIME, ASK_HERMES)
 
 
 class ConfigError(RuntimeError):
@@ -207,6 +214,51 @@ def caller_policy(caller: str | None) -> bool:
     return is_owner(caller) or demo_active()
 
 
+# --- demo page authentication --------------------------------------------
+
+
+def password_matches(password: str, stored: str) -> bool:
+    """Verify a password against a ``scrypt$salt$hash`` string."""
+
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$", 2)
+    except ValueError:
+        return False
+    if scheme != "scrypt":
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except ValueError:
+        return False
+    candidate = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return hmac.compare_digest(candidate, expected)
+
+
+def _cookie_secret(environ: Mapping[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    return (env.get("TALK_DEMO_COOKIE_SECRET") or "").strip()
+
+
+def issue_session(secret: str, hours: int = DEMO_SESSION_HOURS) -> str:
+    expiry = str(int(datetime.now().timestamp()) + hours * 3600)
+    signature = hmac.new(secret.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{signature}"
+
+
+def session_valid(secret: str, value: str | None) -> bool:
+    if not secret or not value or "." not in value:
+        return False
+    expiry, signature = value.split(".", 1)
+    expected = hmac.new(secret.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    try:
+        return int(expiry) > int(datetime.now().timestamp())
+    except ValueError:
+        return False
+
+
 def config_from_env(environ: Mapping[str, str] | None = None) -> twilio.TwilioConfig:
     env = os.environ if environ is None else environ
     base_url = (env.get("TALK_PUBLIC_BASE_URL") or "").strip()
@@ -273,28 +325,31 @@ def build_setup(
         "anything the caller does."
     )
     model = (env.get("TALK_TWILIO_MODEL") or DEFAULT_MODEL).strip()
+    voice = (env.get("TALK_TWILIO_VOICE") or DEFAULT_VOICE).strip()
 
     if is_owner(caller):
-        parts = [(env.get("TALK_TWILIO_INSTRUCTIONS") or OWNER_INSTRUCTIONS).strip(), clock]
+        parts = [(env.get("TALK_TWILIO_INSTRUCTIONS") or ASSISTANT_INSTRUCTIONS).strip(), clock]
         briefing = _briefing()
         if briefing:
             parts.append("Context you may rely on:\n" + briefing)
         return rt.SessionSetup(
             model=model,
-            voice=(env.get("TALK_TWILIO_VOICE") or DEFAULT_VOICE).strip(),
+            voice=voice,
             instructions="\n\n".join(parts),
             tools=OWNER_TOOLS,
         )
 
-    parts = [(env.get("TALK_STRANGER_INSTRUCTIONS") or STRANGER_INSTRUCTIONS).strip(), clock]
+    parts = [
+        (env.get("TALK_TWILIO_INSTRUCTIONS") or ASSISTANT_INSTRUCTIONS).strip(),
+        STRANGER_SCOPE,
+        clock,
+    ]
     profile = _public_profile()
     if profile:
         parts.append("Public facts you may use:\n" + profile)
     return rt.SessionSetup(
         model=model,
-        voice=(
-            env.get("TALK_STRANGER_VOICE") or env.get("TALK_TWILIO_VOICE") or DEFAULT_VOICE
-        ).strip(),
+        voice=voice,
         instructions="\n\n".join(parts),
         tools=STRANGER_TOOLS,
     )
@@ -332,7 +387,7 @@ async def lookup_memory(query: str) -> str:
     return " | ".join(hit[:400] for hit in hits)
 
 
-async def execute_tool(name: str, arguments: Mapping[str, Any]) -> str:
+async def execute_tool(name: str, arguments: Mapping[str, Any], caller: str | None = None) -> str:
     """Run one tool call from the live session."""
 
     print(f"tool: {name}", flush=True)
@@ -340,9 +395,9 @@ async def execute_tool(name: str, arguments: Mapping[str, Any]) -> str:
         return datetime.now(ZoneInfo(TIMEZONE)).strftime("%A %d %B %Y, %H:%M %Z")
     if name == "handover_to_stranger":
         return (
-            "Switched to stranger rules. From now on you are speaking to someone Shaan "
-            "has just met: use only the public facts in your profile, never mention "
-            "anything private about him, and do not use memory or message tools."
+            "Switched to public-facts-only rules. You are now speaking to someone Shaan "
+            "has just met: use only the public profile, never mention anything private, "
+            "and do not use memory or message tools."
         )
     if name == "take_message":
         message = str(arguments.get("message", "")).strip()
@@ -354,6 +409,7 @@ async def execute_tool(name: str, arguments: Mapping[str, Any]) -> str:
                 "at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds"),
                 "message": message,
                 "urgency": str(arguments.get("urgency", "normal")),
+                "caller": caller,
             },
         )
         print(f"message recorded: {message[:120]}", flush=True)
@@ -367,6 +423,7 @@ async def execute_tool(name: str, arguments: Mapping[str, Any]) -> str:
             {
                 "at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds"),
                 "note": note,
+                "caller": caller,
             },
         )
         return "noted"
@@ -375,11 +432,58 @@ async def execute_tool(name: str, arguments: Mapping[str, Any]) -> str:
         if not query:
             return "error: query was empty"
         return await lookup_memory(query)
+    if name == "ask_hermes":
+        question = str(arguments.get("question", "")).strip()
+        if not question:
+            return "error: question was empty"
+        _append_jsonl(
+            DATA_DIR / "questions.jsonl",
+            {
+                "at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds"),
+                "question": question,
+                "caller": caller,
+                "answered": False,
+            },
+        )
+        print(f"question queued: {question[:120]}", flush=True)
+        # Opportunistic in-call answer: memory is fast, Shaan is not.
+        digest = await lookup_memory(question)
+        if digest.startswith(("nothing in memory", "memory lookup failed", "error:")):
+            return (
+                "Shaan is not available right now. Tell the caller you have passed the "
+                "question on and he will get back to them."
+            )
+        return digest
     return f"error: unknown tool {name!r}"
 
 
+# --- pages ---------------------------------------------------------------
+
+
+def login_page(error: bool = False) -> str:
+    message = '<p style="color:#ff8080">Wrong password.</p>' if error else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo mode</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:0;padding:32px;background:#111;color:#eee;text-align:center}}
+h1{{font-size:1.2rem;font-weight:600;margin:0 0 22px}}
+input{{width:100%;box-sizing:border-box;padding:18px;font-size:1.1rem;border-radius:12px;
+  border:1px solid #333;background:#1a1a1a;color:#eee;margin-bottom:12px}}
+button{{width:100%;padding:18px;font-size:1.05rem;border-radius:12px;border:0;background:#2f6feb;color:#fff;font-weight:600}}
+</style></head><body>
+<h1>Phone line</h1>
+{message}
+<form method="post" action="/demo/login">
+<input type="password" name="password" placeholder="Password"
+  autocomplete="current-password" autofocus>
+<button type="submit">Unlock</button>
+</form>
+</body></html>"""
+
+
 def demo_page(state: Mapping[str, Any], active: bool) -> str:
-    """Phone-sized switch page. Authentication is the proxy's job."""
+    """Phone-sized switch page."""
 
     colour = "#1a7f37" if active else "#8b1d1d"
     label = "ON - strangers can call" if active else "OFF - only you get through"
@@ -412,13 +516,39 @@ async def _serve(*, config: twilio.TwilioConfig, host: str, port: int) -> None:
     aiohttp = twilio._import_aiohttp()
     web = aiohttp.web
 
+    secret = _cookie_secret()
+
+    def authed(request) -> bool:
+        return session_valid(secret, request.cookies.get(DEMO_COOKIE))
+
     async def demo(request):
         if request.method == "POST":
+            if not authed(request):
+                raise web.HTTPFound("/demo")
             form = await request.post()
-            choice = str(form.get("state", "")).strip().lower()
-            set_demo(choice == "on")
+            set_demo(str(form.get("state", "")).strip().lower() == "on")
             raise web.HTTPFound("/demo")
+        if not authed(request):
+            return web.Response(text=login_page(), content_type="text/html")
         return web.Response(text=demo_page(demo_state(), demo_active()), content_type="text/html")
+
+    async def demo_login(request):
+        form = await request.post()
+        password = str(form.get("password", ""))
+        stored = (os.environ.get("TALK_DEMO_PASSWORD_HASH") or "").strip()
+        if not stored or not password_matches(password, stored):
+            return web.Response(text=login_page(error=True), content_type="text/html", status=401)
+        response = web.HTTPFound("/demo")
+        response.set_cookie(
+            DEMO_COOKIE,
+            issue_session(secret),
+            max_age=DEMO_SESSION_HOURS * 3600,
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+            path="/",
+        )
+        raise response
 
     app = twilio.create_app(
         config=config,
@@ -431,6 +561,7 @@ async def _serve(*, config: twilio.TwilioConfig, host: str, port: int) -> None:
         aiohttp_module=aiohttp,
     )
     app.router.add_route("*", "/demo", demo)
+    app.router.add_post("/demo/login", demo_login)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -472,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"public profile: {'yes' if _public_profile() else 'none'}")
         demo_line = "ON until " + str(demo_state().get("until")) if demo_active() else "OFF"
         print(f"demo mode: {demo_line}")
+        print(f"demo password: {'set' if os.environ.get('TALK_DEMO_PASSWORD_HASH') else 'MISSING'}")
         return 0
 
     print(f"listening on http://{args.host}:{args.port}", flush=True)
