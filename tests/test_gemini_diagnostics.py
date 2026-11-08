@@ -26,7 +26,10 @@ KEY = "AQ.offline-gemini-key-canary"
 def isolated_gemini(monkeypatch, tmp_path):
     for name in tuple(os.environ):
         if name.startswith("TALK_") or name in {
-            "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "XAI_API_KEY",
         }:
             monkeypatch.delenv(name)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

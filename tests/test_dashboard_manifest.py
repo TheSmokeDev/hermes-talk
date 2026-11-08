@@ -84,10 +84,29 @@ def test_tab_declares_a_route(manifest):
 def test_icon_is_one_the_host_can_resolve(manifest):
     # web/src/App.tsx ICON_MAP — anything else silently falls back to Puzzle.
     host_icons = {
-        "Activity", "BarChart3", "Clock", "Cpu", "FileText", "FolderOpen",
-        "KeyRound", "MessageSquare", "Package", "Settings", "Puzzle",
-        "Sparkles", "Terminal", "Globe", "Database", "Shield", "Users",
-        "Wrench", "Zap", "Heart", "Star", "Code", "Eye",
+        "Activity",
+        "BarChart3",
+        "Clock",
+        "Cpu",
+        "FileText",
+        "FolderOpen",
+        "KeyRound",
+        "MessageSquare",
+        "Package",
+        "Settings",
+        "Puzzle",
+        "Sparkles",
+        "Terminal",
+        "Globe",
+        "Database",
+        "Shield",
+        "Users",
+        "Wrench",
+        "Zap",
+        "Heart",
+        "Star",
+        "Code",
+        "Eye",
     }
     assert manifest["icon"] in host_icons
 

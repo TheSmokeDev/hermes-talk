@@ -241,8 +241,12 @@ def test_tool_call_and_audio_decode_through_the_openai_vocabulary():
         [
             {"type": "session.created", "session": {"id": "sess_local"}},
             {"type": "response.created", "response": {"id": "resp_1"}},
-            {"type": "response.output_audio.delta", "delta": pcm, "item_id": "item_1",
-             "response_id": "resp_1"},
+            {
+                "type": "response.output_audio.delta",
+                "delta": pcm,
+                "item_id": "item_1",
+                "response_id": "resp_1",
+            },
             {
                 "type": "response.function_call_arguments.done",
                 "call_id": "call_1",

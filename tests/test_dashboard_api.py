@@ -504,9 +504,7 @@ def test_configured_token_is_required_even_on_loopback(monkeypatch):
 def test_configured_token_accepts_both_header_forms(monkeypatch):
     monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "s3cret")
 
-    api.require_dashboard_auth(
-        FakeRequest(headers={"x-talk-token": "s3cret"}, host="10.0.0.7")
-    )
+    api.require_dashboard_auth(FakeRequest(headers={"x-talk-token": "s3cret"}, host="10.0.0.7"))
     api.require_dashboard_auth(
         FakeRequest(headers={"Authorization": "Bearer s3cret"}, host="10.0.0.7")
     )
@@ -523,21 +521,33 @@ def test_a_near_miss_token_is_rejected(monkeypatch):
 
 def test_desktop_bridge_token_uses_the_existing_dashboard_gate(monkeypatch):
     monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "plugin-secret")
-    api.require_dashboard_auth(FakeRequest(
-        headers={"x-hermes-plugin-token": "plugin-secret", "authorization": "Bearer host-token"},
-        host="10.0.0.7",
-    ))
+    api.require_dashboard_auth(
+        FakeRequest(
+            headers={
+                "x-hermes-plugin-token": "plugin-secret",
+                "authorization": "Bearer host-token",
+            },
+            host="10.0.0.7",
+        )
+    )
     for token in ("wrong", "", "plugin-secre"):
         with pytest.raises(api.HTTPException) as excinfo:
-            api.require_dashboard_auth(FakeRequest(
-                headers={"x-hermes-plugin-token": token, "authorization": "Bearer host-token"},
-                host="10.0.0.7",
-            ))
+            api.require_dashboard_auth(
+                FakeRequest(
+                    headers={"x-hermes-plugin-token": token, "authorization": "Bearer host-token"},
+                    host="10.0.0.7",
+                )
+            )
         assert excinfo.value.status_code == 401
     with pytest.raises(api.HTTPException):
-        api.require_dashboard_auth(FakeRequest(headers={
-            "x-talk-token": "wrong", "x-hermes-plugin-token": "plugin-secret",
-        }))
+        api.require_dashboard_auth(
+            FakeRequest(
+                headers={
+                    "x-talk-token": "wrong",
+                    "x-hermes-plugin-token": "plugin-secret",
+                }
+            )
+        )
 
 
 def test_token_comparison_is_constant_time(monkeypatch):
@@ -584,12 +594,16 @@ def test_every_route_is_gated():
 def test_route_handlers_covers_every_declared_route():
     """ROUTE_HANDLERS is the gate test's input — it must not drift from the file."""
 
-    source = "\n".join(path.read_text(encoding="utf-8") for path in (
-        DASHBOARD_DIR / "plugin_api.py", DASHBOARD_DIR.parent / "talk_live_routes.py",
-        DASHBOARD_DIR.parent / "talk_recipients.py",
-        DASHBOARD_DIR.parent / "talk_text_input.py",
-        DASHBOARD_DIR.parent / "talk_input_attachments.py",
-    ))
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            DASHBOARD_DIR / "plugin_api.py",
+            DASHBOARD_DIR.parent / "talk_live_routes.py",
+            DASHBOARD_DIR.parent / "talk_recipients.py",
+            DASHBOARD_DIR.parent / "talk_text_input.py",
+            DASHBOARD_DIR.parent / "talk_input_attachments.py",
+        )
+    )
     decorated = re.findall(r"@router\.(?:get|post|put|patch|delete)\(", source)
 
     assert len(decorated) == len(api.ROUTE_HANDLERS)

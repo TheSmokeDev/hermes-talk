@@ -306,9 +306,12 @@ def test_legacy_commands_are_rejected(command):
 
 
 def test_separate_billing_settings_survive_auth_switch():
-    env = {"TALK_LIVE_SUBSCRIPTION_MODEL": "gpt-live-1-codex",
-           "TALK_LIVE_SUBSCRIPTION_VOICE": "cove", "TALK_LIVE_API_MODEL": "gpt-live-1",
-           "TALK_LIVE_API_VOICE": "marin"}
+    env = {
+        "TALK_LIVE_SUBSCRIPTION_MODEL": "gpt-live-1-codex",
+        "TALK_LIVE_SUBSCRIPTION_VOICE": "cove",
+        "TALK_LIVE_API_MODEL": "gpt-live-1",
+        "TALK_LIVE_API_VOICE": "marin",
+    }
     from talk_live_config import resolve_live_config
 
     subscription = resolve_live_config(env)
@@ -318,24 +321,38 @@ def test_separate_billing_settings_survive_auth_switch():
     assert resolve_live_config(env) == subscription
 
 
-@pytest.mark.parametrize("kind,role", [
-    ("session.input_transcript.delta", rt.TranscriptRole.USER),
-    ("session.output_transcript.delta", rt.TranscriptRole.ASSISTANT),
-])
+@pytest.mark.parametrize(
+    "kind,role",
+    [
+        ("session.input_transcript.delta", rt.TranscriptRole.USER),
+        ("session.output_transcript.delta", rt.TranscriptRole.ASSISTANT),
+    ],
+)
 def test_live_fragment_identity_and_whitespace_are_independent_of_text(kind, role):
-    events = [protocol.decode_event({"type": kind, "event_id": identity, "delta": text})
-              for identity, text in [("a", "go"), ("b", " "), ("c", "go")]]
+    events = [
+        protocol.decode_event({"type": kind, "event_id": identity, "delta": text})
+        for identity, text in [("a", "go"), ("b", " "), ("c", "go")]
+    ]
     assert "".join(event.text for event in events) == "go go"
     assert [event.event_id for event in events] == ["a", "b", "c"]
     assert all(event.role is role and event.item_id is None and not event.final for event in events)
 
 
 def test_live_added_item_and_turn_have_separate_event_identity():
-    item = protocol.decode_event({"type": "input_transcript.added", "event_id": "added-event",
-                                  "item": {"id": "utterance", "text": " yes "}})
-    turn = protocol.decode_event({"type": "turn.done", "event_id": "turn-event",
-                                  "turn": {"id": "utterance", "role": "user",
-                                           "transcript": " yes "}})
+    item = protocol.decode_event(
+        {
+            "type": "input_transcript.added",
+            "event_id": "added-event",
+            "item": {"id": "utterance", "text": " yes "},
+        }
+    )
+    turn = protocol.decode_event(
+        {
+            "type": "turn.done",
+            "event_id": "turn-event",
+            "turn": {"id": "utterance", "role": "user", "transcript": " yes "},
+        }
+    )
     assert item.item_id == turn.item_id == "utterance"
     assert item.event_id == "added-event" and turn.event_id == "turn-event"
     assert item.text == turn.text == " yes "

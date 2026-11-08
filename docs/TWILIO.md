@@ -86,3 +86,28 @@ python -m talk_twilio_server --port 8767
 * **One call per stream.** Each Media Stream gets its own session; there is no
   shared audio bus and no mixing.
 * **No DTMF handling yet.** `dtmf` messages parse, but nothing consumes them.
+
+## Who gets through
+
+The caller's number arrives in the webhook's `From` parameter, and the server
+passes it into the media stream as a `<Parameter name="caller">` — Twilio echoes
+it back in `start.customParameters`, because the WebSocket handshake itself
+carries no call metadata.
+
+That number drives the policy:
+
+| Demo mode | Caller | What happens |
+| --- | --- | --- |
+| off | owner | the real assistant: private briefing, full toolset |
+| off | anyone else | `<Say>` a refusal, then `<Hangup/>` |
+| on | owner | same assistant, still able to hand over to a stranger mid-call |
+| on | anyone else | demo persona, **public facts only**, no memory or message tools |
+
+Demo mode is a file, not a config edit: `~/.hermes/data/phone/demo.json`, flipped
+from `/demo` and expiring on its own (45 minutes by default). `/demo` should sit
+behind basic auth at the proxy — anyone who can reach it can open the line.
+
+The persona split matters more than it looks: a stranger gets the profile in
+`~/.hermes/data/talk-public-profile.md` and a tool list with `lookup_memory`
+removed entirely. Undeclared tools cannot be called, so that is a real boundary
+rather than a prompt instruction the model could ignore.

@@ -244,9 +244,7 @@ def test_the_clock_still_trails_and_the_lane_line_just_precedes_it():
     )
 
     assert built.strip().endswith(talk_identity.current_moment())
-    assert built.index("Hermes host attached:") < built.index(
-        talk_identity.LANE_LINES["discord"]
-    )
+    assert built.index("Hermes host attached:") < built.index(talk_identity.LANE_LINES["discord"])
     assert built.index(talk_identity.LANE_LINES["discord"]) < built.index(
         talk_identity.current_moment()
     )
@@ -309,9 +307,7 @@ def test_the_capabilities_section_sits_between_host_summary_and_lane_line():
         capabilities="This Hermes install reports 3 skills installed.",
     )
 
-    assert built.index("Hermes host attached:") < built.index(
-        talk_identity.CAPABILITIES_HEADER
-    )
+    assert built.index("Hermes host attached:") < built.index(talk_identity.CAPABILITIES_HEADER)
     assert built.index(talk_identity.CAPABILITIES_HEADER) < built.index(
         talk_identity.LANE_LINES["cli"]
     )

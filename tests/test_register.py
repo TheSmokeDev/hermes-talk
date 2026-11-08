@@ -39,9 +39,7 @@ def load_plugin():
     # that is the INSTALLED copy, so these tests quietly assert against a
     # stale plugin instead of this checkout.
     for cached in [
-        name
-        for name in sys.modules
-        if name == module_name or name.startswith(f"{module_name}.")
+        name for name in sys.modules if name == module_name or name.startswith(f"{module_name}.")
     ]:
         sys.modules.pop(cached, None)
     spec = importlib.util.spec_from_file_location(
@@ -392,9 +390,7 @@ def test_core_join_captures_and_forwards_the_exact_host_factory(plugin, monkeypa
     monkeypatch.setattr(plugin.talk_core_realtime, "core_provider_available", lambda: True)
     handler = ctx.commands["talk"]["handler"]
     factory = object()
-    invocation = types.SimpleNamespace(
-        capture_realtime_voice_attachment_factory=lambda: factory
-    )
+    invocation = types.SimpleNamespace(capture_realtime_voice_attachment_factory=lambda: factory)
     forwarded = []
     monkeypatch.setattr(
         plugin.talk_discord,
@@ -416,9 +412,7 @@ def test_join_captures_and_forwards_the_exact_host_execution_attachment(plugin, 
     plugin.register(ctx)
     handler = ctx.commands["talk"]["handler"]
     attachment = object()
-    invocation = types.SimpleNamespace(
-        capture_realtime_execution_attachment=lambda: attachment
-    )
+    invocation = types.SimpleNamespace(capture_realtime_execution_attachment=lambda: attachment)
     forwarded = []
     monkeypatch.setattr(
         plugin.talk_discord,
@@ -599,9 +593,14 @@ def test_live_join_uses_trusted_anchor_and_private_room_proof(plugin, monkeypatc
     monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "live")
     monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
     monkeypatch.delenv("TALK_TASK_TARGET", raising=False)
-    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
-               "profile": "WorkProfile", "anchor_session_id": "OriginalTask",
-               "proof": "private-host-proof"}
+    context = {
+        "guild_id": "11",
+        "channel_id": "22",
+        "operator_user_id": "33",
+        "profile": "WorkProfile",
+        "anchor_session_id": "OriginalTask",
+        "proof": "private-host-proof",
+    }
     invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
     calls = []
     monkeypatch.setattr(
@@ -621,8 +620,14 @@ def test_live_join_uses_trusted_anchor_and_private_room_proof(plugin, monkeypatc
 
 def test_explicit_discord_target_preserves_case_and_peer_scope(plugin, monkeypatch):
     monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
-    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
-               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    context = {
+        "guild_id": "11",
+        "channel_id": "22",
+        "operator_user_id": "33",
+        "profile": "issuer",
+        "anchor_session_id": "Anchor",
+        "proof": "private-proof",
+    }
     calls = []
     monkeypatch.setattr(
         plugin.talk_discord, "start_session", lambda **kw: calls.append(kw) or "Starting"
@@ -635,7 +640,9 @@ def test_explicit_discord_target_preserves_case_and_peer_scope(plugin, monkeypat
     assert asyncio.run(run()) == "Starting"
     task = calls[0]["native_task"]
     assert (task["target_id"], task["peer_id"], task["profile"]) == (
-        "Mixed Case Task", "PeerA", "Work",
+        "Mixed Case Task",
+        "PeerA",
+        "Work",
     )
     assert task["surface_context"]["surface_profile"] == "issuer"
 
@@ -655,8 +662,14 @@ def test_live_join_never_falls_back_without_room_proof(plugin, monkeypatch):
 
 def test_canonical_control_needs_trusted_room_and_withholds_private_results(plugin, monkeypatch):
     monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: True)
-    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
-               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    context = {
+        "guild_id": "11",
+        "channel_id": "22",
+        "operator_user_id": "33",
+        "profile": "issuer",
+        "anchor_session_id": "Anchor",
+        "proof": "private-proof",
+    }
     received = []
 
     async def command(line, **ids):
@@ -680,8 +693,14 @@ def test_canonical_control_needs_trusted_room_and_withholds_private_results(plug
 @pytest.mark.parametrize("replacement", [None, "task", "generation"])
 def test_canonical_leave_cancels_only_authorized_current_startup(plugin, monkeypatch, replacement):
     discord = plugin.talk_discord
-    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
-               "profile": "issuer", "anchor_session_id": "Anchor", "proof": "private-proof"}
+    context = {
+        "guild_id": "11",
+        "channel_id": "22",
+        "operator_user_id": "33",
+        "profile": "issuer",
+        "anchor_session_id": "Anchor",
+        "proof": "private-proof",
+    }
     authorized = True
     stopped = []
 
@@ -692,7 +711,8 @@ def test_canonical_leave_cancels_only_authorized_current_startup(plugin, monkeyp
 
     monkeypatch.setattr(discord, "resolve_voice_bridge", lambda guild: {"guild_id": guild})
     monkeypatch.setattr(
-        discord, "DiscordAudio",
+        discord,
+        "DiscordAudio",
         lambda guild: types.SimpleNamespace(stop=lambda: stopped.append(guild)),
     )
     monkeypatch.setattr(
@@ -753,7 +773,9 @@ def test_canonical_leave_cancels_only_authorized_current_startup(plugin, monkeyp
             if successor is not None:
                 successor.cancel()
             await asyncio.gather(
-                original, *([successor] if successor else []), return_exceptions=True,
+                original,
+                *([successor] if successor else []),
+                return_exceptions=True,
             )
             discord.reset_for_tests()
 
@@ -772,9 +794,9 @@ def scoped_gateway_platform(monkeypatch):
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
     context = types.ModuleType("gateway.session_context")
-    context.get_session_env = lambda name: platform.get() if name == (
-        "HERMES_SESSION_PLATFORM"
-    ) else ""
+    context.get_session_env = lambda name: (
+        platform.get() if name == ("HERMES_SESSION_PLATFORM") else ""
+    )
     monkeypatch.setitem(sys.modules, "gateway", gateway)
     monkeypatch.setitem(sys.modules, "gateway.session_context", context)
     return platform
@@ -800,7 +822,10 @@ async def _dispatch_offloaded_talk(plugin, platform, raw, invocation=None):
 
 @pytest.mark.parametrize("raw", ["", "join", "status", "pause", "resume", "leave"])
 def test_offloaded_discord_command_runs_on_owner_loop(
-    plugin, monkeypatch, scoped_gateway_platform, raw,
+    plugin,
+    monkeypatch,
+    scoped_gateway_platform,
+    raw,
 ):
     monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "cascade")
     monkeypatch.delenv("TALK_TASK_TARGET", raising=False)
@@ -817,8 +842,12 @@ def test_offloaded_discord_command_runs_on_owner_loop(
             return "room receipt"
 
         method = {
-            "": "start_session", "join": "start_session", "status": "session_status",
-            "pause": "pause_session", "resume": "resume_session", "leave": "stop_session",
+            "": "start_session",
+            "join": "start_session",
+            "status": "session_status",
+            "pause": "pause_session",
+            "resume": "resume_session",
+            "leave": "stop_session",
         }[raw]
         monkeypatch.setattr(plugin.talk_discord, method, room_command)
         return await _dispatch_offloaded_talk(plugin, scoped_gateway_platform, raw)
@@ -828,12 +857,19 @@ def test_offloaded_discord_command_runs_on_owner_loop(
 
 
 def test_offloaded_canonical_control_awaits_nested_coroutine(
-    plugin, monkeypatch, scoped_gateway_platform,
+    plugin,
+    monkeypatch,
+    scoped_gateway_platform,
 ):
     monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: True)
     monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: pytest.fail("terminal audio"))
-    context = {"guild_id": "11", "channel_id": "22", "operator_user_id": "33",
-               "anchor_session_id": "Anchor", "proof": "test-host-proof"}
+    context = {
+        "guild_id": "11",
+        "channel_id": "22",
+        "operator_user_id": "33",
+        "anchor_session_id": "Anchor",
+        "proof": "test-host-proof",
+    }
     invocation = types.SimpleNamespace(capture_discord_task_context_proof=lambda: context)
     calls = []
 
@@ -847,7 +883,10 @@ def test_offloaded_canonical_control_awaits_nested_coroutine(
 
         monkeypatch.setattr(plugin.talk_discord, "native_command", command)
         return await _dispatch_offloaded_talk(
-            plugin, scoped_gateway_platform, "result 7", invocation,
+            plugin,
+            scoped_gateway_platform,
+            "result 7",
+            invocation,
         )
 
     receipt = asyncio.run(run())
@@ -857,7 +896,9 @@ def test_offloaded_canonical_control_awaits_nested_coroutine(
 
 
 def test_offloaded_live_join_still_requires_host_authorization(
-    plugin, monkeypatch, scoped_gateway_platform,
+    plugin,
+    monkeypatch,
+    scoped_gateway_platform,
 ):
     monkeypatch.setattr(plugin.talk_config, "voice_mode", lambda: "live")
     monkeypatch.setattr(plugin.talk_discord, "native_session_active", lambda: False)
@@ -867,7 +908,9 @@ def test_offloaded_live_join_still_requires_host_authorization(
 
 
 def test_terminal_routing_uses_scoped_platform_not_process_env(
-    plugin, monkeypatch, scoped_gateway_platform,
+    plugin,
+    monkeypatch,
+    scoped_gateway_platform,
 ):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     calls = []

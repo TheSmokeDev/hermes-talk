@@ -20,7 +20,9 @@ def test_generated_ui_is_current():
 
 
 def test_presentation_controls_cannot_override_live_state_or_actions():
-    script = PAGE_HARNESS + r"""
+    script = (
+        PAGE_HARNESS
+        + r"""
 function NativePresentation() {}
 let hidden = 0;
 const hide = () => {hidden++;};
@@ -37,9 +39,13 @@ assert.equal(requests.length, 0);
 tree.props.hide(); assert.equal(hidden, 1);
 process.exit(0);
 """
+    )
     completed = run(
         ["node", "-e", script, str(ROOT / "dashboard/dist/index.js")],
-        cwd=ROOT, capture_output=True, text=True, timeout=NODE_TIMEOUT_S,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -50,7 +56,7 @@ def test_build_is_deterministic_and_check_never_writes(tmp_path, desktop):
     (tmp_path / "dashboard/dist").mkdir(parents=True)
     for name in ("talk-surface.js", "dashboard-entry.js"):
         (tmp_path / "ui" / name).write_bytes((ROOT / "ui" / name).read_bytes())
-    css = '/* ${literal} \"quoted\" 雪 */\n.ht-page { color: red; }\n'
+    css = '/* ${literal} "quoted" 雪 */\n.ht-page { color: red; }\n'
     (tmp_path / "dashboard/dist/style.css").write_text(css, encoding="utf-8", newline="\n")
     if desktop:
         (tmp_path / "ui/desktop-entry.js").write_text(
@@ -145,7 +151,9 @@ def run_node(script, source=SHARED):
 
 
 def test_factory_has_no_dashboard_bootstrap_and_pins_its_sdk():
-    run_node(TRANSPORT_HARNESS + r"""
+    run_node(
+        TRANSPORT_HARNESS
+        + r"""
 (async()=>{
 assert.deepEqual(Object.keys(surface).sort(), ['TalkPage','TalkTransport','LiveTransport',
   'makeTransport','appendTranscriptRows','controlLabel','steeringLabel'].sort());
@@ -158,25 +166,28 @@ assert.equal(requests[0].timeoutMs,6500);
 assert(requests[0].opts.signal instanceof AbortSignal);
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""")
+"""
+    )
 
 
-@pytest.mark.parametrize("scenario", [
-    r"""
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        r"""
 const t=make(); await t.start(); assert.equal(captures,1); assert.equal(offers,1);
 t.stop(); t.stop(); assert.equal(trackStops,1); assert.equal(releases,0);
 """,
-    r"""
+        r"""
 sdk.acquireMicrophone=async()=>lease;
 const t=make(); await t.start(); t.stop(); t.stop(); leaseController.abort();
 assert.equal(releases,1); assert.equal(trackStops,1); assert.equal(closed,0);
 """,
-    r"""
+        r"""
 sdk.acquireMicrophone=async()=>lease;
 const t=make(); await t.start(); leaseController.abort(); t.stop();
 assert(t.closed); assert.equal(releases,1); assert.equal(trackStops,1); assert.equal(closed,1);
 """,
-    r"""
+        r"""
 let resolveLease, acquisitionSignal;
 sdk.acquireMicrophone=({signal})=>{acquisitionSignal=signal;
   return new Promise(resolve=>{resolveLease=resolve;});};
@@ -184,72 +195,90 @@ const t=make(), starting=t.start(); await waitFor(()=>resolveLease);
 t.stop(); assert(acquisitionSignal.aborted); resolveLease(lease); await starting;
 assert.equal(captures,0); assert.equal(peers,0); assert.equal(releases,1);
 """,
-    r"""
+        r"""
 leaseController.abort(); sdk.acquireMicrophone=async()=>lease;
 const t=make(); await t.start(); assert(t.closed);
 assert.equal(captures,0); assert.equal(peers,0); assert.equal(releases,1);
 """,
-    r"""
+        r"""
 let resolveCapture; captureOverride=()=>new Promise(resolve=>{resolveCapture=resolve;});
 sdk.acquireMicrophone=async()=>lease;
 const t=make(), starting=t.start(); await waitFor(()=>resolveCapture);
 leaseController.abort(); assert(t.closed); assert.equal(releases,1);
 resolveCapture(media); await starting; assert.equal(trackStops,1); assert.equal(offers,0);
 """,
-    r"""
+        r"""
 sdk.acquireMicrophone=async()=>lease; captureOverride=()=>{throw Error('capture denied');};
 const t=make(); await assert.rejects(t.start(),/capture denied/); t.stop();
 assert(t.closed); assert.equal(releases,1); assert.equal(offers,0);
 """,
-    r"""
+        r"""
 sdk.acquireMicrophone=async()=>lease; offerOverride=()=>{throw Error('offer refused');};
 const t=make(); await assert.rejects(t.start(),/offer refused/); t.stop();
 assert(t.closed); assert.equal(releases,1); assert.equal(trackStops,1);
 """,
-    r"""
+        r"""
 sdk.validateVoiceMode=async value=>{assert.equal(value.voiceMode,'cascade');
   throw Error('unsupported mode');};
 sdk.acquireMicrophone=async()=>{throw Error('lease must not be acquired');};
 const t=make({voiceMode:'cascade'}); await assert.rejects(t.start(),/unsupported mode/);
 assert.equal(captures,0); assert.equal(peers,0); assert.equal(offers,0);
 """,
-    r"""
+        r"""
 let resolveValidation; sdk.validateVoiceMode=()=>new Promise(resolve=>{resolveValidation=resolve;});
 sdk.acquireMicrophone=async()=>{throw Error('cancelled validation acquired a lease');};
 const t=make(), starting=t.start(); await waitFor(()=>resolveValidation);
 t.stop(); resolveValidation(); await starting; assert.equal(captures,0); assert.equal(peers,0);
 """,
-])
+    ],
+)
 def test_transport_microphone_lifecycle(scenario):
-    run_node(TRANSPORT_HARNESS + "\n(async()=>{\n" + scenario + r"""
+    run_node(
+        TRANSPORT_HARNESS
+        + "\n(async()=>{\n"
+        + scenario
+        + r"""
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""")
+"""
+    )
 
 
 @pytest.mark.parametrize("cancel", [False, True])
 def test_page_validates_before_mint_and_drops_late_validation(cancel):
-    script = PAGE_HARNESS + "\n(async()=>{\n" + r"""
+    script = (
+        PAGE_HARNESS
+        + "\n(async()=>{\n"
+        + r"""
 render(); await drain(); let tree=render(), finish;
 sdk.validateVoiceMode=()=>new Promise((resolve,reject)=>{finish={resolve,reject};});
 button(tree,'Start legacy Talk').props.onClick(); await waitFor(()=>finish);
 assert.equal(requests.filter(row=>row.url.endsWith('/session')).length,0);
-""" + (r"""
+"""
+        + (
+            r"""
 listeners.pagehide(); finish.resolve(); await drain();
-""" if cancel else r"""
+"""
+            if cancel
+            else r"""
 finish.reject(Error('Cascade is unavailable in Desktop.')); await drain();
 assert(label(render()).includes('Cascade is unavailable in Desktop.'));
-""") + r"""
+"""
+        )
+        + r"""
 assert.equal(requests.filter(row=>row.url.endsWith('/session')).length,0);
 assert.equal(transports.length,0);
 for(const slot of slots) if(slot && slot.cleanup) slot.cleanup();
 process.exit(0);
 })().catch(e=>{console.error(e);process.exit(1);});
 """
+    )
     run_node(script, ROOT / "dashboard/dist/index.js")
 
 
 def test_task_request_keeps_abort_signal_and_original_sdk_on_close():
-    run_node(TRANSPORT_HARNESS + r"""
+    run_node(
+        TRANSPORT_HARNESS
+        + r"""
 (async()=>{
 let finish;
 sdk.fetchJSON=(url,opts,timeoutMs)=>{
@@ -268,11 +297,14 @@ await assert.rejects(pending,/closed or request cancelled/);
 assert.equal(requests.filter(row=>row.url.endsWith('/close')).length,1);
 assert.equal(JSON.parse(requests.at(-1).opts.body).connection_id,'original-connection');
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""")
+"""
+    )
 
 
 def test_live_microphone_revocation_keeps_original_close_order():
-    run_node(LIVE_HARNESS + r"""
+    run_node(
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 let released=0;
 const owner=new AbortController();
@@ -290,4 +322,6 @@ assert.deepEqual(closes.map(row=>row.url),[
 assert(closes.every(row=>row.body.connection_id==='bound-live-task'));
 assert.equal(closes[0].body.binding_id,'opaque-live');
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""", ROOT / "dashboard/dist/index.js")
+""",
+        ROOT / "dashboard/dist/index.js",
+    )

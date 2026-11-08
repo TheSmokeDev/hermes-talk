@@ -310,7 +310,6 @@ def test_selection_flushes_old_capture_before_attachment_and_pauses_media(native
     asyncio.run(scenario())
 
 
-
 def test_selection_wait_rechecks_a_wake_from_an_already_retired_generation():
     async def scenario():
         ready = asyncio.Event()
@@ -329,4 +328,5 @@ def test_selection_wait_rechecks_a_wake_from_an_already_retired_generation():
         fresh = selected[0] = object()
         ready.set()
         assert await asyncio.wait_for(waiting, 0.1) is fresh
+
     asyncio.run(scenario())

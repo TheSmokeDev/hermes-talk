@@ -190,6 +190,7 @@ class TwilioFrame:
     call_sid: str | None = None
     payload: bytes | None = None
     mark: str | None = None
+    parameters: Mapping[str, str] = field(default_factory=dict)
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -220,6 +221,12 @@ def parse_message(message: str | bytes | Mapping[str, Any]) -> TwilioFrame:
         raise ValueError(f"Twilio {event} message requires a streamSid")
 
     start = data.get("start")
+    custom = start.get("customParameters") if isinstance(start, Mapping) else None
+    parameters = (
+        {str(key): str(value) for key, value in custom.items()}
+        if isinstance(custom, Mapping)
+        else {}
+    )
     call_sid = start.get("callSid") if isinstance(start, Mapping) else None
     if call_sid is not None and not isinstance(call_sid, str):
         raise ValueError("callSid must be a string")
@@ -243,25 +250,44 @@ def parse_message(message: str | bytes | Mapping[str, Any]) -> TwilioFrame:
         call_sid=call_sid,
         payload=payload,
         mark=data.get("mark", {}).get("name") if isinstance(data.get("mark"), Mapping) else None,
+        parameters=parameters,
         raw=data,
     )
 
 
-def twiml_stream(stream_url: str) -> str:
-    """Return the TwiML document that opens a bidirectional Media Stream."""
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def twiml_stream(stream_url: str, parameters: Mapping[str, str] | None = None) -> str:
+    """Return the TwiML that opens a bidirectional Media Stream.
+
+    ``parameters`` become ``<Parameter>`` children, which Twilio echoes back in
+    the stream's ``start.customParameters``. That is how the caller's number
+    reaches the media socket: the WebSocket handshake carries no call metadata.
+    """
 
     if not stream_url.startswith(("wss://", "ws://")):
         raise ValueError("stream_url must be a WebSocket URL")
-    escaped = (
-        stream_url.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
+    children = "".join(
+        f'<Parameter name="{_xml_escape(name)}" value="{_xml_escape(value)}"/>'
+        for name, value in (parameters or {}).items()
+        if value
     )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        f'<Response><Connect><Stream url="{escaped}"/></Connect></Response>'
-    )
+    if children:
+        stream = f'<Stream url="{_xml_escape(stream_url)}">{children}</Stream>'
+    else:
+        stream = f'<Stream url="{_xml_escape(stream_url)}"/>'
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect>{stream}</Connect></Response>'
+
+
+def twiml_hangup(message: str = "") -> str:
+    """Refuse the call: optionally say one line, then hang up."""
+
+    say = f"<Say>{_xml_escape(message)}</Say>" if message else ""
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response>{say}<Hangup/></Response>'
 
 
 def expected_signature(auth_token: str, url: str, params: Mapping[str, str]) -> str:
@@ -438,10 +464,12 @@ def _signed_url(config: TwilioConfig, path: str, query: str = "") -> str:
 def create_app(
     *,
     config: TwilioConfig,
-    session_factory: Callable[[], rt.RealtimeSession],
-    setup_factory: Callable[[], rt.SessionSetup],
+    session_factory: Callable[[str | None], rt.RealtimeSession],
+    setup_factory: Callable[[str | None], rt.SessionSetup],
     greeting: str | None = None,
     tool_executor: ToolExecutor | None = None,
+    caller_policy: Callable[[str | None], bool] | None = None,
+    deny_message: str = "",
     aiohttp_module: Any = None,
 ):
     """Build the aiohttp app exposing the Voice webhook and the stream socket."""
@@ -450,17 +478,24 @@ def create_app(
     web = aiohttp.web
 
     async def voice(request):
+        if request.method == "POST":
+            form = await request.post()
+            params = {key: str(value) for key, value in form.items()}
+        else:
+            params = {key: str(value) for key, value in request.query.items()}
+
         if config.require_signature:
-            if request.method == "POST":
-                form = await request.post()
-                params = {key: str(value) for key, value in form.items()}
-            else:
-                params = {key: str(value) for key, value in request.query.items()}
             url = _signed_url(config, request.path, request.query_string)
             signature = request.headers.get("X-Twilio-Signature")
             if not validate_signature(config.auth_token or "", url, params, signature):
                 raise web.HTTPForbidden(text="invalid Twilio signature")
-        return web.Response(text=twiml_stream(config.stream_url), content_type="text/xml")
+
+        caller = params.get("From")
+        if caller_policy is not None and not caller_policy(caller):
+            return web.Response(text=twiml_hangup(deny_message), content_type="text/xml")
+
+        document = twiml_stream(config.stream_url, {"caller": caller or ""})
+        return web.Response(text=document, content_type="text/xml")
 
     async def stream(request):
         ws = web.WebSocketResponse(heartbeat=30)
@@ -478,7 +513,8 @@ def create_app(
 
                 if frame.event == "start":
                     state["sid"] = frame.stream_sid
-                    session = session_factory()
+                    caller = frame.parameters.get("caller") or None
+                    session = session_factory(caller)
 
                     async def send_media(payload: bytes, sid=frame.stream_sid) -> None:
                         if ws.closed:
@@ -504,7 +540,7 @@ def create_app(
                         greeting=greeting,
                         tool_executor=tool_executor,
                     )
-                    await bridge.connect(setup_factory())
+                    await bridge.connect(setup_factory(caller))
                     state["bridge"] = bridge
                     state["task"] = asyncio.create_task(bridge.run())
                 elif frame.event == "media" and state["bridge"] is not None:
@@ -534,10 +570,12 @@ def create_app(
 async def serve(
     *,
     config: TwilioConfig,
-    session_factory: Callable[[], rt.RealtimeSession],
-    setup_factory: Callable[[], rt.SessionSetup],
+    session_factory: Callable[[str | None], rt.RealtimeSession],
+    setup_factory: Callable[[str | None], rt.SessionSetup],
     greeting: str | None = None,
     tool_executor: ToolExecutor | None = None,
+    caller_policy: Callable[[str | None], bool] | None = None,
+    deny_message: str = "",
     host: str = "127.0.0.1",
     port: int = 8767,
 ) -> None:
@@ -550,6 +588,8 @@ async def serve(
         setup_factory=setup_factory,
         greeting=greeting,
         tool_executor=tool_executor,
+        caller_policy=caller_policy,
+        deny_message=deny_message,
         aiohttp_module=aiohttp,
     )
     runner = aiohttp.web.AppRunner(app)

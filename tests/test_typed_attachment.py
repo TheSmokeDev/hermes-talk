@@ -76,31 +76,52 @@ def typed(fleet, monkeypatch):
 
         return call
 
-    app = Starlette(routes=[
-        Route(path, endpoint(handler), methods=["GET" if path.endswith("operation") else "POST"])
-        for path, handler in paths.items()
-    ])
-    return SimpleNamespace(api=api, fleet=fleet, app=app, decision=decision,
-                           coordinator=coordinator, forbidden=forbidden)
+    app = Starlette(
+        routes=[
+            Route(
+                path, endpoint(handler), methods=["GET" if path.endswith("operation") else "POST"]
+            )
+            for path, handler in paths.items()
+        ]
+    )
+    return SimpleNamespace(
+        api=api,
+        fleet=fleet,
+        app=app,
+        decision=decision,
+        coordinator=coordinator,
+        forbidden=forbidden,
+    )
 
 
 def client_for(typed, surface="dashboard"):
-    header = ({"x-hermes-desktop-talk-token": "typed-desktop-token"} if surface == "desktop"
-              else {"x-talk-token": "typed-dashboard-token"})
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=typed.app),
-                             base_url="http://hermes.test", headers=header)
+    header = (
+        {"x-hermes-desktop-talk-token": "typed-desktop-token"}
+        if surface == "desktop"
+        else {"x-talk-token": "typed-dashboard-token"}
+    )
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=typed.app), base_url="http://hermes.test", headers=header
+    )
 
 
 async def attach(client, *, surface="dashboard", selected=None, **fields):
     if selected is None:
         catalog = await client.post("/targets", json={})
         assert catalog.status_code == 200, catalog.text
-        selected = next(row["target_id"] for row in catalog.json()["targets"]
-                        if row["session_id"] == "task-a")
-    return await client.post("/native/attach", json={
-        "input_mode": "typed", "surface": surface, "target_id": selected,
-        **({} if "connection_id" in fields else {"tab_id": "typed-tab"}), **fields,
-    })
+        selected = next(
+            row["target_id"] for row in catalog.json()["targets"] if row["session_id"] == "task-a"
+        )
+    return await client.post(
+        "/native/attach",
+        json={
+            "input_mode": "typed",
+            "surface": surface,
+            "target_id": selected,
+            **({} if "connection_id" in fields else {"tab_id": "typed-tab"}),
+            **fields,
+        },
+    )
 
 
 def context(response):
@@ -125,9 +146,13 @@ def test_authenticated_attach_and_async_input_share_canonical_receipts(typed, su
             assert descriptor["task"]["history"]["messages"][0]["content"] == "Earlier typed task"
             decision = typed.decision
             decision.started, decision.release = asyncio.Event(), asyncio.Event()
-            body = {**owner, "provider_session_id": "typed-capture", "input_id": "input-one",
-                    "text": "  Inspect this exact original request.\nKeep this spacing.  ",
-                    "admission": "async"}
+            body = {
+                **owner,
+                "provider_session_id": "typed-capture",
+                "input_id": "input-one",
+                "text": "  Inspect this exact original request.\nKeep this spacing.  ",
+                "admission": "async",
+            }
             try:
                 accepted = await client.post("/live/typed", json=body)
                 assert accepted.status_code == 200, accepted.text
@@ -136,16 +161,24 @@ def test_authenticated_attach_and_async_input_share_canonical_receipts(typed, su
                 await asyncio.wait_for(decision.started.wait(), 5)
                 repeat = await client.post("/live/typed", json=body)
                 assert repeat.json()["operation_id"] == receipt["operation_id"]
-                pending = await client.get("/live/operation", params={
-                    **owner, "operation_id": receipt["operation_id"],
-                })
+                pending = await client.get(
+                    "/live/operation",
+                    params={
+                        **owner,
+                        "operation_id": receipt["operation_id"],
+                    },
+                )
                 assert pending.status_code == 200 and pending.json()["pending"] is True
             finally:
                 decision.release.set()
             await asyncio.wait_for(asyncio.gather(*typed.coordinator._tasks.values()), 10)
-            result = await client.get("/live/operation", params={
-                **owner, "operation_id": receipt["operation_id"],
-            })
+            result = await client.get(
+                "/live/operation",
+                params={
+                    **owner,
+                    "operation_id": receipt["operation_id"],
+                },
+            )
             assert result.status_code == 200 and result.json()["pending"] is False
             assert result.json()["result"]["action"]["state"] == "accepted"
             host = typed.fleet.hosts["local"]
@@ -161,12 +194,14 @@ def test_authenticated_attach_and_async_input_share_canonical_receipts(typed, su
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("headers", [{}, {"x-talk-token": "wrong"},
-                                    {"x-hermes-desktop-talk-token": "wrong"}])
+@pytest.mark.parametrize(
+    "headers", [{}, {"x-talk-token": "wrong"}, {"x-hermes-desktop-talk-token": "wrong"}]
+)
 def test_attach_authentication_precedes_json_and_target_preparation(typed, headers):
     async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=typed.app),
-                                     base_url="http://hermes.test") as client:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=typed.app), base_url="http://hermes.test"
+        ) as client:
             response = await client.post("/native/attach", content="{broken", headers=headers)
             assert response.status_code == 401
             assert not any(host.requests_all for host in typed.fleet.hosts.values())
@@ -174,13 +209,16 @@ def test_attach_authentication_precedes_json_and_target_preparation(typed, heade
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("fields,status", [
-    ({"input_mode": "invalid"}, 400),
-    ({"input_mode": []}, 400),
-    ({"surface": "unknown"}, 403),
-    ({"surface": []}, 403),
-    ({"surface_token": "untrusted-proof"}, 403),
-])
+@pytest.mark.parametrize(
+    "fields,status",
+    [
+        ({"input_mode": "invalid"}, 400),
+        ({"input_mode": []}, 400),
+        ({"surface": "unknown"}, 403),
+        ({"surface": []}, 403),
+        ({"surface_token": "untrusted-proof"}, 403),
+    ],
+)
 def test_invalid_typed_attach_retires_candidate_and_selection_reservation(typed, fields, status):
     async def run():
         async with client_for(typed) as client:
@@ -188,9 +226,10 @@ def test_invalid_typed_attach_retires_candidate_and_selection_reservation(typed,
             assert result.status_code == status, result.text
             assert not typed.fleet.manager._bindings
             assert not typed.fleet.hosts["local"].attachments
-            assert typed.fleet.catalog.state(typed.fleet.request).snapshot("typed-tab")[
-                "current"
-            ] is None
+            assert (
+                typed.fleet.catalog.state(typed.fleet.request).snapshot("typed-tab")["current"]
+                is None
+            )
             assert (await attach(client)).status_code == 200
 
     asyncio.run(run())
@@ -202,28 +241,46 @@ def test_typed_reconnect_fences_old_generation_actor_and_input_identity(typed):
             old = context(await attach(client))
             fresh = context(await attach(client, **old))
             assert fresh != old
-            for owner, headers, status in ((old, {}, 409),
-                                           (fresh, {"x-actor": "foreign-actor"}, 409)):
-                result = await client.post("/live/typed", headers=headers, json={
-                    **owner, "provider_session_id": "capture", "input_id": "late",
-                    "text": "Do not dispatch", "admission": "async",
-                })
+            for owner, headers, status in (
+                (old, {}, 409),
+                (fresh, {"x-actor": "foreign-actor"}, 409),
+            ):
+                result = await client.post(
+                    "/live/typed",
+                    headers=headers,
+                    json={
+                        **owner,
+                        "provider_session_id": "capture",
+                        "input_id": "late",
+                        "text": "Do not dispatch",
+                        "admission": "async",
+                    },
+                )
                 assert result.status_code == status, result.text
             assert not typed.decision.calls and not typed.fleet.hosts["local"].jobs
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("text,status", [("", 400), ("   ", 400), ("é" * 8001, 413)],
-                         ids=["empty", "whitespace", "utf8-byte-limit"])
+@pytest.mark.parametrize(
+    "text,status",
+    [("", 400), ("   ", 400), ("é" * 8001, 413)],
+    ids=["empty", "whitespace", "utf8-byte-limit"],
+)
 def test_typed_input_keeps_existing_utf8_bound_and_nonempty_contract(typed, text, status):
     async def run():
         async with client_for(typed) as client:
             owner = context(await attach(client))
-            response = await client.post("/live/typed", json={
-                **owner, "provider_session_id": "capture", "input_id": "invalid",
-                "text": text, "admission": "async",
-            })
+            response = await client.post(
+                "/live/typed",
+                json={
+                    **owner,
+                    "provider_session_id": "capture",
+                    "input_id": "invalid",
+                    "text": text,
+                    "admission": "async",
+                },
+            )
             assert response.status_code == status, response.text
             assert not typed.decision.calls and not typed.fleet.hosts["local"].jobs
 
@@ -259,8 +316,12 @@ def test_disconnected_typed_attach_cancels_before_activation(typed):
         )
 
         async def body():
-            return {"target_id": selected, "tab_id": "typed-tab",
-                    "input_mode": "typed", "surface": "dashboard"}
+            return {
+                "target_id": selected,
+                "tab_id": "typed-tab",
+                "input_mode": "typed",
+                "surface": "dashboard",
+            }
 
         async def disconnected():
             return True
@@ -345,15 +406,27 @@ def test_typed_discord_cannot_drop_audience_authorization(typed, monkeypatch):
 
     async def run():
         async with client_for(typed) as client:
-            old = context(await attach(client, surface="discord", surface_token="room-proof",
-                                       anchor_session_id="room-session"))
+            old = context(
+                await attach(
+                    client,
+                    surface="discord",
+                    surface_token="room-proof",
+                    anchor_session_id="room-session",
+                )
+            )
             downgrade = await attach(client, **old)
             assert downgrade.status_code == 403
             issuer.denied = True
-            result = await client.post("/live/typed", json={
-                **old, "provider_session_id": "capture", "input_id": "denied",
-                "text": "Do not dispatch", "admission": "async",
-            })
+            result = await client.post(
+                "/live/typed",
+                json={
+                    **old,
+                    "provider_session_id": "capture",
+                    "input_id": "denied",
+                    "text": "Do not dispatch",
+                    "admission": "async",
+                },
+            )
             assert result.status_code in {403, 409}
             assert not typed.decision.calls and not typed.fleet.hosts["local"].jobs
 

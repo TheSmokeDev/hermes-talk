@@ -852,8 +852,7 @@ def test_human_report_renders_the_xai_oauth_receipt(monkeypatch, tmp_path, _no_h
 
     assert "[PASS] auth: xai-oauth is the winning auth lane" in rendered
     assert (
-        "receipt: winner=xai-oauth, xai-oauth=valid (via providers), preference=absent"
-        in rendered
+        "receipt: winner=xai-oauth, xai-oauth=valid (via providers), preference=absent" in rendered
     )
     assert XAI_ACCESS not in rendered
 

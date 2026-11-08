@@ -84,9 +84,7 @@ def _load_real_contract():
         candidate = Path(root) / "agent" / "realtime_voice_provider.py"
         if not candidate.is_file():
             continue
-        spec = importlib.util.spec_from_file_location(
-            "agent.realtime_voice_provider", candidate
-        )
+        spec = importlib.util.spec_from_file_location("agent.realtime_voice_provider", candidate)
         module = importlib.util.module_from_spec(spec)
         prior = sys.modules.get(spec.name)
         sys.modules[spec.name] = module
@@ -171,11 +169,7 @@ def _cached_plugin_modules(module_name: str) -> list[str]:
     """The plugin package and every submodule currently cached under it."""
 
     prefix = f"{module_name}."
-    return [
-        name
-        for name in list(sys.modules)
-        if name == module_name or name.startswith(prefix)
-    ]
+    return [name for name in list(sys.modules) if name == module_name or name.startswith(prefix)]
 
 
 @pytest.fixture
@@ -284,9 +278,7 @@ def drain(core_session):
 def test_redaction_strips_every_credential_shape_from_provider_text():
     # The Gemini lane carries its API key in the socket URL, so transport text
     # built from the request is credential-bearing by construction.
-    redacted = base_provider.redact(
-        "connect wss://host/live?key=AIzaSyREALSECRET&alt=proto failed"
-    )
+    redacted = base_provider.redact("connect wss://host/live?key=AIzaSyREALSECRET&alt=proto failed")
     assert "AIzaSyREALSECRET" not in redacted
     assert "key=<redacted>" in redacted
     assert "alt=proto" in redacted
@@ -338,8 +330,7 @@ def test_a_host_without_the_hook_registers_nothing_warns_nothing(plugin, caplog)
         plugin._register_core_realtime_providers(OldHostCtx())
 
     assert (
-        plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"]
-        == "unsupported-optional"
+        plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"] == "unsupported-optional"
     )
     assert plugin.talk_tools.REGISTRATION_FAILURES == []
     assert [r.levelno for r in caplog.records] == [logging.DEBUG]
@@ -370,9 +361,7 @@ def test_without_the_contract_the_module_is_importable_and_yields_no_providers()
 # -- registration ------------------------------------------------------------
 
 
-def test_all_three_lanes_register_on_a_host_that_has_the_hook(
-    core, plugin, monkeypatch
-):
+def test_all_three_lanes_register_on_a_host_that_has_the_hook(core, plugin, monkeypatch):
     monkeypatch.setattr(plugin, "talk_core_provider", core)
     registered = []
 
@@ -385,10 +374,7 @@ def test_all_three_lanes_register_on_a_host_that_has_the_hook(
 
     assert [p.name for p in registered] == list(core.PROVIDER_NAMES)
     assert all(p.api_version == 2 for p in registered)
-    assert (
-        plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"]
-        == "registered"
-    )
+    assert plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"] == "registered"
     assert plugin.talk_tools.REGISTRATION_FAILURES == []
 
 
@@ -404,9 +390,7 @@ def test_a_refused_registration_is_rejected_not_reported_as_registered(
 
     plugin._register_core_realtime_providers(RefusingCtx())
 
-    assert (
-        plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"] == "rejected"
-    )
+    assert plugin.talk_tools.REGISTRATION_RECEIPTS["core_realtime_providers"] == "rejected"
 
 
 def test_a_raising_host_is_a_redacted_failure_not_a_crash(core, plugin, monkeypatch):
@@ -439,10 +423,7 @@ def test_the_real_registry_accepts_every_lane(core):
     finally:
         if added:
             sys.path.remove(checkout_root)
-    if (
-        realtime_voice_registry.RealtimeVoiceProvider
-        is not core.contract.RealtimeVoiceProvider
-    ):
+    if realtime_voice_registry.RealtimeVoiceProvider is not core.contract.RealtimeVoiceProvider:
         pytest.skip("the importable registry belongs to a different contract build")
 
     realtime_voice_registry._reset_for_tests()
@@ -977,9 +958,7 @@ def test_an_unset_model_or_voice_falls_back_to_the_lanes_default(core):
     )
 
     async def run():
-        opened = await provider.open_session(
-            core.contract.RealtimeVoiceSetup(instructions="hi")
-        )
+        opened = await provider.open_session(core.contract.RealtimeVoiceSetup(instructions="hi"))
         await opened.close()
 
     asyncio.run(run())
@@ -1090,9 +1069,7 @@ def test_availability_reports_configured_without_resolving_a_token(core, monkeyp
     import talk_grok_auth
 
     monkeypatch.setattr(talk_auth, "auth_diagnostic", lambda: {"configured": True})
-    monkeypatch.setattr(
-        talk_grok_auth, "grok_auth_diagnostic", lambda: {"configured": True}
-    )
+    monkeypatch.setattr(talk_grok_auth, "grok_auth_diagnostic", lambda: {"configured": True})
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-value")
     monkeypatch.delenv("TALK_GEMINI_API_KEY", raising=False)
 
@@ -1101,9 +1078,7 @@ def test_availability_reports_configured_without_resolving_a_token(core, monkeyp
     assert core.TalkGeminiCoreProvider().is_available() is True
 
     monkeypatch.setattr(talk_auth, "auth_diagnostic", lambda: {"configured": False})
-    monkeypatch.setattr(
-        talk_grok_auth, "grok_auth_diagnostic", lambda: {"configured": False}
-    )
+    monkeypatch.setattr(talk_grok_auth, "grok_auth_diagnostic", lambda: {"configured": False})
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
     assert core.TalkOpenAICoreProvider().is_available() is False
@@ -1205,6 +1180,7 @@ def test_old_head_contract_keeps_core_lane_with_native_only_turn_detection():
         native = providers[0]._talk_turn_detection(None)
         assert native == rt.RealtimeTurnDetection()
         assert native.mode == rt.RealtimeTurnDetectionMode.PROVIDER_NATIVE
+
         class _UnsupportedMode:
             value = "semantic_vad"
 

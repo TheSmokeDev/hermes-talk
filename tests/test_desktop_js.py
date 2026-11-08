@@ -83,7 +83,9 @@ HermesSDK.host.skills={list:async scope=>[{name:'example',enabled:true}]};
 
 
 def test_desktop_voice_preserves_server_tools_and_uses_scoped_catalog():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 const patch=sdk.realtimeSessionPatch({instructions:'Existing rules',
@@ -100,11 +102,14 @@ assert.equal(output.toolsets[0].name,'terminal');
 assert(!JSON.stringify(output).includes('secret'));
 assert.equal(rpc.length,0);
 })();
-""")
+"""
+    )
 
 
 def test_desktop_create_uses_new_session_and_reports_admission_not_completion():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 const result=await sdk.executeLocalTool('desktop_create_session',{
@@ -120,11 +125,14 @@ assert(rpc.every(r=>r.params.profile==='profile-a'));
 assert.equal(rpc[3].params.submission_id,'talk-opening-call-1');
 assert.equal(hostState.focusedSessionId.get(),'pane-a');
 })();
-""")
+"""
+    )
 
 
 def test_desktop_tools_refuse_scope_drift_and_cancelled_calls():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK(), abort=new AbortController(); abort.abort();
 await assert.rejects(sdk.executeLocalTool('desktop_list_sessions',{},
@@ -134,11 +142,14 @@ await assert.rejects(sdk.executeLocalTool('desktop_create_session',{
  title:'No',initial_message:'No'},{callId:'call-2'}),/active profile/);
 assert.equal(rpc.length,0);
 })();
-""")
+"""
+    )
 
 
 def test_desktop_partial_creation_retains_id_without_retrying():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK(), original=gateway.request;
 gateway.request=async (method,params)=>method==='prompt.submit'
@@ -149,11 +160,14 @@ const result=await sdk.executeLocalTool('desktop_create_session',{
 assert.equal(result.ok,false); assert.equal(result.created,true);
 assert.equal(result.session_id,'new-1'); assert.equal(serial,1);
 })();
-""")
+"""
+    )
 
 
 def test_desktop_inventory_uses_only_fixed_read_commands():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 await sdk.executeLocalTool('desktop_scheduled_jobs',{command:'/cron remove all'});
@@ -163,11 +177,14 @@ assert(rpc.every(r=>r.params.session_id==='pane-a'));
 gateway.request=async()=>({type:'send',message:'Do work'});
 await assert.rejects(sdk.executeLocalTool('desktop_messaging',{}),/read-only/);
 })();
-""")
+"""
+    )
 
 
 def test_desktop_session_inventory_includes_closed_conversations():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 gateway.request=async(method,params)=>({scope:params.scope,sessions: params.scope==='live'
@@ -177,11 +194,14 @@ const result=await sdk.executeLocalTool('desktop_list_sessions',{});
 assert.equal(result.sessions.length,2);
 assert.equal(result.sessions[1].title,'Historical');
 })();
-""")
+"""
+    )
 
 
 def test_ssh_legacy_protocol_uses_advertised_shapes_without_retrying_writes():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 gateway.request=async(method,params)=>{
@@ -207,11 +227,14 @@ const submit=rpc.find(row=>row.method==='prompt.submit').params;
 assert(!('submission_id' in submit));
 assert.equal((await sdk.executeLocalTool('desktop_scheduled_jobs',{})).report,'No jobs');
 })();
-""")
+"""
+    )
 
 
 def test_project_directory_must_come_from_the_scoped_inventory():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK(), base=gateway.request;
 gateway.request=async(method,params)=>{
@@ -233,11 +256,14 @@ await sdk.executeLocalTool('desktop_create_session',args,{callId:'p2'});
 const create=rpc.find(row=>row.method==='session.create');
 assert.equal(create.params.cwd,'/srv/canary');assert.equal(create.params.cwd_explicit,true);
 })();
-""")
+"""
+    )
 
 
 def test_session_progress_and_messages_stay_on_verified_target():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK(), base=gateway.request;
 gateway.request=async(method,params)=>{
@@ -267,11 +293,14 @@ await sdk.executeLocalTool('desktop_message_session',{
 assert.equal(rpc.find(row=>row.method==='session.steer').params.execution_generation,7);
 assert.equal(hostState.focusedSessionId.get(),'pane-a');
 })();
-""")
+"""
+    )
 
 
 def test_session_identity_mismatch_refuses_message_and_failed_probe_never_creates():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK(), base=gateway.request;
 gateway.request=async(method,params)=>method==='session.resume'
@@ -284,11 +313,14 @@ await assert.rejects(sdk.executeLocalTool('desktop_create_session',{
  title:'No duplicate',initial_message:'Wait'},{callId:'no-create'}),/Disconnected/);
 assert.equal(serial,0);
 })();
-""")
+"""
+    )
 
 
 def test_old_exact_title_target_reports_inflight_progress():
-    run_node(DESKTOP_TOOLS + r"""
+    run_node(
+        DESKTOP_TOOLS
+        + r"""
 (async()=>{
 const sdk=createSDK();
 gateway.request=async(method,params)=>{
@@ -308,12 +340,17 @@ assert.equal(result.in_progress.assistant,'Running the checks now');
 assert.equal(result.todos[0].status,'in_progress');
 assert.equal(result.queued_count,1); assert.equal(result.waiting_for_approval,true);
 })();
-""")
+"""
+    )
 
 
 @pytest.mark.parametrize("method", ["session.create", "prompt.submit", "session.steer"])
 def test_lost_write_reply_reports_uncertainty_without_dispatching_again(method):
-    run_node(DESKTOP_TOOLS + "\nconst lostMethod=" + json.dumps(method) + r""";
+    run_node(
+        DESKTOP_TOOLS
+        + "\nconst lostMethod="
+        + json.dumps(method)
+        + r""";
 (async()=>{
 const sdk=createSDK(), base=gateway.request;
 let writes=0;
@@ -336,7 +373,8 @@ assert(result.note.includes('unconfirmed'));
 assert(result.note.includes('Do not automatically repeat'));
 if(lostMethod!=='session.create') assert.equal(result.session_id,'stored-a');
 })();
-""")
+"""
+    )
 
 
 def test_desktop_pins_route_token_and_late_receipt():
@@ -368,50 +406,57 @@ assert.equal(acquires,0);
 """)
 
 
-@pytest.mark.parametrize("scenario", [
-    r"""
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        r"""
 controller.capabilities={microphoneLease:1};
 assert.throws(createSDK,/incomplete Talk contract/);
 """,
-    r"""
+        r"""
 controller.owner=null; assert.throws(createSDK,/connected Hermes conversation/);
 """,
-    r"""
+        r"""
 const sdk=createSDK(); const abort=new AbortController();abort.abort();
 await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status',{
   signal:abort.signal}),{name:'AbortError'});assert.equal(calls.length,0);
 """,
-    r"""
+        r"""
 const sdk=createSDK();
 await assert.rejects(sdk.fetchJSON('/api/plugins/another-plugin/status'),/different plugin/);
 await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/session',{body:'{broken'}));
 assert.equal(calls.length,0);
 """,
-    r"""
+        r"""
 const sdk=createSDK();
 sdk.validateVoiceMode({voiceMode:'live'});sdk.validateVoiceMode({voiceMode:'native'});
 assert.throws(()=>sdk.validateVoiceMode({voiceMode:'cascade'}),/supports GPT-Live/);
 assert.throws(()=>sdk.validateVoiceMode({voiceMode:'unrecognized'}));
 assert.equal(acquires,0);assert.equal(calls.length,0);
 """,
-    r"""
+        r"""
 controller.acquire=async()=>null;
 await assert.rejects(createSDK().acquireMicrophone(),/microphone ownership/);
 """,
-    r"""
+        r"""
 controller.acquire=async()=>({release(){releases++;}});
 await assert.rejects(createSDK().acquireMicrophone(),/microphone ownership/);
 assert.equal(releases,1);
 """,
-    r"""
+        r"""
 const lease=await createSDK().acquireMicrophone();assert.equal(acquires,1);
 assert.equal(lease.signal,leaseController.signal);lease.release();assert.equal(releases,1);
 """,
-])
+    ],
+)
 def test_desktop_rejects_unavailable_or_invalid_operations(scenario):
-    run_node("\n(async()=>{\n" + scenario + r"""
+    run_node(
+        "\n(async()=>{\n"
+        + scenario
+        + r"""
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""")
+"""
+    )
 
 
 def test_desktop_registers_inside_the_composer_without_starting_audio():
@@ -429,7 +474,8 @@ assert.equal(disposers.length,1);disposers[0]();
 
 @pytest.mark.parametrize("status", [401, 403, 503])
 def test_desktop_exposes_http_status_inside_electron_errors(status):
-    run_node(r"""
+    run_node(
+        r"""
 (async()=>{
 const message = STATUS + ': {"detail":"fixture refusal"}';
 host.rest=async()=>{
@@ -443,7 +489,8 @@ await assert.rejects(createSDK().fetchJSON('/api/plugins/hermes-talk/status'),
   error=>error===unchanged);
 assert.equal(acquires,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""".replace("STATUS", str(status)))
+""".replace("STATUS", str(status))
+    )
 
 
 def test_same_owner_controller_refresh_preserves_page_and_updates_acquisition():
@@ -549,56 +596,61 @@ for (const scenario of ['other-task','other-host','resume-failed','cancel','wron
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
 
-@pytest.mark.parametrize(("message", "expected", "retry"), [
-    (
-        '400: {"error":"invalid_event","detail":"file://fixture/private?token=fixture-private-token"}',
-        "Talk could not complete this request. Try again.",
-        True,
-    ),
-    (
-        '401: {"detail":"fixture-private-token"}',
-        "Reconnect to this Hermes connection and try again.",
-        False,
-    ),
-    (
-        '403: {"detail":"fixture-private-token"}',
-        "Reconnect to this Hermes connection and try again.",
-        False,
-    ),
-    (
-        "Temporary failure retrieving item 401: fixture-private-token",
-        "Talk could not complete this request. Try again.",
-        True,
-    ),
-    (
-        '503: {"detail":"fixture-private-token"}',
-        "Talk is temporarily unavailable. Try again.",
-        True,
-    ),
-    (
-        "NotAllowedError: Permission denied; fixture-private-token",
-        "Allow microphone access for Hermes in your system settings, then try again.",
-        True,
-    ),
-    (
-        '503: {"detail":{"code":"context_unavailable","message":"fixture-private-token"}}',
-        "Error code: 503 context_unavailable",
-        True,
-    ),
-    (
-        '503: {"detail":{"code":"Not A Code fixture-private-token","message":"x"}}',
-        "Talk is temporarily unavailable. Try again.",
-        True,
-    ),
-    (
-        "GPT-Live needs a Hermes host with task context support, which this host does not "
-        "report. Use OpenAI Realtime here (TALK_VOICE_MODE=native).",
-        "GPT-Live needs a Hermes host with task context support",
-        False,
-    ),
-])
+
+@pytest.mark.parametrize(
+    ("message", "expected", "retry"),
+    [
+        (
+            '400: {"error":"invalid_event","detail":"file://fixture/private?token=fixture-private-token"}',
+            "Talk could not complete this request. Try again.",
+            True,
+        ),
+        (
+            '401: {"detail":"fixture-private-token"}',
+            "Reconnect to this Hermes connection and try again.",
+            False,
+        ),
+        (
+            '403: {"detail":"fixture-private-token"}',
+            "Reconnect to this Hermes connection and try again.",
+            False,
+        ),
+        (
+            "Temporary failure retrieving item 401: fixture-private-token",
+            "Talk could not complete this request. Try again.",
+            True,
+        ),
+        (
+            '503: {"detail":"fixture-private-token"}',
+            "Talk is temporarily unavailable. Try again.",
+            True,
+        ),
+        (
+            "NotAllowedError: Permission denied; fixture-private-token",
+            "Allow microphone access for Hermes in your system settings, then try again.",
+            True,
+        ),
+        (
+            '503: {"detail":{"code":"context_unavailable","message":"fixture-private-token"}}',
+            "Error code: 503 context_unavailable",
+            True,
+        ),
+        (
+            '503: {"detail":{"code":"Not A Code fixture-private-token","message":"x"}}',
+            "Talk is temporarily unavailable. Try again.",
+            True,
+        ),
+        (
+            "GPT-Live needs a Hermes host with task context support, which this host does not "
+            "report. Use OpenAI Realtime here (TALK_VOICE_MODE=native).",
+            "GPT-Live needs a Hermes host with task context support",
+            False,
+        ),
+    ],
+)
 def test_desktop_notice_distinguishes_request_failure_from_auth(message, expected, retry):
-    run_node(r"""
+    run_node(
+        r"""
 const message = __MESSAGE__, expected = __EXPECTED__, retry = __RETRY__;
 let starts = 0, refreshes = 0;
 const tree = context.DesktopTalkView({
@@ -627,7 +679,9 @@ for (const privateDetail of ['fixture-private-token','invalid_event','file://'])
 assert.equal(calls.length,0);assert.equal(acquires,0);
 """.replace("__MESSAGE__", json.dumps(message))
         .replace("__EXPECTED__", json.dumps(expected))
-        .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+        .replace("__RETRY__", json.dumps(retry)),
+        source="ui/desktop-view.js",
+    )
 
 
 def test_stock_lane_prepares_the_focused_conversation_before_the_catalog():
@@ -710,12 +764,16 @@ assert.equal(calls.length,1,'no request leaves for the moved connection');
 """)
 
 
-@pytest.mark.parametrize(("atom_name", "expected"), [
-    ("focusedStoredSessionId", "Send one message in this conversation first"),
-    ("focusedSessionId", "Send one message in this conversation first"),
-])
+@pytest.mark.parametrize(
+    ("atom_name", "expected"),
+    [
+        ("focusedStoredSessionId", "Send one message in this conversation first"),
+        ("focusedSessionId", "Send one message in this conversation first"),
+    ],
+)
 def test_stock_lane_asks_for_a_first_message_when_the_conversation_is_unsaved(atom_name, expected):
-    run_node(r"""
+    run_node(
+        r"""
 (async()=>{
 stockHooks();
 hostState.__ATOM__.set(null);
@@ -725,7 +783,8 @@ await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/__EXPECTED__/);
 assert.equal(requests.length,0);
 assert.equal(calls.length,0);assert.equal(acquires,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
-""".replace("__ATOM__", atom_name).replace("__EXPECTED__", expected))
+""".replace("__ATOM__", atom_name).replace("__EXPECTED__", expected)
+    )
 
 
 def test_stock_lane_reconnects_after_stop_without_changing_conversation():
@@ -815,48 +874,52 @@ cleanup();
 """)
 
 
-@pytest.mark.parametrize(("message", "lane", "expected", "retry"), [
-    (
-        '404: {"detail":"target_missing"}',
-        "stock",
-        "Send one message in this conversation first, then Connect.",
-        True,
-    ),
-    (
-        '404: {"detail":"target_missing"}',
-        None,
-        "Send one message in this conversation first, then Connect.",
-        True,
-    ),
-    (
-        '404: {"detail":"unknown_route"}',
-        "stock",
-        "Talk could not complete this request. Try again.",
-        True,
-    ),
-    (
-        '401: {"detail":"fixture-private-token"}',
-        "stock",
-        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
-        False,
-    ),
-    (
-        '403: {"detail":"fixture-private-token"}',
-        "stock",
-        "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
-        False,
-    ),
-    (
-        '401: {"detail":"fixture-private-token"}',
-        None,
-        "Reconnect to this Hermes connection and try again.",
-        False,
-    ),
-])
+@pytest.mark.parametrize(
+    ("message", "lane", "expected", "retry"),
+    [
+        (
+            '404: {"detail":"target_missing"}',
+            "stock",
+            "Send one message in this conversation first, then Connect.",
+            True,
+        ),
+        (
+            '404: {"detail":"target_missing"}',
+            None,
+            "Send one message in this conversation first, then Connect.",
+            True,
+        ),
+        (
+            '404: {"detail":"unknown_route"}',
+            "stock",
+            "Talk could not complete this request. Try again.",
+            True,
+        ),
+        (
+            '401: {"detail":"fixture-private-token"}',
+            "stock",
+            "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+            False,
+        ),
+        (
+            '403: {"detail":"fixture-private-token"}',
+            "stock",
+            "This Hermes Desktop cannot send TALK_DASHBOARD_TOKEN.",
+            False,
+        ),
+        (
+            '401: {"detail":"fixture-private-token"}',
+            None,
+            "Reconnect to this Hermes connection and try again.",
+            False,
+        ),
+    ],
+)
 def test_stock_lane_notice_explains_the_first_message_and_token_rules(
     message, lane, expected, retry
 ):
-    run_node(r"""
+    run_node(
+        r"""
 const message = __MESSAGE__, expected = __EXPECTED__, retry = __RETRY__;
 let starts = 0, refreshes = 0;
 const tree = context.DesktopTalkView({
@@ -885,7 +948,9 @@ assert.equal(calls.length,0);assert.equal(acquires,0);
 """.replace("__MESSAGE__", json.dumps(message))
         .replace("__EXPECTED__", json.dumps(expected))
         .replace("__LANE__", json.dumps(lane))
-        .replace("__RETRY__", json.dumps(retry)), source="ui/desktop-view.js")
+        .replace("__RETRY__", json.dumps(retry)),
+        source="ui/desktop-view.js",
+    )
 
 
 def test_stock_lane_token_refusal_keeps_the_stock_lifetime():
@@ -998,7 +1063,8 @@ assert(!warnings.join(' ').includes('fixture-private-token'),
 
 
 def test_recipients_explain_a_host_without_task_context_instead_of_failing():
-    run_node(r"""
+    run_node(
+        r"""
 let refreshes = 0;
 const view = (supported, recipientError) => context.DesktopTalkView({
   status:{configured:true,source:'subscription',taskContinuity:{supported}},ready:true,
@@ -1024,4 +1090,6 @@ const bound = view(true, refused);
 assert(!text(bound).includes('Other recipients need task context support'));
 assert(text(bound).includes('The recipient could not be loaded. Refresh the list and try ' +
   'again. Error code: 503 context_unavailable'));
-""", source="ui/desktop-view.js")
+""",
+        source="ui/desktop-view.js",
+    )

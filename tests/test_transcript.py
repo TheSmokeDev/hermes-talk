@@ -247,9 +247,7 @@ def test_sweep_drops_a_symlink_that_escapes_the_transcript_directory(tmp_path):
     assert not link.exists()
 
 
-def test_path_swap_between_validation_and_claim_never_reads_outside_root(
-    tmp_path, monkeypatch
-):
+def test_path_swap_between_validation_and_claim_never_reads_outside_root(tmp_path, monkeypatch):
     capture = talk_transcript.TranscriptCapture(tmp_path)
     capture.append_turn("user", _long_turn("safe user"))
     capture.append_turn("assistant", _long_turn("safe assistant"))
@@ -259,9 +257,7 @@ def test_path_swap_between_validation_and_claim_never_reads_outside_root(
         "\n".join(
             [
                 json.dumps({"role": "user", "text": _long_turn("OUTSIDE SECRET user")}),
-                json.dumps(
-                    {"role": "assistant", "text": _long_turn("OUTSIDE SECRET assistant")}
-                ),
+                json.dumps({"role": "assistant", "text": _long_turn("OUTSIDE SECRET assistant")}),
             ]
         )
         + "\n",
@@ -481,9 +477,7 @@ def test_force_killed_sweeper_claim_is_recovered_by_next_process(tmp_path):
     assert len(prompts) == 1
 
 
-def test_failed_claimed_flush_is_logged_kept_and_does_not_block_next_file(
-    tmp_path, caplog
-):
+def test_failed_claimed_flush_is_logged_kept_and_does_not_block_next_file(tmp_path, caplog):
     for seed in ("first", "second"):
         capture = talk_transcript.TranscriptCapture(tmp_path)
         capture.append_turn("user", _long_turn(seed + " user"))
@@ -576,9 +570,7 @@ def test_dead_claim_is_recovered_when_pid_now_belongs_to_unrelated_live_process(
             "\n".join(
                 [
                     json.dumps({"role": "user", "text": _long_turn("reused pid user")}),
-                    json.dumps(
-                        {"role": "assistant", "text": _long_turn("reused pid assistant")}
-                    ),
+                    json.dumps({"role": "assistant", "text": _long_turn("reused pid assistant")}),
                 ]
             )
             + "\n",
@@ -672,15 +664,11 @@ def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, 
     # The claim's rename makes the ORIGINAL path vanish at claim time, so
     # watching it proves nothing; the claimed copy's deletion is the handoff
     # thread's last step — poll the directory clean instead of racing it.
-    assert _wait_for(
-        lambda: not list(root.glob("*.jsonl")) and not list(root.glob("*.claimed-*"))
-    )
+    assert _wait_for(lambda: not list(root.glob("*.jsonl")) and not list(root.glob("*.claimed-*")))
     assert talk_transcript.handoff_status()["state"] == "handoff pending"
 
 
-def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
-    tmp_path, monkeypatch, flush_lanes
-):
+def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(tmp_path, monkeypatch, flush_lanes):
     """No host, no api server, no hermes on PATH: the transcript is RESTORED
     under its original name for the next sweep, never dropped."""
 
@@ -691,15 +679,11 @@ def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
     talk_transcript.reset_status_for_tests()
     talk_transcript.sweep_transcripts(tmp_path)
 
-    assert _wait_for(
-        lambda: talk_transcript.handoff_status()["state"] == "handoff deferred"
-    )
+    assert _wait_for(lambda: talk_transcript.handoff_status()["state"] == "handoff deferred")
     root = tmp_path / "state" / "talk-transcripts"
     # The status flips before the claim's finally restores the file — wait for
     # the restore itself, not the bookkeeping, before asserting or re-sweeping.
-    assert _wait_for(
-        lambda: capture.path.exists() and not list(root.glob("*.lease"))
-    )
+    assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
     assert not list(root.glob("*.claimed-*"))
 
     reviewed = []
@@ -740,9 +724,7 @@ def test_the_attached_host_tier_still_carries_the_flush(tmp_path, monkeypatch, f
 
     assert _wait_for(lambda: bool(calls))
     assert calls and calls[0][0] == "delegate_task"
-    assert _wait_for(
-        lambda: "child_session_id" in talk_transcript.handoff_status()
-    )
+    assert _wait_for(lambda: "child_session_id" in talk_transcript.handoff_status())
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
@@ -767,9 +749,7 @@ def test_a_host_refusal_keeps_the_transcript_for_the_next_sweep(tmp_path, flush_
     talk_transcript.reset_status_for_tests()
     talk_transcript.sweep_transcripts(tmp_path)
 
-    assert _wait_for(
-        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
-    )
+    assert _wait_for(lambda: talk_transcript.handoff_status()["state"] == "handoff failed")
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
     assert not list(root.glob("*.claimed-*"))
@@ -811,9 +791,7 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
 
-def test_an_api_server_flush_failure_keeps_the_transcript(
-    tmp_path, monkeypatch, flush_lanes
-):
+def test_an_api_server_flush_failure_keeps_the_transcript(tmp_path, monkeypatch, flush_lanes):
     """WORK_STARTED-then-dead was the drop class: the api-server tier now
     completes synchronously, and a failed run keeps the only copy for the
     next sweep."""
@@ -831,17 +809,13 @@ def test_an_api_server_flush_failure_keeps_the_transcript(
     talk_transcript.reset_status_for_tests()
     talk_transcript.sweep_transcripts(tmp_path)
 
-    assert _wait_for(
-        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
-    )
+    assert _wait_for(lambda: talk_transcript.handoff_status()["state"] == "handoff failed")
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
     assert not list(root.glob("*.claimed-*"))
 
 
-def test_a_detached_nonzero_exit_keeps_the_transcript(
-    tmp_path, monkeypatch, flush_lanes
-):
+def test_a_detached_nonzero_exit_keeps_the_transcript(tmp_path, monkeypatch, flush_lanes):
     """The detached one-shot's exit status is part of the proof: a nonzero
     exit is a failed review, and the transcript is restored, not deleted."""
 
@@ -867,12 +841,9 @@ def test_a_detached_nonzero_exit_keeps_the_transcript(
     talk_transcript.reset_status_for_tests()
     talk_transcript.sweep_transcripts(tmp_path)
 
-    assert _wait_for(
-        lambda: talk_transcript.handoff_status()["state"] == "handoff failed"
-    )
+    assert _wait_for(lambda: talk_transcript.handoff_status()["state"] == "handoff failed")
     root = tmp_path / "state" / "talk-transcripts"
     assert _wait_for(lambda: capture.path.exists() and not list(root.glob("*.lease")))
-
 
 
 def test_recovered_claim_replaces_marker_and_preserves_process_owned_lease(tmp_path, monkeypatch):

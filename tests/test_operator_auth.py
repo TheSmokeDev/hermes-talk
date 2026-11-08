@@ -21,9 +21,7 @@ OTHER_ID = 123456789012345678
 def _speak(ledger, text, *, response_id=None, final=True):
     """Feed one spoken turn (operator or assistant) into the ledger window."""
 
-    ledger.note_transcript(
-        {"text": text, "final": final, "response_id": response_id}
-    )
+    ledger.note_transcript({"text": text, "final": final, "response_id": response_id})
 
 
 def _speaker(user_id: int | None) -> dict:
@@ -221,18 +219,14 @@ def test_missing_response_id_cannot_borrow_the_latest_speaker(monkeypatch):
 
     assert "not run" in ledger.authorize_tool("stop_work", event)
     assert event[talk_operator_auth.TRUSTED_BINDING_EVENT_KEY] is None
-    assert event[talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY] == {
-        "type": "response.create"
-    }
+    assert event[talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY] == {"type": "response.create"}
 
 
 def test_response_metadata_token_is_required_not_just_response_order(monkeypatch):
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger, response_id="resp_good")
-    ledger.note_response_created(
-        {"response": {"id": "resp_unbound", "metadata": {}}}
-    )
+    ledger.note_response_created({"response": {"id": "resp_unbound", "metadata": {}}})
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     good = ledger.bind_tool_event(
@@ -271,9 +265,7 @@ def test_copied_response_token_cannot_bind_a_forged_response_id(monkeypatch):
     )
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    forged = ledger.bind_tool_event(
-        {"response_id": "resp_forged", "call_id": "call_forged"}
-    )
+    forged = ledger.bind_tool_event({"response_id": "resp_forged", "call_id": "call_forged"})
 
     assert "not run" in ledger.authorize_tool("redirect_agent", forged)
 
@@ -282,9 +274,7 @@ def test_reused_response_id_taints_delayed_authority_instead_of_rebinding(monkey
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger, response_id="resp_recycled")
-    delayed = ledger.bind_tool_event(
-        {"response_id": "resp_recycled", "call_id": "call_delayed"}
-    )
+    delayed = ledger.bind_tool_event({"response_id": "resp_recycled", "call_id": "call_delayed"})
 
     ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
     ledger.note_speech_started({"item_id": "item_2", "audio_start_ms": 20})
@@ -305,9 +295,7 @@ def test_reused_response_id_taints_delayed_authority_instead_of_rebinding(monkey
     )
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
-    recycled = ledger.bind_tool_event(
-        {"response_id": "resp_recycled", "call_id": "call_recycled"}
-    )
+    recycled = ledger.bind_tool_event({"response_id": "resp_recycled", "call_id": "call_recycled"})
 
     assert "not run" in ledger.authorize_tool("delegate_task", delayed)
     assert "not run" in ledger.authorize_tool("delegate_task", recycled)
@@ -435,9 +423,7 @@ def test_recycled_parent_response_revokes_unconsumed_continuation_chain(monkeypa
     _bind_response(ledger)
     parent = ledger.bind_tool_event({"response_id": "resp_1", "call_id": "call_parent"})
     continuation = parent[talk_operator_auth.TRUSTED_CONTINUATION_EVENT_KEY]
-    ledger.note_response_created(
-        {"response": {"id": "resp_1", "metadata": {}}}
-    )
+    ledger.note_response_created({"response": {"id": "resp_1", "metadata": {}}})
     ledger.note_response_created(
         {"response": {"id": "resp_2", "metadata": continuation["response"]["metadata"]}}
     )
@@ -483,9 +469,7 @@ def test_queue_rejection_consumes_bound_mutating_call_permit(monkeypatch):
         talk_relay.ToolExecutionTimeout(started=True),
     ],
 )
-def test_daemon_rejection_or_timeout_consumes_bound_permit(
-    monkeypatch, terminal_error
-):
+def test_daemon_rejection_or_timeout_consumes_bound_permit(monkeypatch, terminal_error):
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger)
@@ -595,9 +579,7 @@ def test_response_identity_capacity_exhaustion_poison_denies_all_mutation(monkey
     delayed = None
     for index in range(3):
         item_id = f"item_{index}"
-        ledger.note_speech_started(
-            {"item_id": item_id, "audio_start_ms": index * 20}
-        )
+        ledger.note_speech_started({"item_id": item_id, "audio_start_ms": index * 20})
         ledger.note_speech_stopped(
             {
                 "item_id": item_id,
@@ -735,9 +717,7 @@ def test_completion_and_teardown_clear_bounded_response_state():
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger(max_responses=2)
     for index in range(3):
         ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
-        ledger.note_speech_started(
-            {"item_id": f"item_{index}", "audio_start_ms": index * 20}
-        )
+        ledger.note_speech_started({"item_id": f"item_{index}", "audio_start_ms": index * 20})
         ledger.note_speech_stopped(
             {
                 "item_id": f"item_{index}",
@@ -1262,9 +1242,7 @@ def test_free_text_arguments_are_outside_the_cross_check_by_design(monkeypatch):
 
 
 def _commit_without_response(ledger, item_id, *, start_ms, end_ms):
-    ledger.note_speech_started(
-        {"item_id": item_id, "audio_start_ms": start_ms}
-    )
+    ledger.note_speech_started({"item_id": item_id, "audio_start_ms": start_ms})
     ledger.note_speech_stopped({"item_id": item_id, "audio_end_ms": end_ms})
     return ledger.response_for_commit({"item_id": item_id})
 
@@ -1282,9 +1260,7 @@ def _delegate(ledger, response_id, call_id):
 
 def test_a_provider_that_never_echoes_metadata_binds_by_order(monkeypatch):
     # xAI Grok's response.created carries no metadata at all (#178).
-    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
-        echoes_response_metadata=False
-    )
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(echoes_response_metadata=False)
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     assert _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
     ledger.note_response_created({"response": {"id": "resp_1"}})
@@ -1295,9 +1271,7 @@ def test_a_provider_that_never_echoes_metadata_binds_by_order(monkeypatch):
 
 
 def test_the_same_provider_still_denies_a_non_operator(monkeypatch):
-    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
-        echoes_response_metadata=False
-    )
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(echoes_response_metadata=False)
     ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
     _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
     ledger.note_response_created({"response": {"id": "resp_1"}})
@@ -1308,9 +1282,7 @@ def test_the_same_provider_still_denies_a_non_operator(monkeypatch):
 
 
 def test_order_binding_refuses_when_two_bindings_are_outstanding(monkeypatch):
-    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
-        echoes_response_metadata=False
-    )
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(echoes_response_metadata=False)
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(40))
     _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
     _commit_without_response(ledger, "item_2", start_ms=20, end_ms=40)
@@ -1322,9 +1294,7 @@ def test_order_binding_refuses_when_two_bindings_are_outstanding(monkeypatch):
 
 
 def test_order_binding_never_accepts_a_forged_token(monkeypatch):
-    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(
-        echoes_response_metadata=False
-    )
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(echoes_response_metadata=False)
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _commit_without_response(ledger, "item_1", start_ms=0, end_ms=20)
     ledger.note_response_created(

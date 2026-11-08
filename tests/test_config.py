@@ -141,9 +141,7 @@ def test_discord_operator_ids_are_immutable_numeric_ids(monkeypatch):
         "9" * 5_000,
     ],
 )
-def test_blank_or_malformed_discord_operator_config_authorizes_nobody(
-    monkeypatch, raw
-):
+def test_blank_or_malformed_discord_operator_config_authorizes_nobody(monkeypatch, raw):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", raw)
 
     assert talk_config.discord_operator_user_ids() == frozenset()
@@ -199,8 +197,7 @@ def test_identity_char_limit_reads_the_memory_block(monkeypatch, tmp_path):
     _home_with_config(
         monkeypatch,
         tmp_path,
-        "model:\n  default: gpt-5.5\nmemory:\n  memory_char_limit: 2200\n"
-        "  user_char_limit: 1375\n",
+        "model:\n  default: gpt-5.5\nmemory:\n  memory_char_limit: 2200\n  user_char_limit: 1375\n",
     )
 
     assert talk_config.identity_char_limit("memory_char_limit") == 2200
@@ -216,9 +213,7 @@ def test_identity_char_limit_is_zero_when_unset(monkeypatch, tmp_path):
     assert talk_config.identity_char_limit("user_char_limit") == 0
 
 
-def test_identity_char_limit_ignores_the_key_outside_the_memory_block(
-    monkeypatch, tmp_path
-):
+def test_identity_char_limit_ignores_the_key_outside_the_memory_block(monkeypatch, tmp_path):
     """Same discipline as the model scan: a matching key nested under some
     OTHER top-level section is not this key."""
 
@@ -280,30 +275,35 @@ def test_memory_search_timeout_defaults_and_overrides(monkeypatch):
     assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
     monkeypatch.setenv("TALK_MEMORY_SEARCH_TIMEOUT_S", "0")
     assert talk_config.memory_search_timeout_s() == talk_config.DEFAULT_MEMORY_SEARCH_TIMEOUT_S
+
+
 def test_catalog_startup_wait_honors_zero_and_rejects_junk(monkeypatch):
     monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "0")
     assert talk_config.catalog_startup_wait_s() == 0.0
     monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "-3")
-    assert (
-        talk_config.catalog_startup_wait_s()
-        == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
-    )
+    assert talk_config.catalog_startup_wait_s() == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
     monkeypatch.setenv("TALK_CATALOG_STARTUP_WAIT_S", "junk")
-    assert (
-        talk_config.catalog_startup_wait_s()
-        == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
-    )
+    assert talk_config.catalog_startup_wait_s() == talk_config.DEFAULT_CATALOG_STARTUP_WAIT_S
     monkeypatch.delenv("TALK_CATALOG_STARTUP_WAIT_S")
     assert talk_config.catalog_startup_wait_s() == 2.5
 
 
-@pytest.mark.parametrize("provider,mode,accepted", [
-    ("openai", "provider_native", True), ("openai", "server_vad", True),
-    ("openai", "semantic_vad", True), ("grok", "provider_native", True),
-    ("grok", "server_vad", True), ("grok", "semantic_vad", False),
-    ("gemini", "provider_native", True), ("gemini", "server_vad", False),
-    ("gemini", "semantic_vad", False), ("openai", "", False), ("openai", "vad", False),
-])
+@pytest.mark.parametrize(
+    "provider,mode,accepted",
+    [
+        ("openai", "provider_native", True),
+        ("openai", "server_vad", True),
+        ("openai", "semantic_vad", True),
+        ("grok", "provider_native", True),
+        ("grok", "server_vad", True),
+        ("grok", "semantic_vad", False),
+        ("gemini", "provider_native", True),
+        ("gemini", "server_vad", False),
+        ("gemini", "semantic_vad", False),
+        ("openai", "", False),
+        ("openai", "vad", False),
+    ],
+)
 def test_turn_detection_config_matrix(monkeypatch, provider, mode, accepted):
     monkeypatch.setenv("TALK_TURN_DETECTION", mode)
     monkeypatch.delenv("TALK_SEMANTIC_EAGERNESS", raising=False)

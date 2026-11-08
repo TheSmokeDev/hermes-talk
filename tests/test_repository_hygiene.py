@@ -9,12 +9,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def test_local_review_and_tdd_artifacts_are_gitignored():
     lines = {
-        line.strip()
-        for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        line.strip() for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     }
 
     assert ".hermes-*-review.md" in lines
     assert ".hermes-*-tdd.md" in lines
+
+
 def test_every_version_surface_matches_pyproject():
     """The release flow bumps pyproject.toml; plugin.yaml (what `hermes
     plugins list` shows) and dashboard/manifest.json drifted at 0.8.0 for

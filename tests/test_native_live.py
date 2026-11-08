@@ -316,7 +316,9 @@ def test_live_speech_records_context_but_never_claims_correlated_playback():
         ]
         receipts = [body for path, body in h.requests if path == "receipt"]
         assert [body["state"] for body in receipts] == [
-            "submitting", "context_submitted", "unknown"
+            "submitting",
+            "context_submitted",
+            "unknown",
         ]
         assert all(body["attempt_id"] == "attempt-one" for body in receipts)
         request = next(body for path, body in h.requests if path == "speech")
@@ -342,10 +344,15 @@ def test_live_speech_records_context_but_never_claims_correlated_playback():
 
 def test_live_summary_failed_handoff_is_unknown_and_explicit_replay_only_appends_context():
     async def scenario():
-        h = await connected(speech={
-            "ok": True, "speak": True, "event_id": "event-one", "attempt_id": "attempt-one",
-            "content": "The saved result.",
-        })
+        h = await connected(
+            speech={
+                "ok": True,
+                "speak": True,
+                "event_id": "event-one",
+                "attempt_id": "attempt-one",
+                "content": "The saved result.",
+            }
+        )
         original = h.session.send
 
         async def fail(commands):
@@ -356,7 +363,8 @@ def test_live_summary_failed_handoff_is_unknown_and_explicit_replay_only_appends
         with pytest.raises(OSError, match="handoff"):
             await h.controller._speak({"event_id": "event-one"})
         assert [body["state"] for path, body in h.requests if path == "receipt"] == [
-            "submitting", "unknown"
+            "submitting",
+            "unknown",
         ]
         h.session.send = original
         await h.controller.command("/replay event-one")
@@ -366,9 +374,7 @@ def test_live_summary_failed_handoff_is_unknown_and_explicit_replay_only_appends
         await h.controller.handle(rt.OutputTurnCompleted())
         await h.controller.tick()
         assert {path for path, _ in h.requests} == {"speech", "receipt"}
-        assert not any(
-            body.get("state") == "playback_finished" for _, body in h.requests
-        )
+        assert not any(body.get("state") == "playback_finished" for _, body in h.requests)
         await close(h)
 
     asyncio.run(scenario())

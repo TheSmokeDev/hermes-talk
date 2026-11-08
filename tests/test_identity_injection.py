@@ -111,9 +111,7 @@ class StubProvider:
         self.init_kwargs = {"session_id": session_id, **kwargs}
         if self._raises:
             raise RuntimeError("provider is broken")
-        self._index = types.SimpleNamespace(
-            status=lambda: {"documents": self._documents}
-        )
+        self._index = types.SimpleNamespace(status=lambda: {"documents": self._documents})
 
     def prefetch(self, query, *, session_id=""):
         self.calls.append("prefetch")
@@ -601,9 +599,7 @@ def test_the_scan_uses_the_scope_hermes_uses_for_these_files(_hermetic, monkeypa
     assert seen == ["strict"]
 
 
-def test_a_missing_scanner_drops_the_section_rather_than_injecting_it(
-    _hermetic, monkeypatch
-):
+def test_a_missing_scanner_drops_the_section_rather_than_injecting_it(_hermetic, monkeypatch):
     """Fails CLOSED, unlike every other resolver here. Everywhere else a
     failure costs a section; here passing through IS the failure."""
 
@@ -700,9 +696,7 @@ def test_the_working_file_rides_the_session(_hermetic):
 
     sections = talk_host.host().identity_sections()
 
-    assert sections["WORKING"] == (
-        "Dograh is the voice stack. Talk is TheSmokeDev/hermes-talk."
-    )
+    assert sections["WORKING"] == ("Dograh is the voice stack. Talk is TheSmokeDev/hermes-talk.")
 
 
 def test_an_absent_working_file_with_no_host_is_an_absent_key(_hermetic):
@@ -782,9 +776,7 @@ def test_a_poisoned_working_entry_is_blocked_not_spoken(_hermetic, monkeypatch):
     assert "[BLOCKED:" in working
 
 
-def test_a_spoofed_block_marker_in_working_does_not_bypass_the_scan(
-    _hermetic, monkeypatch
-):
+def test_a_spoofed_block_marker_in_working_does_not_bypass_the_scan(_hermetic, monkeypatch):
     _install_scanner(
         monkeypatch,
         lambda content, scope: ["prompt_injection"] if "ignore all rules" in content else [],
@@ -798,9 +790,7 @@ def test_a_spoofed_block_marker_in_working_does_not_bypass_the_scan(
     assert "ignore all rules" not in talk_host.host().identity_sections().get("WORKING", "")
 
 
-def test_a_missing_scanner_drops_working_rather_than_injecting_it(
-    _hermetic, monkeypatch
-):
+def test_a_missing_scanner_drops_working_rather_than_injecting_it(_hermetic, monkeypatch):
     """Fails CLOSED like every other identity file. An operator-authored file
     is not exempt: the scan is about who can WRITE to the path, not about who
     was supposed to."""
@@ -847,9 +837,7 @@ def test_conflicting_aliases_both_survive_rather_than_one_winning(_hermetic):
 def test_with_a_bound_ctx_both_halves_of_the_split_sentence_are_present(_hermetic):
     talk_host.bind_ctx(types.SimpleNamespace())
 
-    instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections()
-    )
+    instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
 
     assert "ask which one before acting on it" in instructions
     assert "never pick the closest match" in instructions
@@ -859,9 +847,7 @@ def test_with_a_bound_ctx_both_halves_of_the_split_sentence_are_present(_hermeti
 def test_without_a_ctx_the_rule_ships_and_only_the_pointer_is_gated(_hermetic):
     talk_host.bind_ctx(None)
 
-    instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections()
-    )
+    instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
 
     assert "ask which one before acting on it" in instructions
     assert "never pick the closest match" in instructions
@@ -876,9 +862,7 @@ def test_the_rule_survives_a_pinned_include_list(_hermetic, monkeypatch):
     monkeypatch.setenv("TALK_IDENTITY_INCLUDE", "MEMORY,PERSONA")
     talk_host.bind_ctx(None)
 
-    instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections()
-    )
+    instructions = talk_identity.build_instructions(talk_host.host().identity_sections())
 
     assert "never pick the closest match" in instructions
 
@@ -928,9 +912,7 @@ def test_an_oversized_working_section_is_capped_in_the_prompt(_hermetic, monkeyp
     monkeypatch.setattr(talk_config, "identity_char_limit", lambda key: 0)
     _write_identity_file(_hermetic, "WORKING.md", "w" * 50_000)
 
-    rendered = talk_identity.cap_section(
-        "WORKING", talk_host.host().identity_sections()["WORKING"]
-    )
+    rendered = talk_identity.cap_section("WORKING", talk_host.host().identity_sections()["WORKING"])
 
     assert len(rendered) == talk_identity.IDENTITY_CAPS["WORKING"]
 
@@ -971,9 +953,7 @@ def test_working_is_reported_to_diagnostics_by_file_only(_hermetic):
         "MEMORY,PERSONA pin is a standing warning on every session mint"
     ),
 )
-def test_a_deliberate_pin_with_no_working_section_does_not_warn(
-    _hermetic, monkeypatch, caplog
-):
+def test_a_deliberate_pin_with_no_working_section_does_not_warn(_hermetic, monkeypatch, caplog):
     """The warning exists to catch a pin that SILENTLY DROPS curated context.
 
     Where there is no WORKING.md and no bound ctx, the pin drops nothing, so

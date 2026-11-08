@@ -49,9 +49,7 @@ class _Message:
 
 
 class _Socket:
-    def __init__(
-        self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None
-    ):
+    def __init__(self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None):
         self.events = iter(events)
         self.sent: list[dict] = []
         self.fail_send_at = fail_send_at
@@ -885,6 +883,7 @@ def test_connect_turns_an_oauth_401_into_the_relogin_remediation():
     assert str(info.value) == "xAI OAuth token rejected — run `hermes auth add xai-oauth`"
     assert "oauth-canary" not in str(info.value)
     assert adapter.state is rt.SessionState.FAILED
+
 
 @pytest.mark.parametrize("automatic_response", [True, False])
 def test_native_task_mode_requires_explicit_responses_before_connect(automatic_response):

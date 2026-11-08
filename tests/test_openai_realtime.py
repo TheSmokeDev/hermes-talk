@@ -20,9 +20,7 @@ class _Message:
 
 
 class _Socket:
-    def __init__(
-        self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None
-    ):
+    def __init__(self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None):
         self.events = iter(events)
         self.sent: list[dict] = []
         self.fail_send_at = fail_send_at
@@ -169,9 +167,7 @@ def test_core_response_builder_is_exact_and_does_not_change_legacy_encoding():
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Exact words, exactly."}
-                    ],
+                    "content": [{"type": "input_text", "text": "Exact words, exactly."}],
                 }
             ],
             "instructions": (
@@ -190,9 +186,7 @@ def test_core_response_builder_is_exact_and_does_not_change_legacy_encoding():
             "tool_choice": "none",
         },
     }
-    assert openai_rt.encode_command(
-        rt.StartResponse(metadata={"speaker": "opaque"})
-    ) == {
+    assert openai_rt.encode_command(rt.StartResponse(metadata={"speaker": "opaque"})) == {
         "type": "response.create",
         "response": {"metadata": {"speaker": "opaque"}},
     }
@@ -481,9 +475,7 @@ def test_malformed_wire_identifiers_become_neutral_failures():
 
 def test_websocket_error_frame_fails_adapter_instead_of_reporting_clean_eof():
     async def scenario():
-        adapter, _client = _adapter(
-            _Socket([_Message("receive exploded", message_type="error")])
-        )
+        adapter, _client = _adapter(_Socket([_Message("receive exploded", message_type="error")]))
         await adapter.connect(_setup())
         events = [event async for event in adapter]
         state_before_close = adapter.state
@@ -769,6 +761,7 @@ def test_output_events_without_a_response_id_decode_to_none():
     assert audio.response_id is None
     assert delta.response_id is None
     assert done.response_id is None
+
 
 @pytest.mark.parametrize("automatic_response", [True, False])
 def test_native_task_mode_requires_explicit_responses_before_connect(automatic_response):

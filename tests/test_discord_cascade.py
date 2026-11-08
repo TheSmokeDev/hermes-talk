@@ -118,9 +118,7 @@ class _FakeTtsWs:
     # -- test scripting -------------------------------------------------------
 
     def feed(self, frame: dict) -> None:
-        message = types.SimpleNamespace(
-            type=aiohttp.WSMsgType.TEXT, data=json.dumps(frame)
-        )
+        message = types.SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(frame))
         self.incoming.put_nowait(message)
 
     def feed_audio(self, pcm: bytes) -> None:
@@ -291,9 +289,7 @@ def test_barge_in_aborts_the_tts_stream_and_drains_the_channel(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_cascade_on_discord_refuses_a_non_openai_provider_before_the_channel(
-    monkeypatch, capsys
-):
+def test_cascade_on_discord_refuses_a_non_openai_provider_before_the_channel(monkeypatch, capsys):
     async def scenario():
         connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
         original = list(connection.callbacks)

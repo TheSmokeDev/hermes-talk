@@ -103,6 +103,7 @@ def _rest_spy(monkeypatch) -> list[str]:
         "health_detailed": lambda: dict(FAKE_HEALTH),
     }
     for name, payload in payloads.items():
+
         def spy(_name=name, _payload=payload):
             reads.append(_name)
             return _payload()
@@ -182,9 +183,7 @@ def _install_fake_host(
         monkeypatch.setitem(sys.modules, name, module)
 
 
-def test_the_in_process_registries_are_preferred_over_the_api_server(
-    monkeypatch, rest_lane_on
-):
+def test_the_in_process_registries_are_preferred_over_the_api_server(monkeypatch, rest_lane_on):
     reads = _rest_spy(monkeypatch)
     _install_fake_host(monkeypatch)
 
@@ -421,9 +420,7 @@ def test_non_dict_catalog_entries_are_dropped(monkeypatch, rest_lane_on):
     monkeypatch.setattr(
         talk_host.HostAdapter,
         "capability_catalog_probe",
-        lambda _self: json.dumps(
-            {"skills": ["bare-string", {"name": "real"}], "toolsets": "junk"}
-        ),
+        lambda _self: json.dumps({"skills": ["bare-string", {"name": "real"}], "toolsets": "junk"}),
     )
 
     snapshot = talk_capabilities.warm()
@@ -482,9 +479,7 @@ def test_an_expired_snapshot_is_served_while_it_refreshes(monkeypatch, rest_lane
     monkeypatch.setattr(talk_config, "capability_catalog_ttl_s", lambda: 0.0)
 
     reads: list[int] = []
-    monkeypatch.setattr(
-        talk_apiserver, "list_skills", lambda: reads.append(1) or list(FAKE_SKILLS)
-    )
+    monkeypatch.setattr(talk_apiserver, "list_skills", lambda: reads.append(1) or list(FAKE_SKILLS))
 
     # The STALE snapshot comes back now; the refresh happens behind it.
     assert talk_capabilities.status().source == talk_capabilities.SOURCE_API_SERVER
@@ -549,9 +544,7 @@ def test_a_stale_refresh_finishing_late_does_not_clobber_a_newer_snapshot(monkey
     assert talk_capabilities.warm() is healthy
 
     workers = [
-        thread
-        for thread in threading.enumerate()
-        if thread.name == "talk-capabilities-resolve"
+        thread for thread in threading.enumerate() if thread.name == "talk-capabilities-resolve"
     ]
     release.set()
     for thread in workers:
@@ -599,9 +592,7 @@ def test_section_is_absent_when_the_catalog_is_unreachable():
     """Fail-open: an unreadable catalog buys the plain preamble, exactly what
     sessions shipped before the section existed."""
 
-    snapshot = _section_snapshot(
-        source=talk_capabilities.SOURCE_NONE, detail="still checking"
-    )
+    snapshot = _section_snapshot(source=talk_capabilities.SOURCE_NONE, detail="still checking")
     assert talk_capabilities.instruction_section(snapshot) is None
 
 
@@ -811,6 +802,8 @@ def test_section_defaults_to_the_cached_snapshot(monkeypatch, rest_lane_on):
 
     assert section is not None
     assert "browser" in section
+
+
 def test_section_with_a_successful_zero_tool_read_claims_no_categories():
     """F7: a live read that resolved ZERO tools is a real answer — static
     enabled/configured flags must not resurrect categories the registry's
@@ -846,6 +839,8 @@ def test_in_process_snapshot_carries_the_tools_resolved_flag(monkeypatch, rest_l
     talk_capabilities.reset_for_tests()
     snap = talk_capabilities.warm()
     assert snap.tools_resolved is False
+
+
 def test_wait_until_warm_gives_a_cold_start_the_section_deterministically(monkeypatch):
     """F8: the session-start mint used to race the background warm — a cold
     process lost and permanently omitted the live-catalog section. A bounded

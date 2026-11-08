@@ -307,11 +307,13 @@ def test_audio_facts_read_the_device_table_without_opening_a_device(monkeypatch)
         device = (1, 0)
 
     fake = types.SimpleNamespace(
-        query_devices=lambda: calls.append("query")
-        or [
-            {"name": "Speakers (Realtek)", "max_input_channels": 0, "max_output_channels": 2},
-            {"name": "Microphone Array", "max_input_channels": 2, "max_output_channels": 0},
-        ],
+        query_devices=lambda: (
+            calls.append("query")
+            or [
+                {"name": "Speakers (Realtek)", "max_input_channels": 0, "max_output_channels": 2},
+                {"name": "Microphone Array", "max_input_channels": 2, "max_output_channels": 0},
+            ]
+        ),
         default=_Default(),
         InputStream=lambda *a, **k: calls.append("stream"),
     )
@@ -342,9 +344,7 @@ def test_a_device_table_that_will_not_read_is_a_fact_not_a_crash(monkeypatch):
 
 def test_host_version_is_absent_not_invented_off_host(monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_cli", None)
-    monkeypatch.setattr(
-        talk_diagnostics, "_host_version", lambda: None
-    )
+    monkeypatch.setattr(talk_diagnostics, "_host_version", lambda: None)
 
     assert "hermes_agent" not in talk_diagnostics.collect_bundle()["versions"]
 

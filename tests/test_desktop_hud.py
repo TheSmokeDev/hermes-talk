@@ -15,9 +15,7 @@ BUILDER = runpy.run_path(str(ROOT / "scripts/build_ui.py"))
 @pytest.fixture
 def desktop_source(tmp_path):
     source = tmp_path / "plugin.js"
-    source.write_text(
-        BUILDER["render_bundles"](ROOT)[ROOT / "desktop/plugin.js"], encoding="utf-8"
-    )
+    source.write_text(BUILDER["render_bundles"](ROOT)[ROOT / "desktop/plugin.js"], encoding="utf-8")
     return source
 
 
@@ -170,16 +168,28 @@ vm.runInContext(source, context);
 
 def run_hud(desktop_source, script):
     result = run(
-        ["node", "-e", HARNESS + "\n(async()=>{\n" + script + r"""
+        [
+            "node",
+            "-e",
+            HARNESS
+            + "\n(async()=>{\n"
+            + script
+            + r"""
 })().catch(error=>{console.error(error);process.exitCode=1;});
-""", str(desktop_source)],
-        capture_output=True, text=True, timeout=20,
+""",
+            str(desktop_source),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_composer_opens_registered_hud_before_any_audio(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 assert.equal(voiceRenders.length,1);
 assert.equal(registered.length,2);
@@ -195,23 +205,29 @@ assert(Object.isFrozen(opens[0]));
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
 render(null,'composer');
 assert.equal(stops,0,'navigating away from the launcher does not stop the native HUD');
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("changed", ["connectionId", "profile", "storedSessionId"])
 def test_launcher_rejects_preparation_for_another_owner(desktop_source, changed):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 controller.prepareSession=async()=>({...owner,[FIELD]:'other'});
 const tree=render(registered[0].render(),'composer'); flushEffects();
 button(tree,'Talk').props.onClick(); await tick();
 assert.equal(opens.length,0); assert.equal(acquires,0);
 assert(find(render(registered[0].render(),'composer'), node=>node.props.role==='alert'));
-""".replace("FIELD", repr(changed)))
+""".replace("FIELD", repr(changed)),
+    )
 
 
 def test_navigation_during_preparation_cannot_open_a_late_hud(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 let finish;
 controller.prepareSession=()=>new Promise(resolve=>{finish=resolve;});
@@ -219,11 +235,14 @@ const tree=render(registered[0].render(),'composer'); flushEffects();
 button(tree,'Talk').props.onClick(); await waitFor(()=>finish);
 render(null,'composer'); finish(owner); await tick();
 assert.equal(opens.length,0); assert.equal(acquires,0); assert.equal(stops,0);
-""")
+""",
+    )
 
 
 def test_topbar_matches_runtime_as_well_as_stored_owner(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 render(registered[0].render(),'composer-a'); flushEffects();
 controller={...controller,owner:{...owner,sessionId:'runtime-b'}};
@@ -236,11 +255,14 @@ await waitFor(()=>opens.length===1);
 assert.equal(opens[0].sessionId,'runtime-a');
 assert.equal(acquires,0); assert.equal(captures,0);
 render(null,'composer-a'); render(null,'composer-b');
-""")
+""",
+    )
 
 
 def test_collapse_retains_actual_talk_page_draft_and_local_attachment(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const runtime=voiceRenders[0]({controller});
 let tree=render(runtime,'hud');
@@ -276,11 +298,14 @@ let prevented=0;
 find(tree,node=>node.props.className==='ht-hud').props.onKeyDown({key:'Escape',preventDefault(){prevented++;}});
 assert.equal(prevented,1);
 assert(!find(render(runtime,'hud'),node=>node.type==='textarea'));
-""")
+""",
+    )
 
 
 def test_hover_status_uses_exact_recipient_and_observed_work(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 const recipient={recipient_id:'codex:b',app:'codex_desktop',title:'Same title',
   host_id:'host-b',task_id:'task-b'};
 let expanded=false;
@@ -299,12 +324,15 @@ assert(!text(tree).includes('Listening'),'connection alone cannot establish dete
 tree=render(React.createElement(context.TalkHudPresentation,{...props,sleeping:true}));
 assert(text(tree).includes('Sleeping · microphone off'));
 assert.equal(captures,0); assert.equal(calls.length,0); assert.equal(expanded,false);
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("native_close", [False, True])
 def test_active_hud_retains_one_lease_through_collapse_and_navigation(desktop_source, native_close):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 let trackStops=0, offers=0;
 const track={enabled:true,stop(){trackStops++;}};
 const media={getTracks:()=>[track],getAudioTracks:()=>[track]};
@@ -381,23 +409,29 @@ assert(lifetime.signal.aborted);
 render(null,'hud'); await tick();
 assert.equal(trackStops,1); assert.equal(releases,1);
 assert.equal(calls.filter(row=>row.path==='/close').length,1);
-""".replace("NATIVE_CLOSE", str(native_close).lower()))
+""".replace("NATIVE_CLOSE", str(native_close).lower()),
+    )
 
 
 @pytest.mark.parametrize("field", ["connectionId", "profile", "sessionId", "storedSessionId"])
 def test_hud_preparation_is_pinned_to_all_four_owner_fields(desktop_source, field):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 controller.prepareSession=async()=>({...owner,[FIELD]:'changed'});
 const sdk=context.createDesktopTalkSDK(host,controller);
 assert.equal(sdk.lifetimeSignal,lifetime.signal);
 await assert.rejects(sdk.prepareTask({tabId:'tab-a'}),/conversation changed/);
 assert.equal(calls.length,0); assert.equal(acquires,0);
-""".replace("FIELD", repr(field)))
+""".replace("FIELD", repr(field)),
+    )
 
 
 @pytest.mark.parametrize("status", [401, 403, 503])
 def test_plugin_authorization_loss_stops_native_owner(desktop_source, status):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 host.rest=async()=>{
   throw Error("Error invoking remote method 'hermes:api': Error: STATUS: denied");};
 const sdk=context.createDesktopTalkSDK(host,controller);
@@ -405,11 +439,14 @@ await assert.rejects(sdk.fetchJSON('/api/plugins/hermes-talk/status'),/^Error: S
 assert.equal(stops,STATUS===503?0:1);
 assert.equal(sdk.lifetimeSignal.aborted,STATUS!==503);
 assert.equal(acquires,0);
-""".replace("STATUS", str(status)))
+""".replace("STATUS", str(status)),
+    )
 
 
 def test_stopped_hud_releases_late_microphone_lease(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 let finish;
 controller.acquire=()=>new Promise(resolve=>{finish=resolve;});
 const sdk=context.createDesktopTalkSDK(host,controller), pending=sdk.acquireMicrophone();
@@ -418,11 +455,14 @@ finish({signal:leaseLifetime.signal,release(){releases++;}});
 await assert.rejects(pending,{name:'AbortError'});
 assert.equal(releases,1); assert.equal(stops,1); assert.equal(captures,0);
 await assert.rejects(sdk.acquireMicrophone(),{name:'AbortError'});
-""")
+""",
+    )
 
 
 def test_older_host_keeps_explicit_composer_mode(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 delete host.voice;
 context.plugin.register(host);
 let tree=render(registered[0].render(),'composer');
@@ -435,11 +475,14 @@ assert(text(tree).includes('Composer mode'));
 assert(text(tree).includes('The floating Talk window needs the Talk-enabled Hermes Desktop build'));
 assert(!text(tree).includes('update Hermes Desktop'));
 assert.equal(acquires,0); assert.equal(captures,0);
-""")
+""",
+    )
 
 
 def test_hud_shrinks_to_the_button_when_the_session_connects(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const expands=[];
 const props={active:false, expanded:false, setExpanded:value=>expands.push(value),
@@ -454,11 +497,14 @@ show({active:true});
 assert.deepEqual(expands,[false],'connecting shrinks the window to the Talk button');
 show({active:true});
 assert.deepEqual(expands,[false],'staying connected does not collapse again');
-""")
+""",
+    )
 
 
 def test_hud_keeps_the_panel_open_on_connect_when_the_preference_is_off(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const expands=[];
 const props={active:false, expanded:false, setExpanded:value=>expands.push(value),
@@ -474,11 +520,14 @@ assert.deepEqual(expands,[],'connecting leaves the panel alone');
 const tree=render(React.createElement(context.TalkHudPresentation,{...props,active:true}),'hud');
 button(tree,'Talk').props.onClick();
 assert.deepEqual(expands,[true],'the button still opens the panel afterwards');
-""")
+""",
+    )
 
 
 def test_hud_expands_while_hovered_and_a_click_pins_it(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const expands=[];
 const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
@@ -502,11 +551,14 @@ find(tree,node=>node.type==='section').props.onPointerLeave({currentTarget:{cont
 assert.deepEqual(expands,[true,false,true],'a pinned panel survives the pointer leaving');
 button(tree,'Talk').props.onClick();
 assert.deepEqual(expands,[true,false,true,false],'a second click collapses a pinned panel');
-""")
+""",
+    )
 
 
 def test_hud_ignores_hover_when_the_preference_is_off(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const expands=[];
 const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
@@ -518,11 +570,14 @@ section.props.onPointerLeave({currentTarget:{contains:()=>false}});
 assert.deepEqual(expands,[]);
 button(tree,'Talk').props.onClick();
 assert.deepEqual(expands,[true],'the button still opens the panel');
-""")
+""",
+    )
 
 
 def test_a_reconnect_keeps_a_pinned_panel_but_closes_a_hover_opened_one(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 context.plugin.register(host);
 const expands=[];
 const props={active:true, expanded:false, setExpanded:value=>expands.push(value),
@@ -547,11 +602,14 @@ assert.deepEqual(expands,[true,false,true],'hover opens without pinning');
 show({expanded:true, active:false});
 show({expanded:true, active:true});
 assert.deepEqual(expands,[true,false,true,false],'a reconnect closes a hover-opened panel');
-""")
+""",
+    )
 
 
 def test_stock_host_registers_the_same_two_contributions(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 delete host.voice;
 delete HermesSDK.useComposerVoiceController;
 hostState.focusedStoredSessionId.set('stored-stock');
@@ -570,11 +628,14 @@ assert.equal(catalog.options.body.session_id,'stored-stock');
 assert.equal(catalog.options.scope.profile,'profile-a');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(titles,0);
 render(null,'composer'); await tick();
-""")
+""",
+    )
 
 
 def test_full_host_controller_is_preferred_over_the_stock_lane(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 delete host.voice;
 hostState.focusedStoredSessionId.set('stored-stock');
 context.plugin.register(host);
@@ -587,11 +648,14 @@ assert.equal(catalog.options.body.session_id,'stored-a',
   'the Talk-enabled host controller owns the conversation, not the focused atoms');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(stops,0);
 render(null,'composer'); await tick();
-""")
+""",
+    )
 
 
 def test_stock_lane_stops_when_the_focused_conversation_changes(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 const seen=[];
 const Probe=()=>{seen.push(context.useStockVoiceController()); return null;};
 render(React.createElement(Probe),'probe'); flushEffects();
@@ -612,11 +676,14 @@ render(null,'probe');
 assert.equal(second.signal.aborted,true,'unmounting ends the stock lifetime');
 assert.equal(stops,0,'the stock lane never stops a host controller');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
-""")
+""",
+    )
 
 
 def test_stock_lane_rebuilds_after_a_teardown_with_the_same_owner(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 const seen=[];
 const Probe=()=>{seen.push(context.useStockVoiceController()); return null;};
 render(React.createElement(Probe),'probe'); flushEffects();
@@ -640,11 +707,14 @@ assert.equal(seen.at(-1).signal.aborted,false,'a full unmount and remount also r
 render(null,'probe');
 assert.equal(stops,0,'the stock lane never stops a host controller');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(calls.length,0);
-""")
+""",
+    )
 
 
 def test_topbar_matches_a_profile_reported_beside_the_focused_owner(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 delete host.voice;
 delete HermesSDK.useComposerVoiceController;
 hostState.focusedSessionOwner.set({connectionId:'connection-a'});
@@ -659,11 +729,14 @@ assert.equal(notified,0,'the title bar matches the normalised focused owner');
 assert(find(tree,node=>node.type==='popover-content'),'choosing Talk opened the panel');
 assert.equal(acquires,0); assert.equal(captures,0);
 render(null,'composer'); await tick();
-""")
+""",
+    )
 
 
 def test_stock_composer_shows_the_token_notice_instead_of_a_dead_panel(desktop_source):
-    run_hud(desktop_source, r"""
+    run_hud(
+        desktop_source,
+        r"""
 delete host.voice;
 delete HermesSDK.useComposerVoiceController;
 host.rest=async(path,options)=>{
@@ -685,4 +758,5 @@ assert(!text(tree).includes('Checking connection'),
 assert(find(tree,node=>node.props.role==='alert'),'the notice is announced');
 assert.equal(acquires,0); assert.equal(captures,0); assert.equal(stops,0);
 render(null,'composer'); await tick();
-""")
+""",
+    )

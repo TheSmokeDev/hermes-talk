@@ -353,15 +353,29 @@ assert.equal(references.at(-1), events("input.final").at(-1).body.input_id);
 t.stop();
 """,
     ],
-    ids=["typed-stage", "asr-before-commit", "explicit-linkage", "continuation-barrier",
-      "inert-results", "stop-stage", "stop-tool", "missing-call", "completed-turn-context",
-      "bounded-context-groups"],
+    ids=[
+        "typed-stage",
+        "asr-before-commit",
+        "explicit-linkage",
+        "continuation-barrier",
+        "inert-results",
+        "stop-stage",
+        "stop-tool",
+        "missing-call",
+        "completed-turn-context",
+        "bounded-context-groups",
+    ],
 )
 def test_dashboard_bound_task_protocol(scenario):
-    script = TASK_HARNESS + "\n(async () => {\n" + scenario + r"""
+    script = (
+        TASK_HARNESS
+        + "\n(async () => {\n"
+        + scenario
+        + r"""
 process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });
 """
+    )
     completed = run(
         ["node", "-e", script, str(DASHBOARD_JS)],
         cwd=ROOT,
@@ -373,7 +387,9 @@ process.exit(0);
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-PAGE_HARNESS = TASK_HARNESS + r"""
+PAGE_HARNESS = (
+    TASK_HARNESS
+    + r"""
 const slots = [], listeners = {};
 const transports = [];
 let cursor = 0, effects = [], latestTransport, heldSession, sessionRelease, startOverride;
@@ -456,10 +472,13 @@ const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
 const button = (tree, text) => nodes(tree).find((node) => node.tag === "button" && label(
   node) === text);
 """
+)
 
 
 def test_token_submission_refreshes_status_and_authorized_targets():
-    script = PAGE_HARNESS + r"""
+    script = (
+        PAGE_HARNESS
+        + r"""
 (async()=>{
 const baseFetch=fetchOverride, tokens=new Map();
 window.sessionStorage={getItem:key=>tokens.get(key)||'',
@@ -484,6 +503,7 @@ assert.equal(transports.length,0,'Token submission must not start audio');
 process.exit(0);
 })().catch(error=>{console.error(error);process.exit(1);});
 """
+    )
     result = run(
         ["node", "-e", script, str(DASHBOARD_JS)],
         capture_output=True,
@@ -493,9 +513,10 @@ process.exit(0);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-
 def test_presence_bus_mirrors_state_and_routes_commands_through_talk_controls():
-    script = PAGE_HARNESS + r"""
+    script = (
+        PAGE_HARNESS
+        + r"""
 (async()=>{
 const presence=[];let adds=0,removes=0;
 window.dispatchEvent=(event)=>{if(event.type==='hermes-talk:presence')presence.push(event.detail);
@@ -526,6 +547,7 @@ assert.equal(transports.length,0,'Presence commands here must not start audio');
 process.exit(0);
 })().catch(error=>{console.error(error);process.exit(1);});
 """
+    )
     result = run(
         ["node", "-e", script, str(DASHBOARD_JS)],
         capture_output=True,
@@ -534,7 +556,10 @@ process.exit(0);
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-TARGET_PAGE_HARNESS = PAGE_HARNESS + r"""
+
+TARGET_PAGE_HARNESS = (
+    PAGE_HARNESS
+    + r"""
 const baseFetch = fetchOverride, connections = new Map();
 const targetRows = [
   { target_id: "a", kind: "task", label: "Task A", peer_id: "local", host_label: "Local host",
@@ -609,6 +634,7 @@ const bootA = async () => {
   await readyPage(); await latestTransport.task.refresh(); return render();
 };
 """
+)
 
 
 @pytest.mark.parametrize(
@@ -764,32 +790,55 @@ assert.equal(request.body.back, true); assert(!Object.hasOwn(request.body, "peer
 assert.equal(sent.length, 0);
 """,
     ],
-    ids=["local-switch-return", "peer-ambiguity-refusal", "cancel-late-switch",
-         "stale-switch", "cancel-provider-start", "model-selection-intent", "model-refused-return",
-         "offline-return"],
+    ids=[
+        "local-switch-return",
+        "peer-ambiguity-refusal",
+        "cancel-late-switch",
+        "stale-switch",
+        "cancel-provider-start",
+        "model-selection-intent",
+        "model-refused-return",
+        "offline-return",
+    ],
 )
 def test_dashboard_target_switching(scenario):
-    script = TARGET_PAGE_HARNESS + "\n(async () => {\n" + scenario + r"""
+    script = (
+        TARGET_PAGE_HARNESS
+        + "\n(async () => {\n"
+        + scenario
+        + r"""
 listeners.pagehide();
 process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });
 """
+    )
     completed = run(
-        ["node", "-e", script, str(DASHBOARD_JS)], cwd=ROOT, capture_output=True,
-        text=True, timeout=NODE_TIMEOUT_S, check=False,
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize("origin", [
-    "file:///C:/Hermes/resources/app.asar.unpacked/dist/index.html",
-    "http://127.0.0.1:8080/",
-    "https://hermes.example/dashboard?private=value#fragment",
-])
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "file:///C:/Hermes/resources/app.asar.unpacked/dist/index.html",
+        "http://127.0.0.1:8080/",
+        "https://hermes.example/dashboard?private=value#fragment",
+    ],
+)
 def test_session_switch_and_return_page_references_match_backend(origin):
     from talk_dashboard_tasks import DashboardTasks
 
-    script = TARGET_PAGE_HARNESS + "\nwindow.location.href = " + json.dumps(origin) + r""";
+    script = (
+        TARGET_PAGE_HARNESS
+        + "\nwindow.location.href = "
+        + json.dumps(origin)
+        + r""";
 (async () => {
 await bootA();
 choose("Task or Bot target", "b"); click("Switch target"); await readyPage();
@@ -804,9 +853,14 @@ console.log(JSON.stringify(admissions.map(row => ({
 listeners.pagehide(); process.exit(0);
 })().catch(error => {console.error(error); process.exit(1);});
 """
+    )
     completed = run(
-        ["node", "-e", script, str(DASHBOARD_JS)], cwd=ROOT, capture_output=True,
-        text=True, timeout=NODE_TIMEOUT_S, check=False,
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     admissions = json.loads(completed.stdout)
@@ -822,7 +876,9 @@ listeners.pagehide(); process.exit(0);
 
 
 def test_dashboard_task_picker_rendering_and_page_generation_fences():
-    script = PAGE_HARNESS + r"""
+    script = (
+        PAGE_HARNESS
+        + r"""
 (async () => {
   render(); await drain(); let tree = render();
   assert(requests.some((r) => r.url.endsWith("/targets") && r.body.peer_id === "local" &&
@@ -895,6 +951,7 @@ def test_dashboard_task_picker_rendering_and_page_generation_fences():
   process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });
 """
+    )
     completed = run(
         ["node", "-e", script, str(DASHBOARD_JS)],
         cwd=ROOT,
@@ -907,7 +964,9 @@ def test_dashboard_task_picker_rendering_and_page_generation_fences():
 
 
 def test_native_typed_message_item_id_fits_provider_limit():
-    script = TASK_HARNESS + r"""
+    script = (
+        TASK_HARNESS
+        + r"""
 (async()=>{
 window.crypto.randomUUID=()=> '01234567-89ab-4cde-8f01-23456789abcd';
 const t=new Transport({},callbacks);
@@ -918,13 +977,20 @@ assert.equal(item.id.length,32);
 assert.equal(item.content[0].text,'Use my Desktop tools');
 })();
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_desktop_tools_require_provider_ack_and_deduplicate_calls():
-    script = TASK_HARNESS + r"""
+    script = (
+        TASK_HARNESS
+        + r"""
 (async()=>{
 const sdk=window.__HERMES_PLUGIN_SDK__;
 let writes=0;
@@ -956,8 +1022,13 @@ emit(bound,{type:'session.created',session:{tools:[]}});
 assert.equal(sent.length,count,'bound task must not gain unjournaled local tools');
 })();
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -1428,7 +1499,7 @@ const waitFor = async (predicate, timeoutMs = 1000) => {
 
 
 def test_dashboard_reports_a_relay_failure_instead_of_swallowing_it():
-    """"Silently" was half the bug: a dead relay must say so, once."""
+    """ "Silently" was half the bug: a dead relay must say so, once."""
 
     script = r"""
 const fs = require("fs");
@@ -1752,7 +1823,9 @@ process.exit(0);
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-PRESENTATION_HARNESS = TASK_HARNESS + r"""
+PRESENTATION_HARNESS = (
+    TASK_HARNESS
+    + r"""
 const summary = {ok:true,speak:true,event_id:'event-result',attempt_id:'attempt-result',run_id:7,
   result:{run_id:7,status:'completed',output:'Full result [artifact](https://example.test/file)'},
   response:{conversation:'none',tools:[],tool_choice:'none',max_output_tokens:220,
@@ -1767,10 +1840,13 @@ fetchOverride = (url, body) => {
   }
 };
 """
+)
 
 
 def test_synthetic_summary_isolated_from_inputs_tools_and_ordinary_response_linkage():
-    script = PRESENTATION_HARNESS + r"""
+    script = (
+        PRESENTATION_HARNESS
+        + r"""
 (async()=>{
   const t = make(); let full;
   t.cb.onTaskResult = (result) => {full=result;};
@@ -1808,13 +1884,20 @@ def test_synthetic_summary_isolated_from_inputs_tools_and_ordinary_response_link
   t.task.close();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_presentation_waits_for_response_and_close_fences_late_prepare():
-    script = PRESENTATION_HARNESS + r"""
+    script = (
+        PRESENTATION_HARNESS
+        + r"""
 (async()=>{
   const t = make(); t.responseActive = true;
   t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
@@ -1831,13 +1914,20 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   assert(requests.find(r=>r.url.endsWith('/speech')).signal.aborted);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("scenario", [
-    r"""
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        r"""
   let now=1000; t.task.timing.clock=()=>now;
   emit(t,{type:'input_audio_buffer.speech_started',item_id:'operator-item'});
   t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
@@ -1849,7 +1939,7 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   assert.equal(creates().length,1);
   assert(errors.some(e=>e.includes('measured silence')));
 """,
-    r"""
+        r"""
   t.task.timing.nativePlaying=true;
   t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
   await drain(); assert.equal(creates().length,0);
@@ -1861,7 +1951,7 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   t.cascadeReqs.clear(); await t.task.presentation.drain();
   assert.equal(creates().length,1);
 """,
-    r"""
+        r"""
   let release;
   fetchOverride=(url)=>url.endsWith('/speech')
     ? new Promise(resolve=>{release=()=>resolve(summary);}) : undefined;
@@ -1874,7 +1964,7 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   fetchOverride=(url)=>url.endsWith('/speech') ? summary : undefined;
   await t.task.presentation.drain(); assert.equal(creates().length,1);
 """,
-    r"""
+        r"""
   t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
   await waitFor(()=>creates().length===1);
   emit(t,{type:'input_audio_buffer.speech_started',item_id:'operator-item'});
@@ -1887,7 +1977,7 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   assert(requests.some(r=>r.body && r.body.state==='unknown'));
   assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
 """,
-    r"""
+        r"""
   t.task.presentation.offer({announcements:[{event_id:'event-result'}]});
   await waitFor(()=>creates().length===1); created(t,'summary-response');
   emit(t,{type:'output_audio_buffer.started',response_id:'summary-response'});
@@ -1897,7 +1987,7 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   assert.equal(t.task.timing.snapshot().playback_active,false);
   assert(!requests.some(r=>r.body && r.body.state==='playback_acknowledged'));
 """,
-    r"""
+        r"""
   let now=1000; t.task.timing.clock=()=>now;
   await t.task.typed('Keep this real input');
   assert.equal(creates().length,1);
@@ -1908,20 +1998,31 @@ def test_presentation_waits_for_response_and_close_fences_late_prepare():
   await waitFor(()=>events('interaction.incomplete').length===1);
   assert.equal(events('input.final').length,1);
 """,
-])
+    ],
+)
 def test_speech_timing_blocks_recovers_and_preserves_worker_ownership(scenario):
-    script = PRESENTATION_HARNESS + "\n(async()=>{const t=make();\n" + scenario + r"""
+    script = (
+        PRESENTATION_HARNESS
+        + "\n(async()=>{const t=make();\n"
+        + scenario
+        + r"""
   t.task.close();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-
 def test_old_playback_stop_does_not_clear_the_current_response():
-    script = TASK_HARNESS + r"""
+    script = (
+        TASK_HARNESS
+        + r"""
 const t=make();
 emit(t,{type:'output_audio_buffer.started',response_id:'old-response'});
 emit(t,{type:'output_audio_buffer.started',response_id:'current-response'});
@@ -1931,12 +2032,19 @@ emit(t,{type:'output_audio_buffer.stopped',response_id:'current-response'});
 assert.equal(t.task.timing.snapshot().playback_active,false);
 t.task.close();
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-LIVE_HARNESS = TASK_HARNESS + r"""
+LIVE_HARNESS = (
+    TASK_HARNESS
+    + r"""
 const captions = [], fullResults = [], peers = [], tracks = [], audioElements = [];
 let micRequests = 0, closedNotifications = 0, liveFetch;
 class FakePeer {
@@ -2000,11 +2108,15 @@ const pollNow = async (t) => {
   await t.pollEvents();
 };
 """
+)
 
 
 @pytest.mark.parametrize("auth_source", ["subscription", "api"])
 def test_live_browser_negotiates_server_sdp_and_never_relays_actions(auth_source):
-    script = LIVE_HARNESS + f"\n(async()=>{{const t=makeLive('{auth_source}');\n" + r"""
+    script = (
+        LIVE_HARNESS
+        + f"\n(async()=>{{const t=makeLive('{auth_source}');\n"
+        + r"""
 assert(t instanceof Live); assert.equal(micRequests, 0, 'construction requested microphone');
 await t.start(); await waitFor(() => !t.livePolling);
 assert.equal(micRequests, 1);
@@ -2037,13 +2149,20 @@ assert.equal(requests.filter(r => r.url.endsWith('/live/close')).length, 1);
 assert.equal(requests.filter(r => r.url === '/api/plugins/hermes-talk/close').length, 1);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_server_events_deduplicate_without_promoting_partial_transcripts():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
 let batch = [
@@ -2067,27 +2186,40 @@ assert.equal(sent.length,0); assert.equal(events('input.final').length,0);
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("failure", [
-    "throw new Error('403 stale task connection')",
-    "return {ok:false,events:[],cursor:0}",
-    "return {ok:true,events:[],cursor:-1}",
-    "return {ok:true,events:[{sequence:2,type:'transcript',role:'user',"
-    "text:'x',final:false}],cursor:1}",
-    "return {ok:true,events:[{sequence:1,type:'transcript',role:'user',"
-    "text:'x',final:'yes'}],cursor:1}",
-    "return {ok:true,events:[{sequence:1,type:'error',"
-    "message:'Live authentication expired'}],cursor:1}",
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "throw new Error('403 stale task connection')",
+        "return {ok:false,events:[],cursor:0}",
+        "return {ok:true,events:[],cursor:-1}",
+        "return {ok:true,events:[{sequence:2,type:'transcript',role:'user',"
+        "text:'x',final:false}],cursor:1}",
+        "return {ok:true,events:[{sequence:1,type:'transcript',role:'user',"
+        "text:'x',final:'yes'}],cursor:1}",
+        "return {ok:true,events:[{sequence:1,type:'error',"
+        "message:'Live authentication expired'}],cursor:1}",
+    ],
+)
 def test_live_event_failure_stops_microphone_without_rebilling_or_retry(failure):
-    script = LIVE_HARNESS + "\n(async()=>{\n" + r"""
+    script = (
+        LIVE_HARNESS
+        + "\n(async()=>{\n"
+        + r"""
 const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
 liveFetch=(url)=>{if(url.endsWith('/live/events')) {
-""" + failure + r"""
+"""
+        + failure
+        + r"""
 }};
 await pollNow(t); await drain();
 assert(t.closed && tracks[0].stopped); assert.equal(t.liveTimer,null);
@@ -2096,13 +2228,20 @@ assert.equal(errors.length,1); assert.equal(sent.length,0);
 assert.equal(captions.length,0); assert.equal(closedNotifications,1);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_cancelled_negotiation_and_stale_poll_cannot_reopen_audio_or_publish():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 let release;
 liveFetch=(url)=>url.endsWith('/live/session') ? new Promise(resolve=>{release=()=>resolve({
@@ -2124,34 +2263,50 @@ assert.equal(captions.length,0); assert.equal(second.liveTimer,null);
 assert(tracks[1].stopped); assert.equal(sent.length,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("failure", ["disconnected", "channel-close", "typed-input"])
 def test_live_transport_and_input_failure_close_bound_audio(failure):
-    script = LIVE_HARNESS + "\n(async()=>{const t=makeLive();await t.start();\n" + {
-        "disconnected": "peers[0].connectionState='disconnected';"
-        "peers[0].emit('connectionstatechange');",
-        "channel-close": "t.channel.emit('close');",
-        "typed-input": r"""
+    script = (
+        LIVE_HARNESS
+        + "\n(async()=>{const t=makeLive();await t.start();\n"
+        + {
+            "disconnected": "peers[0].connectionState='disconnected';"
+            "peers[0].emit('connectionstatechange');",
+            "channel-close": "t.channel.emit('close');",
+            "typed-input": r"""
 liveFetch=(url)=>{if(url.endsWith('/live/input'))throw new Error('401 expired authentication');};
 await assert.rejects(t.sendTyped('Original input'),/401/);
 """,
-    }[failure] + r"""
+        }[failure]
+        + r"""
 await drain(); assert(t.closed && tracks[0].stopped); assert.equal(closedNotifications,1);
 assert.equal(requests.filter(r=>r.url.endsWith('/live/session')).length,1);
 assert.equal(sent.length,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_page_requires_operator_start_preserves_partials_and_switches_with_existing_flow():
-    script = TARGET_PAGE_HARNESS + r"""
+    script = (
+        TARGET_PAGE_HARNESS
+        + r"""
 const liveBase=fetchOverride;
 fetchOverride=(url,body,opts)=>{
   if(url.endsWith('/live/events')) return {ok:true,cursor:1,events:[
@@ -2193,19 +2348,32 @@ assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/to
 listeners.pagehide(); process.exit(0);
 })().catch(e=>{console.error(e);process.exit(1);});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("response", [
-    "throw new Error('401 subscription login expired')",
-    "return {ok:true,binding_id:'bad-binding',sdp:''}",
-])
+@pytest.mark.parametrize(
+    "response",
+    [
+        "throw new Error('401 subscription login expired')",
+        "return {ok:true,binding_id:'bad-binding',sdp:''}",
+    ],
+)
 def test_live_setup_failure_releases_capture_and_does_not_try_other_auth(response):
-    script = LIVE_HARNESS + "\n(async()=>{\n" + r"""
+    script = (
+        LIVE_HARNESS
+        + "\n(async()=>{\n"
+        + r"""
 liveFetch=(url)=>{if(url.endsWith('/live/session')) {
-""" + response + r"""
+"""
+        + response
+        + r"""
 }};
 const t=makeLive(); await assert.rejects(t.start());
 assert(t.closed && tracks[0].stopped && audioElements[0].paused);
@@ -2215,13 +2383,20 @@ assert.equal(requests.filter(r=>r.url.endsWith('/live/events')).length,0);
 assert.equal(sent.length,0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_missing_task_is_rejected_before_microphone_request():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=new Live({voiceMode:'live',live:{transport:'webrtc'}},callbacks);
 await assert.rejects(t.start(),/authorized task/);
@@ -2229,14 +2404,20 @@ assert.equal(micRequests,0); assert.equal(requests.length,0); assert.equal(peers
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-
 def test_live_spoken_updates_require_recent_input_and_output_measurement():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 const t=makeLive(); let now=5000; t.task.timing.clock=()=>now;
 assert.equal(t.liveTiming(),null,'unmeasured audio must not be assumed quiet');
 t.task.timing.sample('input',false); assert.equal(t.liveTiming(),null);
@@ -2247,14 +2428,20 @@ t.task.timing.sample('input',true); assert.equal(t.liveTiming().operator_speakin
 now=7000; assert.equal(t.liveTiming(),null,'stale samples must not authorize speech');
 t.stop();
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-
 def test_live_large_result_uses_authorized_result_endpoint_without_speech_or_tools():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
 liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:1,events:[
@@ -2267,13 +2454,20 @@ assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/to
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_transcript_rows_preserve_exact_deltas_and_late_item_identity():
-    script = TASK_HARNESS + r"""
+    script = (
+        TASK_HARNESS
+        + r"""
 const append = window.__HERMES_TALK_TEST__.appendTranscriptRows;
 let rows = [];
 const add = (event) => { rows = append(rows, Object.assign({role:'user',final:false},event),
@@ -2297,13 +2491,20 @@ add({event_id:'new',finality:'delta',text:'Fresh words',start_ms:2000,end_ms:220
 assert.equal(rows.at(-1).text,'Fresh words'); assert.equal(rows.at(-1).final,false);
 assert(rows.every(row=>row.item_id !== 'new'),'event ID became item identity');
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_async_operation_receipts_do_not_claim_job_completion_or_stop_captions():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=makeLive(); const statuses=[]; t.cb.onStatus=value=>statuses.push(value);
 await t.start(); await waitFor(()=>!t.livePolling);
@@ -2324,13 +2525,20 @@ assert.equal(fullResults.length,0); assert.equal(sent.length,0);
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_close_stops_local_audio_before_waiting_for_capture_and_revokes_after_ack():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
 let release;
@@ -2346,13 +2554,20 @@ release(); await drain();
 assert.equal(requests.filter(r=>r.url==='/api/plugins/hermes-talk/close').length,1);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_live_snapshot_waits_for_capture_ack_without_blocking_event_polling():
-    script = LIVE_HARNESS + r"""
+    script = (
+        LIVE_HARNESS
+        + r"""
 (async()=>{
 const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
 let release;
@@ -2368,8 +2583,13 @@ assert.equal(requests.filter(r=>r.url.endsWith('/state')).length,before+1);
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
-    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
-                 text=True, timeout=NODE_TIMEOUT_S)
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -2481,15 +2701,26 @@ const drain = () => new Promise((resolve) => setTimeout(resolve, 20));
 def _press_start(status):
     completed = run(
         ["node", "-e", PAGE_START_HARNESS, str(DASHBOARD_JS), json.dumps(status)],
-        cwd=ROOT, capture_output=True, text=True, timeout=NODE_TIMEOUT_S, check=False,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
 def _status(voice_mode, supported):
-    return {"ok": True, "configured": True, "source": "codex-oauth", "voices": ["marin"],
-            "voice": "marin", "voiceMode": voice_mode, "taskContinuity": {"supported": supported}}
+    return {
+        "ok": True,
+        "configured": True,
+        "source": "codex-oauth",
+        "voices": ["marin"],
+        "voice": "marin",
+        "voiceMode": voice_mode,
+        "taskContinuity": {"supported": supported},
+    }
 
 
 def test_task_continuity_false_skips_prepare_task_on_start():

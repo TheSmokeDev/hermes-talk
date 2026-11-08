@@ -114,9 +114,17 @@ def source_bundle(tmp_path):
 
 def execute(source_bundle, scenario):
     result = run(
-        ["node", "-e", HARNESS + "\n(async () => {\n" + scenario + r"""
+        [
+            "node",
+            "-e",
+            HARNESS
+            + "\n(async () => {\n"
+            + scenario
+            + r"""
 })().catch(error => { console.error(error); process.exitCode = 1; });
-""", str(source_bundle)],
+""",
+            str(source_bundle),
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -126,7 +134,11 @@ def execute(source_bundle, scenario):
 
 @pytest.mark.parametrize("accepted", [False, True])
 def test_dispatch_waits_for_persisted_submitting(source_bundle, accepted):
-    execute(source_bundle, "const accepted = " + str(accepted).lower() + r""";
+    execute(
+        source_bundle,
+        "const accepted = "
+        + str(accepted).lower()
+        + r""";
 const t = make(); let release;
 override = (url, body) => body && body.state === 'submitting'
   ? new Promise(resolve => { release = () => resolve({ ok: accepted }); }) : undefined;
@@ -141,28 +153,36 @@ assert.equal(prepare.presentation_protocol, 1);
 assert.equal(prepare.playback_supported, false);
 assert.equal(prepare.connection_id, 'owner-A'); assert.equal(prepare.generation, 7);
 t.stop();
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("retire", ["t.stop()", "t.task.presentation.interrupt()"])
 def test_retirement_fences_a_late_dispatch_receipt(source_bundle, retire):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(); let release;
 override = (url, body) => body && body.state === 'submitting'
   ? new Promise(resolve => { release = () => resolve({ ok: true }); }) : undefined;
 t.task.presentation.offer({ announcements: [{ event_id: 'result-A' }] });
 await wait(() => release);
-""" + retire + r""";
+"""
+        + retire
+        + r""";
 release(); await wait(() => !t.task.presentation.preparing);
 assert.equal(creates().length, 0);
 await wait(() => states().includes('deferred'));
 assert(!states().includes('context_submitted'));
 t.stop();
-""")
+""",
+    )
 
 
 def test_webrtc_remains_unknown_and_replay_only_presents_existing_result(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(); await start(t);
 emit(t, { type: 'output_audio_buffer.started', response_id: 'response-A' });
 done(t);
@@ -180,11 +200,14 @@ assert(!requests.some(item => item.url.endsWith('/tool') || item.url.endsWith('/
 assert(creates().every(item => item.response.conversation === 'none' &&
   item.response.tool_choice === 'none' && item.response.tools.length === 0));
 t.stop();
-""")
+""",
+    )
 
 
 def test_foreign_preparation_is_rejected_before_any_receipt_or_dispatch(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make();
 override = url => url.endsWith('/speech') ? prepared({event_id: 'foreign-result'}) : undefined;
 t.task.presentation.offer({ announcements: [{ event_id: 'result-A' }] });
@@ -192,14 +215,19 @@ await wait(() => !t.task.presentation.preparing);
 assert.equal(creates().length, 0); assert.equal(receipts().length, 0);
 assert(errors.some(message => message.includes('requested event')));
 t.stop();
-""")
+""",
+    )
 
 
 @pytest.mark.parametrize("generation_first", [False, True])
 def test_pcm_completion_requires_response_end_and_correlated_local_drain(
     source_bundle, generation_first
 ):
-    execute(source_bundle, "const generationFirst = " + str(generation_first).lower() + r""";
+    execute(
+        source_bundle,
+        "const generationFirst = "
+        + str(generation_first).lower()
+        + r""";
 const t = make(true); await start(t); textDone(t);
 await feed(t);
 assert.equal(requests.find(item => item.url.endsWith('/speech')).body.playback_supported, true);
@@ -224,11 +252,14 @@ assert.equal(states().filter(state => state === 'playback_finished').length, 1);
 assert(receipts().filter(item => item.state.startsWith('playback_')).every(item =>
   item.response_id === 'response-A' && item.attempt_id === 'attempt-1' && item.generation === 7));
 t.stop();
-""")
+""",
+    )
 
 
 def test_pcm_interruption_and_late_drain_never_finish_or_execute_tools(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(true); await start(t); textDone(t); await feed(t);
 t.pcmContext.currentTime = 0.01; await wait(() => states().includes('playback_started'));
 t.task.presentation.interrupt();
@@ -239,11 +270,14 @@ emit(t, { type: 'response.function_call_arguments.done', response_id: 'response-
 await pause(); assert(!states().includes('playback_finished'));
 assert(!requests.some(item => item.url.endsWith('/tool')));
 t.stop();
-""")
+""",
+    )
 
 
 def test_pcm_drain_waits_for_relay_eof(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(true); await start(t); textDone(t); done(t);
 await wait(() => relays.length === 1);
 let reads = 0, endStream;
@@ -259,11 +293,14 @@ sources[0].onended(); await pause();
 assert(states().includes('playback_started')); assert(!states().includes('playback_finished'));
 endStream(); await wait(() => states().includes('playback_finished'));
 t.stop();
-""")
+""",
+    )
 
 
 def test_uncertain_provider_dispatch_is_not_retried_from_state(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(); let dispatches = 0;
 t.channel.send = () => { dispatches += 1; throw new Error('connection lost after write'); };
 t.task.presentation.offer({ announcements: [{ event_id: 'result-A' }] });
@@ -274,21 +311,27 @@ assert.equal(dispatches, 1);
 assert.equal(requests.filter(item => item.url.endsWith('/speech')).length, 1);
 assert(!requests.some(item => item.url.endsWith('/tool')));
 t.task.close();
-""")
+""",
+    )
 
 
 def test_pcm_truncated_stream_cannot_confirm_completion(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(true); await start(t); textDone(t); await feed(t, [new Uint8Array(961)]);
 done(t); await wait(() => states().includes('unknown'));
 t.pcmContext.currentTime = 1; sources[0].onended(); await pause();
 assert(!states().includes('playback_finished'));
 t.stop();
-""")
+""",
+    )
 
 
 def test_shutdown_preserves_exact_attempt_retirement(source_bundle):
-    execute(source_bundle, r"""
+    execute(
+        source_bundle,
+        r"""
 const t = make(); await start(t); t.stop();
 await wait(() => states().includes('unknown'));
 const retirement = requests.find(item => item.body && item.body.state === 'unknown');
@@ -296,4 +339,5 @@ assert.equal(retirement.options.keepalive, true);
 assert.equal(retirement.body.connection_id, 'owner-A'); assert.equal(retirement.body.generation, 7);
 assert.equal(retirement.body.event_id, 'result-A');
 assert.equal(retirement.body.attempt_id, 'attempt-1');
-""")
+""",
+    )

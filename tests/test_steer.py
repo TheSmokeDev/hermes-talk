@@ -110,9 +110,7 @@ def test_empty_text_is_refused_before_any_lane():
 
 def test_tool_layer_requires_agent_id_and_text():
     assert "list_agents" in talk_tools.execute_talk_tool("steer_agent", {"text": "x"})
-    assert "note itself" in talk_tools.execute_talk_tool(
-        "steer_agent", {"agent_id": "sa-0-aaaa"}
-    )
+    assert "note itself" in talk_tools.execute_talk_tool("steer_agent", {"agent_id": "sa-0-aaaa"})
 
 
 # -- run numbers: lanes that cannot steer -------------------------------------
@@ -599,9 +597,7 @@ def test_redirect_accepted_mid_thought_claims_accepted_never_the_abort(monkeypat
     assert "drops what it was doing" not in out.lower()
     # The wire text leads with the correlation token — both verbs share it.
     assert len(agent.redirected) == 1
-    assert re.fullmatch(
-        r"\[tk-[0-9a-f]{8}\] wrong repo, use taskchad-ship", agent.redirected[0]
-    )
+    assert re.fullmatch(r"\[tk-[0-9a-f]{8}\] wrong repo, use taskchad-ship", agent.redirected[0])
     assert "redirect accepted" in talk_steer.notes_summary()
 
 
@@ -708,9 +704,7 @@ def test_redirect_tool_layer_requires_agent_id_and_text():
 
 
 def test_redirect_description_scopes_the_verb():
-    schema = next(
-        t for t in talk_tools.default_talk_tools() if t["name"] == "redirect_agent"
-    )
+    schema = next(t for t in talk_tools.default_talk_tools() if t["name"] == "redirect_agent")
     text = schema["description"].lower()
     assert "stronger than steer_agent" in text
     assert "never cancels" in text
@@ -727,9 +721,7 @@ def test_the_three_tools_are_advertised():
 
 
 def test_steer_agent_description_forbids_delivery_claims():
-    schema = next(
-        t for t in talk_tools.default_talk_tools() if t["name"] == "steer_agent"
-    )
+    schema = next(t for t in talk_tools.default_talk_tools() if t["name"] == "steer_agent")
     text = schema["description"].lower()
     assert "queued, not delivered" in text
     assert "never cancels" in text

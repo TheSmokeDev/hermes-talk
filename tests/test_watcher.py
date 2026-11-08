@@ -137,9 +137,9 @@ def test_injected_output_is_the_tail_not_the_head():
 
 
 def test_empty_output_still_produces_a_speakable_turn():
-    text = talk_cli.run_finished_messages({"runId": 10, "status": "done", "output": ""})[0][
-        "item"
-    ]["content"][0]["text"]
+    text = talk_cli.run_finished_messages({"runId": 10, "status": "done", "output": ""})[0]["item"][
+        "content"
+    ][0]["text"]
 
     assert "Background run #10 finished with no output." in text
 
@@ -176,9 +176,7 @@ def test_the_announcement_ignores_the_ticket_and_delivery_fields():
     )
 
     assert [type(c) for c in ticketed] == [type(c) for c in plain]
-    spoken = " ".join(
-        getattr(command, "text", "") for command in ticketed
-    )
+    spoken = " ".join(getattr(command, "text", "") for command in ticketed)
     for leaked in ("ts-secret", "gen-secret", "sess-secret", "req-secret", "codex-oauth"):
         assert leaked not in spoken
 

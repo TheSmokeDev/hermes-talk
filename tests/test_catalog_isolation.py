@@ -11,8 +11,13 @@ from conftest import isolated_capability_catalog
 @pytest.mark.parametrize("installed", [False, True])
 def test_catalog_fixture_restores_modules_after_test_overrides(monkeypatch, installed):
     names = (
-        "hermes_cli", "hermes_cli.config", "hermes_cli.tools_config",
-        "tools", "tools.skills_tool", "toolsets", "model_tools",
+        "hermes_cli",
+        "hermes_cli.config",
+        "hermes_cli.tools_config",
+        "tools",
+        "tools.skills_tool",
+        "toolsets",
+        "model_tools",
     )
     ambient = {name: types.ModuleType(name) if installed else None for name in names}
     for name, value in ambient.items():

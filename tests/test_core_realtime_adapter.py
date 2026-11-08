@@ -87,9 +87,7 @@ class Harness:
         self.wire_calls += 1
         return self.wire
 
-    def provider(
-        self, *, ledger_capacity=1024, token_factory=None, response_ledger_capacity=1024
-    ):
+    def provider(self, *, ledger_capacity=1024, token_factory=None, response_ledger_capacity=1024):
         kwargs = {}
         if token_factory is not None:
             kwargs["token_factory"] = token_factory
@@ -301,14 +299,17 @@ def test_exact_api_v2_contract_and_fixed_capabilities():
 
 
 def test_explicit_output_format_is_exact_pcm_s16le():
-    assert RealtimeOutputAudioFormat(
-        mime_type="audio/pcm",
-        sample_rate_hz=24_000,
-        channels=1,
-        sample_encoding="pcm_s16le",
-        sample_width_bytes=2,
-        endianness="little",
-    ) == core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT
+    assert (
+        RealtimeOutputAudioFormat(
+            mime_type="audio/pcm",
+            sample_rate_hz=24_000,
+            channels=1,
+            sample_encoding="pcm_s16le",
+            sample_width_bytes=2,
+            endianness="little",
+        )
+        == core_rt.SUPPORTED_OUTPUT_AUDIO_FORMAT
+    )
 
 
 def test_explicit_response_sends_exact_causally_opaque_no_tool_payload():
@@ -483,9 +484,7 @@ def test_bound_response_maps_started_audio_transcript_and_completed():
     session, received = asyncio.run(scenario())
     assert received[:-1] == [
         ResponseStarted(response_id="resp-1", turn_id="turn-41"),
-        OutputAudio(
-            data=b"pcm\x00", item_id="item-out-1", response_id="resp-1", turn_id="turn-41"
-        ),
+        OutputAudio(data=b"pcm\x00", item_id="item-out-1", response_id="resp-1", turn_id="turn-41"),
         OutputTranscript(
             item_id="item-out-1",
             response_id="resp-1",
@@ -515,9 +514,7 @@ def test_pcm16le_arbitrary_chunks_use_exact_one_byte_carry_and_clean_terminals()
         await session.start_response(response_request())
         bind_response(session, "token-1")
         session._enforce_output_lifecycle = True
-        lifecycle = valid_output_lifecycle_events(
-            "token-1", transcript="Exact words, exactly."
-        )
+        lifecycle = valid_output_lifecycle_events("token-1", transcript="Exact words, exactly.")
         session._map_event(lifecycle[0])
         session._map_event(lifecycle[1])
         return harness, session, lifecycle
@@ -1042,9 +1039,7 @@ def test_output_transcript_finality_is_terminal_and_exact(late_event, match):
         ({"id": "item-1"}, "sequence"),
     ],
 )
-def test_response_done_rejects_non_exact_audio_only_schema_without_consuming_active(
-    output, match
-):
+def test_response_done_rejects_non_exact_audio_only_schema_without_consuming_active(output, match):
     harness = Harness()
 
     async def scenario():
@@ -1787,9 +1782,7 @@ def output_authority_state(session):
 
 
 @pytest.mark.parametrize(("bad_event", "forbidden_output"), output_envelope_authority_cases())
-def test_every_output_event_envelope_authority_fails_before_emission(
-    bad_event, forbidden_output
-):
+def test_every_output_event_envelope_authority_fails_before_emission(bad_event, forbidden_output):
     correlation = "token-1"
     created = {
         "type": "response.created",
@@ -1812,9 +1805,7 @@ def test_every_output_event_envelope_authority_fails_before_emission(
 
 
 @pytest.mark.parametrize(("bad_event", "_forbidden_output"), output_envelope_authority_cases())
-def test_every_output_event_envelope_authority_preserves_direct_state(
-    bad_event, _forbidden_output
-):
+def test_every_output_event_envelope_authority_preserves_direct_state(bad_event, _forbidden_output):
     harness = Harness()
 
     async def scenario():
@@ -1939,13 +1930,16 @@ def test_recursive_authority_covers_every_recognized_nonoutput_family_atomically
                 },
             }
         ) == SessionReady(session_id="session-1")
-        assert session._map_event(
-            {
-                "type": "input_audio_buffer.committed",
-                "item_id": "input-1",
-                "metadata": {"right": [{"classification": "operator-audio"}]},
-            }
-        ) is None
+        assert (
+            session._map_event(
+                {
+                    "type": "input_audio_buffer.committed",
+                    "item_id": "input-1",
+                    "metadata": {"right": [{"classification": "operator-audio"}]},
+                }
+            )
+            is None
+        )
         transcript = session._map_event(
             {
                 "type": "conversation.item.input_audio_transcription.completed",
@@ -1963,12 +1957,15 @@ def test_recursive_authority_covers_every_recognized_nonoutput_family_atomically
             provenance=TranscriptProvenance.OPERATOR_INPUT,
         )
         before_unknown = state(session)
-        assert session._map_event(
-            {
-                "type": "vendor.future_diagnostic",
-                "metadata": {"nested": [{"tools": []}, {"type": "tool_call"}]},
-            }
-        ) is None
+        assert (
+            session._map_event(
+                {
+                    "type": "vendor.future_diagnostic",
+                    "metadata": {"nested": [{"tools": []}, {"type": "tool_call"}]},
+                }
+            )
+            is None
+        )
         assert state(session) == before_unknown
         with pytest.raises(core_rt.OpenAIWireError, match="legitimate provider error"):
             session._map_event(
@@ -2041,9 +2038,7 @@ def test_terminal_transcript_digest_mismatch_fails_closed_and_clears_all_respons
     harness = Harness(
         [
             created,
-            *valid_output_lifecycle_events(
-                correlation, transcript="DIFFERENT WORDS"
-            ),
+            *valid_output_lifecycle_events(correlation, transcript="DIFFERENT WORDS"),
         ]
     )
 
@@ -2083,9 +2078,7 @@ def test_live_pre_start_audio_delta_fails_before_emission_and_cleans_all_respons
         "type": "response.created",
         "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
     }
-    lifecycle = valid_output_lifecycle_events(
-        correlation, transcript="Exact words, exactly."
-    )
+    lifecycle = valid_output_lifecycle_events(correlation, transcript="Exact words, exactly.")
     harness = Harness([created, lifecycle[2], *lifecycle])
 
     async def scenario():
@@ -2140,9 +2133,7 @@ def test_response_done_requires_every_live_output_lifecycle_stage(omitted_type):
         "type": "response.created",
         "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
     }
-    lifecycle = valid_output_lifecycle_events(
-        correlation, transcript="Exact words, exactly."
-    )
+    lifecycle = valid_output_lifecycle_events(correlation, transcript="Exact words, exactly.")
     events = [event for event in lifecycle[:-1] if event["type"] != omitted_type]
     harness = Harness([created, *events, lifecycle[-1]])
 
@@ -2158,7 +2149,21 @@ def test_response_done_requires_every_live_output_lifecycle_stage(omitted_type):
     assert session._terminal is True
     assert not session._response_lifecycle
     assert output_authority_state(session) == (
-        {}, {}, {}, {}, {}, set(), set(), {}, set(), set(), set(), set(), set(), {}, {}
+        {},
+        {},
+        {},
+        {},
+        {},
+        set(),
+        set(),
+        {},
+        set(),
+        set(),
+        set(),
+        set(),
+        set(),
+        {},
+        {},
     )
 
 
@@ -2178,9 +2183,7 @@ def test_live_output_lifecycle_rejects_out_of_order_stages(earlier_type, later_t
         "type": "response.created",
         "response": {"id": "resp-1", "metadata": {"correlation": correlation}},
     }
-    lifecycle = valid_output_lifecycle_events(
-        correlation, transcript="Exact words, exactly."
-    )
+    lifecycle = valid_output_lifecycle_events(correlation, transcript="Exact words, exactly.")
     positions = {event["type"]: index for index, event in enumerate(lifecycle)}
     first, second = positions[earlier_type], positions[later_type]
     lifecycle[first], lifecycle[second] = lifecycle[second], lifecycle[first]
@@ -2206,9 +2209,7 @@ def test_valid_live_output_lifecycle_completes_exactly_once_and_cleans_terminal_
     harness = Harness(
         [
             created,
-            *valid_output_lifecycle_events(
-                correlation, transcript="Exact words, exactly."
-            ),
+            *valid_output_lifecycle_events(correlation, transcript="Exact words, exactly."),
         ]
     )
 
@@ -2334,12 +2335,15 @@ def test_missing_task1_symbols_leave_legacy_input_only_contract_available(monkey
     legacy = importlib.reload(core_rt)
     try:
         assert legacy.core_provider_available() is True
-        assert frozenset(
-            {
-                legacy.RealtimeCapability.INPUT_TRANSCRIPTION,
-                legacy.RealtimeCapability.INPUT_COMMIT_EVENTS,
-            }
-        ) == legacy.CORE_CAPABILITIES
+        assert (
+            frozenset(
+                {
+                    legacy.RealtimeCapability.INPUT_TRANSCRIPTION,
+                    legacy.RealtimeCapability.INPUT_COMMIT_EVENTS,
+                }
+            )
+            == legacy.CORE_CAPABILITIES
+        )
         assert legacy.SUPPORTED_OUTPUT_AUDIO_FORMAT is None
     finally:
         monkeypatch.undo()
@@ -2512,9 +2516,7 @@ def test_provider_failures_use_fixed_public_receipts_and_release_raw_detail(
     if operation in {"send_audio", "start_response"}:
         harness.wire.send_error = core_rt.OpenAIWireError(provider_detail)
     elif operation == "protocol":
-        harness.wire.events = iter(
-            ({"type": "error", "error": {"message": provider_detail}},)
-        )
+        harness.wire.events = iter(({"type": "error", "error": {"message": provider_detail}},))
     else:
         harness.wire.events = iter((core_rt.OpenAIWireEOF(provider_detail),))
 
@@ -2586,9 +2588,7 @@ def test_retained_send_failure_wins_over_secondary_protocol_failure_receipt():
         return [event async for event in session.events()]
 
     session, harness, events = asyncio.run(scenario())
-    assert events == [
-        SessionFailure(code="provider_send_failure", message="provider send failed")
-    ]
+    assert events == [SessionFailure(code="provider_send_failure", message="provider send failed")]
     assert provider_detail not in repr(events)
     assert provider_detail not in repr(vars(session))
     assert session._pending_send_failure is None
@@ -2702,9 +2702,7 @@ def test_passive_speech_start_maps_exact_primitives_without_sending():
                 )
         return mapped
 
-    assert asyncio.run(scenario()) == InputSpeechStarted(
-        item_id="input-1", audio_start_ms=7
-    )
+    assert asyncio.run(scenario()) == InputSpeechStarted(item_id="input-1", audio_start_ms=7)
 
 
 def test_cancel_response_exact_authority_and_empty_cancelled_terminal():

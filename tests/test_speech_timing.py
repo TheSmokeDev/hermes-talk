@@ -35,8 +35,9 @@ def test_generation_order_and_expired_observations_do_not_authorize_speech():
     assert gate.observe(("task", 3), snapshot(3))
 
 
-@pytest.mark.parametrize("value", [None, {}, snapshot(True), snapshot(-1),
-                                    snapshot(operator_speaking="false")])
+@pytest.mark.parametrize(
+    "value", [None, {}, snapshot(True), snapshot(-1), snapshot(operator_speaking="false")]
+)
 def test_incomplete_or_untyped_readiness_is_refused(value):
     with pytest.raises(TaskEventError, match="invalid_event"):
         SpeechTiming("capture").observe("capture", value)

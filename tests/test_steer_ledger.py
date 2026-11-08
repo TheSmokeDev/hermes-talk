@@ -43,9 +43,7 @@ def test_drain_preview_lands_the_matching_receipt():
 def test_drain_preview_is_truncated_at_120_chars_and_still_matches():
     long_note = "focus on " + "pricing " * 30  # far past the 120-char preview
     talk_steer.record_queued("sa-0-aaaa", long_note)
-    flipped = talk_steer.mark_landed_from_preview(
-        long_note[: talk_steer.DRAIN_PREVIEW_CHARS]
-    )
+    flipped = talk_steer.mark_landed_from_preview(long_note[: talk_steer.DRAIN_PREVIEW_CHARS])
     assert flipped == 1
 
 
@@ -54,12 +52,8 @@ def test_concatenated_drain_lands_the_whole_batch():
     # preview only shows the head. The earlier receipt must land too.
     agent = _Steerable()
     talk_steer.record_queued("sa-0-aaaa", "first note about auth", agent=agent)
-    talk_steer.record_queued(
-        "sa-0-aaaa", "second note far past the preview window", agent=agent
-    )
-    flipped = talk_steer.mark_landed_from_preview(
-        "first note about auth\nsecond", agent=agent
-    )
+    talk_steer.record_queued("sa-0-aaaa", "second note far past the preview window", agent=agent)
+    flipped = talk_steer.mark_landed_from_preview("first note about auth\nsecond", agent=agent)
     assert flipped == 2
 
 
@@ -85,9 +79,7 @@ def test_stop_supersedes_queued_notes():
 
 def test_missed_steer_from_a_patched_host_marks_missed():
     talk_steer.record_queued("sa-0-aaaa", "focus on pricing")
-    hit = talk_steer.apply_missed_steer(
-        "sa-0-aaaa", {"missed_steer": "focus on pricing"}
-    )
+    hit = talk_steer.apply_missed_steer("sa-0-aaaa", {"missed_steer": "focus on pricing"})
     assert hit is True
     assert "never saw the note" in talk_steer.notes_summary()
 
@@ -157,10 +149,7 @@ def test_watcher_ignores_unrelated_log_lines(monkeypatch):
 def test_new_token_shape_and_composition():
     token = talk_steer.new_token()
     assert re.fullmatch(r"tk-[0-9a-f]{8}", token)
-    assert (
-        talk_steer.compose_wire_text(token, "focus on pricing")
-        == f"[{token}] focus on pricing"
-    )
+    assert talk_steer.compose_wire_text(token, "focus on pricing") == f"[{token}] focus on pricing"
 
 
 def test_identical_notes_on_two_agents_land_only_by_token():
@@ -176,9 +165,7 @@ def test_identical_notes_on_two_agents_land_only_by_token():
     talk_steer.record_queued(
         "sa-1-bbbb", talk_steer.compose_wire_text(token_b, note), token=token_b
     )
-    preview = talk_steer.compose_wire_text(token_a, note)[
-        : talk_steer.DRAIN_PREVIEW_CHARS
-    ]
+    preview = talk_steer.compose_wire_text(token_a, note)[: talk_steer.DRAIN_PREVIEW_CHARS]
     assert talk_steer.mark_landed_from_preview(preview) == 1
     summary = talk_steer.notes_summary()
     assert "note to sa-0-aaaa: landed" in summary
@@ -230,10 +217,7 @@ def test_redirected_is_recorded_and_spoken():
     talk_steer.record_redirected("sa-0-aaaa", "[tk-00000000] wrong repo")
     # "accepted … current or next step" — never a claim that the in-flight
     # work was dropped (the host may have taken the steer-queue path).
-    assert (
-        "redirect accepted — applied at its current or next step"
-        in talk_steer.notes_summary()
-    )
+    assert "redirect accepted — applied at its current or next step" in talk_steer.notes_summary()
 
 
 def test_redirected_is_not_downgraded_by_gone_or_stop():
@@ -418,9 +402,7 @@ def test_post_tool_drain_does_not_land_ref_less_receipt_from_recycled_id():
     old_wire = talk_steer.compose_wire_text(old_token, "old agent note")
     new_wire = talk_steer.compose_wire_text(new_token, "replacement agent note")
     talk_steer.record_queued("sa-0-aaaa", old_wire, token=old_token)
-    talk_steer.record_queued(
-        "sa-0-aaaa", new_wire, token=new_token, agent=replacement
-    )
+    talk_steer.record_queued("sa-0-aaaa", new_wire, token=new_token, agent=replacement)
 
     flipped = talk_steer.mark_landed_from_preview(new_wire, agent=replacement)
 
@@ -437,15 +419,9 @@ def test_post_tool_old_agent_drain_does_not_inherit_replacement_ref_less_receipt
     old_token = talk_steer.new_token()
     replacement_token = talk_steer.new_token()
     old_wire = talk_steer.compose_wire_text(old_token, "old agent note")
-    replacement_wire = talk_steer.compose_wire_text(
-        replacement_token, "replacement agent note"
-    )
-    talk_steer.record_queued(
-        "sa-0-aaaa", old_wire, token=old_token, agent=old_agent
-    )
-    talk_steer.record_queued(
-        "sa-0-aaaa", replacement_wire, token=replacement_token
-    )
+    replacement_wire = talk_steer.compose_wire_text(replacement_token, "replacement agent note")
+    talk_steer.record_queued("sa-0-aaaa", old_wire, token=old_token, agent=old_agent)
+    talk_steer.record_queued("sa-0-aaaa", replacement_wire, token=replacement_token)
 
     assert talk_steer.mark_landed_from_preview(old_wire, agent=old_agent) == 1
     summary = talk_steer.notes_summary()
@@ -580,9 +556,7 @@ def test_uninstall_watchers_detaches_everything_but_keeps_receipts(monkeypatch):
 
 def test_landed_push_fires_per_agent_outside_the_lock():
     seen: list[tuple[str, bool]] = []
-    talk_steer.set_landed_notifier(
-        lambda sid: seen.append((sid, talk_steer._LOCK.locked()))
-    )
+    talk_steer.set_landed_notifier(lambda sid: seen.append((sid, talk_steer._LOCK.locked())))
     token = talk_steer.new_token()
     wire = talk_steer.compose_wire_text(token, "a note about auth")
     talk_steer.record_queued("sa-0-aaaa", wire, token=token)

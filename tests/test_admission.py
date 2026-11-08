@@ -93,9 +93,7 @@ def test_shared_keys_serialize_until_the_holder_finishes():
     _wait_terminal(first)
     # A terminal holder holds nothing: the same declaration is admitted now.
     second_gate = _Gate()
-    second = talk_runs.start_run(
-        "agent", "deploy", second_gate.worker, resource_keys=["/repo/a"]
-    )
+    second = talk_runs.start_run("agent", "deploy", second_gate.worker, resource_keys=["/repo/a"])
     assert talk_runs.get_run(second)["status"] == "running"
     second_gate.release.set()
 
@@ -127,32 +125,47 @@ def test_two_shared_keys_are_plural_in_the_refusal():
 def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
     gate = _Gate()
     talk_runs.start_run(
-        "agent", "read a", gate.worker,
-        execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+        "agent",
+        "read a",
+        gate.worker,
+        execution_mode="parallel_read_only",
+        resource_keys=["/repo/a"],
     )
     # Default: the declaration is not trusted, so the holder was admitted as
     # exclusive and the sibling is refused.
     with pytest.raises(talk_runs.AdmissionRefused):
         talk_runs.start_run(
-            "agent", "read b", gate.worker,
-            execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+            "agent",
+            "read b",
+            gate.worker,
+            execution_mode="parallel_read_only",
+            resource_keys=["/repo/a"],
         )
     gate.release.set()
     talk_runs.reset_for_tests()
     talk_runs.attach_owner(
-        talk_session_id="ts-test", generation_id="g", hermes_session_id="s",
-        operator="test", profile=None,
+        talk_session_id="ts-test",
+        generation_id="g",
+        hermes_session_id="s",
+        operator="test",
+        profile=None,
     )
 
     monkeypatch.setenv("TALK_TRUST_DECLARED_READ_ONLY", "true")
     gate = _Gate()
     first = talk_runs.start_run(
-        "agent", "read a", gate.worker,
-        execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+        "agent",
+        "read a",
+        gate.worker,
+        execution_mode="parallel_read_only",
+        resource_keys=["/repo/a"],
     )
     second = talk_runs.start_run(
-        "agent", "read b", gate.worker,
-        execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+        "agent",
+        "read b",
+        gate.worker,
+        execution_mode="parallel_read_only",
+        resource_keys=["/repo/a"],
     )
     assert talk_runs.get_run(first)["admission"]["mode"] == "parallel_read_only"
     assert talk_runs.get_run(second)["status"] == "running"
@@ -165,8 +178,11 @@ def test_read_only_pairs_overlap_only_with_the_knob_on(monkeypatch):
 def test_the_declaration_is_downgraded_not_dropped_when_untrusted():
     gate = _Gate()
     run_id = talk_runs.start_run(
-        "agent", "read", gate.worker,
-        execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+        "agent",
+        "read",
+        gate.worker,
+        execution_mode="parallel_read_only",
+        resource_keys=["/repo/a"],
     )
     admission = talk_runs.get_run(run_id)["admission"]
     assert admission == {"mode": "exclusive", "keys": ["/repo/a"]}
@@ -181,14 +197,20 @@ def test_turning_the_knob_off_closes_overlaps_it_had_allowed(monkeypatch):
     monkeypatch.setenv("TALK_TRUST_DECLARED_READ_ONLY", "1")
     gate = _Gate()
     talk_runs.start_run(
-        "agent", "read a", gate.worker,
-        execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+        "agent",
+        "read a",
+        gate.worker,
+        execution_mode="parallel_read_only",
+        resource_keys=["/repo/a"],
     )
     monkeypatch.delenv("TALK_TRUST_DECLARED_READ_ONLY")
     with pytest.raises(talk_runs.AdmissionRefused):
         talk_runs.start_run(
-            "agent", "read b", gate.worker,
-            execution_mode="parallel_read_only", resource_keys=["/repo/a"],
+            "agent",
+            "read b",
+            gate.worker,
+            execution_mode="parallel_read_only",
+            resource_keys=["/repo/a"],
         )
     gate.release.set()
 
@@ -277,7 +299,16 @@ def test_undeclared_runs_are_exactly_yesterdays_runs(monkeypatch, tmp_path: Path
     ]
     undeclared = next(rec for rec in records if rec["runId"] == first)
     assert set(undeclared) == {
-        "runId", "kind", "label", "status", "output", "meta", "ticket", "delivery", "ts", "updated",
+        "runId",
+        "kind",
+        "label",
+        "status",
+        "output",
+        "meta",
+        "ticket",
+        "delivery",
+        "ts",
+        "updated",
     }
     declared = next(rec for rec in records if rec["runId"] == third)
     assert declared["admission"] == {"mode": "exclusive", "keys": ["/repo"]}
@@ -401,9 +432,7 @@ def test_delegate_task_threads_the_declaration_into_the_host(monkeypatch):
 
     class _Host:
         def run_agent(self, task, background=True, *, execution_mode=None, resource_keys=None):
-            seen.update(
-                task=task, background=background, mode=execution_mode, keys=resource_keys
-            )
+            seen.update(task=task, background=background, mode=execution_mode, keys=resource_keys)
             return "WORK_STARTED #1 kind=agent (x)"
 
     monkeypatch.setattr(talk_host, "host", lambda: _Host())
@@ -476,7 +505,7 @@ def test_the_registry_lanes_speak_the_refusal(monkeypatch):
 def test_the_registry_lanes_admit_and_record_the_declaration(monkeypatch):
     monkeypatch.setattr(talk_host.talk_apiserver, "is_available", lambda: True)
     monkeypatch.setattr(
-        talk_host, "_api_server_worker", lambda prompt, session_id=None: (lambda _r: "ok")
+        talk_host, "_api_server_worker", lambda prompt, session_id=None: lambda _r: "ok"
     )
 
     spoken = talk_host.host().run_agent(

@@ -34,6 +34,7 @@ def test_lazy_import_failure_names_the_extra(monkeypatch):
         talk_audio.import_sounddevice()
     assert talk_audio.audio_available() is False
 
+
 def test_audio_availability_only_requires_sounddevice(monkeypatch):
     monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: object())
 
@@ -106,6 +107,7 @@ def test_linux_default_audio_uses_pulse_webrtc_echo_cancellation(monkeypatch):
     audio.stop()
 
     assert commands[-1] == ["/usr/bin/pactl", "unload-module", "42"]
+
 
 def test_pulse_device_open_failure_retries_original_devices(monkeypatch):
     class FailingPulseSoundDevice(_SoundDevice):
@@ -192,9 +194,11 @@ def test_audio_start_serializes_pulse_environment_through_stream_open(monkeypatc
     monkeypatch.setattr(
         talk_audio.subprocess,
         "run",
-        lambda command, **_kwargs: _CompletedProcess(next(module_ids))
-        if command[1] == "load-module"
-        else _CompletedProcess(""),
+        lambda command, **_kwargs: (
+            _CompletedProcess(next(module_ids))
+            if command[1] == "load-module"
+            else _CompletedProcess("")
+        ),
     )
     active_opens = 0
     maximum_active_opens = 0
@@ -233,9 +237,9 @@ def test_input_chunks_round_trip():
     assert audio.read_input_chunk() == b"\x01\x02"
     assert audio.read_input_chunk() is None
 
+
 def _pcm16(amplitude: int, frames: int = 32) -> bytes:
     return struct.pack(f"<{frames}h", *([amplitude] * frames))
-
 
 
 def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
@@ -247,6 +251,7 @@ def test_playback_echo_below_omp_barge_in_threshold_is_not_uploaded():
     audio._input_callback(_pcm16(5_000, 2_400), 2_400, None, None)
 
     assert audio.read_input_chunk() is None
+
 
 def test_fallback_gate_does_not_allow_vad_to_override_omp_threshold():
     audio = talk_audio.DuplexAudio()
@@ -463,9 +468,7 @@ def test_pulse_stop_preserves_environment_when_never_started_or_load_failed(monk
 
 
 @pytest.mark.parametrize("stop_order", [(0, 1), (1, 0)])
-def test_concurrent_pulse_routes_restore_environment_in_either_order(
-    monkeypatch, stop_order
-):
+def test_concurrent_pulse_routes_restore_environment_in_either_order(monkeypatch, stop_order):
     monkeypatch.setenv("PULSE_SOURCE", "original-source")
     monkeypatch.setenv("PULSE_SINK", "original-sink")
     monkeypatch.setattr(talk_audio.sys, "platform", "linux")
@@ -474,9 +477,11 @@ def test_concurrent_pulse_routes_restore_environment_in_either_order(
     monkeypatch.setattr(
         talk_audio.subprocess,
         "run",
-        lambda command, **_kwargs: _CompletedProcess(next(module_ids))
-        if command[1] == "load-module"
-        else _CompletedProcess(""),
+        lambda command, **_kwargs: (
+            _CompletedProcess(next(module_ids))
+            if command[1] == "load-module"
+            else _CompletedProcess("")
+        ),
     )
     routes = [talk_audio._PulseWebRtcAudio(), talk_audio._PulseWebRtcAudio()]
     routes[0].start(None, None)

@@ -14,9 +14,7 @@ from talk_task_sources import TaskEventError
 def completed(tmp_path, *, clock=None):
     store, box, token = scope(tmp_path, clock=clock)
     bind(store, token)
-    source = store.open_source(
-        token, "job", mode="api_poll", source_session="worker", run_id=7
-    )
+    source = store.open_source(token, "job", mode="api_poll", source_session="worker", run_id=7)
     store.observe_poll(token, source, 7, poll(), live=True)
     event = store.page(token)["events"][0]["event_id"]
     return store, box, token, source, event
@@ -153,11 +151,18 @@ def test_candidate_batch_and_concurrent_claims_are_bounded(tmp_path):
     store, _, token = scope(tmp_path)
     for index in range(1, 11):
         store.bind_run(
-            token, {**run_record(request=f"request-{index}"), "runId": index},
-            operator="operator", worker_session_id="worker", api_run_id=f"remote-{index}",
+            token,
+            {**run_record(request=f"request-{index}"), "runId": index},
+            operator="operator",
+            worker_session_id="worker",
+            api_run_id=f"remote-{index}",
         )
         source = store.open_source(
-            token, f"job-{index}", mode="api_poll", source_session="worker", run_id=index,
+            token,
+            f"job-{index}",
+            mode="api_poll",
+            source_session="worker",
+            run_id=index,
         )
         store.observe_poll(token, source, index, {**poll(), "run_id": f"remote-{index}"}, live=True)
     candidates = store.speech_candidates(token)

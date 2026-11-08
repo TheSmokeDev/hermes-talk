@@ -723,13 +723,21 @@ def test_preferences_fence_owner_generation_and_canonical_deletion(tmp_path):
     with pytest.raises(HistoryError):
         store.preferences(token)
     assert store.preferences(fresh)["update_mode"] == "completion"
-    box.invalidate(token.owner, code="target_missing", connection_id=fresh.connection_id,
-                   generation=fresh.generation)
+    box.invalidate(
+        token.owner,
+        code="target_missing",
+        connection_id=fresh.connection_id,
+        generation=fresh.generation,
+    )
     with pytest.raises(HistoryError):
         store.preferences(fresh)
     with box._db() as db:
-        assert db.execute("SELECT count(*) FROM task_preferences WHERE owner=?",
-                          (token.owner.key,)).fetchone()[0] == 0
+        assert (
+            db.execute(
+                "SELECT count(*) FROM task_preferences WHERE owner=?", (token.owner.key,)
+            ).fetchone()[0]
+            == 0
+        )
     assert other.preferences(foreign)["update_mode"] == "frequent"
 
 
@@ -745,8 +753,10 @@ def test_invalid_preferences_leave_existing_setting_unchanged(tmp_path, mode):
 def test_preference_capacity_does_not_evict_other_owners(tmp_path):
     store, box, token = scope(tmp_path)
     with box._db() as db:
-        db.executemany("INSERT INTO task_preferences VALUES (?,?)",
-                       [(f"owner-{i}", "frequent") for i in range(256)])
+        db.executemany(
+            "INSERT INTO task_preferences VALUES (?,?)",
+            [(f"owner-{i}", "frequent") for i in range(256)],
+        )
     with pytest.raises(TaskEventError, match="capacity"):
         store.set_update_preference(token, "completion")
     assert store.preferences(token)["update_mode"] == "important"
