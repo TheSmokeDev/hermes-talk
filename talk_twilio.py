@@ -327,6 +327,8 @@ class TwilioConfig:
 
 
 SendMedia = Callable[[bytes], Awaitable[None]]
+#: Runs one provider function call and returns the text handed back to it.
+ToolExecutor = Callable[[str, Mapping[str, Any]], Awaitable[str]]
 SendControl = Callable[[], Awaitable[None]]
 
 
@@ -341,6 +343,8 @@ class TwilioCallBridge:
         clear_playback: SendControl | None = None,
         input_rate: int = 16000,
         output_rate: int = 24000,
+        greeting: str | None = None,
+        tool_executor: ToolExecutor | None = None,
         on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.session = session
@@ -348,11 +352,23 @@ class TwilioCallBridge:
         self._clear_playback = clear_playback
         self._inbound = PcmResampler(TWILIO_RATE, input_rate)
         self._outbound = PcmResampler(output_rate, TWILIO_RATE)
+        self._greeting = greeting
+        self._tool_executor = tool_executor
+        self._cancelled_calls: set[str] = set()
         self._on_error = on_error
         self._closed = False
 
     async def connect(self, setup: rt.SessionSetup) -> None:
         await self.session.connect(setup)
+        if self._greeting:
+            # A phone call has no visual cue: without this the caller waits for
+            # the agent and the agent waits for the caller.
+            await self.session.send(
+                [
+                    rt.AddInputText(item_id="twilio-greeting", text=self._greeting),
+                    rt.StartResponse(),
+                ]
+            )
 
     async def feed_media(self, payload: bytes) -> None:
         """Take one inbound µ-law frame from Twilio and feed the session."""
@@ -374,6 +390,29 @@ class TwilioCallBridge:
                     await self._send_media(frame)
             elif isinstance(event, rt.OutputInterrupted) and self._clear_playback is not None:
                 await self._clear_playback()
+            elif isinstance(event, rt.ToolCallsCancelled):
+                self._cancelled_calls.update(getattr(event, "call_ids", ()))
+            elif isinstance(event, rt.FunctionCall):
+                await self._answer_tool_call(event)
+
+    async def _answer_tool_call(self, call: rt.FunctionCall) -> None:
+        """Run one function call and hand the result back to the provider."""
+
+        if self._tool_executor is None:
+            output = "error: no tools are available on this transport"
+        else:
+            try:
+                arguments = json.loads(call.arguments) if call.arguments else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            try:
+                output = await self._tool_executor(call.name, arguments)
+            except Exception as exc:  # noqa: BLE001 - report, never kill the call
+                output = f"error: {type(exc).__name__}: {exc}"
+        if call.call_id in self._cancelled_calls:
+            self._cancelled_calls.discard(call.call_id)
+            return
+        await self.session.send([rt.SubmitToolResult(call_id=call.call_id, output=output)])
 
     async def close(self) -> None:
         self._closed = True
@@ -401,6 +440,8 @@ def create_app(
     config: TwilioConfig,
     session_factory: Callable[[], rt.RealtimeSession],
     setup_factory: Callable[[], rt.SessionSetup],
+    greeting: str | None = None,
+    tool_executor: ToolExecutor | None = None,
     aiohttp_module: Any = None,
 ):
     """Build the aiohttp app exposing the Voice webhook and the stream socket."""
@@ -460,6 +501,8 @@ def create_app(
                         clear_playback=clear_playback,
                         input_rate=config.input_rate,
                         output_rate=config.output_rate,
+                        greeting=greeting,
+                        tool_executor=tool_executor,
                     )
                     await bridge.connect(setup_factory())
                     state["bridge"] = bridge
@@ -493,6 +536,8 @@ async def serve(
     config: TwilioConfig,
     session_factory: Callable[[], rt.RealtimeSession],
     setup_factory: Callable[[], rt.SessionSetup],
+    greeting: str | None = None,
+    tool_executor: ToolExecutor | None = None,
     host: str = "127.0.0.1",
     port: int = 8767,
 ) -> None:
@@ -503,6 +548,8 @@ async def serve(
         config=config,
         session_factory=session_factory,
         setup_factory=setup_factory,
+        greeting=greeting,
+        tool_executor=tool_executor,
         aiohttp_module=aiohttp,
     )
     runner = aiohttp.web.AppRunner(app)

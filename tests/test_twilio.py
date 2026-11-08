@@ -310,3 +310,76 @@ def test_bridge_ignores_inbound_after_close():
     asyncio.run(run())
     assert session.closed is True
     assert session.commands == []
+
+
+def test_bridge_greets_the_caller_on_connect():
+    session = ScriptedSession([])
+
+    async def send_media(payload: bytes) -> None:
+        return None
+
+    async def run() -> None:
+        bridge = twilio.TwilioCallBridge(session, send_media=send_media, greeting="say hello")
+        await bridge.connect(_setup())
+
+    asyncio.run(run())
+    kinds = [type(command).__name__ for command in session.commands]
+    assert kinds == ["AddInputText", "StartResponse"]
+    assert session.commands[0].text == "say hello"
+
+
+def test_bridge_answers_tool_calls_and_reports_the_result():
+    call = rt.FunctionCall(call_id="call_1", name="check_time", arguments='{"x": 1}')
+    session = ScriptedSession([call])
+    seen: list[tuple[str, dict]] = []
+
+    async def send_media(payload: bytes) -> None:
+        return None
+
+    async def execute(name: str, arguments) -> str:
+        seen.append((name, dict(arguments)))
+        return "Sunday"
+
+    async def run() -> None:
+        bridge = twilio.TwilioCallBridge(session, send_media=send_media, tool_executor=execute)
+        await bridge.run()
+
+    asyncio.run(run())
+    assert seen == [("check_time", {"x": 1})]
+    assert isinstance(session.commands[-1], rt.SubmitToolResult)
+    assert session.commands[-1].call_id == "call_1"
+    assert session.commands[-1].output == "Sunday"
+
+
+def test_bridge_reports_tool_failures_instead_of_dying():
+    call = rt.FunctionCall(call_id="call_2", name="boom", arguments="")
+    session = ScriptedSession([call])
+
+    async def send_media(payload: bytes) -> None:
+        return None
+
+    async def execute(name: str, arguments) -> str:
+        raise RuntimeError("nope")
+
+    async def run() -> None:
+        bridge = twilio.TwilioCallBridge(session, send_media=send_media, tool_executor=execute)
+        await bridge.run()
+
+    asyncio.run(run())
+    assert "RuntimeError" in session.commands[-1].output
+
+
+def test_bridge_stays_silent_without_a_tool_executor():
+    call = rt.FunctionCall(call_id="call_3", name="check_time", arguments="")
+    session = ScriptedSession([call])
+
+    async def send_media(payload: bytes) -> None:
+        return None
+
+    async def run() -> None:
+        bridge = twilio.TwilioCallBridge(session, send_media=send_media)
+        await bridge.run()
+
+    asyncio.run(run())
+    assert isinstance(session.commands[-1], rt.SubmitToolResult)
+    assert "no tools" in session.commands[-1].output
