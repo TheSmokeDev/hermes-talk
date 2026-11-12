@@ -21,6 +21,11 @@ named rather than smoothed.
   `hermes talk journal` lists calls and prints one as Markdown. Retention is
   bounded (`TALK_CALL_JOURNAL_DAYS`, default 30). Off by default.
   Contributed by @Philibergus.
+- `hermes talk echo HOST` uses an Amazon Echo running echo-dot-assist's hassmic
+  in Wyoming mode as an optional Talk surface. Each wake word starts a session
+  on the Echo's microphone and speaker. The session ends after `--idle` seconds
+  of quiet. Full duplex needs hassmic's `-D`. Thanks to
+  [@patrickhaahr](https://github.com/patrickhaahr).
 
 ## [0.23.1] — 2026-11-17
 
