@@ -189,6 +189,7 @@ fails the release if a declared module is missing from the wheel.
 | `talk_relay.py` | Realtime event loop — transport-agnostic, fully testable offline |
 | `talk_audio.py` | Duplex mic/speaker (sounddevice), echo gate, PulseAudio AEC on Linux |
 | `talk_discord.py` | Discord voice as an audio device — the same methods, a different room |
+| `talk_echo.py` | An Amazon Echo running hassmic as an audio device, over Wyoming — one session per wake word |
 | `talk_cascade_voice.py` | Custom-voice cascade — the provider thinks in text, ElevenLabs speaks |
 | `talk_cli.py` | `hermes talk` — transport, lifecycle, the announcement pump |
 | `talk_tools.py` | The 11 model-facing tools and their speakable-error contract |

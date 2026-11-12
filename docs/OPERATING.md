@@ -810,6 +810,52 @@ is left pointing at the old connection and the call goes quiet — it
 fails to silence, never to a wrong answer. Say `/talk leave` and rejoin.
 Tracked as [#8](https://github.com/TheSmokeDev/hermes-talk/issues/8).
 
+## Amazon Echo — hassmic over Wyoming
+
+`hermes talk echo HOST` puts the session on an Amazon Echo running
+[echo-dot-assist](https://github.com/Gamer92000/echo-dot-assist)'s
+hassmic, with no Home Assistant between. The Echo keeps Amazon's echo
+canceller, beamforming and wake word engine; Talk is the Wyoming client
+that Home Assistant would otherwise be. Each wake word starts one session
+on the Echo's microphone and speaker, and the session ends after `--idle`
+seconds with nobody speaking and nothing playing.
+
+On the Echo, in `/data/local/hassmic/hassmic.conf`:
+
+```bash
+PROTO=wyoming
+ARGS="-D"
+```
+
+`-D` keeps the microphone streaming while a reply plays, so you can talk
+over it. Without it hassmic stops the microphone at the first reply and
+each wake word gives one exchange.
+
+On the Hermes host:
+
+```bash
+hermes talk echo 192.168.1.50              # the Echo's address
+hermes talk echo 192.168.1.50 --idle 30    # end after 30 s of quiet (default 20)
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--port` | `16700` | hassmic's Wyoming port |
+| `--idle` | `20` | seconds of quiet before the session ends |
+| `--barge-in-level` | `0.02` | while the Echo speaks, microphone chunks quieter than this RMS are replaced with silence. Raise it if the session answers its own replies, lower it if talking over a reply is not heard |
+
+Each session ends with one line on the microphone level while the Echo
+spoke and otherwise, which is what to tune `--barge-in-level` from.
+
+The Hermes host connects to the Echo, so the only network rule needed is TCP
+16700 from the host to the Echo. A dropped link is retried with backoff
+(1 s up to 30 s).
+
+Boundaries: Wyoming is plain TCP with no authentication, so keep the Echo
+and the host on a network you trust. The Echo hears a room, not a person:
+like the terminal lane, the session treats whoever speaks as the operator,
+and there is no per-speaker authorization as there is on Discord.
+
 ## Dashboard tab
 
 The demo in the [README](../README.md) is this tab. Start the dashboard and Talk

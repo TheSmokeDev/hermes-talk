@@ -195,6 +195,10 @@ def test_each_known_lane_renders_its_exact_sentence():
             "You are live in the Hermes dashboard browser tab — the hang-up "
             "control or closing the tab ends the call."
         ),
+        "echo": (
+            "You are speaking through an Amazon Echo speaker in the operator's home — "
+            "the call ends by itself after a quiet spell, and its wake word starts a new one."
+        ),
     }
     # The map is the contract: a renamed key must fail here, not on a call.
     assert set(talk_identity.LANE_LINES) == set(expected)
