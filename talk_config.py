@@ -20,6 +20,43 @@ import os
 import re
 from pathlib import Path
 
+# -- profile-scoped env resolution ---------------------------------------------
+#
+# In a multiplexed gateway turn the profile's ``.env`` lives in a context-local
+# secret scope, not in ``os.environ``.  ``get_secret`` from Hermes core resolves
+# it correctly (read-scope → raise on routed-miss → fall-through to
+# ``os.environ`` in standalone mode).  On a standalone ``hermes`` invocation or
+# in tests that don't import the agent, fall back to ``os.environ`` directly.
+
+# Attempt the import once at module load so every function below reuses the
+# cached reference.  When ``agent.secret_scope`` is not importable (standalone
+# install, isolated tests) we fall through to plain ``os.environ``.
+_hermes_get_secret = None
+try:
+    from agent.secret_scope import get_secret as _hgs
+    _hermes_get_secret = _hgs
+except ImportError:
+    pass
+
+
+def _talk_env_get(key: str, default: str | None = None) -> str | None:
+    """Resolve a TALK_* config value, respecting profile-scoped secrets.
+
+    When the Hermes ``agent.secret_scope`` module is importable (multiplexed
+    gateway turn), delegates to ``get_secret`` which:
+      - returns the scoped value when a profile scope is installed,
+      - returns *default* when the scoped key is absent,
+      - raises ``UnscopedSecretError`` when multiplexed but scope is missing,
+      - falls through to ``os.environ`` in standalone mode.
+
+    On a standalone ``hermes`` invocation or in isolated tests without the agent,
+    falls back to ``os.environ.get(key, default)`` directly.
+    """
+    if _hermes_get_secret is not None:
+        return _hermes_get_secret(key, default=default)
+    return os.environ.get(key, default)
+
+
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
 DEFAULT_AGENT_TIMEOUT_S = 1_800
@@ -360,7 +397,7 @@ def agent_profile() -> str | None:
     without editing any config.
     """
 
-    raw = os.environ.get("TALK_AGENT_PROFILE")
+    raw = _talk_env_get("TALK_AGENT_PROFILE")
     if raw is not None:
         return raw.strip() or None
     return detect_agent_profile()
@@ -388,7 +425,7 @@ def identity_include() -> tuple[str, ...] | None:
     narrow the prompt, never take the voice surface down with it.
     """
 
-    raw = (os.environ.get("TALK_IDENTITY_INCLUDE") or "").strip()
+    raw = (_talk_env_get("TALK_IDENTITY_INCLUDE") or "").strip()
     if not raw:
         return None
     names = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
@@ -422,7 +459,7 @@ def session_key() -> str | None:
     per-speaker scoping is a follow-up, not shipped.
     """
 
-    return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
+    return (_talk_env_get("TALK_SESSION_KEY") or "").strip() or None
 
 
 def turn_detection(provider: str | None = None):
@@ -433,8 +470,8 @@ def turn_detection(provider: str | None = None):
         import talk_realtime as rt
 
     provider = provider or talk_provider()
-    raw = os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
-    eagerness = os.environ.get("TALK_SEMANTIC_EAGERNESS")
+    raw = _talk_env_get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+    eagerness = _talk_env_get("TALK_SEMANTIC_EAGERNESS")
     supported = {
         "openai": {"provider_native", "server_vad", "semantic_vad"},
         "grok": {"provider_native", "server_vad"},
@@ -465,7 +502,7 @@ def talk_provider() -> str:
     """
 
     raw = (
-        (os.environ.get("TALK_PROVIDER") or DEFAULT_TALK_PROVIDER).strip().lower()
+        (_talk_env_get("TALK_PROVIDER") or DEFAULT_TALK_PROVIDER).strip().lower()
         or DEFAULT_TALK_PROVIDER
     )
     if raw not in TALK_PROVIDERS:
@@ -479,19 +516,19 @@ def talk_provider() -> str:
 def talk_model() -> str:
     """Realtime model, resolved at call time."""
 
-    return (os.environ.get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
+    return (_talk_env_get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
 
 
 def talk_grok_model() -> str:
     """Grok realtime model, resolved at call time (``TALK_GROK_MODEL``)."""
 
-    return (os.environ.get("TALK_GROK_MODEL") or DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL
+    return (_talk_env_get("TALK_GROK_MODEL") or DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL
 
 
 def talk_grok_voice() -> str:
     """Grok realtime voice, fail-closed on unknown ids (``TALK_GROK_VOICE``)."""
 
-    raw = (os.environ.get("TALK_GROK_VOICE") or DEFAULT_GROK_VOICE).strip().lower()
+    raw = (_talk_env_get("TALK_GROK_VOICE") or DEFAULT_GROK_VOICE).strip().lower()
     raw = raw or DEFAULT_GROK_VOICE
     if raw not in GROK_REALTIME_VOICES:
         raise TalkConfigError(
@@ -510,7 +547,7 @@ def talk_local_url() -> str:
 
     from urllib.parse import urlsplit
 
-    raw = (os.environ.get("TALK_LOCAL_URL") or DEFAULT_LOCAL_URL).strip() or DEFAULT_LOCAL_URL
+    raw = (_talk_env_get("TALK_LOCAL_URL") or DEFAULT_LOCAL_URL).strip() or DEFAULT_LOCAL_URL
     try:
         parts = urlsplit(raw)
         host = (parts.hostname or "").lower()
@@ -532,7 +569,7 @@ def talk_local_url() -> str:
 def talk_local_model() -> str:
     """Model id sent to the local server (``TALK_LOCAL_MODEL``)."""
 
-    raw = (os.environ.get("TALK_LOCAL_MODEL") or DEFAULT_LOCAL_MODEL).strip()
+    raw = (_talk_env_get("TALK_LOCAL_MODEL") or DEFAULT_LOCAL_MODEL).strip()
     return raw or DEFAULT_LOCAL_MODEL
 
 
@@ -543,7 +580,7 @@ def talk_local_voice() -> str:
     closed list to validate against here.
     """
 
-    raw = (os.environ.get("TALK_LOCAL_VOICE") or DEFAULT_LOCAL_VOICE).strip()
+    raw = (_talk_env_get("TALK_LOCAL_VOICE") or DEFAULT_LOCAL_VOICE).strip()
     return raw or DEFAULT_LOCAL_VOICE
 
 
@@ -554,7 +591,7 @@ def resolve_local_key() -> str:
     other Talk key: a blank value is a mistake, not a choice.
     """
 
-    raw = os.environ.get("TALK_LOCAL_API_KEY")
+    raw = _talk_env_get("TALK_LOCAL_API_KEY")
     if raw is None:
         return ""
     if not raw.strip():
@@ -568,7 +605,7 @@ def talk_gemini_model() -> str:
     """Gemini Live model, resolved at call time (``TALK_GEMINI_MODEL``)."""
 
     return (
-        (os.environ.get("TALK_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+        (_talk_env_get("TALK_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
         or DEFAULT_GEMINI_MODEL
     )
 
@@ -582,7 +619,7 @@ def talk_gemini_voice() -> str:
     accept.
     """
 
-    raw = (os.environ.get("TALK_GEMINI_VOICE") or DEFAULT_GEMINI_VOICE).strip()
+    raw = (_talk_env_get("TALK_GEMINI_VOICE") or DEFAULT_GEMINI_VOICE).strip()
     raw = raw or DEFAULT_GEMINI_VOICE
     if raw not in GEMINI_LIVE_VOICES:
         raise TalkConfigError(
@@ -620,7 +657,7 @@ def realtime_model_valid(model: str) -> bool:
 def talk_voice() -> str:
     """Realtime voice, fail-closed on unknown ids."""
 
-    raw = (os.environ.get("TALK_VOICE") or DEFAULT_TALK_VOICE).strip().lower() or DEFAULT_TALK_VOICE
+    raw = (_talk_env_get("TALK_VOICE") or DEFAULT_TALK_VOICE).strip().lower() or DEFAULT_TALK_VOICE
     if raw not in OPENAI_REALTIME_VOICES:
         raise TalkConfigError(
             f"TALK_VOICE '{raw}' is not a built-in Realtime voice "
@@ -637,14 +674,14 @@ def resolve_openai_key() -> str:
     scoped a key expects that key to be used or the surface to say why not.
     """
 
-    scoped = os.environ.get("TALK_OPENAI_API_KEY")
+    scoped = _talk_env_get("TALK_OPENAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_OPENAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("OPENAI_API_KEY")
+    shared = _talk_env_get("OPENAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("OPENAI_API_KEY is set but empty — set a real key or unset it")
@@ -663,14 +700,14 @@ def resolve_xai_key() -> str:
     the subscription lane lives in ``talk_grok_auth.resolve_grok_auth``.
     """
 
-    scoped = os.environ.get("TALK_XAI_API_KEY")
+    scoped = _talk_env_get("TALK_XAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_XAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("XAI_API_KEY")
+    shared = _talk_env_get("XAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("XAI_API_KEY is set but empty — set a real key or unset it")
@@ -688,14 +725,14 @@ def resolve_gemini_key() -> str:
     logged, and scrubbed out of transport errors before they surface.
     """
 
-    scoped = os.environ.get("TALK_GEMINI_API_KEY")
+    scoped = _talk_env_get("TALK_GEMINI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_GEMINI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("GEMINI_API_KEY")
+    shared = _talk_env_get("GEMINI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("GEMINI_API_KEY is set but empty — set a real key or unset it")
@@ -717,7 +754,7 @@ def voice_mode() -> str:
     """
 
     raw = (
-        (os.environ.get("TALK_VOICE_MODE") or DEFAULT_VOICE_MODE).strip().lower()
+        (_talk_env_get("TALK_VOICE_MODE") or DEFAULT_VOICE_MODE).strip().lower()
         or DEFAULT_VOICE_MODE
     )
     if raw not in TALK_VOICE_MODES:
@@ -737,7 +774,7 @@ def cascade_tts() -> str:
     """
 
     raw = (
-        (os.environ.get("TALK_CASCADE_TTS") or DEFAULT_CASCADE_TTS).strip().lower()
+        (_talk_env_get("TALK_CASCADE_TTS") or DEFAULT_CASCADE_TTS).strip().lower()
         or DEFAULT_CASCADE_TTS
     )
     if raw not in TALK_CASCADE_TTS_PROVIDERS:
@@ -757,14 +794,14 @@ def resolve_elevenlabs_key() -> str:
     ``xi-api-key`` WebSocket header — never the URL, never a log line.
     """
 
-    scoped = os.environ.get("TALK_ELEVENLABS_API_KEY")
+    scoped = _talk_env_get("TALK_ELEVENLABS_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_ELEVENLABS_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = os.environ.get("ELEVENLABS_API_KEY")
+    shared = _talk_env_get("ELEVENLABS_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError(
@@ -786,7 +823,7 @@ def elevenlabs_voice_id() -> str:
     an identifier, not a secret; the KEY is the secret.
     """
 
-    raw = (os.environ.get("TALK_ELEVENLABS_VOICE_ID") or "").strip()
+    raw = (_talk_env_get("TALK_ELEVENLABS_VOICE_ID") or "").strip()
     if not raw:
         raise TalkConfigError(
             "TALK_VOICE_MODE=cascade needs TALK_ELEVENLABS_VOICE_ID — set it to a "
@@ -799,7 +836,7 @@ def elevenlabs_model() -> str:
     """ElevenLabs TTS model for the cascade lane (``TALK_ELEVENLABS_MODEL``)."""
 
     return (
-        (os.environ.get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
+        (_talk_env_get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
         or DEFAULT_ELEVENLABS_MODEL
     )
 
@@ -818,7 +855,7 @@ def elevenlabs_speed() -> float | None:
     audible on every single word.
     """
 
-    raw = (os.environ.get("TALK_CASCADE_SPEED") or "").strip()
+    raw = (_talk_env_get("TALK_CASCADE_SPEED") or "").strip()
     if not raw:
         return None
     try:
@@ -886,7 +923,7 @@ def agent_timeout_s() -> int:
     a wedged agent cannot leave a poll loop running for the whole session.
     """
 
-    raw = (os.environ.get("TALK_AGENT_TIMEOUT_S") or "").strip()
+    raw = (_talk_env_get("TALK_AGENT_TIMEOUT_S") or "").strip()
     if raw:
         try:
             parsed = int(raw)
@@ -914,7 +951,7 @@ def _positive_float(name: str, default: float) -> float:
 def api_server_url() -> str:
     """Base URL of the Hermes api_server gateway platform, no trailing slash."""
 
-    raw = (os.environ.get("TALK_API_SERVER_URL") or "").strip()
+    raw = (_talk_env_get("TALK_API_SERVER_URL") or "").strip()
     return (raw or DEFAULT_API_SERVER_URL).rstrip("/")
 
 
@@ -931,10 +968,10 @@ def api_server_key() -> str | None:
     so "no key" is a real, reachable configuration rather than a broken one.
     """
 
-    scoped = os.environ.get("TALK_API_SERVER_KEY")
+    scoped = _talk_env_get("TALK_API_SERVER_KEY")
     if scoped is not None:
         return scoped.strip() or None
-    return (os.environ.get("API_SERVER_KEY") or "").strip() or None
+    return (_talk_env_get("API_SERVER_KEY") or "").strip() or None
 
 
 def api_server_probe_timeout_s() -> float:
@@ -975,7 +1012,7 @@ def catalog_startup_wait_s() -> float:
     — section omitted, never a stall.
     """
 
-    raw = (os.environ.get("TALK_CATALOG_STARTUP_WAIT_S") or "").strip()
+    raw = (_talk_env_get("TALK_CATALOG_STARTUP_WAIT_S") or "").strip()
     if raw:
         try:
             parsed = float(raw)
@@ -1003,14 +1040,14 @@ def memory_search_timeout_s() -> float:
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
-    raw = (os.environ.get("TALK_INPUT_DEVICE") or "").strip()
+    raw = (_talk_env_get("TALK_INPUT_DEVICE") or "").strip()
     return raw or None
 
 
 def audio_output_device() -> str | None:
     """Optional sounddevice output override."""
 
-    raw = (os.environ.get("TALK_OUTPUT_DEVICE") or "").strip()
+    raw = (_talk_env_get("TALK_OUTPUT_DEVICE") or "").strip()
     return raw or None
 
 
@@ -1021,7 +1058,7 @@ def discord_operator_user_ids() -> frozenset[int]:
     A partially valid list never partially authorizes.
     """
 
-    raw = os.environ.get("TALK_DISCORD_OPERATOR_USER_IDS")
+    raw = _talk_env_get("TALK_DISCORD_OPERATOR_USER_IDS")
     if raw is None or not raw.strip():
         return frozenset()
     resolved: set[int] = set()
@@ -1077,7 +1114,7 @@ def trust_declared_read_only() -> bool:
     key run together; anything else, junk included, keeps the fence.
     """
 
-    raw = (os.environ.get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
+    raw = (_talk_env_get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

@@ -177,6 +177,122 @@ def session_to_discord(pcm24_mono: bytes, *, carry: int | None = None) -> tuple[
 # -- the host's voice surface -------------------------------------------------
 
 
+def _resolve_discord_adapter_for_profile(runner, profile_name: str | None) -> Any:
+    """Find the Discord adapter, respecting the profile's adapter map.
+
+    Hermes v0.22.6+ multiplexed gateways expose:
+      - ``runner._primary_profile_name`` — the profile that owns ``runner.adapters``.
+        Under multiplexing this is always ``"default"``, under standalone it is the
+        actual launch profile name.
+      - ``runner._profile_adapters`` — dict mapping *secondary* profile names to
+        their own adapter maps.  The primary profile is NOT in this dict.
+
+    Rules (mirrors ``authz_mixin.py:_adapters_for_profile``):
+      - ``profile_name`` is ``None`` or ``"default"`` → use the primary map
+        (``runner.adapters``).
+      - ``profile_name`` is in ``_profile_adapters`` → resolve only from that
+        profile's map.  A missing Discord adapter is a **hard error** — never
+        silently fall back to the default bot (issue #185).
+      - ``profile_name`` is not in ``_profile_adapters`` but equals
+        ``_primary_profile_name`` → the caller identified the primary by name;
+        use ``runner.adapters``.
+      - ``profile_name`` is not in ``_profile_adapters`` and does NOT equal
+        ``_primary_profile_name`` → it is an unknown secondary profile.  **Fail
+        closed**: return ``None`` so the caller reports "no Discord adapter on
+        this profile".
+      - No ``_profile_adapters`` attribute (standalone/legacy host) → use
+        ``runner.adapters``.
+    """
+
+    def _find_in_map(adapter_map: dict) -> Any:
+        """Search one adapter map for the Discord adapter.
+
+        The Platform enum has lived in more than one module across host
+        versions; we try each candidate and fall back to a label match.
+        """
+        adapter = None
+        for module_name in ("gateway.config", "models", "gateway.platform_registry"):
+            try:
+                module = __import__(module_name, fromlist=["Platform"])
+                adapter = adapter_map.get(module.Platform.DISCORD)
+            except Exception:  # noqa: BLE001 — try the next candidate
+                continue
+            if adapter is not None:
+                break
+        if adapter is None:
+            # Last resort: match on the key's own name, so a host that moves or
+            # renames the enum entirely still resolves.
+            for key, value in adapter_map.items():
+                label = getattr(key, "value", None) or getattr(key, "name", None) or key
+                if str(label).strip().lower() == "discord":
+                    adapter = value
+                    break
+        return adapter
+
+    # --- Determine which adapter map to use -----------------------------------
+    adapters_map: dict = {}  # always set before use
+    # Track whether the profile had an explicit map entry (even if empty).
+    # This distinguishes "known profile that simply has no Discord adapter"
+    # from "unknown profile / no map available" so we can produce the right error.
+    profile_has_explicit_map: bool = False
+
+    profile_adapters = getattr(runner, "_profile_adapters", None)
+
+    # 1. Trivial cases: no profile name, or the canonical default name.
+    clean_name = (profile_name or "").strip() or None
+    if clean_name is None or clean_name == "default" or profile_adapters is None:
+        adapters_map = getattr(runner, "adapters", {}) or {}
+    # 3. Secondary profile with an explicit map.
+    elif clean_name in profile_adapters:
+        adapters_map = profile_adapters[clean_name]
+        profile_has_explicit_map = True
+    # 4. Named profile not in _profile_adapters — check _primary_profile_name.
+    else:
+        primary = getattr(runner, "_primary_profile_name", None)
+        if primary and clean_name == primary:
+            # The caller identified the primary by its real name.
+            adapters_map = getattr(runner, "adapters", {}) or {}
+        else:
+            # Unknown secondary profile under multiplexing: fail closed.
+            # Return empty map; let resolve_voice_bridge produce the generic
+            # "adapter isn't loaded on this gateway" error — we do NOT borrow
+            # the default profile's Discord bot (issue #185).
+            adapters_map = {}
+
+    # --- Search the chosen map ------------------------------------------------
+    adapter = _find_in_map(adapters_map)
+    if adapter is not None:
+        return adapter
+
+    # A known profile with an explicit adapter map entry was queried but has no
+    # Discord adapter.  Raise a specific error so the operator knows which
+    # profile is misconfigured rather than getting a misleading "gateway" error.
+    if profile_name and profile_has_explicit_map:
+        raise TalkDiscordError(
+            f"Discord adapter is not loaded on profile {profile_name!r}; "
+            "this profile does not have a Discord bot."
+        )
+    return None
+
+
+def _resolve_current_profile() -> str | None:
+    """Return the active profile name, or ``None`` for standalone.
+
+    Under multiplexing the gateway sets ``HERMES_SESSION_PROFILE`` on every
+    turn.  When ``talk_discord`` is invoked from the CLI (standalone) the
+    context variable is absent and we return ``None`` so the legacy
+    ``runner.adapters`` path is taken.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        name = get_session_env("HERMES_SESSION_PROFILE")
+        if name:
+            return name
+    except ImportError:
+        pass  # standalone / test without session_context module
+    return None
+
+
 def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     """Find the host's live Discord voice connection. Raises on any miss.
 
@@ -184,6 +300,12 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     is guarded: this reaches into host internals that carry no stability
     promise, so a rename must surface as one refusal sentence rather than a
     traceback on the voice path.
+
+    Profile-aware: under a multiplexed gateway the Discord adapter is looked
+    up in the invoking profile's map
+    (``runner._profile_adapters[profile]``) rather than the default profile's
+    ``runner.adapters``.  A missing secondary-profile adapter is a hard error
+    rather than silently using the default profile's Discord bot.
     """
 
     try:
@@ -197,28 +319,10 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     if runner is None:
         raise TalkDiscordError("the Hermes gateway isn't running in this process")
 
-    # Find the Discord adapter without pinning one import path. The enum has
-    # lived in more than one module across host versions, and guessing wrong
-    # is indistinguishable from "Discord isn't running" — which is how this
-    # first shipped, refusing on a gateway that was connected fine.
-    adapters = getattr(runner, "adapters", None) or {}
-    adapter = None
-    for module_name in ("gateway.config", "models", "gateway.platform_registry"):
-        try:
-            module = __import__(module_name, fromlist=["Platform"])
-            adapter = adapters.get(module.Platform.DISCORD)
-        except Exception:  # noqa: BLE001 — try the next candidate
-            continue
-        if adapter is not None:
-            break
-    if adapter is None:
-        # Last resort: match on the key's own name, so a host that moves or
-        # renames the enum entirely still resolves.
-        for key, value in adapters.items():
-            label = getattr(key, "value", None) or getattr(key, "name", None) or key
-            if str(label).strip().lower() == "discord":
-                adapter = value
-                break
+    # Resolve the invoking profile so we can pick the correct adapter map.
+    profile_name = _resolve_current_profile()
+
+    adapter = _resolve_discord_adapter_for_profile(runner, profile_name)
     if adapter is None:
         raise TalkDiscordError("the Discord adapter isn't loaded on this gateway")
 
