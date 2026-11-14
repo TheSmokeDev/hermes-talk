@@ -23,6 +23,10 @@ named rather than smoothed.
   latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
 
 ### Fixed
+- REST skill and toolset discovery accepts OpenAI-style `data` list envelopes
+  alongside bare lists and named envelopes. Named lists keep precedence,
+  non-object entries are filtered, and invalid response shapes still fail.
+  Contributed by @tancou.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
