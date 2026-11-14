@@ -1,12 +1,12 @@
 [project]
 name = "hermes-talk"
-version = "0.22.1"
+version = "0.23.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "SmokeDev" }]
-dependencies = ["httpx>=0.27,<1", "aiohttp>=3.9,<4"]
+dependencies = ["httpx>=0.27,<1", "aiohttp>=3.9,<4", "phonenumbers>=9.0.0,<10", "mcp>=2.3.0,<3", "uvicorn>=0.34,<1"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6,<0.6", "numpy>=1.26,<3"]
@@ -22,7 +22,7 @@ live = ["aiortc>=1.14,<2"]
 # own workspace when the plugin is enabled, so a pin in this list must agree
 # with Hermes core's dev pins or nobody can enable the plugin (#180). ruff's
 # version pin lives in requirements-lint.txt instead.
-dev = ["pytest>=8", "pytest-timeout>=2.3", "starlette>=0.40"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "starlette>=0.40", "PyYAML>=6,<7"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -38,6 +38,7 @@ build-backend = "setuptools.build_meta"
 # it, so a roadmap entry here (talk_actuators, talk_flush) would
 # read as shipped while the wheel quietly omitted it — add each one as it lands.
 [tool.setuptools]
+packages = ["talk_phone"]
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 py-modules = [
   "talk_config",
@@ -113,6 +114,9 @@ py-modules = [
   "talk_providers",
   "talk_vault",
 ]
+
+[tool.setuptools.package-data]
+talk_phone = ["skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

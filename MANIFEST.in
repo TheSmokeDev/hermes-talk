@@ -1,4 +1,6 @@
 include __init__.py plugin.yaml .env.example
+recursive-include talk_phone *.py *.md
+recursive-include docs/plans/phone-mode *.md
 include .gitattributes
 recursive-include dashboard *.py *.json *.js *.css
 recursive-include desktop *.js

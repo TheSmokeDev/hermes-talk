@@ -137,6 +137,9 @@ def test_no_handler_is_orphaned():
     advertised = {tool["name"] for tool in talk_tools.default_talk_tools()}
     advertised.add("search_vault")  # conditional, absent when unservable
     advertised.add("pause_voice_input")  # conditional, absent without a way to resume
+    from talk_phone.plugin import TOOLS
+
+    advertised.update(t.name for t in TOOLS)  # conditional, absent when Phone mode is off
 
     assert set(talk_tools._HANDLERS) == advertised
 

@@ -1,5 +1,30 @@
 # Hermes Talk
 
+### Optional native Phone mode
+
+Phone mode is part of Hermes Talk and is off by default. Enable it in Hermes's
+plugin settings, then connect a dedicated Dograh account and an existing owned
+caller number with `hermes talk phone setup`. Normal Talk use needs no Dograh account.
+
+Call tools, review controls, status and caller questions use the existing Hermes
+conversation. `/phone review CALL_ID` opens the host's native approval picker;
+`/phone answer REQUEST_ID ANSWER` returns an authenticated owner answer to the call.
+Desktop/dashboard and mobile viewers use the host's message stream; Discord uses
+its existing adapter and channel/thread. There is no separate Phone dashboard.
+
+An existing separate Dograh test setup can be imported explicitly with
+`hermes talk phone setup --import-dograh`. The original journal is preserved and
+previous approvals are revoked. Use `hermes talk phone doctor` for connection checks.
+The optional authenticated in-call bridge starts explicitly with
+`hermes talk phone bridge`; configure its existing private relay or HTTPS proxy
+before accepting remote caller questions. Installation never dials or buys a number.
+
+Phone mode uses Dograh and its configured carrier/STT/LLM/TTS services. Carrier,
+hosting and model charges may apply. Audio, transcripts and recordings are processed
+and stored according to that account's provider configuration. Keep keys in Hermes
+secret settings, use exact owned-number allowlists, and review every call. Phone
+Stop prevents new calls and revokes grants; it does not hang up an active carrier call.
+
 **Realtime duplex voice for your own agent — talk to it, it runs real work in the background, it reports back out loud.**
 
 <p>
