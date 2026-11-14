@@ -33,10 +33,10 @@ def run(ctx, args):
 
             return setup(ctx)
         if args.phone_action == "doctor":
-            from .doctor import doctor
+            from .doctor import cli_report, doctor
 
             result = doctor(ctx)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(cli_report(result), indent=2))
             return 0 if result.get("connection_ready") else 1
         from .bridge import serve
 

@@ -53,7 +53,11 @@ def test_import_preserves_history_and_revokes_old_approval(monkeypatch, tmp_path
     root, saved = install_public_helpers(monkeypatch, tmp_path, config)
     old = BridgeStore(root / "hermes-dograh/calls.db", clock=lambda: 1000)
     old.prepare("owner-session", {"purpose": "synthetic history"})
-    old.connect("old-transport")
+    with old.connection(write=True) as db:
+        db.execute(
+            "INSERT INTO bridge_connections(connection,code,created,expires) "
+            "VALUES('legacy-transport','legacy-code',1000,1120)"
+        )
     result = migration.import_dograh()
     assert result["call_placed"] is False and result["old_journal_preserved"]
     assert config["plugins"]["enabled"] == ["hermes-talk"]

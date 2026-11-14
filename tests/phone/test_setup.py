@@ -3,9 +3,16 @@ from dataclasses import replace
 import pytest
 
 from talk_phone.policy import DISCLOSURE, PhoneError, Settings
-from talk_phone.setup import collect, phone_workflow
+from talk_phone.setup import choose, collect, phone_workflow
 
 from .conftest import NUMBER, OWNER
+
+
+def test_fallback_selection_does_not_log_private_contact_metadata(capsys):
+    rows = [{"id": 2, "name": "PRIVATE-NAME", "address": "PRIVATE-CONTACT"}]
+    assert choose(rows, "caller", lambda *args, **kwargs: "2") == rows[0]
+    output = capsys.readouterr().out
+    assert "PRIVATE-NAME" not in output and "PRIVATE-CONTACT" not in output
 
 
 class Provider:
@@ -123,3 +130,57 @@ def test_setup_reuses_agent_without_republishing_or_enabling_dialing():
     )
     assert not result.dialing_enabled
     assert all(m == "GET" for m, _, _ in provider.requests)
+
+
+def test_conversation_tool_uses_server_context_and_existing_hermes_permissions():
+    from talk_phone.setup import CONVERSATION_PROMPT, conversation_tool_definitions
+
+    tools = conversation_tool_definitions("http://bridge-relay:8787", "synthetic-credential")
+    assert [t["name"] for t in tools] == ["hermes_chat", "hermes_result"]
+    for tool in tools:
+        cfg = tool["definition"]["config"]
+        assert cfg["credential_uuid"] == "synthetic-credential"
+        assert cfg["body_template"]["call_route"] == "{{initial_context.hermes_call_route}}"
+        assert "call_route" not in {p["name"] for p in cfg["parameters"]}
+    assert "same memory, tools and permissions" in CONVERSATION_PROMPT
+    assert "allowed_toolsets" not in str(tools)
+
+
+def test_conversation_setup_preserves_other_workflows_and_carrier_configuration():
+    from copy import deepcopy
+
+    from talk_phone.setup import configure_conversation
+
+    graph = phone_workflow()
+    agent = next(n for n in graph["nodes"] if n["type"] == "agentNode")
+    agent["data"]["prompt"] = "Legacy prompt"
+    version = {"workflow_json": graph, "workflow_configurations": {"max_call_duration": 120}}
+    writes = []
+
+    class Client:
+        def request(self, method, path, body=None):
+            if method == "GET" and "versions?" in path:
+                return [deepcopy(version)]
+            if method == "GET":
+                return [
+                    {
+                        "name": "hermes_chat",
+                        "tool_uuid": "another-workflow-tool",
+                        "definition": {
+                            "type": "http_api",
+                            "config": {"url": "https://other.invalid"},
+                        },
+                    }
+                ]
+            writes.append((method, path, deepcopy(body)))
+            if path == "/api/v1/tools/":
+                return {"tool_uuid": body["name"] + "-new"}
+            return {}
+
+    settings = replace(Settings(), workflow_id=1, bridge_public_url="https://phone.invalid")
+    configure_conversation(Client(), settings, "synthetic-credential")
+    assert not any("another-workflow-tool" in path for _, path, _ in writes)
+    update = next(body for method, path, body in writes if method == "PUT")
+    assert update["workflow_configurations"] == {"max_call_duration": 120}
+    assert update["workflow_definition"]["nodes"][0] == graph["nodes"][0]
+    assert all("telephony" not in path for _, path, _ in writes)

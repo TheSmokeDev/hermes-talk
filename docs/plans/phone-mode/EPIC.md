@@ -12,7 +12,10 @@ There is no second dashboard, app, custom chat UI or provider credential store.
 
 The acceptance flow is: prepare an owned-number call in Hermes, approve it using the
 host's existing controls, answer the telephone, receive a caller question in that
-same Hermes conversation, answer there, and hear the approved answer on the call.
+same Hermes conversation, answer there, and hear the Hermes answer on the call.
+
+Phone uses the same session history, memory, tools and existing permissions.
+There are no pairing codes or additional Phone task/answer approvals.
 
 ## Slice 1: Native plugin integration
 
@@ -35,9 +38,10 @@ same Hermes conversation, answer there, and hear the approved answer on the call
   The handle targets the original conversation; the bridge never chooses another chat.
 - Reuse Hermes's native event/message delivery for local/Desktop/mobile viewers and
   messaging adapters. Never replace the response stream or open a separate interface.
-- Pair the call through an authenticated owner command and verify the Dograh run.
-  Surface caller content as untrusted. Only the authenticated owner releases an answer.
-- Test delivery, refusal, expiration, isolation and answer return over real local MCP/HTTP.
+- Connect the approved outgoing call automatically and send input through the normal
+  Hermes session queue. Return answers directly with phone_reply, without a child
+  session, separate task permissions or a manual result-release step.
+- Test delivery, retries, expiration, session routing and answer return over local HTTP.
 - Exercise the integrated candidate in the existing isolated lab with an authorized
   owned-number call. Retain the exact version, carrier completion, question delivery,
   owner answer and spoken answer evidence in the local work checklist.
@@ -47,7 +51,7 @@ same Hermes conversation, answer there, and hear the approved answer on the call
 Phone mode is optional. It uses the configured Dograh account/carrier; installing
 Talk does not purchase numbers, dial, start a public tunnel or change business lines.
 Native host APIs are feature-detected and fail closed when the requested operation
-cannot be represented. Caller speech never becomes owner authority.
+cannot be represented. The connected phone continues the owner's existing session.
 
 ## Sources
 
@@ -57,7 +61,7 @@ cannot be represented. Caller speech never becomes owner authority.
 - Existing Talk: `__init__.py`, `talk_cli.py`, `talk_tools.py`, `talk_host.py`,
   `talk_operator_auth.py`, `talk_native_api.py` and `docs/DESKTOP.md`.
 - The carried phone primitives include their original synthetic safety and real
-  loopback HTTP/MCP regression coverage. Local live-call receipts are retained
+  loopback HTTP regression coverage. Local live-call receipts are retained
   separately from source.
 
 Execution evidence and remaining actions live in the existing local WORK-STATUS.md.

@@ -10,10 +10,6 @@ from uuid import uuid4
 from .policy import PhoneError, text
 from .store import Store
 
-PAIR_TTL = 120
-REQUEST_TTL = 90
-WORK_APPROVAL_TTL = 60
-
 
 def connection_key(session_id):
     # This is the SDK-validated stateful transport session, never a tool argument.
@@ -41,73 +37,81 @@ class BridgeStore(Store):
                   shared INTEGER NOT NULL DEFAULT 0,
                   UNIQUE(connection,request_key)
                 );
+                CREATE TABLE IF NOT EXISTS phone_call_routes (
+                  capability_hash TEXT PRIMARY KEY, call_id TEXT UNIQUE NOT NULL,
+                  created REAL NOT NULL
+                );
             """)
+            columns = {r[1] for r in db.execute("PRAGMA table_info(bridge_requests)")}
+            if "dispatched" not in columns:
+                db.execute("ALTER TABLE bridge_requests ADD COLUMN dispatched INTEGER DEFAULT 0")
 
-    def connect(self, transport_session):
-        key = connection_key(transport_session)
+    def issue_route(self, call_id, session):
+        """Create an opaque transport address for the call's existing Hermes session.
+
+        The owner never sees or enters this value. Only its hash is journalled;
+        Dograh receives the original through the server-side initial context.
+        This routes input, without changing the session's tool permissions.
+        """
+        capability = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(capability.encode()).hexdigest()
+        with self.connection(write=True) as db:
+            call = self.owned(db, call_id, session)
+            if call["status"] != "dialing":
+                raise PhoneError("A call route can only be created while starting this call.")
+            db.execute(
+                "INSERT INTO phone_call_routes VALUES(?,?,?)", (digest, call_id, self.clock())
+            )
+        return capability
+
+    def route(self, capability):
+        text(capability, "Call route", 128)
+        digest = hashlib.sha256(capability.encode()).hexdigest()
         with self.connection(write=True) as db:
             self.check_switch(db)
-            row = db.execute(
-                "SELECT * FROM bridge_connections WHERE connection=?", (key,)
+            route = db.execute(
+                "SELECT call_id FROM phone_call_routes WHERE capability_hash=?", (digest,)
             ).fetchone()
-            if row is not None:
-                if row["revoked"] or row["expires"] <= self.clock():
-                    raise PhoneError(
-                        "This bridge connection expired or was revoked. Reconnect and pair again."
-                    )
-                return dict(row)
-            # Bound authenticated discovery abuse; expired rows remain as an audit trail.
-            count = db.execute(
-                "SELECT count(*) FROM bridge_connections WHERE expires>? AND revoked=0",
-                (self.clock(),),
-            ).fetchone()[0]
-            if count >= 24:
-                raise PhoneError("Too many pending bridge connections. Wait for pairing expiry.")
-            code = secrets.token_hex(5).upper()
+            if route is None:
+                raise PhoneError("Call route is unavailable.")
+            call = db.execute("SELECT * FROM calls WHERE id=?", (route["call_id"],)).fetchone()
+            if call is None or call["status"] != "started" or not call["run_id"]:
+                raise PhoneError("This call is no longer active.")
+            deadline = call["started_at"] + json.loads(call["draft"])["max_duration_seconds"]
+            if deadline <= self.clock():
+                raise PhoneError("This call ended.")
+            key = connection_key("phone-call:" + call["id"])
             db.execute(
-                "INSERT INTO bridge_connections(connection,code,created,expires) VALUES(?,?,?,?)",
-                (key, code, self.clock(), self.clock() + PAIR_TTL),
+                "INSERT OR IGNORE INTO bridge_connections"
+                "(connection,code,created,call_id,expires) VALUES(?,?,?,?,?)",
+                (key, "route:" + call["id"], self.clock(), call["id"], deadline),
             )
-            return {"connection": key, "code": code, "call_id": None}
+            self.active_grant(db, key)
+            return key
+
+    def claim_turn(self, request_id, session):
+        """Persist one dispatch claim before handing input to the host's normal FIFO."""
+        with self.connection(write=True) as db:
+            row = self.owner_request(db, request_id, session, require_live=True)
+            if row["state"] != "pending" or row["dispatched"]:
+                return None
+            db.execute("UPDATE bridge_requests SET dispatched=1 WHERE id=?", (request_id,))
+            return dict(row)
+
+    def dispatch_failed(self, request_id, session):
+        with self.connection(write=True) as db:
+            self.owner_request(db, request_id, session)
+            db.execute("UPDATE bridge_requests SET state='unavailable' WHERE id=?", (request_id,))
 
     def active_grant(self, db, key):
         self.check_switch(db)
         row = db.execute("SELECT * FROM bridge_connections WHERE connection=?", (key,)).fetchone()
         if row is None or row["revoked"] or row["expires"] <= self.clock() or not row["call_id"]:
-            raise PhoneError("No active owner-paired call for this connection.")
+            raise PhoneError("No active call for this connection.")
         call = db.execute("SELECT * FROM calls WHERE id=?", (row["call_id"],)).fetchone()
         if call is None or call["status"] != "started" or not call["run_id"]:
-            raise PhoneError("The paired call is no longer active.")
+            raise PhoneError("The call is no longer active.")
         return row, call
-
-    def pair(self, code, call_id, session):
-        with self.connection(write=True) as db:
-            self.check_switch(db)
-            call = self.owned(db, call_id, session)
-            if call["status"] != "started" or not call["run_id"] or call["started_at"] is None:
-                raise PhoneError(
-                    "Pairing requires a started, approved outbound call with a known run ID."
-                )
-            deadline = call["started_at"] + json.loads(call["draft"])["max_duration_seconds"]
-            if deadline <= self.clock():
-                raise PhoneError("The call's bridge duration has expired.")
-            row = db.execute(
-                "SELECT * FROM bridge_connections WHERE code=?", (code.upper(),)
-            ).fetchone()
-            if row is None or row["expires"] <= self.clock() or row["revoked"] or row["call_id"]:
-                raise PhoneError("Pairing code is expired, unknown, or already used.")
-            if db.execute(
-                "SELECT 1 FROM bridge_connections WHERE call_id=?", (call_id,)
-            ).fetchone():
-                raise PhoneError(
-                    "This call already has a bridge connection. End it before "
-                    "preparing another call."
-                )
-            db.execute(
-                "UPDATE bridge_connections SET call_id=?,expires=? WHERE connection=?",
-                (call_id, deadline, row["connection"]),
-            )
-        return {"call_id": call_id, "status": "paired", "expires_at": deadline}
 
     def revoke(self, call_id, session):
         with self.connection(write=True) as db:
@@ -129,18 +133,6 @@ class BridgeStore(Store):
                 if existing["kind"] != kind or existing["content"] != content:
                     raise PhoneError("Request key already used for different content.")
                 return existing["id"]
-            count = db.execute(
-                "SELECT count(*) FROM bridge_requests WHERE call_id=?", (call["id"],)
-            ).fetchone()[0]
-            if count >= 20:
-                raise PhoneError("This call has reached its bridge request limit.")
-            pending = db.execute(
-                "SELECT count(*) FROM bridge_requests WHERE call_id=? "
-                "AND state IN ('pending','approved','launching','running') AND expires>?",
-                (call["id"], self.clock()),
-            ).fetchone()[0]
-            if pending >= 3:
-                raise PhoneError("Finish the pending requests before asking for more.")
             rid = str(uuid4())
             db.execute(
                 "INSERT INTO "
@@ -155,7 +147,7 @@ class BridgeStore(Store):
                     kind,
                     content,
                     self.clock(),
-                    min(grant["expires"], self.clock() + REQUEST_TTL),
+                    grant["expires"],
                 ),
             )
             return rid
@@ -187,16 +179,8 @@ class BridgeStore(Store):
                     "message": "No answer is available; continue without it.",
                 }
             result = {"request_id": request_id, "state": state}
-            if state in {"launching", "running"}:
-                result["status_source"] = (
-                    "Last known Hermes status; the owner chat refreshes it with phone_work_status."
-                )
             if row["kind"] == "question" and state == "answered":
                 result["owner_answer"] = row["answer"]
-            elif row["kind"] == "task" and row["shared"]:
-                result["owner_shared_result"] = row["summary"]
-            elif state == "succeeded":
-                result["state"] = "awaiting_owner_release"
             return result
 
     def inbox(self, session):
@@ -212,7 +196,7 @@ class BridgeStore(Store):
                     "request_id": r["id"],
                     "call_id": r["call_id"],
                     "kind": r["kind"],
-                    "untrusted_content": r["content"],
+                    "content": r["content"],
                     "state": r["state"],
                     "expired": r["expires"] <= self.clock(),
                     "summary_for_owner": r["summary"],
@@ -231,73 +215,3 @@ class BridgeStore(Store):
                 "UPDATE bridge_requests SET state='answered',answer=? WHERE id=?",
                 (answer, request_id),
             )
-
-    def approve_work(self, request_id, session, toolsets):
-        if not toolsets or any(not isinstance(v, str) or not v for v in toolsets):
-            raise PhoneError(
-                "Configure a nonempty delegation_toolsets allowlist before approving work."
-            )
-        with self.connection(write=True) as db:
-            row = self.owner_request(db, request_id, session, require_live=True)
-            if row["kind"] != "task" or row["state"] != "pending":
-                raise PhoneError("Only a pending task can be approved.")
-            db.execute(
-                "UPDATE bridge_requests SET "
-                "state='approved',approved_until=?,toolsets=? WHERE id=?",
-                (
-                    min(row["expires"], self.clock() + WORK_APPROVAL_TTL),
-                    json.dumps(list(toolsets)),
-                    request_id,
-                ),
-            )
-
-    def claim_work(self, request_id, session, toolsets):
-        with self.connection(write=True) as db:
-            row = self.owner_request(db, request_id, session, require_live=True)
-            if (
-                row["kind"] != "task"
-                or row["state"] != "approved"
-                or row["approved_until"] <= self.clock()
-            ):
-                raise PhoneError("A fresh owner /phone allow-work approval is required.")
-            if json.loads(row["toolsets"]) != list(toolsets) or not toolsets:
-                raise PhoneError("Delegation permissions changed; this approval cannot be used.")
-            active = db.execute(
-                "SELECT 1 FROM bridge_requests WHERE call_id=? AND state IN "
-                "('launching','running','unknown')",
-                (row["call_id"],),
-            ).fetchone()
-            if active:
-                raise PhoneError("A task is already active or unresolved for this call.")
-            db.execute("UPDATE bridge_requests SET state='launching' WHERE id=?", (request_id,))
-            return dict(row)
-
-    def save_work(self, request_id, session, state, *, handle=None, summary=None):
-        with self.connection(write=True) as db:
-            self.owner_request(db, request_id, session)
-            db.execute(
-                "UPDATE bridge_requests SET state=?,handle=COALESCE(?,handle),summary=? WHERE id=?",
-                (state, json.dumps(handle) if handle is not None else None, summary, request_id),
-            )
-
-    def work(self, request_id, session):
-        with self.connection() as db:
-            row = dict(self.owner_request(db, request_id, session))
-        row["handle"] = json.loads(row["handle"]) if row["handle"] else None
-        return row
-
-    def share(self, request_id, session):
-        with self.connection(write=True) as db:
-            row = self.owner_request(db, request_id, session, require_live=True)
-            if row["kind"] != "task" or row["state"] != "succeeded" or not row["summary"]:
-                raise PhoneError("Only a successful result reviewed by the owner can be shared.")
-            db.execute("UPDATE bridge_requests SET shared=1 WHERE id=?", (request_id,))
-
-    def deny(self, request_id, session):
-        with self.connection(write=True) as db:
-            row = self.owner_request(db, request_id, session)
-            if row["state"] not in {"pending", "approved"}:
-                raise PhoneError(
-                    "This request already started. Use phone_work_cancel to cancel a child."
-                )
-            db.execute("UPDATE bridge_requests SET state='denied' WHERE id=?", (request_id,))

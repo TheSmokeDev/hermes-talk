@@ -17,9 +17,7 @@ provides_tools:
   - phone_cancel
   - phone_kill_switch
   - phone_inbox
-  - phone_process_work
-  - phone_work_status
-  - phone_work_cancel
+  - phone_reply
 provides_hooks:
   - on_session_end
   - subagent_start
@@ -86,7 +84,3 @@ config_schema:
     type: str
     default: ""
     label: Phone — authenticated bridge origin
-  phone_delegation_toolsets:
-    type: list
-    default: [web]
-    label: Phone — allowed task toolsets

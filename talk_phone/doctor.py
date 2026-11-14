@@ -105,3 +105,37 @@ def doctor(ctx):
             "talk phone setup.",
         }
     return inspect(Settings.read(phone_context(ctx).get_config), get_secret)
+
+
+def cli_report(report):
+    """Keep CLI diagnostics to known statuses; never log arbitrary provider messages."""
+    names = (
+        "connection_settings",
+        "api_key",
+        "published_workflow",
+        "carrier_and_caller",
+        "owner_allowlist",
+        "destination_allowlist",
+        "dialing_enabled",
+        "bridge_token",
+    )
+    rows = report.get("checks", [])
+    checks = [
+        {
+            "name": name,
+            "ok": any(
+                row.get("name") == name and row.get("ok") is True
+                for row in rows
+                if isinstance(row, dict)
+            ),
+        }
+        for name in names
+    ]
+    return {
+        "version": __version__,
+        "connection_ready": report.get("connection_ready") is True,
+        "dialing_configuration_ready": report.get("dialing_configuration_ready") is True,
+        "checks": checks,
+        "call_attempted": False,
+        "help": "Check failed settings in Hermes Settings > Plugins > hermes-talk.",
+    }
