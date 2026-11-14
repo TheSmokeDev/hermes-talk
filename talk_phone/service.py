@@ -36,7 +36,7 @@ class PhoneService:
             "cost_notice": "Carrier and voice/model charges may apply. No call has been placed.",
             "next_step": (
                 f"Review in Hermes: /phone review {call_id}. "
-                "The native picker can approve and dial this exact call. "
+                "The native picker can approve this exact card; then ask Hermes to call. "
                 f"You can also type /phone approve {call_id}; approval expires in 120 seconds."
             ),
         }
