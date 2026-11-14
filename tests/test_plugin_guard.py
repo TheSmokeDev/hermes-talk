@@ -7,7 +7,8 @@ blocking or confirmation-gated). It skips cleanly otherwise, so the suite
 stays hermetic.
 
 To run the gate locally, point ``TALK_PLUGIN_GUARD_HOME`` at a directory
-whose ``tools/`` holds ``plugin_guard.py`` and ``skills_guard.py`` from
+whose ``tools/`` holds ``plugin_guard.py``, ``plugin_guard_context.py``,
+``skills_guard.py`` and ``skills_guard_credentials.py`` from
 NousResearch/hermes-agent (keep it OUTSIDE this checkout — the scanner's
 own pattern table would otherwise be scanned as repo content).
 """
