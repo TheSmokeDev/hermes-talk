@@ -10,7 +10,7 @@ import talk_tools
 from talk_phone import plugin
 from talk_phone.bridge_store import BridgeStore
 from talk_phone.context import PhoneContext
-from talk_phone.notifications import pending_text, watch_call
+from talk_phone.notifications import native_canary, pending_text, watch_call
 
 from .conftest import OWNER, SESSION, prepared
 from .test_plugin import Context
@@ -173,3 +173,23 @@ def test_refused_native_message_never_chooses_another_chat(setup_phone):
     api.call(SESSION, call_id)
     ctx = SimpleNamespace(post_message=lambda text: SimpleNamespace(ok=False))
     assert watch_call(ctx, api.store, SESSION, call_id) is False
+
+
+def test_no_dial_canary_edits_only_the_bound_native_handle():
+    messages = []
+
+    class Handle:
+        ok = True
+
+        def edit(self, text):
+            messages.append(text)
+            return {"ok": True}
+
+    ctx = SimpleNamespace(post_message=lambda text: Handle())
+    result = native_canary(ctx)
+    assert result == {
+        "native_notice_accepted": True,
+        "native_notice_edited": True,
+        "call_placed": False,
+    }
+    assert len(messages) == 1 and "no-dial diagnostic" in messages[0]

@@ -179,6 +179,10 @@ def command(ctx, raw_args, *, session_id="", platform="", source=None, **kwargs)
         if action == "approve" and len(words) == 2:
             require_enabled(ctx)
             return api.approve(session_id, words[1], owner_id)
+        if words == ["doctor", "notice"]:
+            from .notifications import native_canary
+
+            return native_canary(ctx)
         if action == "review" and len(words) == 2:
             require_enabled(ctx)
             card = api.store.get(words[1], session_id)["draft"]

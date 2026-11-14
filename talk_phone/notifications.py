@@ -5,6 +5,37 @@ import time
 from contextlib import suppress
 
 
+def native_canary(ctx):
+    """Exercise the real host message/edit path without a provider call or model turn."""
+    post = getattr(ctx, "post_message", None)
+    if not callable(post):
+        return {"native_notice_accepted": False, "call_placed": False}
+    handle = post("Hermes Talk Phone: checking this conversation's native message stream.")
+    if not getattr(handle, "ok", False):
+        return {"native_notice_accepted": False, "call_placed": False}
+    finished = threading.Event()
+    outcome = {}
+
+    def edit():
+        try:
+            outcome.update(
+                handle.edit(
+                    "Hermes Talk Phone: native message delivery passed in this conversation. "
+                    "This was a no-dial diagnostic."
+                )
+            )
+        finally:
+            finished.set()
+
+    threading.Thread(target=edit, name="talk-phone-notice-check", daemon=True).start()
+    finished.wait(2)
+    return {
+        "native_notice_accepted": True,
+        "native_notice_edited": bool(outcome.get("ok")) if finished.is_set() else None,
+        "call_placed": False,
+    }
+
+
 def pending_text(store, session, call_id):
     rows = [
         r
