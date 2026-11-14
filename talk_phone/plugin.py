@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
 from .bridge_store import BridgeStore
 from .client import DograhClient
@@ -182,11 +183,13 @@ def command(ctx, raw_args, *, session_id="", platform="", source=None, **kwargs)
             require_enabled(ctx)
             card = api.store.get(words[1], session_id)["draft"]
             ask = getattr(ctx, "ask_choice", None)
+            started = monotonic()
             choice = (
                 ask(
                     f"Call {card['phone_number']}?\nPurpose: {card['purpose']}\n"
-                    f"Instructions: {card['instructions']}\n"
-                    f"Limit: {card['max_duration_seconds']} seconds. Carrier/model charges apply.",
+                    f"Limit: {card['max_duration_seconds']} seconds. Carrier/model charges apply.\n"
+                    "Review the full phone_prepare card first. "
+                    "This quick confirmation expires in 25 seconds.",
                     [
                         {"value": "approve", "label": "Approve this call"},
                         {"value": "cancel", "label": "Cancel"},
@@ -196,13 +199,15 @@ def command(ctx, raw_args, *, session_id="", platform="", source=None, **kwargs)
                 else None
             )
             if choice != "approve":
+                if choice == "cancel":
+                    api.store.cancel(words[1], session_id)
+                    return {"call_id": words[1], "status": "cancelled", "call_placed": False}
                 return {"call_id": words[1], "status": "not_approved", "call_placed": False}
-            api.approve(session_id, words[1], owner_id)
-            result = api.call(session_id, words[1])
-            from .notifications import watch_call
-
-            result["native_notifications"] = watch_call(ctx, api.store, session_id, words[1])
-            return result
+            if monotonic() - started > 25:
+                return {"call_id": words[1], "status": "review_expired", "call_placed": False}
+            # Slash-command RPCs have a short host deadline. Review grants permission;
+            # only the normal asynchronous phone_call tool makes the billable request.
+            return {**api.approve(session_id, words[1], owner_id), "call_placed": False}
         if words == ["inbox"]:
             return {
                 "requests": api.store.inbox(session_id),

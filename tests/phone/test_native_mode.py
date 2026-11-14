@@ -53,11 +53,14 @@ def test_native_review_cancel_does_not_approve_or_dial(setup_phone, monkeypatch,
             source=SimpleNamespace(user_id="synthetic-owner"),
         )
     )
-    assert result["status"] == "not_approved" and not provider.posts
-    assert api.store.get(call_id, SESSION)["status"] == "prepared"
+    assert result["status"] == ("cancelled" if choice == "cancel" else "not_approved")
+    assert not provider.posts
+    assert api.store.get(call_id, SESSION)["status"] == (
+        "cancelled" if choice == "cancel" else "prepared"
+    )
 
 
-def test_native_review_uses_authenticated_owner_and_dials_once(setup_phone, monkeypatch):
+def test_native_review_grants_one_use_permission_without_dialing(setup_phone, monkeypatch):
     api, provider, _ = setup_phone
     monkeypatch.setattr(plugin, "service", lambda ctx: api)
     ctx = Context()
@@ -73,7 +76,8 @@ def test_native_review_uses_authenticated_owner_and_dials_once(setup_phone, monk
             source=SimpleNamespace(user_id="synthetic-owner"),
         )
     )
-    assert result["status"] == "started" and len(provider.posts) == 1
+    assert result["status"] == "approved" and not provider.posts
+    assert result["call_placed"] is False
     again = json.loads(
         plugin.command(
             ctx,
@@ -83,9 +87,32 @@ def test_native_review_uses_authenticated_owner_and_dials_once(setup_phone, monk
             source=SimpleNamespace(user_id="synthetic-owner"),
         )
     )
-    assert "error" in again and len(provider.posts) == 1
+    assert "error" in again and not provider.posts
     assert api.store.get(call_id, SESSION)["approved_by"] == OWNER
     assert choices and "Carrier/model charges" in choices[0][0]
+    api.call(SESSION, call_id)
+    assert len(provider.posts) == 1
+
+
+def test_late_native_confirmation_cannot_grant_permission(setup_phone, monkeypatch):
+    api, provider, _ = setup_phone
+    monkeypatch.setattr(plugin, "service", lambda ctx: api)
+    clock = iter([0, 26])
+    monkeypatch.setattr(plugin, "monotonic", lambda: next(clock))
+    ctx = Context()
+    ctx.ask_choice = lambda *args: "approve"
+    call_id = prepared(api)
+    result = json.loads(
+        plugin.command(
+            ctx,
+            f"review {call_id}",
+            session_id=SESSION,
+            platform="local",
+            source=SimpleNamespace(user_id="synthetic-owner"),
+        )
+    )
+    assert result["status"] == "review_expired" and not provider.posts
+    assert api.store.get(call_id, SESSION)["status"] == "prepared"
 
 
 def test_same_conversation_notice_and_owner_answer_return(setup_phone, tmp_path, monkeypatch):
