@@ -70,6 +70,28 @@ silently does less than you asked:
    lane that always exists as long as `hermes` is on the PATH.
 4. None available — a refusal naming all three missing lanes.
 
+## Profile context across background work
+
+Talk captures the caller's context variables separately at every dispatch to a
+host/run worker, transcript handoff, approval worker or SSE reader, approval
+timeout timer (including a rearmed timer), and API/catalog refresh. A later
+change to the caller's context does not retarget that work. Existing stop,
+approval-generation and transcript-lease rules still govern late callbacks.
+
+This preserves an installed Hermes profile scope; it does not install a scope
+where none was bound, or change how configuration and credentials are read.
+Profile-scoped configuration resolution and Discord adapter routing are separate
+requirements for multiplexed hosts.
+
+The API verdict and capability snapshot caches, including their in-flight
+refresh guards, remain module globals. Callers sharing one module instance also
+share its cached result, even under different contexts. Separate module
+instances have separate caches; the offline tests model that arrangement but
+do not verify an installed host's loader or its dependency imports. Context
+propagation alone therefore does not establish complete profile isolation.
+Live credential resolution still requires a receipt from the exact plugin and
+host revisions under test.
+
 ## Two jobs, one checkout — admission control
 
 Delegate two tasks that both touch the same repository and, left alone, they

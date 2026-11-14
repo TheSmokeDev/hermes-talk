@@ -17,6 +17,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from contextvars import copy_context
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -401,9 +402,10 @@ def _finish_claim(
 def _start_default_handoff(claimed: Path, transcript_fd: int, lease: _Lease) -> None:
     """Detach the host handoff while retaining its descriptor and OS lease."""
 
+    context = copy_context()
     worker = threading.Thread(
-        target=_finish_claim,
-        args=(claimed, transcript_fd, lease, _default_run_agent),
+        target=context.run,
+        args=(_finish_claim, claimed, transcript_fd, lease, _default_run_agent),
         daemon=True,
         name="talk-memory-handoff",
     )

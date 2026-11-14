@@ -27,7 +27,7 @@ _FAKE_HERMES = "/usr/local/bin/hermes"
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch, tmp_path):
+def _clean(monkeypatch, tmp_path, run_workers):
     talk_host.bind_ctx(None)
     talk_runs.reset_for_tests()
     # Runs are refused without a bound return route (hermes-talk#35), so the
@@ -46,9 +46,12 @@ def _clean(monkeypatch, tmp_path):
     # must never see their actual profiles.
     monkeypatch.setitem(sys.modules, "hermes_constants", None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    yield
-    talk_host.bind_ctx(None)
-    talk_runs.reset_for_tests()
+    try:
+        yield
+    finally:
+        run_workers.join_all()
+        talk_host.bind_ctx(None)
+        talk_runs.reset_for_tests()
 
 
 def _write_home(root, *, root_model: bool, profiles: dict[str, bool]) -> None:
@@ -579,7 +582,7 @@ def test_a_refused_dispatch_leaves_no_run_behind(monkeypatch):
 # --- the tier-2 remote handle must outlive the process -----------------------
 
 
-def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp_path):
+def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp_path, run_workers):
     """``api_run_id`` is the only handle a reconnect could resume tracking by.
 
     It has to be on DISK before the run ends, because the process a reconnect
@@ -599,6 +602,7 @@ def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp
 
     started = _threading.Event()
     release = _threading.Event()
+    run_workers.release_on_exit(release)
 
     def fake_run_to_completion(
         _task, *, session_id=None, session_key=None, on_start=None, on_event=None

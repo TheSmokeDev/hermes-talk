@@ -36,6 +36,7 @@ import logging
 import os
 import threading
 import time
+from contextvars import copy_context
 from dataclasses import dataclass
 
 try:
@@ -358,8 +359,9 @@ def _refresh_in_background() -> None:
         # failed probe: a cache that never fills re-reads on every single turn.
         _store(snapshot, started_seq)
 
+    context = copy_context()
     threading.Thread(
-        target=worker, name="talk-capabilities-resolve", daemon=True
+        target=context.run, args=(worker,), name="talk-capabilities-resolve", daemon=True
     ).start()
 
 

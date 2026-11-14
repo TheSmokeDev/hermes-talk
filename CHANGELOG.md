@@ -23,6 +23,14 @@ named rather than smoothed.
   latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
 
 ### Fixed
+- Delegation and admission tests release their gates and join owned workers
+  before resetting run IDs or removing mocks. Deterministic neighboring-test
+  regressions cover stale completion, mock teardown, and failed-test cleanup.
+- Background host/run workers, transcript handoffs, approval workers and SSE
+  readers, approval timeout timers, and API/catalog refreshes retain the caller's
+  context variables at dispatch. Each worker and timer gets its own context;
+  module-level caches still require separate module instances per profile.
+  Contributed by @tancou.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and

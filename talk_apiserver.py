@@ -51,6 +51,7 @@ import logging
 import os
 import threading
 import time
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -227,7 +228,10 @@ def _refresh_in_background() -> None:
         # on every single turn, which is the stampede this cache exists to stop.
         _store(verdict)
 
-    threading.Thread(target=worker, name="talk-apiserver-probe", daemon=True).start()
+    context = copy_context()
+    threading.Thread(
+        target=context.run, args=(worker,), name="talk-apiserver-probe", daemon=True
+    ).start()
 
 
 def _store(verdict: ApiServerStatus) -> None:
