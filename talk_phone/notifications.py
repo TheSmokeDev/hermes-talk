@@ -3,6 +3,7 @@
 import threading
 import time
 from contextlib import suppress
+from contextvars import copy_context
 
 
 def native_canary(ctx):
@@ -36,6 +37,16 @@ def native_canary(ctx):
     }
 
 
+def input_canary(ctx):
+    """Exercise the same-session input queue without making a phone call."""
+    inject = getattr(ctx, "inject_message", None)
+    accepted = callable(inject) and inject(
+        "Hermes Talk Phone no-dial input check: using this conversation's history, "
+        "name the earlier two-word call-test phrase. Do not dial or use phone tools."
+    )
+    return {"session_input_accepted": bool(accepted), "call_placed": False}
+
+
 def pending_text(store, session, call_id):
     rows = [
         r
@@ -44,9 +55,9 @@ def pending_text(store, session, call_id):
     ]
     if not rows:
         return None
-    lines = ["Hermes Talk Phone: caller requests (untrusted caller content)."]
+    lines = ["Hermes Talk Phone: input in this conversation."]
     for row in rows:
-        lines.append(f"{row['kind']}: {row['untrusted_content']}")
+        lines.append(f"{row['kind']}: {row['content']}")
         if row["kind"] == "question":
             lines.append(
                 f"Answer in this conversation: /phone answer {row['request_id']} YOUR ANSWER"
@@ -57,21 +68,24 @@ def pending_text(store, session, call_id):
 
 
 def watch_call(ctx, store, session, call_id, *, interval=0.3):
-    """Capture a host-owned message handle now; a worker only edits that handle."""
+    """Continue the owning session through the normal Hermes input queue."""
     post = getattr(ctx, "post_message", None)
     if not callable(post):
         return False
     try:
         row = store.get(call_id, session)
         handle = post(
-            f"Hermes Talk Phone: call active ({call_id}). Caller questions appear here.\n"
-            "Pair the spoken code in this conversation with /phone pair CODE."
+            f"Hermes Talk Phone: call active ({call_id}). "
+            "Connected to this conversation's memory and tools."
         )
         if not getattr(handle, "ok", False):
             return False
         deadline = row["started_at"] + row["draft"]["max_duration_seconds"]
     except Exception:  # noqa: BLE001 - external boundary; keep host/provider details private
         return False
+
+    route_key = session_route()
+    context = copy_context()
 
     def run():
         previous = None
@@ -85,6 +99,31 @@ def watch_call(ctx, store, session, call_id, *, interval=0.3):
                     if not result.get("ok"):
                         return
                     previous = text
+                inject = getattr(ctx, "inject_message", None)
+                if callable(inject):
+                    for item in store.inbox(session):
+                        if item["call_id"] != call_id or item["expired"]:
+                            continue
+                        claimed = store.claim_turn(item["request_id"], session)
+                        if not claimed:
+                            continue
+                        message = (
+                            "[Hermes Talk Phone input — same conversation]\n"
+                            + claimed["content"]
+                            + "\nUse this conversation's existing memory, tools and permissions. "
+                            "Reply naturally, then send the spoken answer using phone_reply "
+                            f"with request_id={claimed['id']}. No separate Phone approval or "
+                            "pairing step is needed."
+                        )
+                        accepted = inject(
+                            message, **({"session_key": route_key} if route_key else {})
+                        )
+                        if not accepted:
+                            store.dispatch_failed(claimed["id"], session)
+                            handle.edit(
+                                "Hermes Talk Phone: this conversation could not accept "
+                                "the phone input. Check Phone setup."
+                            )
             except Exception:  # noqa: BLE001 - external boundary; keep host/provider details private
                 return
             time.sleep(interval)
@@ -93,5 +132,13 @@ def watch_call(ctx, store, session, call_id, *, interval=0.3):
                 "Hermes Talk Phone: call window ended. Use phone_status for the carrier result."
             )
 
-    threading.Thread(target=run, name="talk-phone-notices", daemon=True).start()
+    threading.Thread(
+        target=context.run, args=(run,), name="talk-phone-notices", daemon=True
+    ).start()
     return True
+
+
+def session_route():
+    from gateway.session_context import get_session_env
+
+    return get_session_env("HERMES_SESSION_KEY", "")

@@ -1,5 +1,7 @@
 import json
 import threading
+from contextvars import ContextVar
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -19,8 +21,8 @@ from .test_plugin import Context
 def test_phone_tools_are_hidden_without_configuration():
     ctx = Context()
     ctx.get_config = lambda key, default=None: default
-    plugin.register(ctx, include_cli=False)
-    assert len(ctx.tools) == 9
+    plugin.register(ctx)
+    assert len(ctx.tools) == 7
     assert all(not tool["check_fn"]() for tool in ctx.tools.values())
     assert "dograh" not in ctx.commands and "dograh-bridge" not in ctx.commands
 
@@ -115,52 +117,59 @@ def test_late_native_confirmation_cannot_grant_permission(setup_phone, monkeypat
     assert api.store.get(call_id, SESSION)["status"] == "prepared"
 
 
-def test_same_conversation_notice_and_owner_answer_return(setup_phone, tmp_path, monkeypatch):
-    api, _, now = setup_phone
+def test_phone_input_runs_in_the_original_session_and_reply_needs_no_extra_approval(
+    setup_phone, tmp_path, monkeypatch
+):
+    from talk_phone import notifications
+
+    api, provider, now = setup_phone
     api.store = BridgeStore(tmp_path / "phone.db", clock=lambda: now[0])
+    api.settings = replace(api.settings, bridge_enabled=True)
     call_id = prepared(api)
     api.approve(SESSION, call_id, OWNER)
     api.call(SESSION, call_id)
-    connection = api.store.connect("real-call-transport")
-    api.store.pair(connection["code"], call_id, SESSION)
-    request_id = api.store.enqueue(
-        connection["connection"], "question-1", "question", "Which test phrase?"
-    )
+    key = api.store.route(provider.posts[-1]["bridge_capability"])
+    request_id = api.store.enqueue(key, "question-1", "question", "What do you remember?")
     received = threading.Event()
-    updates = []
+    updates, turns = [], []
+    scope = ContextVar("test-phone-context", default="missing")
+    scope.set("original-context")
+    monkeypatch.setattr(notifications, "session_route", lambda: "original-session-route")
+    monkeypatch.setattr(plugin, "service", lambda ctx: api)
 
     class NativeHandle:
         ok = True
 
         def edit(self, text):
             updates.append(text)
-            received.set()
             return {"ok": True}
 
     class NativeContext(Context):
         def post_message(self, text):
-            self.initial = text
+            assert "pair" not in text.lower()
             return NativeHandle()
 
+        def inject_message(self, text, **kwargs):
+            turns.append((text, kwargs, scope.get()))
+            received.set()
+            return True
+
     ctx = NativeContext()
+    plugin.register(ctx)
     assert watch_call(ctx, api.store, SESSION, call_id, interval=0.01)
     assert received.wait(2)
-    assert "Which test phrase?" in updates[0] and request_id in updates[0]
-    monkeypatch.setattr(plugin, "service", lambda ctx: api)
-    response = json.loads(
-        plugin.command(
-            ctx,
-            f"answer {request_id} amber river",
-            session_id=SESSION,
-            platform="local",
-            source=SimpleNamespace(user_id="synthetic-owner"),
-        )
+    assert turns[0][1] == {"session_key": "original-session-route"}
+    assert turns[0][2] == "original-context"
+    assert "existing memory, tools and permissions" in turns[0][0]
+    assert api.store.claim_turn(request_id, SESSION) is None
+    reply = ctx.tools["phone_reply"]["handler"]
+    assert "error" in json.loads(
+        reply({"request_id": request_id, "answer": "amber river"}, session_id="different-session")
     )
-    assert response["shared_with_caller"]
-    assert (
-        api.store.remote_result(connection["connection"], request_id)["owner_answer"]
-        == "amber river"
-    )
+    assert json.loads(
+        reply({"request_id": request_id, "answer": "amber river"}, session_id=SESSION)
+    )["sent_to_call"]
+    assert api.store.remote_result(key, request_id)["owner_answer"] == "amber river"
     assert pending_text(api.store, SESSION, call_id) is None
     assert not watch_call(ctx, api.store, "different-session", call_id)
     api.store.finish(call_id, SESSION, "completed")

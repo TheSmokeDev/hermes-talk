@@ -410,7 +410,7 @@ def register(ctx) -> None:
                 from .talk_phone.plugin import register as register_phone
             except ImportError:
                 from talk_phone.plugin import register as register_phone
-            register_phone(ctx, include_cli=False)
+            register_phone(ctx)
         except Exception as exc:  # noqa: BLE001 - external boundary; keep host/provider details private
             _record("optional Phone mode", "phone_mode", exc)
 

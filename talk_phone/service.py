@@ -67,6 +67,8 @@ class PhoneService:
             self.store.finish(call_id, session, "failed_preflight")
             raise
         draft["call_id"] = call_id
+        if self.settings.bridge_enabled:
+            draft["bridge_capability"] = self.store.issue_route(call_id, session)
         try:
             # Recheck the switch after network preflight, immediately before the billable request.
             with self.store.connection() as db:

@@ -922,7 +922,7 @@ _HANDLERS = {
 }
 for _phone_name in (
     "phone_prepare", "phone_call", "phone_status", "phone_cancel", "phone_kill_switch",
-    "phone_inbox", "phone_process_work", "phone_work_status", "phone_work_cancel",
+    "phone_inbox", "phone_reply",
 ):
     _HANDLERS[_phone_name] = functools.partial(_handle_phone_tool, _phone_name)
 

@@ -15,7 +15,7 @@ class PhoneError(ValueError):
     """A safe, user-visible failure without provider response bodies or credentials."""
 
 
-def origin(value: str) -> str:
+def origin(value: str, *, service_http=False) -> str:
     if not isinstance(value, str):
         raise PhoneError("Dograh base_url must be an HTTPS origin.")
     try:
@@ -33,7 +33,7 @@ def origin(value: str) -> str:
         or parts.path not in {"", "/"}
         or "\\" in value
         or any(ord(c) < 33 for c in value)
-        or not (parts.scheme == "https" or (parts.scheme == "http" and local))
+        or not (parts.scheme == "https" or (parts.scheme == "http" and (local or service_http)))
     ):
         raise PhoneError("Use an HTTPS origin without credentials, path, query, or fragment.")
     return value.rstrip("/")
@@ -97,13 +97,12 @@ class Settings:
     from_phone_number_id: int = 0
     bridge_enabled: bool = False
     bridge_public_url: str = ""
-    delegation_toolsets: tuple[str, ...] = ("web",)
 
     @classmethod
     def read(cls, get_config):
         defaults = cls()
         values = {key: get_config(key, default=value) for key, value in asdict(defaults).items()}
-        for key in ("allowed_numbers", "owner_user_ids", "delegation_toolsets"):
+        for key in ("allowed_numbers", "owner_user_ids"):
             value = values[key]
             if not isinstance(value, (list, tuple)) or any(not isinstance(v, str) for v in value):
                 raise PhoneError(f"{key} must be a list of strings.")

@@ -4,9 +4,10 @@ from dataclasses import replace
 
 import pytest
 
-from talk_phone import plugin
+from talk_phone import cli, plugin
+from talk_phone import doctor as doctor_module
 from talk_phone.client import DograhClient
-from talk_phone.doctor import inspect
+from talk_phone.doctor import cli_report, inspect
 
 from .test_client import dograh_http
 from .test_plugin import Context
@@ -81,20 +82,30 @@ def test_bad_workflow_and_raw_exception_are_not_hidden_as_success(setup_phone):
 
 
 def test_cli_and_slash_use_same_diagnostics_without_call_service(monkeypatch, capsys):
-    monkeypatch.setattr(
-        plugin, "doctor", lambda ctx: {"connection_ready": True, "call_attempted": False}
-    )
+    report = {"connection_ready": True, "call_attempted": False}
+    monkeypatch.setattr(plugin, "doctor", lambda ctx: report)
     monkeypatch.setattr(
         plugin, "service", lambda ctx: pytest.fail("Doctor must not open the call journal")
     )
     ctx = Context()
     plugin.register(ctx)
-    assert "skill:quickstart" in ctx.commands
-    parser = argparse.ArgumentParser()
-    cli = ctx.commands["dograh"]
-    cli["setup_fn"](parser)
-    assert cli["handler_fn"](parser.parse_args(["doctor"])) == 0
-    assert json.loads(capsys.readouterr().out) == json.loads(plugin.command(ctx, "doctor"))
+    assert "skill:phone" in ctx.commands and "dograh" not in ctx.commands
+    monkeypatch.setattr(doctor_module, "doctor", lambda ctx: report)
+    assert cli.run(ctx, argparse.Namespace(phone_action="doctor")) == 0
+    assert json.loads(capsys.readouterr().out) == cli_report(report)
+    assert json.loads(plugin.command(ctx, "doctor")) == report
+
+
+def test_cli_report_excludes_arbitrary_sensitive_provider_text():
+    result = cli_report(
+        {
+            "connection_ready": True,
+            "checks": [{"name": "api_key", "ok": False, "message": "PRIVATE-PROVIDER-VALUE"}],
+            "note": "PRIVATE-PROVIDER-VALUE",
+        }
+    )
+    assert "PRIVATE-PROVIDER-VALUE" not in json.dumps(result)
+    assert result["connection_ready"] and not result["call_attempted"]
 
 
 def test_doctor_preserves_unknown_call_and_approval(setup_phone):

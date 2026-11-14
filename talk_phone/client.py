@@ -96,6 +96,11 @@ class DograhClient:
                     "hermes_call_id": draft["call_id"],
                     "purpose": draft["purpose"],
                     "owner_instructions": draft["instructions"],
+                    **(
+                        {"hermes_call_route": draft["bridge_capability"]}
+                        if draft.get("bridge_capability")
+                        else {}
+                    ),
                 },
                 "telephony_configuration_id": s.telephony_configuration_id,
                 "from_phone_number_id": s.from_phone_number_id,

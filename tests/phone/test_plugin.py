@@ -37,7 +37,9 @@ def test_manifest_matches_inert_registration():
 
     ctx = Context()
     plugin.register(ctx)
-    manifest = yaml.safe_load((Path(__file__).parents[2] / "plugin.yaml").read_text())
+    manifest = yaml.safe_load(
+        (Path(__file__).parents[2] / "plugin.yaml").read_text(encoding="utf-8")
+    )
     assert set(ctx.tools) == set(manifest["provides_tools"])
     assert set(ctx.hooks) <= set(manifest["provides_hooks"])
     assert "phone_approve" not in ctx.tools
