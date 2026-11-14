@@ -27,14 +27,25 @@ async def connected(*, audio=None, fail_receipt=None):
         requests.append((path, body))
         if path == "speech":
             attempt = "attempt-" + str(sum(path == "speech" for path, _ in requests))
-            return httpx.Response(200, json={
-                "ok": True, "speak": True, "event_id": body["event_id"], "attempt_id": attempt,
-                "response": {
-                    "conversation": "none", "tools": [], "tool_choice": "none", "input": [],
-                    "metadata": {"talk_presentation_id": attempt,
-                                 "talk_event_id": body["event_id"]},
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "speak": True,
+                    "event_id": body["event_id"],
+                    "attempt_id": attempt,
+                    "response": {
+                        "conversation": "none",
+                        "tools": [],
+                        "tool_choice": "none",
+                        "input": [],
+                        "metadata": {
+                            "talk_presentation_id": attempt,
+                            "talk_event_id": body["event_id"],
+                        },
+                    },
                 },
-            })
+            )
         if path == "receipt" and body["state"] == fail_receipt:
             return httpx.Response(409, json={"detail": "expired claim"})
         return httpx.Response(200, json={"ok": True})
@@ -94,7 +105,10 @@ def test_terminal_summary_finishes_after_generation_and_exact_local_consumption(
         consume(h.controller.audio)
         await h.controller.tick()
         assert states(h) == [
-            "submitting", "context_submitted", "playback_started", "playback_finished"
+            "submitting",
+            "context_submitted",
+            "playback_started",
+            "playback_finished",
         ]
         await finish(h)
         await h.controller.tick()

@@ -37,12 +37,25 @@ def setup(environment):
     manager, request, host, _ = environment
     bound, context = join(environment)
     decide = Decision()
-    coordinator = LiveCoordinator(manager, None, lambda _: [{"name": "delegate_task"}],
-                                  decide=decide)
-    body = {**context, "provider_session_id": "provider-session", "delegation_id": "d-one",
-            "offset_ms": 1000, "fragments": [{"event_id": "input-one", "role": "user",
-                "text": "Start background work inspecting my project", "start_ms": 0,
-                "end_ms": 900, "final": False}]}
+    coordinator = LiveCoordinator(
+        manager, None, lambda _: [{"name": "delegate_task"}], decide=decide
+    )
+    body = {
+        **context,
+        "provider_session_id": "provider-session",
+        "delegation_id": "d-one",
+        "offset_ms": 1000,
+        "fragments": [
+            {
+                "event_id": "input-one",
+                "role": "user",
+                "text": "Start background work inspecting my project",
+                "start_ms": 0,
+                "end_ms": 900,
+                "final": False,
+            }
+        ],
+    }
     return coordinator, decide, request, host, bound, body
 
 
@@ -67,6 +80,7 @@ def test_partial_capture_duplicate_and_reconnect_share_one_worker(environment):
         assert len(host.jobs) == len(decide.calls) == 1
         with pytest.raises(DashboardTaskError, match="no longer current"):
             await coordinator.delegation(request, body)
+
     asyncio.run(run())
 
 
@@ -82,6 +96,7 @@ def test_concurrent_event_does_not_repeat_reasoning_or_dispatch(environment):
         decide.release.set()
         await first
         assert len(host.jobs) == 1
+
     asyncio.run(run())
 
 
@@ -96,6 +111,7 @@ def test_final_typed_origin_is_saved_once_and_keeps_its_modality(environment):
         assert records[0]["text"] == typed["text"]
         assert host.rows[("default", "task-a")][-1]["content"] == typed["text"]
         assert len(host.jobs) == len(decide.calls) == 1
+
     asyncio.run(run())
 
 
@@ -110,10 +126,13 @@ def test_outputs_future_input_and_conflicting_events_cannot_authorize_work(envir
         assert not host.jobs and not decide.calls
         await coordinator.delegation(request, body)
         with pytest.raises(DashboardTaskError, match="different content"):
-            await coordinator.delegation(request, {**body, "fragments": [
-                {**body["fragments"][0], "text": "Different request"}]})
+            await coordinator.delegation(
+                request,
+                {**body, "fragments": [{**body["fragments"][0], "text": "Different request"}]},
+            )
         assert len(host.jobs) == 1
         assert LiveLedger(bound).recent()[0]["text"] == body["fragments"][0]["text"]
+
     asyncio.run(run())
 
 
@@ -128,4 +147,5 @@ def test_revocation_during_reasoning_prevents_action(environment):
         with pytest.raises(DashboardTaskError):
             await pending
         assert not host.jobs
+
     asyncio.run(run())

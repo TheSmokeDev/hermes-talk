@@ -17,7 +17,8 @@ from talk_task_sources import TaskEventError
 
 def operation_view(fixture, operation_id):
     return fixture.registry.coordinator.operation(
-        fixture.request, {**fixture.context, "operation_id": operation_id},
+        fixture.request,
+        {**fixture.context, "operation_id": operation_id},
     )
 
 
@@ -38,8 +39,14 @@ def test_operation_handoff_is_durable_exact_and_never_marks_playback(environment
         events = [event for event, _ in binding.events if event["type"] == "result"]
         assert len(events) == 1 and events[0]["presentation"]["state"] == "result_ready"
         restored_browser = FakeBrowser()
-        restored = BrowserBinding(fixture.registry, "restored", fixture.request,
-                                  fixture.context, restored_browser, restored_browser.session)
+        restored = BrowserBinding(
+            fixture.registry,
+            "restored",
+            fixture.request,
+            fixture.context,
+            restored_browser,
+            restored_browser.session,
+        )
         await restored.publish_result({**view["result"], "operation_id": view["operation_id"]})
         assert not restored_browser.session.commands
         assert len(fixture.host.jobs) == len(fixture.decision.calls) == 1
@@ -72,7 +79,8 @@ def test_send_failure_records_unknown_and_never_retries_an_uncertain_delivery(en
         assert not view["presentation"]["context_submitted"]
         assert not binding.deliveries and len(sent) == 1
         refused = fixture.registry.coordinator.presentation(
-            fixture.request, binding.body(operation_id=view["operation_id"], state="submitting"),
+            fixture.request,
+            binding.body(operation_id=view["operation_id"], state="submitting"),
         )
         assert refused["ok"] and not refused["speak"]
         assert len(fixture.host.jobs) == len(fixture.decision.calls) == 1
@@ -88,12 +96,17 @@ def test_operation_receipts_reject_foreign_attempt_session_and_stale_generation(
         receipt = await binding.typed("Inspect this project", "typed-one")
         await wait_for(lambda: not binding.typed_pending)
         presentation = operation_view(fixture, receipt["operation_id"])["presentation"]
-        body = binding.body(operation_id=receipt["operation_id"],
-                            attempt_id=presentation["attempt_id"], state="context_submitted")
-        for patch in ({"attempt_id": "another-attempt"},
-                      {"provider_session_id": "another-session"},
-                      {"operation_id": "another-operation"},
-                      {"state": "playback_finished"}):
+        body = binding.body(
+            operation_id=receipt["operation_id"],
+            attempt_id=presentation["attempt_id"],
+            state="context_submitted",
+        )
+        for patch in (
+            {"attempt_id": "another-attempt"},
+            {"provider_session_id": "another-session"},
+            {"operation_id": "another-operation"},
+            {"state": "playback_finished"},
+        ):
             with pytest.raises(DashboardTaskError):
                 fixture.registry.coordinator.presentation(fixture.request, {**body, **patch})
         repeated = fixture.registry.coordinator.presentation(fixture.request, body)
@@ -103,7 +116,8 @@ def test_operation_receipts_reject_foreign_attempt_session_and_stale_generation(
         with pytest.raises(DashboardTaskError):
             fixture.registry.coordinator.presentation(fixture.request, body)
         current = fixture.registry.coordinator.operation(
-            fixture.request, {**renewed, "operation_id": receipt["operation_id"]},
+            fixture.request,
+            {**renewed, "operation_id": receipt["operation_id"]},
         )
         assert current["presentation"]["state"] == "unknown"
         assert len(fixture.host.jobs) == len(fixture.decision.calls) == 1
@@ -122,7 +136,8 @@ def test_expired_operation_dispatch_is_unknown_without_a_second_attempt(environm
         await wait_for(lambda: not binding.pending)
         operation_id = next(iter(binding.operations))
         prepared = fixture.registry.coordinator.presentation(
-            fixture.request, binding.body(operation_id=operation_id, state="submitting"),
+            fixture.request,
+            binding.body(operation_id=operation_id, state="submitting"),
         )
         assert prepared["speak"] and not fixture.browser.session.commands
         expires = prepared["presentation"]["claim_expires_at"]
@@ -151,13 +166,16 @@ def test_recorded_operation_result_publishes_while_transcript_capture_is_blocked
             fixture.decision.release.set()
             await wait_for(lambda: bool(fixture.host.jobs))
             operation_id = receipt["operation_id"]
-            await wait_for(lambda: LiveLedger(fixture.bound).operation(operation_id)["state"]
-                           == "completed")
+            await wait_for(
+                lambda: LiveLedger(fixture.bound).operation(operation_id)["state"] == "completed"
+            )
             await asyncio.wait_for(wait_for(lambda: not binding.typed_pending), 1)
             assert binding.persist_queue and binding.capture_lock.locked()
             assert len(fixture.browser.session.commands) == 1
-            assert any(event["type"] == "result" and event["operation_id"] == operation_id
-                       for event, _ in binding.events)
+            assert any(
+                event["type"] == "result" and event["operation_id"] == operation_id
+                for event, _ in binding.events
+            )
             assert operation_view(fixture, operation_id)["presentation"]["context_submitted"]
         finally:
             binding.capture_lock.release()
@@ -173,7 +191,10 @@ def test_job_handoff_requires_persisted_dispatch_and_does_not_retry_unknown(envi
         await binding.typed("Inspect this project", "typed-one")
         await wait_for(lambda: not binding.typed_pending)
         fixture.host.jobs["remote-1"].update(
-            status="completed", updated_at=200.0, last_event="run.completed", output="Done",
+            status="completed",
+            updated_at=200.0,
+            last_event="run.completed",
+            output="Done",
         )
         commands = []
 
@@ -207,7 +228,10 @@ def test_job_handoff_stops_when_dispatch_receipt_is_refused(environment, monkeyp
         await binding.typed("Inspect this project", "typed-one")
         await wait_for(lambda: not binding.typed_pending)
         fixture.host.jobs["remote-1"].update(
-            status="completed", updated_at=200.0, last_event="run.completed", output="Done",
+            status="completed",
+            updated_at=200.0,
+            last_event="run.completed",
+            output="Done",
         )
         manager = fixture.registry.manager
         original = manager.speech_receipt

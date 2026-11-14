@@ -376,9 +376,7 @@ def test_a_late_transport_failure_reopens_the_record_and_rearms_the_floor(monkey
         calls.append(choice)
         raise talk_apiserver.TalkApiServerError("refused (500)")
 
-    monkeypatch.setattr(
-        talk_approvals.talk_apiserver, "respond_to_approval", failing_then_deny
-    )
+    monkeypatch.setattr(talk_approvals.talk_apiserver, "respond_to_approval", failing_then_deny)
     monkeypatch.setattr(talk_approvals, "RESOLVE_CONFIRM_WAIT_S", 0.01)
     monkeypatch.setenv("TALK_APPROVAL_PROMPT_TIMEOUT_S", "0.25")
     talk_approvals.attach_session(FakeLoop(), lambda event: None)
@@ -450,9 +448,7 @@ def test_a_dead_watcher_reconciles_one_generic_prompt_from_the_poll():
 
     # A non-waiting payload never registers; a stale generation never does.
     talk_approvals.reconcile_from_poll(8, "run_remote_8", {"status": "running"}, generation)
-    talk_approvals.reconcile_from_poll(
-        9, "run_remote_9", payload, generation - 1
-    )
+    talk_approvals.reconcile_from_poll(9, "run_remote_9", payload, generation - 1)
     assert not talk_approvals.has_pending(8)
     assert not talk_approvals.has_pending(9)
 
@@ -540,14 +536,10 @@ def test_an_unanswered_prompt_times_out_into_a_deny(monkeypatch):
     # The deny POST rides a daemon and outruns _expire's own notify — wait for
     # the outcome event itself rather than reading the list tail.
     assert _wait_for(
-        lambda: any(
-            event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME for event in seen
-        )
+        lambda: any(event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME for event in seen)
     )
     outcome = next(
-        event
-        for event in seen
-        if event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME
+        event for event in seen if event.get("kind") == talk_approvals.EVENT_APPROVAL_OUTCOME
     )
     assert outcome["outcome"] == "timeout"
 
@@ -640,9 +632,7 @@ def test_approval_responded_clears_the_pending_record(monkeypatch):
     _register(FakeLoop())
     talk_approvals.note_prompt_sent(7)
 
-    talk_approvals._note_event(
-        7, "run_remote_1", {"event": "approval.responded", "choice": "once"}
-    )
+    talk_approvals._note_event(7, "run_remote_1", {"event": "approval.responded", "choice": "once"})
 
     assert not talk_approvals.has_pending(7)
 
@@ -694,9 +684,7 @@ def test_the_tool_handler_validates_and_routes(monkeypatch):
     assert "needs the run number" in talk_tools.execute_talk_tool(
         "resolve_approval", {"run_id": "not-a-number", "choice": "once"}
     )
-    receipt = talk_tools.execute_talk_tool(
-        "resolve_approval", {"run_id": 7, "choice": "once"}
-    )
+    receipt = talk_tools.execute_talk_tool("resolve_approval", {"run_id": 7, "choice": "once"})
 
     assert "Approved" in receipt
     assert posts == [("run_remote_1", "once")]
@@ -771,9 +759,7 @@ def test_stream_run_events_parses_data_frames_and_skips_keepalives(monkeypatch):
         "",
         ": stream closed",
     ]
-    monkeypatch.setattr(
-        talk_apiserver.httpx, "stream", lambda *a, **k: _FakeStreamResponse(frames)
-    )
+    monkeypatch.setattr(talk_apiserver.httpx, "stream", lambda *a, **k: _FakeStreamResponse(frames))
 
     events = []
     talk_apiserver.stream_run_events("r1", events.append)

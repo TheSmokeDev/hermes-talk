@@ -879,8 +879,14 @@ def test_run_ids_skip_past_a_sibling_process_acceptance(history_env: Path):
     _wait_history_terminal(history_env, first)
 
     sibling = json.dumps(
-        {"runId": 50, "kind": "agent", "label": "sibling process", "status": "running",
-         "ts": 1.0, "updated": 1.0}
+        {
+            "runId": 50,
+            "kind": "agent",
+            "label": "sibling process",
+            "status": "running",
+            "ts": 1.0,
+            "updated": 1.0,
+        }
     )
     with (history_env / talk_runs._HISTORY_FILENAME).open("a", encoding="utf-8") as fh:
         fh.write(sibling + "\n")
@@ -914,8 +920,14 @@ def test_the_history_file_lock_serializes_writers(history_env: Path):
 
     writer = threading.Thread(
         target=lambda: talk_runs._append_history(
-            {"runId": 77, "kind": "agent", "label": "waits", "status": "done",
-             "ts": 1.0, "updated": 1.0}
+            {
+                "runId": 77,
+                "kind": "agent",
+                "label": "waits",
+                "status": "done",
+                "ts": 1.0,
+                "updated": 1.0,
+            }
         ),
         daemon=True,
     )
@@ -1086,24 +1098,35 @@ def test_durable_annotate_escalates_when_the_write_cannot_land(
 # --- fall-off visibility for the adoption tail (review F6) -------------------
 
 
-def test_orphans_beyond_the_adoption_tail_are_reported(
-    history_env: Path, monkeypatch, caplog
-):
+def test_orphans_beyond_the_adoption_tail_are_reported(history_env: Path, monkeypatch, caplog):
     """The tail bound is the design; falling off it must not be silent."""
 
     import logging as _logging
 
     monkeypatch.setattr(talk_runs, "_HISTORY_TAIL_LINES", 3)
     orphan = json.dumps(
-        {"runId": 5, "kind": "agent", "label": "owed", "status": "done",
-         "output": "lost to the tail", "delivery": "pending",
-         "ticket": {"hermesSessionId": "sess-test", "operator": "test", "profile": None},
-         "ts": 1.0, "updated": 1.0}
+        {
+            "runId": 5,
+            "kind": "agent",
+            "label": "owed",
+            "status": "done",
+            "output": "lost to the tail",
+            "delivery": "pending",
+            "ticket": {"hermesSessionId": "sess-test", "operator": "test", "profile": None},
+            "ts": 1.0,
+            "updated": 1.0,
+        }
     )
     filler = [
         json.dumps(
-            {"runId": 100 + n, "kind": "skill", "label": f"f{n}", "status": "done",
-             "ts": 2.0, "updated": 2.0}
+            {
+                "runId": 100 + n,
+                "kind": "skill",
+                "label": f"f{n}",
+                "status": "done",
+                "ts": 2.0,
+                "updated": 2.0,
+            }
         )
         for n in range(3)
     ]

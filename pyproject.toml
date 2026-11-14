@@ -108,6 +108,8 @@ py-modules = [
   "talk_discord",
   "talk_relay",
   "talk_transcript",
+  "talk_twilio",
+  "talk_twilio_server",
   "talk_audio",
   "talk_cli",
   "talk_providers",
@@ -220,5 +222,7 @@ known-first-party = [
   "talk_speech_timing",
   "talk_tools",
   "talk_transcript",
+  "talk_twilio",
+  "talk_twilio_server",
   "talk_wire",
 ]

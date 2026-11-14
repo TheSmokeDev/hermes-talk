@@ -296,9 +296,7 @@ def test_a_multi_speaker_transport_with_its_ledger_is_not_refused(monkeypatch):
             pass
 
     code = asyncio.run(
-        talk_cli.run_talk_session(
-            audio=audio, session_factory=lambda _auth: _RefusingSession()
-        )
+        talk_cli.run_talk_session(audio=audio, session_factory=lambda _auth: _RefusingSession())
     )
 
     assert code == 1  # refused at the provider, not at the ledger gate
@@ -323,9 +321,7 @@ def test_a_single_speaker_transport_still_needs_no_ledger(monkeypatch):
             pass
 
     code = asyncio.run(
-        talk_cli.run_talk_session(
-            audio=audio, session_factory=lambda _auth: _RefusingSession()
-        )
+        talk_cli.run_talk_session(audio=audio, session_factory=lambda _auth: _RefusingSession())
     )
 
     assert code == 1
@@ -2234,9 +2230,7 @@ def test_host_summary_is_none_when_the_catalog_has_no_answer(monkeypatch):
     monkeypatch.setattr(
         talk_capabilities,
         "status",
-        lambda: _catalog_snapshot(
-            source=talk_capabilities.SOURCE_NONE, detail="still checking"
-        ),
+        lambda: _catalog_snapshot(source=talk_capabilities.SOURCE_NONE, detail="still checking"),
     )
 
     assert talk_cli._host_summary_line() is None
@@ -2314,8 +2308,14 @@ def test_cli_mint_keeps_manual_response_and_semantic_detection(monkeypatch):
     seen = []
     monkeypatch.setattr(talk_cli.talk_wire, "mint_ephemeral_session", lambda **kw: seen.append(kw))
     detection = rt.RealtimeTurnDetection(mode=rt.RealtimeTurnDetectionMode.SEMANTIC_VAD)
-    talk_cli._mint_session(types.SimpleNamespace(token="fixture", source="fixture"),
-                           model="fixture", voice="cedar", instructions="", tools=[],
-                           automatic_response=False, turn_detection=detection)
+    talk_cli._mint_session(
+        types.SimpleNamespace(token="fixture", source="fixture"),
+        model="fixture",
+        voice="cedar",
+        instructions="",
+        tools=[],
+        automatic_response=False,
+        turn_detection=detection,
+    )
     assert seen[0]["automatic_response"] is False
     assert seen[0]["turn_detection"] is detection

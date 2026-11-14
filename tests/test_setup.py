@@ -98,9 +98,7 @@ def _windows_dacl_sddl(path: Path) -> str:
     local_free.argtypes = [ctypes.c_void_p]
     local_free.restype = ctypes.c_void_p
 
-    error = get_security(
-        str(path), 1, 0x00000004, None, None, None, None, ctypes.byref(descriptor)
-    )
+    error = get_security(str(path), 1, 0x00000004, None, None, None, None, ctypes.byref(descriptor))
     if error:
         raise ctypes.WinError(error)
     sddl = wintypes.LPWSTR()
@@ -169,9 +167,7 @@ def _windows_set_dacl(path: Path, sddl: str) -> None:
         ):
             raise ctypes.WinError(ctypes.get_last_error())
         assert dacl_present.value
-        error = set_security(
-            str(path), 1, 0x00000004 | 0x80000000, None, None, dacl, None
-        )
+        error = set_security(str(path), 1, 0x00000004 | 0x80000000, None, None, dacl, None)
         if error:
             raise ctypes.WinError(error)
     finally:
@@ -316,16 +312,12 @@ def test_setup_asks_only_for_missing_model_confirms_write_and_reruns_doctor(
     assert len(prompts) == 2
     assert "model" in prompts[0].lower()
     assert "write" in prompts[1].lower()
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == (
-        "TALK_MODEL=gpt-realtime-2.1\n"
-    )
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == ("TALK_MODEL=gpt-realtime-2.1\n")
     assert len(doctor_calls) == 2
     assert "Verification: PASS" in capsys.readouterr().out
 
 
-def test_setup_with_no_missing_decisions_asks_nothing_and_writes_nothing(
-    monkeypatch, tmp_path
-):
+def test_setup_with_no_missing_decisions_asks_nothing_and_writes_nothing(monkeypatch, tmp_path):
     doctor_calls = []
     monkeypatch.setattr(
         talk_setup.talk_doctor,
@@ -372,9 +364,7 @@ def test_setup_key_entry_is_secret_safe_and_requires_confirmation(monkeypatch, t
     output = capsys.readouterr().out
     assert secret not in output
     assert secret not in " ".join(prompts)
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == (
-        f"TALK_OPENAI_API_KEY={secret}\n"
-    )
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == (f"TALK_OPENAI_API_KEY={secret}\n")
 
 
 def test_setup_key_choice_reuses_existing_metered_key_and_confirms_policy_transition(
@@ -413,9 +403,7 @@ def test_setup_key_choice_reuses_existing_metered_key_and_confirms_policy_transi
     assert doctor_calls == [1, 1]
     assert len(prompts) == 2
     assert "TALK_PREFER_CODEX_OAUTH" in prompts[1]
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == (
-        "TALK_PREFER_CODEX_OAUTH=false\n"
-    )
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == ("TALK_PREFER_CODEX_OAUTH=false\n")
     assert existing_secret not in output
     assert "state=applied" in output
     assert "Verification: PASS" in output
@@ -648,9 +636,7 @@ def test_setup_prints_the_xai_login_when_no_login_exists(monkeypatch, tmp_path, 
     assert "Verification: FAIL" in output
 
 
-def test_declined_write_is_not_applied_and_failed_verification_is_returned(
-    monkeypatch, tmp_path
-):
+def test_declined_write_is_not_applied_and_failed_verification_is_returned(monkeypatch, tmp_path):
     broken = _report(
         auth={
             "winning_lane": "openai-api-key",
@@ -722,17 +708,19 @@ def test_setup_catches_replace_failure_cleans_secret_temp_and_reruns_doctor(
     env_path = tmp_path / ".env"
     original = "OTHER=preserved\n"
     env_path.write_text(original, encoding="utf-8")
-    reports = [_report(
-        auth={
-            "status": "fail",
-            "winning_lane": None,
-            "blocked_by": "no-usable-auth",
-            "preference": "absent",
-            "codex_oauth": "missing",
-            "metered_key_present": False,
-            "metered_key_wins_over_codex": False,
-        }
-    )]
+    reports = [
+        _report(
+            auth={
+                "status": "fail",
+                "winning_lane": None,
+                "blocked_by": "no-usable-auth",
+                "preference": "absent",
+                "codex_oauth": "missing",
+                "metered_key_present": False,
+                "metered_key_wins_over_codex": False,
+            }
+        )
+    ]
     doctor_calls = []
 
     def collect_report():
@@ -749,10 +737,13 @@ def test_setup_catches_replace_failure_cleans_secret_temp_and_reruns_doctor(
     )
 
     answers = iter(["key", "yes"])
-    assert talk_setup.cli_entry(
-        input_fn=lambda _prompt: next(answers),
-        secret_input_fn=lambda _prompt: secret,
-    ) == 1
+    assert (
+        talk_setup.cli_entry(
+            input_fn=lambda _prompt: next(answers),
+            secret_input_fn=lambda _prompt: secret,
+        )
+        == 1
+    )
     output = capsys.readouterr().out
 
     assert doctor_calls == [1, 1]
@@ -807,9 +798,7 @@ def test_commit_failure_and_denied_temp_cleanup_reports_surviving_secret_mutatio
         assert receipt.mutation_survived is True
         assert receipt.failed_at == "commit"
         assert receipt.error_type == "PermissionError"
-        assert receipt.cleanup_errors == (
-            "staged-temp[0]-beside-destination:PermissionError",
-        )
+        assert receipt.cleanup_errors == ("staged-temp[0]-beside-destination:PermissionError",)
         assert len(staged_paths) == 1
         assert staged_paths[0].exists()
         assert secret in staged_paths[0].read_text(encoding="utf-8")
@@ -823,9 +812,7 @@ def test_commit_failure_and_denied_temp_cleanup_reports_surviving_secret_mutatio
             real_unlink(staged_path, missing_ok=True)
 
 
-def test_transaction_tracks_initial_and_rollback_stages_through_cleanup(
-    monkeypatch, tmp_path
-):
+def test_transaction_tracks_initial_and_rollback_stages_through_cleanup(monkeypatch, tmp_path):
     env_path = tmp_path / ".env"
     original = b"TALK_VOICE=ash\n"
     env_path.write_bytes(original)
@@ -879,9 +866,7 @@ def test_transaction_tracks_initial_and_rollback_stages_through_cleanup(
     assert environment == {"TALK_VOICE": "ash"}
 
 
-def test_failed_receipt_with_surviving_mutation_still_reruns_doctor(
-    monkeypatch, tmp_path, capsys
-):
+def test_failed_receipt_with_surviving_mutation_still_reruns_doctor(monkeypatch, tmp_path, capsys):
     broken = _report(
         auth={
             "winning_lane": "openai-api-key",
@@ -978,9 +963,7 @@ def test_atomic_env_update_preserves_existing_file_mode(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows ACL discriminator")
-def test_new_secret_temp_and_env_override_permissive_inherited_parent_dacl(
-    monkeypatch, tmp_path
-):
+def test_new_secret_temp_and_env_override_permissive_inherited_parent_dacl(monkeypatch, tmp_path):
     parent = tmp_path / "permissive-parent"
     parent.mkdir()
     _windows_set_dacl(parent, "D:P(A;OICI;FA;;;WD)")

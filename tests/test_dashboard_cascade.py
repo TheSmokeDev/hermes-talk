@@ -513,9 +513,7 @@ class _RecordingChannel:
         raise AssertionError("unreachable")
 
     def body(self) -> bytes:
-        return b"".join(
-            m.get("body", b"") for m in self.sent if m["type"] == "http.response.body"
-        )
+        return b"".join(m.get("body", b"") for m in self.sent if m["type"] == "http.response.body")
 
 
 def _http_scope(spec_version: str) -> dict:
@@ -545,11 +543,7 @@ def test_relay_streams_on_a_server_advertising_asgi_below_2_4():
     channel = _RecordingChannel()
     response = api.RelayResponse(_one_chunk(), media_type=api.CASCADE_PCM_MEDIA_TYPE)
 
-    _run(
-        asyncio.wait_for(
-            response(_http_scope("2.3"), channel.receive, channel.send), timeout=2.0
-        )
-    )
+    _run(asyncio.wait_for(response(_http_scope("2.3"), channel.receive, channel.send), timeout=2.0))
 
     assert channel.receive_calls == 0, "the relay must own the request body channel"
     assert channel.body() == b"pcm-bytes"
@@ -573,8 +567,7 @@ class _AsgiChannel:
 
     def __init__(self, *bodies: bytes) -> None:
         self.messages = [
-            {"type": "http.request", "body": body, "more_body": True}
-            for body in bodies
+            {"type": "http.request", "body": body, "more_body": True} for body in bodies
         ]
         self.messages.append({"type": "http.request", "body": b"", "more_body": False})
         self.messages.append({"type": "http.disconnect"})
@@ -592,9 +585,7 @@ class _AsgiChannel:
         self.sent.append(message)
 
     def body(self) -> bytes:
-        return b"".join(
-            m.get("body", b"") for m in self.sent if m["type"] == "http.response.body"
-        )
+        return b"".join(m.get("body", b"") for m in self.sent if m["type"] == "http.response.body")
 
 
 async def _drive_relay(response_cls, tts, pcm: bytes) -> bytes:
@@ -602,9 +593,7 @@ async def _drive_relay(response_cls, tts, pcm: bytes) -> bytes:
 
     starlette_requests = pytest.importorskip("starlette.requests")
 
-    upload = b"".join(
-        ndjson({"delta": "Hello there. "}, {"done": "Hello there."})
-    )
+    upload = b"".join(ndjson({"delta": "Hello there. "}, {"done": "Hello there."}))
     channel = _AsgiChannel(upload)
     scope = _http_scope("2.3")
     request = starlette_requests.Request(scope, channel.receive)
@@ -648,9 +637,7 @@ def test_the_stock_streaming_response_loses_the_upload_on_the_same_scope(tts):
 
     starlette_responses = pytest.importorskip("starlette.responses")
 
-    body = _run(
-        _drive_relay(starlette_responses.StreamingResponse, tts, b"\x07\x08" * 480)
-    )
+    body = _run(_drive_relay(starlette_responses.StreamingResponse, tts, b"\x07\x08" * 480))
 
     assert body == b"", "the stock response is expected to lose the upload"
     assert not tts.sockets, "no text reached the cascade, so it never dialed"
@@ -674,11 +661,7 @@ def test_relay_streams_identically_when_the_server_advertises_2_4():
     channel = _RecordingChannel()
     response = api.RelayResponse(_one_chunk(), media_type=api.CASCADE_PCM_MEDIA_TYPE)
 
-    _run(
-        asyncio.wait_for(
-            response(_http_scope("2.4"), channel.receive, channel.send), timeout=2.0
-        )
-    )
+    _run(asyncio.wait_for(response(_http_scope("2.4"), channel.receive, channel.send), timeout=2.0))
 
     assert channel.receive_calls == 0
     assert channel.body() == b"pcm-bytes"

@@ -151,9 +151,7 @@ def test_agent_loop_absent_is_recognised(raw):
         # verbatim (registry.py:1120, delegate_tool.py:3463), so the match is
         # the whole error string — substring matching classified these as
         # "no agent loop" and routed around the host's decision (review r2, F7).
-        json.dumps(
-            {"error": "Delegation refused: the brief names unknown tool: delegate_task"}
-        ),
+        json.dumps({"error": "Delegation refused: the brief names unknown tool: delegate_task"}),
         json.dumps(
             {"error": "Rejected — delegate_task requires a parent agent context. See docs."}
         ),
@@ -535,16 +533,14 @@ def test_the_detached_lane_refuses_before_spawning_when_unrouted(monkeypatch):
 
 
 def test_an_unrouted_refusal_is_worded_apart_from_a_broken_lane(monkeypatch):
-    """"Never accepted" and "accepted then broke" must not sound the same.
+    """ "Never accepted" and "accepted then broke" must not sound the same.
 
     The operator can act on the difference: one has nothing in flight to check
     on, the other does.
     """
 
     monkeypatch.setattr(talk_host, "hermes_binary", lambda: _FAKE_HERMES)
-    monkeypatch.setattr(
-        talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="ok")
-    )
+    monkeypatch.setattr(talk_host.subprocess, "Popen", lambda *a, **k: _fake_completed(stdout="ok"))
 
     talk_runs.detach_owner()
     unrouted = talk_host.host().run_agent("go")
@@ -609,9 +605,7 @@ def test_the_api_run_id_is_durable_while_the_run_is_still_going(monkeypatch, tmp
         release.wait(timeout=3.0)
         return "the answer"
 
-    monkeypatch.setattr(
-        talk_host.talk_apiserver, "run_to_completion", fake_run_to_completion
-    )
+    monkeypatch.setattr(talk_host.talk_apiserver, "run_to_completion", fake_run_to_completion)
 
     run_id = talk_runs.start_run(
         "agent", "tier 2", talk_host._api_server_worker("go", session_id=None)

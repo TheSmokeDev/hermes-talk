@@ -54,7 +54,10 @@ async def finished_job(client, fixture):
     manager = fixture.registry.manager
     await asyncio.to_thread(manager.state, binding.lease, fixture.context)
     fixture.host.jobs["remote-1"].update(
-        status="completed", output="Done", updated_at=200.0, last_event="run.completed",
+        status="completed",
+        output="Done",
+        updated_at=200.0,
+        last_event="run.completed",
     )
     state = await asyncio.to_thread(manager.state, binding.lease, fixture.context)
     assert state["announcements"], state
@@ -79,8 +82,12 @@ async def retire_first_attempt(fixture, binding):
 
 def replay_body(body, event_id, sequence):
     return {
-        **body, "event_id": event_id, "timing": quiet(sequence),
-        "presentation_protocol": 1, "playback_supported": False, "replay": True,
+        **body,
+        "event_id": event_id,
+        "timing": quiet(sequence),
+        "presentation_protocol": 1,
+        "playback_supported": False,
+        "replay": True,
     }
 
 
@@ -90,9 +97,12 @@ def presentation(fixture, event_id):
 
 def speech_rows(fixture):
     with fixture.bound.events._db(fixture.bound.token) as db:
-        return [tuple(row) for row in db.execute(
-            "SELECT attempt_id,state FROM task_event_speech ORDER BY attempt_order"
-        ).fetchall()]
+        return [
+            tuple(row)
+            for row in db.execute(
+                "SELECT attempt_id,state FROM task_event_speech ORDER BY attempt_order"
+            ).fetchall()
+        ]
 
 
 def table_counts(fixture):
@@ -159,7 +169,8 @@ def test_live_replay_rejects_foreign_binding_and_stale_generation(environment):
                 ({}, {"x-actor": "other"}, 403),
             ):
                 reply = await client.post(
-                    "/live/speech", json={**replay_body(body, event_id, 2), **patch},
+                    "/live/speech",
+                    json={**replay_body(body, event_id, 2), **patch},
                     headers=headers,
                 )
                 assert reply.status_code == status, reply.text
@@ -183,12 +194,16 @@ def test_live_replay_refuses_non_terminal_or_active_attempt(environment):
             running = state["events"]["events"][-1]
             assert running["state"] == "running"
             reply = await client.post(
-                "/live/speech", json=replay_body(body, running["event_id"], 1),
+                "/live/speech",
+                json=replay_body(body, running["event_id"], 1),
             )
             assert reply.status_code == 200 and reply.json()["speak"] is False, reply.text
             assert announced(fixture.browser.session) == [] and speech_rows(fixture) == []
             fixture.host.jobs["remote-1"].update(
-                status="completed", output="Done", updated_at=200.0, last_event="run.completed",
+                status="completed",
+                output="Done",
+                updated_at=200.0,
+                last_event="run.completed",
             )
             state = await asyncio.to_thread(manager.state, binding.lease, fixture.context)
             event_id = state["announcements"][0]["event_id"]
@@ -253,8 +268,11 @@ def test_live_replay_never_stages_input_or_coordinator_work(environment, monkeyp
 
             coordinator = fixture.registry.coordinator
             for target, name in (
-                (coordinator, "typed"), (coordinator, "delegation"), (LiveLedger, "admit"),
-                (DashboardStages, "stage"), (DashboardStages, "stage_live"),
+                (coordinator, "typed"),
+                (coordinator, "delegation"),
+                (LiveLedger, "admit"),
+                (DashboardStages, "stage"),
+                (DashboardStages, "stage_live"),
                 (DashboardStages, "prepare_action"),
             ):
                 monkeypatch.setattr(target, name, forbidden)
@@ -277,7 +295,8 @@ def test_live_speech_without_replay_keeps_preparation_only_behaviour(environment
         async with application(environment) as (client, fixture):
             body, _, event_id = await finished_job(client, fixture)
             reply = await client.post(
-                "/live/speech", json={**fixture.context, "event_id": event_id, "timing": quiet(1)},
+                "/live/speech",
+                json={**fixture.context, "event_id": event_id, "timing": quiet(1)},
             )
             assert reply.status_code == 200, reply.text
             speech = reply.json()
@@ -285,16 +304,21 @@ def test_live_speech_without_replay_keeps_preparation_only_behaviour(environment
             assert "response" not in speech and speech["presentation"]["state"] == "claimed"
             assert announced(fixture.browser.session) == []
             assert speech_rows(fixture) == [(speech["attempt_id"], "queued")]
-            for wrong in ({"replay": True},
-                          {"replay": True, "presentation_protocol": 0,
-                           "playback_supported": False},
-                          {"replay": True, "presentation_protocol": 1,
-                           "playback_supported": True},
-                          {"replay": "yes", "presentation_protocol": 1,
-                           "playback_supported": False}):
-                refused = await client.post("/live/speech", json={
-                    **body, "event_id": event_id, "timing": quiet(2), **wrong,
-                })
+            for wrong in (
+                {"replay": True},
+                {"replay": True, "presentation_protocol": 0, "playback_supported": False},
+                {"replay": True, "presentation_protocol": 1, "playback_supported": True},
+                {"replay": "yes", "presentation_protocol": 1, "playback_supported": False},
+            ):
+                refused = await client.post(
+                    "/live/speech",
+                    json={
+                        **body,
+                        "event_id": event_id,
+                        "timing": quiet(2),
+                        **wrong,
+                    },
+                )
                 assert refused.status_code == 400, refused.text
                 assert refused.json()["detail"]["code"] == "invalid_event"
             assert announced(fixture.browser.session) == []
@@ -305,7 +329,8 @@ def test_live_speech_without_replay_keeps_preparation_only_behaviour(environment
 
 @pytest.mark.parametrize("retired", [False, True])
 def test_live_replay_answers_an_open_delegation_and_appends_for_a_retired_one(
-    environment, retired,
+    environment,
+    retired,
 ):
     async def run():
         async with application(environment) as (client, fixture):

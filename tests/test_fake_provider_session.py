@@ -332,13 +332,16 @@ def test_malformed_web_search_arguments_return_an_error_without_authority_or_eff
         ]
     )
 
-    result, _audio = asyncio.run(
-        talk_cli.run_talk_session(
-            audio=Audio(),
-            session_factory=lambda _auth: fake,
-            host_execution_attachment=attachment,
-        )
-    ), None
+    result, _audio = (
+        asyncio.run(
+            talk_cli.run_talk_session(
+                audio=Audio(),
+                session_factory=lambda _auth: fake,
+                host_execution_attachment=attachment,
+            )
+        ),
+        None,
+    )
 
     assert result == 0
     assert attachment.minted == []
@@ -492,12 +495,8 @@ def test_malformed_response_id_consumes_echoed_authority_before_terminal_failure
         {"ssrc": 11, "user_id": 586638048133906576, "display_name": "operator"},
         bytes(20 * 24 * 2),
     )
-    ledger.note_speech_started(
-        {"item_id": "input-1", "audio_start_ms": 0}
-    )
-    ledger.note_speech_stopped(
-        {"item_id": "input-1", "audio_end_ms": 20}
-    )
+    ledger.note_speech_started({"item_id": "input-1", "audio_start_ms": 0})
+    ledger.note_speech_stopped({"item_id": "input-1", "audio_end_ms": 20})
     create = ledger.response_for_commit({"item_id": "input-1"})
     metadata = create["response"]["metadata"]
     malformed = openai_rt.decode_event(
@@ -595,9 +594,7 @@ def test_cancellation_during_connect_closes_every_session_owned_resource(monkeyp
 
 
 def test_terminal_provider_failure_makes_session_nonzero():
-    fake = FakeProviderSession(
-        [rt.ProviderFailure(detail="fatal receive", terminal=True)]
-    )
+    fake = FakeProviderSession([rt.ProviderFailure(detail="fatal receive", terminal=True)])
 
     result, audio = _run(fake)
 
@@ -605,9 +602,7 @@ def test_terminal_provider_failure_makes_session_nonzero():
     assert fake.closed and audio.stopped
 
 
-def test_abnormal_openai_eof_fails_session_without_flushing_active_tool_batch(
-    monkeypatch, capsys
-):
+def test_abnormal_openai_eof_fails_session_without_flushing_active_tool_batch(monkeypatch, capsys):
     executed = []
 
     def execute(name, arguments):
@@ -926,11 +921,7 @@ def test_a_reconnect_speaks_the_result_it_was_owed(routed):
     )
     _run(fake)
 
-    spoken = " ".join(
-        getattr(command, "text", "")
-        for batch in fake.sent
-        for command in batch
-    )
+    spoken = " ".join(getattr(command, "text", "") for batch in fake.sent for command in batch)
     assert f"Background run #{run_id}" in spoken
     assert "the index is rebuilt" in spoken
     # Delivered (post-send flip), so the next reconnect does not say it again.
@@ -960,11 +951,7 @@ def test_a_reconnect_speaks_every_result_it_was_owed(routed):
     )
     _run(fake)
 
-    spoken = " ".join(
-        getattr(command, "text", "")
-        for batch in fake.sent
-        for command in batch
-    )
+    spoken = " ".join(getattr(command, "text", "") for batch in fake.sent for command in batch)
     assert f"Background run #{first}" in spoken
     assert "the index is rebuilt" in spoken
     assert f"Background run #{second}" in spoken
@@ -982,11 +969,7 @@ def test_a_reconnect_does_not_speak_a_stranger_s_result(routed):
     fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
     _run(fake)
 
-    spoken = " ".join(
-        getattr(command, "text", "")
-        for batch in fake.sent
-        for command in batch
-    )
+    spoken = " ".join(getattr(command, "text", "") for batch in fake.sent for command in batch)
     assert "not yours" not in spoken
     assert "Background run #" not in spoken
     # Still owed to its real owner rather than silently consumed.
@@ -1001,11 +984,7 @@ def test_a_reconnect_does_not_adopt_a_different_operator_binding(routed):
     fake = FakeProviderSession([rt.SessionReady(session_id="session-1")])
     _run(fake)
 
-    spoken = " ".join(
-        getattr(command, "text", "")
-        for batch in fake.sent
-        for command in batch
-    )
+    spoken = " ".join(getattr(command, "text", "") for batch in fake.sent for command in batch)
     assert "someone else's answer" not in spoken
     assert "Background run #" not in spoken
     # Still owed under its OWN binding rather than consumed by this one.

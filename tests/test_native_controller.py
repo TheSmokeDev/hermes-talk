@@ -637,8 +637,11 @@ def test_shared_history_allowlist_excludes_hidden_non_dialogue_and_credentials(n
                 {"id": 70, "role": "system", "content": "Hidden system"},
                 {"id": 71, "role": "tool", "content": "Hidden tool"},
                 {"id": 72, "role": "user", "content": "Hidden flag", "hidden": True},
-                {"id": 73, "role": "user",
-                 "content": "Key " + fixture_data.fake_credential("doctor-api")},
+                {
+                    "id": 73,
+                    "role": "user",
+                    "content": "Key " + fixture_data.fake_credential("doctor-api"),
+                },
                 {"id": 74, "role": "assistant", "content": "Bearer fixture-secret-value"},
                 {"id": 75, "role": "user", "content": "Visible saved dialogue"},
             ]

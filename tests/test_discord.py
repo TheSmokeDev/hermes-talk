@@ -614,9 +614,7 @@ def test_a_clean_legacy_session_never_delivers_a_failure_receipt(monkeypatch):
 def test_every_startup_refusal_reason_has_exactly_one_speakable_line():
     """The mapping is keyed by literal (talk_cli imports lazily) — pin it."""
 
-    assert set(talk_discord._STARTUP_REFUSAL_FAILURES) == set(
-        talk_cli.STARTUP_REFUSAL_REASONS
-    )
+    assert set(talk_discord._STARTUP_REFUSAL_FAILURES) == set(talk_cli.STARTUP_REFUSAL_REASONS)
     for reason, line in talk_discord._STARTUP_REFUSAL_FAILURES.items():
         assert talk_discord._startup_refusal_failure(reason) == line
         assert line and len(line) < 200
@@ -645,9 +643,7 @@ def test_only_the_reasons_core_join_can_route_around_offer_core_join():
 def test_the_authorization_refusal_names_the_host_not_a_retry():
     """A wiring contradiction is not something the operator can retry away."""
 
-    line = talk_discord._startup_refusal_failure(
-        talk_cli.STARTUP_REFUSAL_AUTHORIZATION
-    )
+    line = talk_discord._startup_refusal_failure(talk_cli.STARTUP_REFUSAL_AUTHORIZATION)
 
     assert line is not None
     assert "core join" not in line.lower()
@@ -1632,9 +1628,7 @@ def test_drain_does_not_coerce_receiver_user_id_mappings(monkeypatch, raw_user_i
     bridge.stop()
 
 
-def test_e2ee_unmapped_speaker_is_identified_and_pre_mapping_audio_withheld(
-    monkeypatch, caplog
-):
+def test_e2ee_unmapped_speaker_is_identified_and_pre_mapping_audio_withheld(monkeypatch, caplog):
     """Sep 1 regression: DAVE on, Discord never sent SPEAKING, our drain
     starved the host's silence gate, so the SSRC stayed unmapped, the host
     skipped DAVE decrypt, and Opus turned ciphertext into white noise."""

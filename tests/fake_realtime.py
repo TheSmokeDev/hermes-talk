@@ -172,9 +172,7 @@ def rt_transcript_delta(text: str, *, response_id: str | None = "resp_1") -> rt.
     )
 
 
-def rt_transcript_done(
-    text: str = "", *, response_id: str | None = "resp_1"
-) -> rt.Transcript:
+def rt_transcript_done(text: str = "", *, response_id: str | None = "resp_1") -> rt.Transcript:
     return rt.Transcript(
         role=rt.TranscriptRole.ASSISTANT,
         text=text,

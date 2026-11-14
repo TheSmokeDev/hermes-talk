@@ -22,15 +22,9 @@ def _pcm(ms):
     return bytes(ms * 24 * 2)
 
 
-def _bind_response(
-    ledger, *, response_id="resp-1", start_ms=0, end_ms=20, input_item="input-1"
-):
-    ledger.note_speech_started(
-        {"item_id": input_item, "audio_start_ms": start_ms}
-    )
-    ledger.note_speech_stopped(
-        {"item_id": input_item, "audio_end_ms": end_ms}
-    )
+def _bind_response(ledger, *, response_id="resp-1", start_ms=0, end_ms=20, input_item="input-1"):
+    ledger.note_speech_started({"item_id": input_item, "audio_start_ms": start_ms})
+    ledger.note_speech_stopped({"item_id": input_item, "audio_end_ms": end_ms})
     create = ledger.response_for_commit({"item_id": input_item})
     ledger.note_response_created(
         {
@@ -63,9 +57,7 @@ def _make_tool_event(
 
 
 def _run_batch(relay, events, batch_id="batch-1"):
-    return asyncio.run(
-        relay.handle_tool_batch_async(tuple(events), batch_id)
-    )
+    return asyncio.run(relay.handle_tool_batch_async(tuple(events), batch_id))
 
 
 # ---------- 1. Operator permitted ----------
@@ -79,9 +71,7 @@ def test_operator_mutating_tool_permitted_through_host_path(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 1
@@ -100,9 +90,7 @@ def test_non_operator_denied_mutating_tool_through_host_path(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 0
@@ -116,15 +104,11 @@ def test_read_only_tool_passes_for_non_operator_through_host_path(monkeypatch):
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
     _bind_response(ledger)
-    event = _make_tool_event(
-        ledger, tool_name="search_memory", call_id="call-readonly"
-    )
+    event = _make_tool_event(ledger, tool_name="search_memory", call_id="call-readonly")
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 1
@@ -139,15 +123,11 @@ def test_unclassified_tool_fails_closed_through_host_path(monkeypatch):
     ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
     _bind_response(ledger)
-    event = _make_tool_event(
-        ledger, tool_name="future_unknown_tool", call_id="call-unknown"
-    )
+    event = _make_tool_event(ledger, tool_name="future_unknown_tool", call_id="call-unknown")
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 0
@@ -166,9 +146,7 @@ def test_mixed_speakers_denied_through_host_path(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 0
@@ -191,9 +169,7 @@ def test_missing_attribution_denied_through_host_path(monkeypatch):
     }
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [unbound_event])
 
     assert len(attachment.minted) == 0
@@ -219,9 +195,7 @@ def test_provider_metadata_cannot_satisfy_authority(monkeypatch):
     }
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [spoofed_event])
 
     assert len(attachment.minted) == 0
@@ -239,9 +213,7 @@ def test_discard_consumes_permit_through_host_path(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     relay.discard_tool_event(event)
     results = _run_batch(relay, [event])
 
@@ -260,9 +232,7 @@ def test_queue_full_consumes_permit_through_host_path(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     relay.tool_queue_full_commands(event)
     results = _run_batch(relay, [event])
 
@@ -283,9 +253,7 @@ def test_replayed_proof_denied_through_host_path(monkeypatch):
     assert ledger.authorize_tool("delegate_task", event) is None
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 0
@@ -305,9 +273,7 @@ def test_reconnect_invalidates_old_proofs(monkeypatch):
     ledger.clear()
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 0
@@ -371,9 +337,7 @@ def test_missing_call_id_is_dropped_not_crashed(monkeypatch):
     }
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [malformed])
 
     assert len(attachment.minted) == 0
@@ -396,25 +360,15 @@ def test_a_mixed_batch_authorizes_each_event_on_its_own_merits(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
-    _bind_response(
-        ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1"
-    )
-    permitted = _make_tool_event(
-        ledger, response_id="resp-1", call_id="call-ok", item_id="item-1"
-    )
+    _bind_response(ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1")
+    permitted = _make_tool_event(ledger, response_id="resp-1", call_id="call-ok", item_id="item-1")
 
     ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
-    _bind_response(
-        ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2"
-    )
-    denied = _make_tool_event(
-        ledger, response_id="resp-2", call_id="call-no", item_id="item-2"
-    )
+    _bind_response(ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2")
+    denied = _make_tool_event(ledger, response_id="resp-2", call_id="call-no", item_id="item-2")
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [permitted, denied])
 
     # Exactly one permit reached the host, and it is the operator's.
@@ -440,25 +394,15 @@ def test_a_mixed_batch_consumes_the_denied_events_permit_too(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     ledger.record_packet(_speaker(OPERATOR_ID), _pcm(20))
-    _bind_response(
-        ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1"
-    )
-    permitted = _make_tool_event(
-        ledger, response_id="resp-1", call_id="call-ok", item_id="item-1"
-    )
+    _bind_response(ledger, response_id="resp-1", start_ms=0, end_ms=20, input_item="in-1")
+    permitted = _make_tool_event(ledger, response_id="resp-1", call_id="call-ok", item_id="item-1")
 
     ledger.record_packet(_speaker(OTHER_ID), _pcm(20))
-    _bind_response(
-        ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2"
-    )
-    denied = _make_tool_event(
-        ledger, response_id="resp-2", call_id="call-no", item_id="item-2"
-    )
+    _bind_response(ledger, response_id="resp-2", start_ms=20, end_ms=40, input_item="in-2")
+    denied = _make_tool_event(ledger, response_id="resp-2", call_id="call-no", item_id="item-2")
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     _run_batch(relay, [permitted, denied])
 
     # Replay the once-denied event now that the operator has spoken again:
@@ -488,9 +432,7 @@ def test_an_unnamed_call_is_revoked_under_the_same_name_it_is_authorized_under()
         return None
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=recording_authorizer
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=recording_authorizer)
     nameless = {"call_id": "call-1", "arguments": "{}", "response_id": "r", "item_id": "i"}
 
     relay.discard_tool_event(dict(nameless))
@@ -523,9 +465,7 @@ def test_capability_catalog_is_readable_by_a_non_operator(monkeypatch):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert len(attachment.minted) == 1
@@ -555,9 +495,7 @@ def test_a_catalog_read_cannot_be_replayed_as_a_mutating_call(monkeypatch):
     assert ledger.authorize_tool("talk_capabilities", event) is None
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [dict(event, name="delegate_task")])
 
     assert len(attachment.minted) == 0
@@ -645,9 +583,7 @@ def test_discord_lane_classification_is_unchanged_by_the_relay_gate(monkeypatch)
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
 
     attachment = HostExecutionAttachment()
-    relay = talk_cli.HostExecutionRelay(
-        attachment, tool_authorizer=ledger.authorize_tool
-    )
+    relay = talk_cli.HostExecutionRelay(attachment, tool_authorizer=ledger.authorize_tool)
     results = _run_batch(relay, [event])
 
     assert attachment.minted == []

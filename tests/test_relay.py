@@ -64,7 +64,7 @@ def test_authorizer_allow_reaches_the_tool_executor():
         tool_authorizer=lambda _name, _event: None,
     )
 
-    messages = relay.handle_event(fr.function_call("search_memory", '{}'))
+    messages = relay.handle_event(fr.function_call("search_memory", "{}"))
 
     assert messages[0]["item"]["output"] == "ran search_memory"
 
@@ -134,9 +134,7 @@ def test_timed_out_tools_have_bounded_worker_admission(monkeypatch):
     assert pool.worker_count == 1
     assert started <= 1
     outputs = [result[0]["item"]["output"] for result in messages]
-    running = sum(
-        output.startswith("The stuck tool is still running") for output in outputs
-    )
+    running = sum(output.startswith("The stuck tool is still running") for output in outputs)
     assert running == started
     assert all(
         "still running" in output or "not started" in output or "did not start" in output
@@ -203,9 +201,7 @@ def test_speech_while_idle_drains_but_cancels_nothing():
 
 
 def test_response_done_rearms_the_idle_gate():
-    recorder = fr.run_transcript(
-        [fr.response_created(), fr.response_done(), fr.speech_started()]
-    )
+    recorder = fr.run_transcript([fr.response_created(), fr.response_done(), fr.speech_started()])
 
     assert recorder.barge_ins == 1
     assert recorder.sent == []
@@ -523,9 +519,7 @@ def test_a_cancelled_response_still_blocks_announcements_until_it_terminates():
     recorder = fr.Recorder()
     relay = fr.build_relay(recorder)
 
-    fr.play_neutral(
-        relay, recorder, [fr.rt_response_started("resp_A"), fr.rt_speech_started()]
-    )
+    fr.play_neutral(relay, recorder, [fr.rt_response_started("resp_A"), fr.rt_speech_started()])
     assert relay.response_active is True
 
     fr.play_neutral(relay, recorder, [fr.rt_response_finished("resp_A")])
@@ -566,9 +560,7 @@ def test_the_settled_ledger_stays_bounded_over_a_long_call():
     assert len(relay._settled_response_ids) == talk_relay.MAX_SETTLED_RESPONSES
     # Eviction takes the oldest, so the responses whose tails could still be in
     # flight are exactly the ones still fenced.
-    fr.play_neutral(
-        relay, recorder, [fr.rt_audio(b"\x01", response_id=f"resp_{turns - 1}")]
-    )
+    fr.play_neutral(relay, recorder, [fr.rt_audio(b"\x01", response_id=f"resp_{turns - 1}")])
     assert recorder.audio == []
 
 
@@ -699,9 +691,7 @@ def test_a_second_barge_in_on_a_lost_terminal_recovers_the_ledger():
     recorder = fr.Recorder()
     relay = fr.build_relay(recorder)
 
-    fr.play_neutral(
-        relay, recorder, [fr.rt_response_started("resp_A"), fr.rt_speech_started()]
-    )
+    fr.play_neutral(relay, recorder, [fr.rt_response_started("resp_A"), fr.rt_speech_started()])
     assert recorder.command_types == ["CancelResponse"]
     assert relay.response_active is True  # cancel sent; terminal still owed
 
@@ -731,9 +721,7 @@ def test_a_second_barge_in_on_a_lost_unnamed_terminal_recovers_the_ledger():
     recorder = fr.Recorder()
     relay = fr.build_relay(recorder)
 
-    fr.play_neutral(
-        relay, recorder, [fr.rt_response_started(None), fr.rt_speech_started()]
-    )
+    fr.play_neutral(relay, recorder, [fr.rt_response_started(None), fr.rt_speech_started()])
     assert recorder.command_types == ["CancelResponse"]
     assert relay.response_active is True
 

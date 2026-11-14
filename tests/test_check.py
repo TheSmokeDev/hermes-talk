@@ -525,8 +525,9 @@ def test_lane_resolution_failure_is_the_finding(live):
     step = _steps(report)["provider_session"]
 
     assert step["status"] == "fail"
-    assert "provider lane could not be resolved: Realtime voice needs a credential" in (
-        step["summary"]
+    assert (
+        "provider lane could not be resolved: Realtime voice needs a credential"
+        in (step["summary"])
     )
     # The run step still runs, on a neutral operator: the two halves are
     # independent findings.

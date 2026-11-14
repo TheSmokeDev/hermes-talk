@@ -15,22 +15,38 @@ from talk_live_browser import BrowserBinding
 
 
 def quiet(sequence=1):
-    return {"sequence": sequence, "operator_speaking": False, "playback_active": False,
-            "response_pending": False, "input_pending": False, "tools_pending": False}
+    return {
+        "sequence": sequence,
+        "operator_speaking": False,
+        "playback_active": False,
+        "response_pending": False,
+        "input_pending": False,
+        "tools_pending": False,
+    }
 
 
 def observation(identity, text, *, end=900, item="utterance", finality="delta", role="user"):
-    return rt.Transcript(rt.TranscriptRole(role), text, finality == "turn",
-                         rt.TranscriptProvenance.INPUT_AUDIO if role == "user"
-                         else rt.TranscriptProvenance.OUTPUT_AUDIO,
-                         item_id=item, event_id=identity, finality=finality,
-                         start_ms=0, end_ms=end)
+    return rt.Transcript(
+        rt.TranscriptRole(role),
+        text,
+        finality == "turn",
+        rt.TranscriptProvenance.INPUT_AUDIO
+        if role == "user"
+        else rt.TranscriptProvenance.OUTPUT_AUDIO,
+        item_id=item,
+        event_id=identity,
+        finality=finality,
+        start_ms=0,
+        end_ms=end,
+    )
 
 
 def ledger_rows(bound):
     with bound.stages._db(bound.token) as db:
-        return [json.loads(row[0]) for row in db.execute(
-            "SELECT record FROM live_transcripts ORDER BY rowid").fetchall()]
+        return [
+            json.loads(row[0])
+            for row in db.execute("SELECT record FROM live_transcripts ORDER BY rowid").fetchall()
+        ]
 
 
 def test_capture_batches_preserve_320_repeated_deltas_and_late_offsets(environment):
@@ -78,11 +94,19 @@ def test_capture_batches_preserve_320_repeated_deltas_and_late_offsets(environme
 def test_capture_ack_failure_retains_evidence_and_large_atomic_item_flushes_alone(environment):
     async def run():
         fixture = registry_for(environment)
-        binding = BrowserBinding(fixture.registry, "capture-only", fixture.request,
-                                 fixture.context, fixture.browser, fixture.browser.session)
+        binding = BrowserBinding(
+            fixture.registry,
+            "capture-only",
+            fixture.request,
+            fixture.context,
+            fixture.browser,
+            fixture.browser.session,
+        )
         original = fixture.registry.coordinator.transcript
         fixture.registry.coordinator.transcript = lambda request, body: {
-            "ok": True, "acked_event_ids": ["not-in-batch"]}
+            "ok": True,
+            "acked_event_ids": ["not-in-batch"],
+        }
         await binding.transcript(observation("atomic", "x" * 9000, finality="item"))
         with pytest.raises(DashboardTaskError):
             await binding.flush_capture()
@@ -107,8 +131,11 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
                 started.set()
                 await asyncio.sleep(25)
                 first_decision_done.set()
-            return {"name": "delegate_task", "arguments": {"task": "Inspect captured request"},
-                    "message": ""}
+            return {
+                "name": "delegate_task",
+                "arguments": {"task": "Inspect captured request"},
+                "message": "",
+            }
 
         fixture = registry_for(environment, decision=decide)
         _, binding = await start(fixture)
@@ -124,18 +151,23 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
         seen = []
         progress_while_first_pending = set()
         while binding.operations.get(receipt["operation_id"], {}).get("state") != "completed":
-            await fixture.registry.binding(fixture.request, {
-                **fixture.context, "binding_id": binding.key}, refresh=True)
-            await binding.transcript(observation(f"output-{poll_count}", " Still here ",
-                                                 item=None, role="assistant"))
+            await fixture.registry.binding(
+                fixture.request, {**fixture.context, "binding_id": binding.key}, refresh=True
+            )
+            await binding.transcript(
+                observation(f"output-{poll_count}", " Still here ", item=None, role="assistant")
+            )
             response = await binding.poll(cursor)
             seen.extend(response["events"])
             # Each poll includes real host/SQLite work; prove concurrent progress, not loop speed.
             if not first_decision_done.is_set():
                 if any(event.get("text") == " Still here " for event in response["events"]):
                     progress_while_first_pending.add("caption")
-                if any(event.get("operation_id") == parallel["operation_id"]
-                       and event.get("state") == "completed" for event in response["events"]):
+                if any(
+                    event.get("operation_id") == parallel["operation_id"]
+                    and event.get("state") == "completed"
+                    for event in response["events"]
+                ):
                     progress_while_first_pending.add("parallel_completed")
             cursor = response["cursor"]
             poll_count += 1
@@ -146,15 +178,31 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
         assert not binding.closed
         assert len(calls) == len(fixture.host.jobs) == 2
         assert any(event.get("text") == " Still here " for event in seen)
-        assert any(event.get("operation_id") == parallel["operation_id"]
-                   and event.get("state") == "completed" for event in seen)
-        completed_receipts = len([event for event, _ in binding.events
-                                  if event.get("operation_id") == receipt["operation_id"]])
+        assert any(
+            event.get("operation_id") == parallel["operation_id"]
+            and event.get("state") == "completed"
+            for event in seen
+        )
+        completed_receipts = len(
+            [
+                event
+                for event, _ in binding.events
+                if event.get("operation_id") == receipt["operation_id"]
+            ]
+        )
         command_count = len(fixture.browser.session.commands)
         await asyncio.sleep(0.35)
         assert len(fixture.browser.session.commands) == command_count == 2
-        assert len([event for event, _ in binding.events
-                    if event.get("operation_id") == receipt["operation_id"]]) == completed_receipts
+        assert (
+            len(
+                [
+                    event
+                    for event, _ in binding.events
+                    if event.get("operation_id") == receipt["operation_id"]
+                ]
+            )
+            == completed_receipts
+        )
         assert all(job["status"] == "running" for job in fixture.host.jobs.values())
         await fixture.registry.close_all()
 
@@ -163,7 +211,9 @@ def test_async_25_second_decision_preserves_poll_lease_captions_and_parallel_req
 
 
 def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result(
-    environment, record_property, monkeypatch,
+    environment,
+    record_property,
+    monkeypatch,
 ):
     async def run():
         fixture = registry_for(environment, clock=lambda: 100.0)
@@ -172,23 +222,35 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
         await wait_for(lambda: not binding.pending)
         await binding.poll(0, quiet())
         fixture.host.jobs["remote-1"].update(
-            status="completed", updated_at=200.0, last_event="run.completed",
-            output="Verified worker result")
+            status="completed",
+            updated_at=200.0,
+            last_event="run.completed",
+            output="Verified worker result",
+        )
         manager = fixture.registry.manager
         # Keep the real host/SQLite projection, but measure it separately from
         # presentation scheduling while capture is blocked.
         projected_at = time.perf_counter()
         state = await asyncio.to_thread(manager.state, binding.lease, binding.context)
         result = await asyncio.to_thread(
-            manager.result, binding.lease,
-            {**binding.context, "run_id": state["jobs"][0]["run_id"]})
+            manager.result, binding.lease, {**binding.context, "run_id": state["jobs"][0]["run_id"]}
+        )
         prepared = await asyncio.to_thread(
-            manager.speech, binding.lease,
-            {**binding.context, "event_id": state["announcements"][0]["event_id"],
-             "timing": quiet(2), "presentation_protocol": 1, "playback_supported": False})
+            manager.speech,
+            binding.lease,
+            {
+                **binding.context,
+                "event_id": state["announcements"][0]["event_id"],
+                "timing": quiet(2),
+                "presentation_protocol": 1,
+                "playback_supported": False,
+            },
+        )
         assert prepared["speak"]
-        record_property("completion_host_sqlite_projection_ms",
-                        round((time.perf_counter() - projected_at) * 1000, 2))
+        record_property(
+            "completion_host_sqlite_projection_ms",
+            round((time.perf_counter() - projected_at) * 1000, 2),
+        )
         receipts = []
         entered, release = threading.Event(), threading.Event()
         original = fixture.registry.coordinator.transcript
@@ -209,42 +271,59 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
                 projected.setattr(manager, "result", lambda *_: result)
                 projected.setattr(manager, "speech", lambda *_: prepared)
                 projected.setattr(
-                    manager, "speech_receipt",
-                    lambda request, body: (receipts.append(body), {"ok": True})[1])
+                    manager,
+                    "speech_receipt",
+                    lambda request, body: (receipts.append(body), {"ok": True})[1],
+                )
                 recorded = time.perf_counter()
                 response = await asyncio.wait_for(binding.poll(binding.sequence, quiet(2)), 1)
                 eligible_ms = (time.perf_counter() - recorded) * 1000
             record_property("completion_capture_isolation_ms", round(eligible_ms, 2))
             record_property("audio_played_confirmed", False)
-            summaries = [command for command in fixture.browser.session.commands
-                         if isinstance(command, rt.SubmitDelegationResult)
-                         and "completed" in command.content]
+            summaries = [
+                command
+                for command in fixture.browser.session.commands
+                if isinstance(command, rt.SubmitDelegationResult) and "completed" in command.content
+            ]
             assert eligible_ms < 1000 and not release.is_set() and binding.capture_lock.locked()
             assert len(summaries) == 1
             assert summaries[0].delegation_id == "original-delegation"
-            assert any(event.get("result", {}).get("output") == "Verified worker result"
-                       for event in response["events"])
+            assert any(
+                event.get("result", {}).get("output") == "Verified worker result"
+                for event in response["events"]
+            )
             assert not binding.active_jobs
             assert [receipt["state"] for receipt in receipts] == [
-                "submitting", "context_submitted",
+                "submitting",
+                "context_submitted",
             ]
             assert receipts[0]["event_id"] == prepared["event_id"]
             release.set()
             receipt_at = time.perf_counter()
             for receipt in receipts:
                 await asyncio.to_thread(manager.speech_receipt, binding.lease, receipt)
-            record_property("completion_sqlite_receipt_ms",
-                            round((time.perf_counter() - receipt_at) * 1000, 2))
+            record_property(
+                "completion_sqlite_receipt_ms", round((time.perf_counter() - receipt_at) * 1000, 2)
+            )
             with fixture.bound.events._db(fixture.bound.token) as db:
                 states = db.execute(
-                    "SELECT state,playback_supported FROM task_event_speech").fetchall()
+                    "SELECT state,playback_supported FROM task_event_speech"
+                ).fetchall()
             assert all(tuple(row) == ("sent", 0) for row in states)
             binding.last_state = 0
             again = await binding.poll(response["cursor"], quiet(3))
             assert not any(event["type"] == "result" for event in again["events"])
-            assert len([command for command in fixture.browser.session.commands
+            assert (
+                len(
+                    [
+                        command
+                        for command in fixture.browser.session.commands
                         if isinstance(command, rt.SubmitDelegationResult)
-                        and "completed" in command.content]) == 1
+                        and "completed" in command.content
+                    ]
+                )
+                == 1
+            )
         finally:
             release.set()
             await fixture.registry.close_all()
@@ -258,8 +337,9 @@ def test_sync_coordinator_reply_remains_compatible_and_duplicate_delivery_is_ine
         original = fixture.registry.coordinator.typed
 
         async def legacy(request, body):
-            return await original(request, {key: value for key, value in body.items()
-                                            if key != "admission"})
+            return await original(
+                request, {key: value for key, value in body.items() if key != "admission"}
+            )
 
         fixture.registry.coordinator.typed = legacy
         _, binding = await start(fixture)

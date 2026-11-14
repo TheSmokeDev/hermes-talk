@@ -16,29 +16,49 @@ def settled_uncertain_send(environment, *, dropped_phase):
     backend = Backend(bound)
     manager.recipients = RecipientService(manager, backend_factory=lambda _: backend)
     manager.recipients.select_recipient(
-        request, {**context, "arguments": {"reference": "desktop-a"}},
-        operation_id="select-one", bound=bound,
+        request,
+        {**context, "arguments": {"reference": "desktop-a"}},
+        operation_id="select-one",
+        bound=bound,
     )
     setattr(backend, "drop_" + dropped_phase, True)
     interaction = dashboard_fixtures.input_event(environment, context)
     interaction_id = interaction["interaction_id"]
     dashboard_fixtures.event(
-        environment, context, "response.started", interaction_id=interaction_id,
+        environment,
+        context,
+        "response.started",
+        interaction_id=interaction_id,
         response_id="send-response",
     )
-    response = manager.tool(request, {
-        **context, "interaction_id": interaction_id, "response_id": "send-response",
-        "call_id": "send-call", "name": "send_agent_message",
-        "arguments": {"message": "Continue the original job."},
-    })
+    response = manager.tool(
+        request,
+        {
+            **context,
+            "interaction_id": interaction_id,
+            "response_id": "send-response",
+            "call_id": "send-call",
+            "name": "send_agent_message",
+            "arguments": {"message": "Continue the original job."},
+        },
+    )
     assert response["action"]["recipient_receipt"]["status"] == "unknown"
     dashboard_fixtures.event(
-        environment, context, "response.done", interaction_id=interaction_id,
-        response_id="send-response", status="completed", tool_call_ids=["send-call"],
+        environment,
+        context,
+        "response.done",
+        interaction_id=interaction_id,
+        response_id="send-response",
+        status="completed",
+        tool_call_ids=["send-call"],
     )
     settled = dashboard_fixtures.finish(
-        environment, context, interaction, response="final-response",
-        previous="send-response", text="Delivery is uncertain.",
+        environment,
+        context,
+        interaction,
+        response="final-response",
+        previous="send-response",
+        text="Delivery is uncertain.",
     )
     assert settled["state"] == "saved"
     setattr(backend, "drop_" + dropped_phase, False)
@@ -48,7 +68,8 @@ def settled_uncertain_send(environment, *, dropped_phase):
 @pytest.mark.parametrize("reconnect", [False, True])
 def test_settled_unknown_delivery_result_reconciles_original_operation(environment, reconnect):
     manager, request, backend, context, action = settled_uncertain_send(
-        environment, dropped_phase="commit",
+        environment,
+        dropped_phase="commit",
     )
     if reconnect:
         _, context = dashboard_fixtures.join(environment)
@@ -66,7 +87,8 @@ def test_settled_unknown_delivery_result_reconciles_original_operation(environme
 
 def test_result_reconciliation_never_commits_a_queued_prepare(environment):
     manager, request, backend, context, action = settled_uncertain_send(
-        environment, dropped_phase="prepare",
+        environment,
+        dropped_phase="prepare",
     )
     for _ in range(2):
         result = manager.result(request, {**context, "run_id": action["run_id"]})
@@ -78,7 +100,8 @@ def test_result_reconciliation_never_commits_a_queued_prepare(environment):
 
 def test_reconciliation_rechecks_authority_before_returning_receipt(environment, monkeypatch):
     manager, request, backend, context, action = settled_uncertain_send(
-        environment, dropped_phase="commit",
+        environment,
+        dropped_phase="commit",
     )
     reconcile = backend.reconcile
 
@@ -96,11 +119,13 @@ def test_reconciliation_rechecks_authority_before_returning_receipt(environment,
 @pytest.mark.parametrize("with_app", [False, True])
 def test_unknown_send_stays_fenced_after_same_task_token_refresh(environment, with_app):
     manager, request, backend, context, _ = settled_uncertain_send(
-        environment, dropped_phase="commit",
+        environment,
+        dropped_phase="commit",
     )
     backend.rows[0]["target_token"] = "refreshed-proof-for-the-same-task"
     manager.recipients.select_recipient(
-        request, {**context, "arguments": {"reference": "desktop-a"}},
+        request,
+        {**context, "arguments": {"reference": "desktop-a"}},
         operation_id="reselect-same-task",
     )
     arguments = {"message": "Continue the original job."}
@@ -108,7 +133,9 @@ def test_unknown_send_stays_fenced_after_same_task_token_refresh(environment, wi
         arguments["app"] = "codex_desktop"
     with pytest.raises(DashboardTaskError) as error:
         manager.recipients.send_agent_message(
-            request, {**context, "arguments": arguments}, operation_id="new-send-attempt",
+            request,
+            {**context, "arguments": arguments},
+            operation_id="new-send-attempt",
         )
     assert error.value.code == "recipient_reconciliation_required"
     assert [row[0] for row in backend.calls].count("commit") == 1

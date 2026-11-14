@@ -192,7 +192,7 @@ def test_realtime_contract_and_openai_adapter_are_shipped_modules():
     assert "talk_core_realtime" in shipped
 
 
-_CORE_SHIM_PROBE = r'''
+_CORE_SHIM_PROBE = r"""
 import enum
 import json
 import sys
@@ -252,7 +252,7 @@ print(json.dumps({
     "cancellation": core._RESPONSE_CANCELLATION_SURFACE_AVAILABLE,
     "capabilities": sorted(item.value for item in core.CORE_CAPABILITIES),
 }))
-'''
+"""
 
 
 def _probe_core_shim(symbols):

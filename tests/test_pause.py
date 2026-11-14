@@ -75,7 +75,7 @@ def test_pause_stops_terminal_capture_and_resume_restores_it():
 
 
 def test_pause_discards_what_was_queued_before_the_flag():
-    """"Paused" means nothing the microphone heard reaches the wire —
+    """ "Paused" means nothing the microphone heard reaches the wire —
     including the blocks the sender had not drained yet."""
 
     audio = talk_audio.DuplexAudio()
@@ -185,9 +185,7 @@ def test_a_bridge_pause_discards_the_frame_that_raced_the_flag(monkeypatch):
     bridge = talk_discord.DiscordAudio(7)
     bridge.start()
     bridge.pause_input()
-    bridge._inbound.put_nowait(
-        talk_discord.InputAudioPacket(speaker=None, pcm=b"\x01\x02" * 480)
-    )
+    bridge._inbound.put_nowait(talk_discord.InputAudioPacket(speaker=None, pcm=b"\x01\x02" * 480))
 
     bridge.resume_input()
     packet = bridge.read_input_packet()
@@ -429,8 +427,9 @@ def test_a_provider_that_serializes_the_flag_as_text_still_resumes(raw):
     audio.pause_input()
     talk_pause.attach_session(audio, resume_control=talk_pause.RESUME_KEYBOARD)
 
-    assert talk_tools.execute_talk_tool("pause_voice_input", {"paused": raw}) == (
-        talk_tools.PAUSE_RECEIPTS[talk_pause.RESUMED]
+    assert (
+        talk_tools.execute_talk_tool("pause_voice_input", {"paused": raw})
+        == (talk_tools.PAUSE_RECEIPTS[talk_pause.RESUMED])
     )
     assert audio.input_paused is False
 
@@ -590,8 +589,9 @@ def test_discord_commands_route_to_the_live_session_and_refuse_without_one():
     assert talk_discord.pause_session() == talk_discord._PAUSE_COMMAND_RECEIPTS[talk_pause.PAUSED]
     assert audio.input_paused is True
     assert "microphone is paused" in talk_discord.session_status()
-    assert talk_discord.pause_session() == (
-        talk_discord._PAUSE_COMMAND_RECEIPTS[talk_pause.ALREADY_PAUSED]
+    assert (
+        talk_discord.pause_session()
+        == (talk_discord._PAUSE_COMMAND_RECEIPTS[talk_pause.ALREADY_PAUSED])
     )
     assert talk_discord.resume_session() == talk_discord._PAUSE_COMMAND_RECEIPTS[talk_pause.RESUMED]
     assert "microphone is paused" not in talk_discord.session_status()
@@ -763,9 +763,7 @@ def _pause_by_tool():
     return talk_tools.execute_talk_tool("pause_voice_input", {})
 
 
-def test_the_standalone_terminal_offers_the_pause_and_watches_its_own_keyboard(
-    monkeypatch, capsys
-):
+def test_the_standalone_terminal_offers_the_pause_and_watches_its_own_keyboard(monkeypatch, capsys):
     """``hermes talk`` on a real tty: the key exists, so the tool is offered,
     the watcher runs, the connected line says so, and an operator flip from
     the keyboard is announced in the contained shape and printed with the

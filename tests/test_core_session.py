@@ -103,14 +103,8 @@ def test_core_setup_is_input_only_and_requests_only_commit_transcription():
     assert setup.instructions == ""
     assert setup.tools == ()
     assert setup.audio == talk_core_session.talk_core_realtime.SUPPORTED_AUDIO_FORMAT
-    assert (
-        setup.input_audio
-        == talk_core_session.talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT
-    )
-    assert (
-        setup.output_audio
-        == talk_core_session.talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT
-    )
+    assert setup.input_audio == talk_core_session.talk_core_realtime.SUPPORTED_INPUT_AUDIO_FORMAT
+    assert setup.output_audio == talk_core_session.talk_core_realtime.SUPPORTED_OUTPUT_AUDIO_FORMAT
     assert setup.automatic_response is False
     assert setup.provider_options == {
         "capabilities": (

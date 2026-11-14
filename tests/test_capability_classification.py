@@ -54,18 +54,15 @@ def test_every_inline_safe_entry_is_read_only_by_host_precedent():
     """The list is short and auditable: the host's own webhook-safe read class
     plus session_search, which the legacy lane already exposes read-only."""
 
-    assert frozenset(
-        {"session_search", "web_search", "web_extract", "vision_analyze"}
-    ) == talk_operator_auth.VOICE_INLINE_SAFE
-    # No overlap with the permit class: a name routes to exactly one class.
-    assert talk_operator_auth.VOICE_INLINE_SAFE.isdisjoint(
-        talk_operator_auth.VOICE_PERMIT_GATED
+    assert (
+        frozenset({"session_search", "web_search", "web_extract", "vision_analyze"})
+        == talk_operator_auth.VOICE_INLINE_SAFE
     )
+    # No overlap with the permit class: a name routes to exactly one class.
+    assert talk_operator_auth.VOICE_INLINE_SAFE.isdisjoint(talk_operator_auth.VOICE_PERMIT_GATED)
 
 
-@pytest.mark.parametrize(
-    "tool", sorted(talk_operator_auth.VOICE_INLINE_SAFE), ids=lambda t: t
-)
+@pytest.mark.parametrize("tool", sorted(talk_operator_auth.VOICE_INLINE_SAFE), ids=lambda t: t)
 def test_inline_safe_tools_classify_inline(tool):
     assert talk_operator_auth.classify_host_tool(tool) == "inline"
     assert talk_operator_auth.classify_host_tool(tool, {"query": "x"}) == "inline"
@@ -74,8 +71,7 @@ def test_inline_safe_tools_classify_inline(tool):
 def test_computer_use_read_actions_classify_permit():
     for action in sorted(talk_operator_auth.COMPUTER_USE_VOICE_READ_ACTIONS):
         assert (
-            talk_operator_auth.classify_host_tool("computer_use", {"action": action})
-            == "permit"
+            talk_operator_auth.classify_host_tool("computer_use", {"action": action}) == "permit"
         ), action
 
 
@@ -86,8 +82,7 @@ def test_computer_use_mutating_actions_classify_delegate():
 
     for action in ("click", "type", "key", "scroll", "focus_app"):
         assert (
-            talk_operator_auth.classify_host_tool("computer_use", {"action": action})
-            == "delegate"
+            talk_operator_auth.classify_host_tool("computer_use", {"action": action}) == "delegate"
         ), action
 
 
@@ -98,8 +93,7 @@ def test_computer_use_with_a_missing_or_unparseable_action_fails_closed():
     assert talk_operator_auth.classify_host_tool("computer_use", "not json") == "delegate"
     # Case/whitespace tolerate speech-shaped input; unknown verbs do not.
     assert (
-        talk_operator_auth.classify_host_tool("computer_use", {"action": " Capture "})
-        == "permit"
+        talk_operator_auth.classify_host_tool("computer_use", {"action": " Capture "}) == "permit"
     )
     assert (
         talk_operator_auth.classify_host_tool("computer_use", {"action": "screenshot"})

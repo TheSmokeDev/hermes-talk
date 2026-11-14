@@ -273,7 +273,6 @@ async def _stream_lifecycle_bos_chunks_eos_isfinal():
         await voice.aclose()
 
 
-
 def test_multi_sentence_response_pipelines_through_one_stream():
     asyncio.run(_multi_sentence_response_pipelines_through_one_stream())
 
@@ -302,7 +301,6 @@ async def _multi_sentence_response_pipelines_through_one_stream():
         assert harness.audio == [b"audio-1", b"audio-2"]
     finally:
         await voice.aclose()
-
 
 
 def test_barge_in_aborts_stream_and_emits_zero_audio_after():
@@ -349,7 +347,6 @@ async def _barge_in_aborts_stream_and_emits_zero_audio_after():
         await voice.aclose()
 
 
-
 def test_tts_error_degrades_one_response_to_text_only():
     asyncio.run(_tts_error_degrades_one_response_to_text_only())
 
@@ -385,7 +382,6 @@ async def _tts_error_degrades_one_response_to_text_only():
         await voice.aclose()
 
 
-
 def test_malformed_audio_frame_is_a_tts_error():
     asyncio.run(_malformed_audio_frame_is_a_tts_error())
 
@@ -403,7 +399,6 @@ async def _malformed_audio_frame_is_a_tts_error():
         assert harness.audio == []
     finally:
         await voice.aclose()
-
 
 
 def test_connect_failure_degrades_and_recovers():
@@ -450,7 +445,6 @@ async def _connect_failure_degrades_and_recovers():
         await voice.aclose()
 
 
-
 def test_unflushed_tail_speaks_at_response_finished():
     asyncio.run(_unflushed_tail_speaks_at_response_finished())
 
@@ -472,7 +466,6 @@ async def _unflushed_tail_speaks_at_response_finished():
         await voice.aclose()
 
 
-
 def test_stream_input_url_carries_identifiers_only():
     url = cascade.stream_input_url("voice abc", "model/1")
     assert "voice%20abc" in url
@@ -489,9 +482,7 @@ def test_stream_input_url_states_ssml_parsing_explicitly():
     """
 
     assert "enable_ssml_parsing=true" in cascade.stream_input_url("v", "m")
-    assert "enable_ssml_parsing=false" in cascade.stream_input_url(
-        "v", "m", enable_ssml=False
-    )
+    assert "enable_ssml_parsing=false" in cascade.stream_input_url("v", "m", enable_ssml=False)
 
 
 # ---------------------------------------------------------------------------
@@ -533,9 +524,7 @@ async def _no_chunk_ever_forces_its_own_generation():
         # No frame carries a `flush` key at all: the close IS the flush.
         assert not any("flush" in frame for frame in ws.sent)
         # The EOS is the LAST frame and appears exactly once.
-        assert [i for i, f in enumerate(ws.sent) if f == {"text": ""}] == [
-            len(ws.sent) - 1
-        ]
+        assert [i for i, f in enumerate(ws.sent) if f == {"text": ""}] == [len(ws.sent) - 1]
         # Everything between BOS and EOS is a bare text frame.
         assert all(set(frame) == {"text"} for frame in ws.sent[1:-1])
     finally:
@@ -903,9 +892,7 @@ def test_text_output_payload_drops_voice_and_requests_text():
 
 
 def test_session_update_carries_text_output_from_setup():
-    setup = rt.SessionSetup(
-        model="m", voice="cedar", instructions="hi", text_output=True
-    )
+    setup = rt.SessionSetup(model="m", voice="cedar", instructions="hi", text_output=True)
     message = talk_openai_realtime.build_session_update(setup)
     assert message["session"]["output_modalities"] == ["text"]
     assert "output" not in message["session"]["audio"]

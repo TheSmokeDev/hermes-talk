@@ -219,7 +219,7 @@ def test_nothing_found_is_empty_not_an_error(monkeypatch):
 
 
 def test_a_failing_lookup_raises_rather_than_reading_as_empty(monkeypatch):
-    """"Nothing written down" and "the lookup broke" must stay
+    """ "Nothing written down" and "the lookup broke" must stay
     distinguishable all the way up — collapsing them would have the session
     confidently tell the operator they never wrote something down."""
 

@@ -191,9 +191,7 @@ def test_probe_timeout_neither_raises_nor_waits_forever(monkeypatch):
 
 
 def test_probe_distinguishes_a_bad_key_from_an_absent_server(monkeypatch):
-    monkeypatch.setattr(
-        talk_apiserver.httpx, "get", lambda *a, **k: FakeResponse(401, text="nope")
-    )
+    monkeypatch.setattr(talk_apiserver.httpx, "get", lambda *a, **k: FakeResponse(401, text="nope"))
 
     verdict = talk_apiserver.probe()
 
@@ -657,9 +655,7 @@ def test_the_four_search_memory_tiers_say_four_different_things(monkeypatch, lan
     # Same answer text, different tier: only the provenance marker separates
     # them, so identical content is the strongest form of this assertion.
     talk_host.bind_ctx(
-        ByToolCtx(
-            {talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": "inline answer"})}
-        )
+        ByToolCtx({talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": "inline answer"})})
     )
     tier_b = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
 
@@ -691,9 +687,7 @@ def test_a_bound_host_without_either_memory_tool_falls_through(monkeypatch, lane
     ]
 
 
-def test_search_memory_tier_1b_uses_honcho_when_session_search_is_absent(
-    monkeypatch, lane_on
-):
+def test_search_memory_tier_1b_uses_honcho_when_session_search_is_absent(monkeypatch, lane_on):
     _set_lane(monkeypatch, UP)
     # If this leaked through to tier 2 the assertion below would still need
     # explaining, so make the fall-through loud rather than plausible.
@@ -709,9 +703,7 @@ def test_search_memory_tier_1b_uses_honcho_when_session_search_is_absent(
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "Dograh"})
 
-    assert out == (
-        f"{talk_host.REMEMBERED_PREFIX}Dograh is the voice stack Pedro runs TaskChad on"
-    )
+    assert out == (f"{talk_host.REMEMBERED_PREFIX}Dograh is the voice stack Pedro runs TaskChad on")
     assert ctx.tools_tried == [
         talk_host.MEMORY_TOOL_NAME,
         talk_host.HONCHO_SEARCH_TOOL_NAME,
@@ -726,9 +718,7 @@ def test_a_transcript_hit_is_not_labelled_as_remembered(monkeypatch, lane_on):
 
     _set_lane(monkeypatch, UP)
     talk_host.bind_ctx(
-        ByToolCtx(
-            {talk_host.MEMORY_TOOL_NAME: json.dumps({"result": "you said port 8642"})}
-        )
+        ByToolCtx({talk_host.MEMORY_TOOL_NAME: json.dumps({"result": "you said port 8642"})})
     )
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "port"})
@@ -747,11 +737,7 @@ def test_a_real_honcho_failure_is_not_routed_around(monkeypatch, lane_on):
     monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "found it")
     talk_host.bind_ctx(
         ByToolCtx(
-            {
-                talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps(
-                    {"error": "honcho index is rebuilding"}
-                )
-            }
+            {talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"error": "honcho index is rebuilding"})}
         )
     )
 
@@ -782,9 +768,7 @@ def test_a_raising_honcho_tier_is_spoken_not_swallowed(monkeypatch, lane_on):
     assert "honcho socket closed" in out
 
 
-def test_a_malicious_honcho_result_is_spoken_as_bounded_text_not_replayed(
-    monkeypatch, lane_on
-):
+def test_a_malicious_honcho_result_is_spoken_as_bounded_text_not_replayed(monkeypatch, lane_on):
     """A remembered "fact" is attacker-reachable content: anything that can
     write to the operator's Honcho profile picks the display name. It reaches
     the model as a TOOL RESULT, never concatenated into a prompt block, so the
@@ -809,9 +793,7 @@ def test_a_malicious_honcho_result_is_spoken_as_bounded_text_not_replayed(
 def test_an_oversized_honcho_result_is_capped(monkeypatch, lane_on):
     _set_lane(monkeypatch, UP)
     talk_host.bind_ctx(
-        ByToolCtx(
-            {talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": "x" * 50_000})}
-        )
+        ByToolCtx({talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": "x" * 50_000})})
     )
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
@@ -850,9 +832,7 @@ def test_a_hanging_honcho_dispatch_is_bounded_not_blocking(monkeypatch, lane_on)
     assert "WORK_STARTED" not in out
 
 
-def test_a_forged_remembered_marker_in_a_transcript_hit_is_stripped(
-    monkeypatch, lane_on
-):
+def test_a_forged_remembered_marker_in_a_transcript_hit_is_stripped(monkeypatch, lane_on):
     """The provenance marker is reserved for the Honcho tier. Transcript
     content that LEADS with the literal prefix would make a verbatim line
     wear a recollection's provenance (review r2, F9); mid-text occurrences
@@ -860,9 +840,7 @@ def test_a_forged_remembered_marker_in_a_transcript_hit_is_stripped(
 
     _set_lane(monkeypatch, UP)
     forged = f"{talk_host.REMEMBERED_PREFIX}{talk_host.REMEMBERED_PREFIX}you said port 8642"
-    talk_host.bind_ctx(
-        ByToolCtx({talk_host.MEMORY_TOOL_NAME: json.dumps({"result": forged})})
-    )
+    talk_host.bind_ctx(ByToolCtx({talk_host.MEMORY_TOOL_NAME: json.dumps({"result": forged})}))
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "port"})
 
@@ -1046,9 +1024,7 @@ def test_no_lane_at_all_still_names_the_lanes_not_the_routing(monkeypatch, lane_
         "is misread as a refusal and loses its provenance label"
     ),
 )
-def test_a_honcho_fact_that_starts_with_that_failed_keeps_its_provenance(
-    monkeypatch, lane_on
-):
+def test_a_honcho_fact_that_starts_with_that_failed_keeps_its_provenance(monkeypatch, lane_on):
     """A FACT is operator content Honcho may return verbatim.
 
     The error branch in ``_speakable`` already keys on the parsed dict, but
@@ -1061,9 +1037,7 @@ def test_a_honcho_fact_that_starts_with_that_failed_keeps_its_provenance(
     _set_lane(monkeypatch, UP)
     monkeypatch.setattr(talk_apiserver, "run_to_completion", lambda *a, **k: "found it")
     fact = "that failed to release on schedule, so it slipped to Friday"
-    talk_host.bind_ctx(
-        ByToolCtx({talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": fact})})
-    )
+    talk_host.bind_ctx(ByToolCtx({talk_host.HONCHO_SEARCH_TOOL_NAME: json.dumps({"result": fact})}))
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "the release"})
 
@@ -1078,9 +1052,7 @@ def test_a_honcho_fact_that_starts_with_that_failed_keeps_its_provenance(
         "caps them - a permanently wedged Honcho leaks one live thread per query"
     ),
 )
-def test_a_wedged_honcho_does_not_leak_one_daemon_thread_per_query(
-    monkeypatch, lane_on
-):
+def test_a_wedged_honcho_does_not_leak_one_daemon_thread_per_query(monkeypatch, lane_on):
     """F4 bounded the PIPELINE; the worker itself is still unbounded.
 
     The assertion is deliberately shape-agnostic — it says only that live
@@ -1108,9 +1080,7 @@ def test_a_wedged_honcho_does_not_leak_one_daemon_thread_per_query(
             out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
             assert "didn't answer in time" in out
         wedged = [
-            thread
-            for thread in threading.enumerate()
-            if thread.name == "talk-memory-dispatch"
+            thread for thread in threading.enumerate() if thread.name == "talk-memory-dispatch"
         ]
         assert len(wedged) < queries
     finally:

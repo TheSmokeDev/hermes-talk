@@ -295,7 +295,7 @@ async def test_dashboard_to_real_host_to_scripted_codex_preserves_ownership(
                             lambda conn: (
                                 conn.execute(
                                     "UPDATE session_turn_leases "
-                                "SET holder='replacement-worker',expires_at=? "
+                                    "SET holder='replacement-worker',expires_at=? "
                                     "WHERE conversation_id=? AND holder=?",
                                     (time.time() + 60, child_id, holder),
                                 ).rowcount

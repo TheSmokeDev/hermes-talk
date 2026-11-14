@@ -143,9 +143,7 @@ def test_http_browser_flow_keeps_credentials_private_replays_events_and_closes_o
             # sent commands leaves the last event in flight: the first poll's cursor
             # and the repeat below would then disagree. Wait for the event itself.
             binding = fixture.registry.bindings[body["binding_id"]]
-            await wait_for(lambda: any(
-                event["type"] == "delivery" for event, _ in binding.events
-            ))
+            await wait_for(lambda: any(event["type"] == "delivery" for event, _ in binding.events))
             first = await client.post("/live/events", json={**body, "after": 0})
             assert first.status_code == 200, first.text
             response = first.json()
@@ -293,10 +291,12 @@ def test_http_speech_returns_trusted_status_and_original_receipt_ids(environment
 def test_operation_lookup_requires_auth_before_query_validation(environment):
     async def run():
         async with application(environment) as (client, fixture):
-            result = await client.get("/live/operation?generation=invalid",
-                                      headers={"x-dashboard-token": "wrong"})
+            result = await client.get(
+                "/live/operation?generation=invalid", headers={"x-dashboard-token": "wrong"}
+            )
             assert result.status_code == 401
             result = await client.get("/live/operation?generation=invalid")
             assert result.status_code == 400
             assert not fixture.host.jobs
+
     asyncio.run(run())

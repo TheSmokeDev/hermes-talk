@@ -33,9 +33,17 @@ def test_owned_desktop_bridge_requires_constant_time_token_and_host_identity(mon
     assert (b"owned-child-fixture", b"owned-child-fixture") in comparisons
 
 
-@pytest.mark.parametrize("failure", [
-    "remote", "missing_peer", "wrong", "unset", "host_denied", "host_denied_unconfigured",
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "remote",
+        "missing_peer",
+        "wrong",
+        "unset",
+        "host_denied",
+        "host_denied_unconfigured",
+    ],
+)
 def test_desktop_bridge_never_replaces_external_or_host_auth(monkeypatch, failure):
     monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "external-dashboard-fixture")
     monkeypatch.setenv(api.DESKTOP_TOKEN_ENV, "owned-child-fixture")
@@ -53,16 +61,22 @@ def test_desktop_bridge_never_replaces_external_or_host_auth(monkeypatch, failur
 
     monkeypatch.setattr(api.talk_dashboard_tasks, "resolve_context", deny)
     with pytest.raises(api.HTTPException) as error:
-        api.require_dashboard_auth(FakeRequest(
-            host=host, headers={api.DESKTOP_TOKEN_HEADER: token},
-        ))
+        api.require_dashboard_auth(
+            FakeRequest(
+                host=host,
+                headers={api.DESKTOP_TOKEN_HEADER: token},
+            )
+        )
     assert error.value.status_code == 401
     assert len(verified) == (1 if failure.startswith("host_denied") else 0)
     assert token not in str(error.value.detail)
     monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "external-dashboard-fixture")
-    api.require_dashboard_auth(FakeRequest(
-        host="203.0.113.2", headers={api.DASHBOARD_TOKEN_HEADER: "external-dashboard-fixture"},
-    ))
+    api.require_dashboard_auth(
+        FakeRequest(
+            host="203.0.113.2",
+            headers={api.DASHBOARD_TOKEN_HEADER: "external-dashboard-fixture"},
+        )
+    )
 
 
 def test_exact_desktop_session_outside_recent_page_is_authorized_cached_and_revalidated(fleet):
@@ -81,7 +95,8 @@ def test_exact_desktop_session_outside_recent_page_is_authorized_cached_and_reva
         return response
 
     fleet.catalog.local_factory = lambda context: replace(
-        factory(context), _http_transport=httpx.MockTransport(paginated),
+        factory(context),
+        _http_transport=httpx.MockTransport(paginated),
     )
     body = {"peer_id": "local", "profile": "alpha", "session_id": exact_id, "tab_id": "desk"}
     response = fleet.catalog.catalog(fleet.request, body)
@@ -102,9 +117,16 @@ def test_exact_desktop_session_outside_recent_page_is_authorized_cached_and_reva
         fleet.catalog.materialize(fleet.request, selected["target_id"])
 
 
-@pytest.mark.parametrize("failure", [
-    "missing", "profile", "response_id", "denied", "profile_fallback",
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "profile",
+        "response_id",
+        "denied",
+        "profile_fallback",
+    ],
+)
 def test_exact_desktop_target_failure_never_returns_an_alternative(fleet, failure):
     body = {"peer_id": "local", "profile": "default", "session_id": "task-a"}
     if failure == "missing":
@@ -129,22 +151,36 @@ def test_exact_desktop_target_failure_never_returns_an_alternative(fleet, failur
             return response
 
         fleet.catalog.local_factory = lambda context: replace(
-            factory(context), _http_transport=httpx.MockTransport(wrong_id),
+            factory(context),
+            _http_transport=httpx.MockTransport(wrong_id),
         )
     with pytest.raises(DashboardTaskError) as error:
         fleet.catalog.catalog(fleet.request, body)
-    assert error.value.code == {
-        "missing": "target_missing", "profile": "target_missing",
-        "response_id": "gateway_response_invalid", "denied": "context_denied",
-        "profile_fallback": "context_denied",
-    }[failure]
+    assert (
+        error.value.code
+        == {
+            "missing": "target_missing",
+            "profile": "target_missing",
+            "response_id": "gateway_response_invalid",
+            "denied": "context_denied",
+            "profile_fallback": "context_denied",
+        }[failure]
+    )
 
 
-@pytest.mark.parametrize("change", [
-    {"session_id": "../task-a"}, {"session_id": "task-a\n"}, {"session_id": None},
-    {"session_id": "a" * 257}, {"session_id": "task-a/other"}, {"profile": None},
-    {"peer_id": None}, {"peer_id": "east"},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"session_id": "../task-a"},
+        {"session_id": "task-a\n"},
+        {"session_id": None},
+        {"session_id": "a" * 257},
+        {"session_id": "task-a/other"},
+        {"profile": None},
+        {"peer_id": None},
+        {"peer_id": "east"},
+    ],
+)
 def test_exact_desktop_target_requires_strict_id_and_explicit_local_profile(fleet, change):
     body = {"peer_id": "local", "profile": "default", "session_id": "task-a", **change}
     with pytest.raises(DashboardTaskError) as error:

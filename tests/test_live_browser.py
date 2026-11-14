@@ -227,12 +227,20 @@ def test_delegation_does_not_block_transcript_pump_and_retirement_does_not_cance
         )
         fixture.browser.session.queue.put_nowait(rt.DelegationRequested("accepted"))
         await wait_for(lambda: len(fixture.host.jobs) == 2)
-        await binding.proactive({"sequence": 1, "operator_speaking": False,
-                                 "playback_active": False, "response_pending": False,
-                                 "input_pending": False, "tools_pending": False})
-        assert any(isinstance(command, rt.SubmitDelegationResult)
-                   and command.delegation_id == "pending"
-                   for command in fixture.browser.session.commands)
+        await binding.proactive(
+            {
+                "sequence": 1,
+                "operator_speaking": False,
+                "playback_active": False,
+                "response_pending": False,
+                "input_pending": False,
+                "tools_pending": False,
+            }
+        )
+        assert any(
+            isinstance(command, rt.SubmitDelegationResult) and command.delegation_id == "pending"
+            for command in fixture.browser.session.commands
+        )
         fixture.browser.session.queue.put_nowait(rt.DelegationRetired("accepted"))
         await binding.close()
         assert len(fixture.host.jobs) == 2
@@ -419,8 +427,7 @@ def test_proactive_result_uses_quiet_timing_and_records_sent_not_heard(environme
         summaries = [
             command
             for command in fixture.browser.session.commands
-            if isinstance(command, rt.SubmitDelegationResult)
-            and "completed" in command.content
+            if isinstance(command, rt.SubmitDelegationResult) and "completed" in command.content
         ]
         assert len(summaries) == 1 and "completed" in summaries[0].content
         assert "launch another task" not in summaries[0].content

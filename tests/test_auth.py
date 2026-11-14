@@ -370,9 +370,7 @@ def test_explicit_false_keeps_existing_key_precedence(monkeypatch, tmp_path):
     assert talk_auth.resolve_auth().source == talk_auth.SOURCE_ENV
 
 
-def test_preferred_expired_oauth_fails_closed_instead_of_spending_a_key(
-    monkeypatch, tmp_path
-):
+def test_preferred_expired_oauth_fails_closed_instead_of_spending_a_key(monkeypatch, tmp_path):
     home = tmp_path / "codex"
     _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10), refresh="refresh-old")
     monkeypatch.setenv("CODEX_HOME", str(home))
@@ -384,9 +382,7 @@ def test_preferred_expired_oauth_fails_closed_instead_of_spending_a_key(
         talk_auth.resolve_auth()
 
 
-def test_preferred_blank_oauth_fails_closed_without_spending_a_key(
-    monkeypatch, tmp_path
-):
+def test_preferred_blank_oauth_fails_closed_without_spending_a_key(monkeypatch, tmp_path):
     home = tmp_path / "codex"
     _write_codex_auth(home, access="", refresh="")
     monkeypatch.setenv("CODEX_HOME", str(home))
@@ -411,6 +407,7 @@ def test_resolved_oauth_keeps_account_identity_server_side(monkeypatch, tmp_path
 
 def test_live_subscription_expired_token_refuses_without_touching_the_store(monkeypatch, tmp_path):
     from talk_live_config import resolve_live_auth
+
     home = tmp_path / "codex"
     _write_codex_auth(home, access=_jwt_with_exp(time.time() - 10))
     monkeypatch.setattr(talk_auth, "_resolve_hermes_codex_oauth", lambda: None)

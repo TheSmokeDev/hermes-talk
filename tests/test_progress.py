@@ -244,9 +244,7 @@ def test_terminal_phases_build_no_milestone_speech():
     """The outcome sentence belongs to the terminal announcement, not a phase."""
     for phase in ("complete", "failed", "stopped"):
         assert talk_cli.run_phase_commands(_run_snapshot(7, phase), phase) == []
-        assert (
-            talk_cli.subagent_phase_commands({"subagent_id": "sa-0-x", "phase": phase}) == []
-        )
+        assert talk_cli.subagent_phase_commands({"subagent_id": "sa-0-x", "phase": phase}) == []
 
 
 # -- run projection --------------------------------------------------------------
@@ -817,9 +815,8 @@ def test_subagent_phase_speech_names_the_agent_its_role_and_its_phase():
     """
 
     base = {"subagent_id": "sa-0-aaaa", "role": "researcher"}
-    assert (
-        "Background agent sa-0-aaaa (researcher) was accepted."
-        in _child_spoken(**base, phase="accepted")
+    assert "Background agent sa-0-aaaa (researcher) was accepted." in _child_spoken(
+        **base, phase="accepted"
     )
     assert (
         "Background agent sa-0-aaaa (researcher) is executing \u2014 Reading files."
@@ -827,9 +824,8 @@ def test_subagent_phase_speech_names_the_agent_its_role_and_its_phase():
     )
     assert "is executing." in _child_spoken(**base, phase="executing")
     assert "waiting on an approval" in _child_spoken(**base, phase="blocked")
-    assert (
-        "Background agent sa-0-aaaa was accepted."
-        in _child_spoken(subagent_id="sa-0-aaaa", phase="accepted")
+    assert "Background agent sa-0-aaaa was accepted." in _child_spoken(
+        subagent_id="sa-0-aaaa", phase="accepted"
     )
     # No id is no subject: nothing is spoken rather than a nameless sentence.
     assert talk_cli.subagent_phase_commands({"phase": "accepted"}) == []

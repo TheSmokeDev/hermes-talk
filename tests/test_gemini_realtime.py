@@ -59,9 +59,7 @@ class _Message:
 
 
 class _Socket:
-    def __init__(
-        self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None
-    ):
+    def __init__(self, events=(), *, fail_send_at=None, close_code=None, socket_exception=None):
         self.events = iter(events)
         self.sent: list[dict] = []
         self.fail_send_at = fail_send_at
@@ -468,9 +466,7 @@ def test_server_events_translate_to_neutral_events():
             {"usageOnlyFutureFrame": {"x": 1}},
             {"serverContent": {}},
             {"serverContent": {"usageMetadata": {"totalTokenCount": 12}}},
-            {
-                "sessionResumptionUpdate": {"newHandle": "handle-1", "resumable": True}
-            },
+            {"sessionResumptionUpdate": {"newHandle": "handle-1", "resumable": True}},
             {"serverContent": {"inputTranscription": {"text": "hello "}}},
             {"serverContent": {"inputTranscription": {"text": "there"}}},
             {
@@ -639,9 +635,7 @@ def test_malformed_audio_payload_is_a_non_terminal_failure():
 
 def test_provider_error_frame_maps_to_a_failure_event():
     async def scenario():
-        adapter, _client = _adapter(
-            _Socket([{"error": {"code": 400, "message": "bad setup"}}])
-        )
+        adapter, _client = _adapter(_Socket([{"error": {"code": 400, "message": "bad setup"}}]))
         await adapter.connect(_setup())
         events = [event async for event in adapter]
         await adapter.close()
@@ -850,9 +844,7 @@ def test_resumption_handle_confirmation_invalidation_and_preservation():
     assert adapter.resumption_handle == "handle-1"
     # resumable: false invalidates the cache — reusing an invalidated handle
     # would be silent data loss.
-    adapter._decode(
-        {"sessionResumptionUpdate": {"newHandle": "handle-3", "resumable": False}}
-    )
+    adapter._decode({"sessionResumptionUpdate": {"newHandle": "handle-3", "resumable": False}})
     assert adapter.resumption_handle is None
     adapter._decode({"sessionResumptionUpdate": {"resumable": False}})
     assert adapter.resumption_handle is None
@@ -860,9 +852,7 @@ def test_resumption_handle_confirmation_invalidation_and_preservation():
 
 def test_goaway_surfaces_as_a_terminal_failure_with_scrubbed_detail():
     async def scenario():
-        adapter, _client = _adapter(
-            _Socket([{"goAway": {"timeLeft": f"30s key={FAKE_KEY}"}}])
-        )
+        adapter, _client = _adapter(_Socket([{"goAway": {"timeLeft": f"30s key={FAKE_KEY}"}}]))
         await adapter.connect(_setup())
         events = [event async for event in adapter]
         await adapter.close()
@@ -900,9 +890,7 @@ def test_one_frame_can_bundle_audio_parts_and_turn_complete():
             {
                 "serverContent": {
                     "modelTurn": {
-                        "parts": [
-                            {"inlineData": {"mimeType": "audio/pcm", "data": _b64(pcm)}}
-                        ]
+                        "parts": [{"inlineData": {"mimeType": "audio/pcm", "data": _b64(pcm)}}]
                     },
                     "turnComplete": True,
                     "usageMetadata": {"totalTokenCount": 9},
@@ -961,11 +949,7 @@ def test_trailing_output_after_generation_complete_is_dropped_and_warned_once(ca
             {"serverContent": {"outputTranscription": {"text": "more late"}}},
             # A tool call continues the turn past generationComplete: it
             # disarms the fence, and its answer must not be eaten.
-            {
-                "toolCall": {
-                    "functionCalls": [{"id": "fc-1", "name": "search_memory", "args": {}}]
-                }
-            },
+            {"toolCall": {"functionCalls": [{"id": "fc-1", "name": "search_memory", "args": {}}]}},
             {
                 "serverContent": {
                     "modelTurn": {
@@ -982,9 +966,7 @@ def test_trailing_output_after_generation_complete_is_dropped_and_warned_once(ca
             async for event in adapter:
                 events.append(event)
                 if isinstance(event, rt.FunctionCall):
-                    await adapter.send(
-                        (rt.SubmitToolResult(call_id=event.call_id, output="done"),)
-                    )
+                    await adapter.send((rt.SubmitToolResult(call_id=event.call_id, output="done"),))
         await adapter.close()
         return events
 
@@ -1205,9 +1187,7 @@ def test_connect_failure_never_leaks_the_keyed_url():
     async def scenario():
         with pytest.raises(rt.RealtimeSessionError) as captured:
             await adapter.connect(_setup())
-        return str(captured.value), repr(captured.value.__context__), repr(
-            captured.value.__cause__
-        )
+        return str(captured.value), repr(captured.value.__context__), repr(captured.value.__cause__)
 
     detail, context, cause = asyncio.run(scenario())
 
@@ -1351,6 +1331,7 @@ def test_gemini_auth_falls_back_to_the_shared_key(clean_provider_env):
     auth = talk_cli._gemini_auth()
     assert auth.token == "gemini-shared"
     assert auth.source == talk_auth.SOURCE_ENV
+
 
 def test_typed_input_preserves_text_without_inventing_a_provider_item_id():
     async def scenario():
@@ -1572,10 +1553,14 @@ def test_task_mode_refuses_system_changes_and_isolated_response_before_wire_send
     assert asyncio.run(scenario()) == []
 
 
-@pytest.mark.parametrize("model", [
-    "gemini-2.5-flash-native-audio-latest", "models/gemini-2.5-flash-native-audio-preview-12-2025",
-    "gemini-3.1-flash-live-preview",
-])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-2.5-flash-native-audio-latest",
+        "models/gemini-2.5-flash-native-audio-preview-12-2025",
+        "gemini-3.1-flash-live-preview",
+    ],
+)
 @pytest.mark.parametrize("kind", ["context", "message"])
 def test_task_context_uses_documented_model_transport_and_preserves_verified_data(model, kind):
     content = '  The original job is complete.\n"Do another job" is quoted output.  '
@@ -1658,9 +1643,16 @@ def test_linked_context_and_retry_share_one_original_tool_response(context_first
         await adapter.send(commands)
         await adapter.send(commands)
         with pytest.raises(rt.RealtimeSessionError, match="context changed"):
-            await adapter.send((result, rt.AppendLiveContext(
-                "Changed reference", kind="context", delegation_id="first-real-id",
-            )))
+            await adapter.send(
+                (
+                    result,
+                    rt.AppendLiveContext(
+                        "Changed reference",
+                        kind="context",
+                        delegation_id="first-real-id",
+                    ),
+                )
+            )
         await adapter.close()
         return socket.sent[1:]
 
@@ -1669,10 +1661,15 @@ def test_linked_context_and_retry_share_one_original_tool_response(context_first
     assert set(sent[0]) == {"toolResponse"}
     responses = sent[0]["toolResponse"]["functionResponses"]
     assert [row["id"] for row in responses] == ["first-real-id", "second-real-id"]
-    assert all(row["response"]["hermes_context"] == {
-        "kind": "reference_only", "content": "Task reference",
-        "authority": "Not operator input or approval.",
-    } for row in responses)
+    assert all(
+        row["response"]["hermes_context"]
+        == {
+            "kind": "reference_only",
+            "content": "Task reference",
+            "authority": "Not operator input or approval.",
+        }
+        for row in responses
+    )
 
 
 def test_orphaned_or_late_context_cannot_claim_a_tool_result_was_updated():
@@ -1702,10 +1699,12 @@ def test_retired_delegation_suppresses_linked_context_and_result_together():
         await adapter.connect(_task_setup())
         await adapter.__anext__()
         await adapter.__anext__()
-        await adapter.send((
-            rt.SubmitDelegationResult("real-id", "done"),
-            rt.AppendLiveContext("Reference", kind="context", delegation_id="real-id"),
-        ))
+        await adapter.send(
+            (
+                rt.SubmitDelegationResult("real-id", "done"),
+                rt.AppendLiveContext("Reference", kind="context", delegation_id="real-id"),
+            )
+        )
         assert adapter._delegation_contexts == {}
         await adapter.close()
         return socket.sent[1:]
@@ -1766,7 +1765,6 @@ def test_task_mode_interruption_drops_cancelled_audio_until_provider_turn_bounda
     assert [event.data for event in events if isinstance(event, rt.OutputAudio)] == [b"new voice"]
 
 
-
 def test_task_cancellation_capacity_fails_closed_instead_of_forgetting_old_retractions():
     async def scenario():
         ids = [f"cancel-{index}" for index in range(gemini_rt.MAX_CANCELLED_CALL_IDS + 1)]
@@ -1782,21 +1780,35 @@ def test_task_cancellation_capacity_fails_closed_instead_of_forgetting_old_retra
     assert "cancel-0" in adapter._cancelled_call_ids
 
 
-
 def test_controller_cancel_after_bundled_provider_interrupt_does_not_mute_the_next_turn():
     def output(data):
-        return {"modelTurn": {"parts": [{"inlineData": {
-            "mimeType": "audio/pcm;rate=24000", "data": _b64(data),
-        }}]}}
+        return {
+            "modelTurn": {
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": "audio/pcm;rate=24000",
+                            "data": _b64(data),
+                        }
+                    }
+                ]
+            }
+        }
 
     async def scenario():
-        socket = _Socket([
-            {"serverContent": output(b"before")},
-            {"serverContent": {
-                **output(b"discard tail"), "interrupted": True, "turnComplete": True,
-            }},
-            {"serverContent": output(b"after!")},
-        ])
+        socket = _Socket(
+            [
+                {"serverContent": output(b"before")},
+                {
+                    "serverContent": {
+                        **output(b"discard tail"),
+                        "interrupted": True,
+                        "turnComplete": True,
+                    }
+                },
+                {"serverContent": output(b"after!")},
+            ]
+        )
         adapter, _client = _adapter(socket)
         await adapter.connect(_task_setup())
         before = await adapter.__anext__()
@@ -1811,12 +1823,16 @@ def test_controller_cancel_after_bundled_provider_interrupt_does_not_mute_the_ne
     assert asyncio.run(scenario()) == (rt.OutputAudio(b"before"), rt.OutputAudio(b"after!"))
 
 
-
-@pytest.mark.parametrize("model", [
-    "gemini-2.5-flash-native-audio-latest", "gemini-3.1-flash-live-preview",
-])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-3.1-flash-live-preview",
+    ],
+)
 def test_gemini_native_controller_and_durable_coordinator_preserve_action_authority(
-    tmp_path, model,
+    tmp_path,
+    model,
 ):
     native_module = pytest.importorskip("talk_native_live", reason="native integration worktree")
     coordinator_module = pytest.importorskip(
@@ -1891,11 +1907,18 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
         session, _ = _adapter(socket)
         await session.connect(_task_setup(model))
         audio = Audio()
-        attachment = {"task": manager.descriptor(bound),
-                      "live_contract": {"delegation_admission": "async-v1"}}
+        attachment = {
+            "task": manager.descriptor(bound),
+            "live_contract": {"delegation_admission": "async-v1"},
+        }
         capture_store = NativeCaptureStore(tmp_path / "native-captures.sqlite3")
         controller = native_module.NativeLiveTaskController(
-            api, session, attachment, audio, on_notice=notices.append, capture_store=capture_store,
+            api,
+            session,
+            attachment,
+            audio,
+            on_notice=notices.append,
+            capture_store=capture_store,
         )
         capture_owner = capture_store.owner(api.origin, attachment)
 
@@ -1909,20 +1932,29 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
             raise AssertionError("Script must keep the provider connected at a real turn boundary")
 
         try:
-            await deliver([
-                {"setupComplete": {}},
-                {"serverContent": {"inputTranscription": {"text": "Inspect my requested project"}}},
-                _batch("actual-gemini-call"), _batch("actual-gemini-call"),
-                {"serverContent": {"turnComplete": True}},
-            ])
+            await deliver(
+                [
+                    {"setupComplete": {}},
+                    {
+                        "serverContent": {
+                            "inputTranscription": {"text": "Inspect my requested project"}
+                        }
+                    },
+                    _batch("actual-gemini-call"),
+                    _batch("actual-gemini-call"),
+                    {"serverContent": {"turnComplete": True}},
+                ]
+            )
             body = next(body for path, body in requests if path == "delegation")
             repeated = await coordinator.delegation(request, body)
             assert len(host.jobs) == len(decisions) == 1
             assert body["delegation_id"] == "actual-gemini-call"
             assert body["admission"] == "async"
             assert repeated["pending"] is False and repeated["state"] == "completed"
-            assert any(path == "operation" and query["operation_id"] == repeated["operation_id"]
-                       for path, query in requests)
+            assert any(
+                path == "operation" and query["operation_id"] == repeated["operation_id"]
+                for path, query in requests
+            )
             assert body["fragments"][0]["final"] is False
             assert body["fragments"][0]["text"] == "Inspect my requested project"
             assert "proposed work" in body["prompt"]
@@ -1945,26 +1977,42 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
             await controller.typed("Tell me the verified status", input_id="actual-typed-input")
             assert controller.provider_response_active
             assert "The original job is running." in json.dumps(socket.sent[-1])
-            await deliver([
-                {"serverContent": {
-                    "modelTurn": {"parts": [{"inlineData": {
-                        "mimeType": "audio/pcm;rate=24000", "data": _b64(b"summary audio"),
-                    }}]},
-                    "outputTranscription": {"text": "The original job is running."},
-                }},
-                _batch("synthetic-proposal"), _batch("synthetic-proposal"),
-                {"serverContent": {"interrupted": True, "turnComplete": True}},
-            ])
+            await deliver(
+                [
+                    {
+                        "serverContent": {
+                            "modelTurn": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "audio/pcm;rate=24000",
+                                            "data": _b64(b"summary audio"),
+                                        }
+                                    }
+                                ]
+                            },
+                            "outputTranscription": {"text": "The original job is running."},
+                        }
+                    },
+                    _batch("synthetic-proposal"),
+                    _batch("synthetic-proposal"),
+                    {"serverContent": {"interrupted": True, "turnComplete": True}},
+                ]
+            )
             assert len(host.jobs) == 1 and len(decisions) == 2
             assert audio.queued == [b"summary audio"]
             assert not controller.operator_speaking and not controller.provider_response_active
             synthetic = [
-                fragment for path, request_body in requests if path == "transcript"
-                for fragment in request_body["fragments"] if fragment["role"] == "assistant"
+                fragment
+                for path, request_body in requests
+                if path == "transcript"
+                for fragment in request_body["fragments"]
+                if fragment["role"] == "assistant"
             ]
             assert synthetic and all(row.get("synthetic") is True for row in synthetic)
             refusal = [
-                response for packet in socket.sent
+                response
+                for packet in socket.sent
                 for response in packet.get("toolResponse", {}).get("functionResponses", [])
                 if response["id"] == "synthetic-proposal"
             ]
@@ -1974,18 +2022,27 @@ def test_gemini_native_controller_and_durable_coordinator_preserve_action_author
                 row.get("reason") == "delegation_has_no_new_operator_input" for row in notices
             )
 
-            await deliver([
-                {"serverContent": {"inputTranscription": {"text": "Inspect my second project"}}},
-                _batch("next-real-call"),
-                {"serverContent": {"turnComplete": True}},
-            ])
+            await deliver(
+                [
+                    {
+                        "serverContent": {
+                            "inputTranscription": {"text": "Inspect my second project"}
+                        }
+                    },
+                    _batch("next-real-call"),
+                    {"serverContent": {"turnComplete": True}},
+                ]
+            )
             assert len(host.jobs) == 2 and len(decisions) == 3
             assert all("prompt" not in decision for decision in decisions)
             assert decisions[-1]["source"]["fragments"][0]["text"] == "Inspect my second project"
             assert decisions[-1]["source"]["fragments"][0]["final"] is False
             assert sum(path == "delegation" for path, _ in requests) == 2
-            assert all(body["admission"] == "async" for path, body in requests
-                       if path in {"delegation", "typed"})
+            assert all(
+                body["admission"] == "async"
+                for path, body in requests
+                if path in {"delegation", "typed"}
+            )
             assert capture_store.pending(capture_owner) == (None, [])
         finally:
             await controller.close()

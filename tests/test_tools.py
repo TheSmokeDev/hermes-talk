@@ -210,9 +210,7 @@ def _snapshot(**overrides) -> talk_capabilities.CatalogSnapshot:
     fields = {
         "source": talk_capabilities.SOURCE_IN_PROCESS,
         "skills": ({"name": "web_search"},),
-        "toolsets": (
-            {"name": "browser", "enabled": True, "configured": True, "tools": ["open"]},
-        ),
+        "toolsets": ({"name": "browser", "enabled": True, "configured": True, "tools": ["open"]},),
         "capabilities": {"run_approval": True},
         "health": {"active_runs": 1},
         "detail": "the Hermes agent I'm attached to",
@@ -239,16 +237,12 @@ def test_talk_capabilities_passes_disabled_toolsets_through(monkeypatch):
     monkeypatch.setattr(
         talk_capabilities,
         "status",
-        lambda: _snapshot(
-            toolsets=({"name": "email", "enabled": False, "configured": False},)
-        ),
+        lambda: _snapshot(toolsets=({"name": "email", "enabled": False, "configured": False},)),
     )
 
     catalog = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
 
-    assert catalog["toolsets"] == [
-        {"name": "email", "enabled": False, "configured": False}
-    ]
+    assert catalog["toolsets"] == [{"name": "email", "enabled": False, "configured": False}]
 
 
 def test_talk_capabilities_redacts_secret_shaped_values(monkeypatch):
@@ -259,9 +253,7 @@ def test_talk_capabilities_redacts_secret_shaped_values(monkeypatch):
         talk_capabilities,
         "status",
         lambda: _snapshot(
-            toolsets=(
-                {"name": "email", "config": {"token": "sk-abcdefgh12345678"}},
-            ),
+            toolsets=({"name": "email", "config": {"token": "sk-abcdefgh12345678"}},),
             capabilities={"webhook": "https://x.test/xoxb-abcdefgh12345678"},
         ),
     )
@@ -282,8 +274,7 @@ def test_talk_capabilities_stays_parseable_when_the_catalog_is_huge(monkeypatch)
         "status",
         lambda: _snapshot(
             skills=tuple(
-                {"name": f"skill_{index}", "description": "x" * 200}
-                for index in range(200)
+                {"name": f"skill_{index}", "description": "x" * 200} for index in range(200)
             ),
             toolsets=tuple(
                 {"name": f"toolset_{index}", "enabled": True, "configured": False}
@@ -344,9 +335,7 @@ def test_absurdly_long_names_still_yield_parseable_json_under_the_bound(monkeypa
         "status",
         lambda: _snapshot(
             skills=tuple({"name": "s" * 5_000} for _ in range(50)),
-            toolsets=tuple(
-                {"name": "t" * 5_000, "enabled": True} for _ in range(10)
-            ),
+            toolsets=tuple({"name": "t" * 5_000, "enabled": True} for _ in range(10)),
         ),
     )
 
@@ -387,9 +376,7 @@ def test_talk_capabilities_omits_capabilities_when_still_oversized_after_compact
         talk_capabilities,
         "status",
         lambda: _snapshot(
-            capabilities={
-                "features": {f"flag_{index}": "x" * 200 for index in range(50)}
-            },
+            capabilities={"features": {f"flag_{index}": "x" * 200 for index in range(50)}},
         ),
     )
 
@@ -657,7 +644,9 @@ def test_nothing_found_is_a_different_sentence_from_a_failure(monkeypatch):
 
 @pytest.mark.parametrize("manifest", ["version: 4.5.6\n", None, "version: \n"])
 def test_plugin_version_uses_loaded_source_before_stale_editable_metadata(
-    tmp_path, monkeypatch, manifest,
+    tmp_path,
+    monkeypatch,
+    manifest,
 ):
     import importlib.metadata
 

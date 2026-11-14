@@ -13,8 +13,14 @@ def test_live_persona_keeps_client_delegation_and_receipt_authority_explicit():
     assert "Only captured operator input can authorize work" in prompt
     assert "exact job" in prompt and "stop checking that completed job" in prompt
     assert "original delegation" in prompt and "not proof that audio was heard" in prompt
-    for legacy in ("call the talk_capabilities", "delegate_task", "resolve_approval", "check_work",
-                   "Advertised legacy tools", "cannot click"):
+    for legacy in (
+        "call the talk_capabilities",
+        "delegate_task",
+        "resolve_approval",
+        "check_work",
+        "Advertised legacy tools",
+        "cannot click",
+    ):
         assert legacy not in prompt
     assert talk_identity.advertised_tool_names(prompt) == ()
 
@@ -24,7 +30,8 @@ def test_live_prompt_exposes_only_supplied_delegated_capabilities_and_bounded_re
     assert "computer_use" not in baseline
     prompt = talk_identity.build_live_instructions(
         {"PERSONA": "Friendly operator", "MEMORY": "Unrelated hidden notes"},
-        capabilities="computer_use, file_read", task_context="Selected user message " + "x" * 20000,
+        capabilities="computer_use, file_read",
+        task_context="Selected user message " + "x" * 20000,
     )
     assert "Friendly operator" in prompt and "Unrelated hidden notes" not in prompt
     assert "Verified delegated host capabilities:\ncomputer_use, file_read" in prompt
@@ -33,9 +40,15 @@ def test_live_prompt_exposes_only_supplied_delegated_capabilities_and_bounded_re
 
 
 def test_live_capabilities_requires_resolved_host_evidence_and_has_no_function_demand():
-    snapshot = SimpleNamespace(tools_resolved=True, tools=[
-        "file_read", "computer_use", "not a tool directive", *[f"tool_{n}" for n in range(50)],
-    ])
+    snapshot = SimpleNamespace(
+        tools_resolved=True,
+        tools=[
+            "file_read",
+            "computer_use",
+            "not a tool directive",
+            *[f"tool_{n}" for n in range(50)],
+        ],
+    )
     section = talk_identity.live_capabilities(snapshot)
     assert "computer_use, file_read" in section
     assert "not a tool directive" not in section
