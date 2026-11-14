@@ -27,6 +27,8 @@ named rather than smoothed.
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
   explicit lease-expiry/revocation coverage are unchanged.
+- Plugin-guard CI downloads the upstream scanner's credential-analysis helper
+  from the same resolved commit, preventing an import failure before scanning.
 
 ## [0.22.0] — 2026-10-25
 

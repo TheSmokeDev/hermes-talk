@@ -8,7 +8,7 @@ on:
   # ref by hand when event delivery drops.
   workflow_dispatch:
 
-# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads two
+# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads scanner
 # files from a PUBLIC upstream repository through `gh api`; a token scoped to
 # contents:read on this repository can still read public repositories, and
 # the authenticated call is only there for the rate limit. Nothing is written
@@ -68,6 +68,7 @@ jobs:
           fetch plugin_guard.py "${home}/tools/plugin_guard.py"
           fetch plugin_guard_context.py "${home}/tools/plugin_guard_context.py"
           fetch skills_guard.py "${home}/tools/skills_guard.py"
+          fetch skills_guard_credentials.py "${home}/tools/skills_guard_credentials.py"
           touch "${home}/tools/__init__.py"
 
       - name: Scan this repository
