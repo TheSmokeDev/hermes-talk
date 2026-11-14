@@ -23,6 +23,9 @@ named rather than smoothed.
   latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
 
 ### Fixed
+- Bound in-process capability-catalog probes and share an outstanding read after
+  a timeout, so a stuck registry cannot pin callers or accumulate probe workers.
+  Thanks Kiven (@abaichuan1017).
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
