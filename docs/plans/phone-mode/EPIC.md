@@ -1,6 +1,6 @@
 # Native Phone mode for Hermes Talk
 
-Owner: Pedro. Requested November 14, 2026. Goal closure requires Pedro's explicit confirmation.
+Requested November 14, 2026. Goal closure requires the project owner's explicit confirmation.
 
 ## Outcome
 
@@ -49,10 +49,6 @@ Talk does not purchase numbers, dial, start a public tunnel or change business l
 Native host APIs are feature-detected and fail closed when the requested operation
 cannot be represented. Caller speech never becomes owner authority.
 
-The current primary checkout's uncommitted Desktop work is preserved. Implementation
-uses the existing `fix-live-replay-ci` worktree on `codex/phone-mode`, based on
-`029ccedf52313afe67061ad8ad0b0b2239a3b0fa`. No new checkout was created.
-
 ## Sources
 
 - Hermes plugin guide and public API: <https://hermes-agent.nousresearch.com/docs/developer-guide/plugins>
@@ -60,7 +56,8 @@ uses the existing `fix-live-replay-ci` worktree on `codex/phone-mode`, based on
   `PluginContext.ask_choice`, and their host implementations.
 - Existing Talk: `__init__.py`, `talk_cli.py`, `talk_tools.py`, `talk_host.py`,
   `talk_operator_auth.py`, `talk_native_api.py` and `docs/DESKTOP.md`.
-- Existing phone implementation: private owner repository `hermes-dograh`,
-  implementation `119ebbd11e481e1be19aba0a373a4c0199966eb3`.
+- The carried phone primitives include their original synthetic safety and real
+  loopback HTTP/MCP regression coverage. Local live-call receipts are retained
+  separately from source.
 
 Execution evidence and remaining actions live in the existing local WORK-STATUS.md.
