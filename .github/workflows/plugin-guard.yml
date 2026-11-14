@@ -68,6 +68,7 @@ jobs:
           fetch plugin_guard.py "${home}/tools/plugin_guard.py"
           fetch plugin_guard_context.py "${home}/tools/plugin_guard_context.py"
           fetch skills_guard.py "${home}/tools/skills_guard.py"
+          fetch skills_guard_credentials.py "${home}/tools/skills_guard_credentials.py"
           touch "${home}/tools/__init__.py"
 
       - name: Scan this repository
