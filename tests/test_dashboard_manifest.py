@@ -114,6 +114,8 @@ def test_every_talk_module_is_packaged():
     """
 
     on_disk = {path.stem for path in PLUGIN_ROOT.glob("talk_*.py")}
+    on_disk.update(path.name for path in PLUGIN_ROOT.glob("talk_*")
+                   if path.is_dir() and (path / "__init__.py").is_file())
     declared = set(
         re.findall(
             r'"(talk_[a-z_]+)"',

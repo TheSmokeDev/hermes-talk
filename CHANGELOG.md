@@ -14,6 +14,11 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- Optional native Phone mode powered by Dograh, inside Hermes Talk. Hermes plugin
+  settings, native review choices, the existing chat message stream and `/phone`
+  commands handle setup, approvals, caller questions and owner answers. Phone
+  tools are hidden by default. Explicit migration preserves the separate test
+  plugin's history and revokes its old call approvals and bridge grants.
 - `TALK_PROVIDER=local`: run the voice lane on your own GPU against any
   self-hosted server that speaks the OpenAI Realtime protocol, such as
   huggingface/speech-to-speech with an Ollama LLM, on the terminal lane.

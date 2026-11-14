@@ -16,6 +16,7 @@ here should be formatted for a screen.
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import time
@@ -472,6 +473,21 @@ def default_talk_tools(*, pausable: bool = False) -> list[dict]:
             tools.insert(1, _TOOL_SEARCH_VAULT)
     except Exception as exc:  # noqa: BLE001 — a missing tool, never a dead session
         _log.debug("vault availability unknown: %s: %s", type(exc).__name__, exc)
+    ctx = talk_host.get_ctx()
+    if ctx is not None:
+        try:
+            try:
+                from .talk_phone.context import enabled
+                from .talk_phone.plugin import TOOLS
+            except ImportError:
+                from talk_phone.context import enabled
+                from talk_phone.plugin import TOOLS
+            if enabled(ctx):
+                tools.extend({"type": "function", "name": t.name,
+                              "description": t.description, "parameters": t.schema()["parameters"]}
+                             for t in TOOLS)
+        except Exception as exc:  # noqa: BLE001 - optional Phone mode cannot break ordinary voice
+            _log.debug("Phone tools unavailable: %s", type(exc).__name__)
     return copy.deepcopy(tools)
 
 
@@ -490,6 +506,29 @@ def execute_talk_tool(name: str, arguments: dict | None) -> str:
 
 
 # -- handlers -----------------------------------------------------------------
+
+
+def _speakable_phone_result(result):
+    text = result if isinstance(result, str) else json.dumps(result, default=str)
+    return text[:MAX_OUTPUT_CHARS]
+
+
+def _handle_phone_tool(name, arguments):
+    try:
+        try:
+            from .talk_phone.context import require_enabled
+        except ImportError:
+            from talk_phone.context import require_enabled
+        ctx = talk_host.get_ctx()
+        if ctx is None:
+            return "Phone mode needs the current Hermes conversation."
+        require_enabled(ctx)
+        return _speakable_phone_result(ctx.dispatch_tool(name, arguments))
+    except Exception as exc:  # noqa: BLE001 - never echo host exceptions or credentials
+        return (
+            f"Phone operation failed ({type(exc).__name__}). "
+            "Check the call in Hermes before retrying."
+        )
 
 
 def _handle_search_memory(arguments: dict) -> str:
@@ -881,6 +920,11 @@ _HANDLERS = {
     "talk_capabilities": _handle_talk_capabilities,
     "pause_voice_input": _handle_pause_voice_input,
 }
+for _phone_name in (
+    "phone_prepare", "phone_call", "phone_status", "phone_cancel", "phone_kill_switch",
+    "phone_inbox", "phone_process_work", "phone_work_status", "phone_work_cancel",
+):
+    _HANDLERS[_phone_name] = functools.partial(_handle_phone_tool, _phone_name)
 
 
 __all__ = [

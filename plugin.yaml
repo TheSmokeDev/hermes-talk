@@ -1,14 +1,88 @@
 name: hermes-talk
-version: 0.22.0
+version: 0.23.0
+requires_hermes: ">=0.23.0"
 manifest_version: 1
 kind: standalone
 description: "OpenAI Realtime speech-to-speech voice for Hermes: duplex talk with live tool calling."
 author: SmokeDev (TheSmokeDev)
 license: MIT
-provides_tools: []
+provides_tools:
+  - phone_prepare
+  - phone_call
+  - phone_status
+  - phone_cancel
+  - phone_kill_switch
+  - phone_inbox
+  - phone_process_work
+  - phone_work_status
+  - phone_work_cancel
 provides_hooks:
   - on_session_end
   - subagent_start
   - subagent_stop
   - post_tool_call
   - pre_approval_request
+  - pre_tool_call
+  - pre_llm_call
+config_schema:
+  phone_enabled:
+    type: bool
+    default: false
+    label: Phone mode
+    description: Enable optional Dograh calling in this Hermes conversation. Off by default.
+  phone_api_key:
+    type: secret
+    env: DOGRAH_API_KEY
+    label: Phone — Dograh API key
+  phone_base_url:
+    type: str
+    default: https://app.dograh.com
+    label: Phone — Dograh address
+  phone_workflow_id:
+    type: int
+    default: 0
+    label: Phone — dedicated workflow ID
+  phone_agent_uuid:
+    type: str
+    default: ""
+    label: Phone — dedicated Agent UUID
+  phone_telephony_configuration_id:
+    type: int
+    default: 0
+    label: Phone — carrier ID
+  phone_from_phone_number_id:
+    type: int
+    default: 0
+    label: Phone — caller number ID
+  phone_allowed_numbers:
+    type: list
+    default: []
+    label: Phone — owned test destinations
+  phone_owner_user_ids:
+    type: list
+    default: []
+    label: Phone — authenticated owners
+  phone_dialing_enabled:
+    type: bool
+    default: false
+    label: Phone — allow reviewed calls
+  phone_max_duration_seconds:
+    type: int
+    default: 120
+    label: Phone — maximum call seconds
+  phone_bridge_enabled:
+    type: bool
+    default: false
+    label: Phone — in-call questions and tasks
+  phone_bridge_token:
+    type: secret
+    env: DOGRAH_BRIDGE_TOKEN
+    label: Phone — bridge bearer secret
+  phone_bridge_public_url:
+    type: str
+    default: ""
+    label: Phone — authenticated bridge origin
+  phone_delegation_toolsets:
+    type: list
+    default: [web]
+    label: Phone — allowed task toolsets
