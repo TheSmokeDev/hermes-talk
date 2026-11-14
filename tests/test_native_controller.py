@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from test_target_switching import fleet as fleet
 
+import talk_discord
 import talk_openai_realtime
 import talk_realtime as rt
 from talk_native_api import NativeTaskAPI, NativeTaskError
@@ -209,6 +210,32 @@ async def user(handle, text, *, input_id="input-one", response_id="response-one"
     receipt = await handle.controller.typed(text, input_id=input_id)
     await started(handle, response_id)
     return receipt
+
+
+def test_discord_completion_only_flushes_the_response_that_supplied_audio(native):
+    async def scenario():
+        h = await native.connect()
+        audio = talk_discord.DiscordAudio()
+        audio._source = talk_discord._RealtimeSource(audio._outbound)
+        h.controller.audio = audio
+        try:
+            await user(h, "A short answer")
+            pcm = b"\x01\x00" * 5
+            await h.controller.handle(rt.OutputAudio(pcm, "answer", "response-one"))
+            await h.controller.handle(rt.ResponseFinished(response_id="foreign"))
+            assert audio._source.read() == talk_discord.SILENCE_FRAME
+            await finished(h)
+            expected, _ = talk_discord.session_to_discord(pcm)
+            assert audio._source.read() == expected + bytes(3840 - len(expected))
+            assert not audio.playback_pending
+            # A duplicate completion cannot mark the next response's partial PCM.
+            audio.queue_playback(pcm)
+            await finished(h)
+            assert audio._source.read() == talk_discord.SILENCE_FRAME
+        finally:
+            await close(h)
+
+    asyncio.run(scenario())
 
 
 async def tool(handle, name, arguments, *, call_id="call-one", response_id="response-one"):

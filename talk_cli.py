@@ -2060,6 +2060,7 @@ async def run_talk_session(
                 # stops before the sink empties, never after.
                 if cascade is not None:
                     cascade.handle_event(event)
+                response_was_active = relay.response_active
                 outgoing = relay.handle_realtime_event(event)
                 if (
                     authorization_ledger is not None
@@ -2071,6 +2072,16 @@ async def run_talk_session(
                     if response_create is not None:
                         outgoing.append(_neutral_response_command(response_create))
                 if isinstance(event, talk_realtime.ResponseFinished):
+                    # A stale terminal must not flush the next response's PCM.
+                    # Cascade TTS can still be producing audio after this event.
+                    finish_playback = getattr(audio, "finish_playback", None)
+                    if (
+                        cascade is None
+                        and response_was_active
+                        and not relay.response_active
+                        and callable(finish_playback)
+                    ):
+                        finish_playback()
                     continued = bool(tool_coordinator.outputs)
                     await tool_coordinator.response_done()
                     if authorization_ledger is not None:
