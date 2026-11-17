@@ -2369,6 +2369,11 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--targets", action="store_true", default=False,
                            help="list authorized task targets without starting audio")
     commands = subparser.add_subparsers(dest="talk_command")
+    try:
+        from .talk_phone.cli import setup_parser
+    except ImportError:
+        from talk_phone.cli import setup_parser
+    setup_parser(commands)
     commands.add_parser(
         "setup",
         help="Interactively configure only missing Talk decisions",
@@ -2473,6 +2478,15 @@ def cli_entry(
     """
 
     command = getattr(args, "talk_command", "session") if args is not None else "session"
+    if command == "phone":
+        try:
+            from .talk_phone.cli import run
+        except ImportError:
+            from talk_phone.cli import run
+        code = run(talk_host.get_ctx(), args)
+        if code:
+            raise SystemExit(code)
+        return 0
     if command == "setup":
         code = talk_setup.cli_entry()
         if code:

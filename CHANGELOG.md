@@ -13,7 +13,18 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-11-17
+
+Continue your Hermes conversation over an optional Dograh phone call, using its
+existing history, memory and tools. The terminal voice lane can also run against
+a self-hosted model server.
+
 ### Added
+- Optional native Phone mode powered by Dograh, inside Hermes Talk. Hermes plugin
+  settings, native review choices, the existing chat message stream and `/phone`
+  commands handle setup, approvals, caller questions and owner answers. Phone
+  tools are hidden by default. Explicit migration preserves the separate test
+  plugin's history and revokes its old call approvals and bridge grants.
 - `TALK_PROVIDER=local`: run the voice lane on your own GPU against any
   self-hosted server that speaks the OpenAI Realtime protocol, such as
   huggingface/speech-to-speech with an Ollama LLM, on the terminal lane.
@@ -23,6 +34,9 @@ named rather than smoothed.
   latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
 
 ### Fixed
+- Plugin Guard CI follows the upstream scanner's new module paths and includes
+  its shared threat-pattern module. Missing scanners and critical/high findings
+  continue to fail the gate.
 - REST skill and toolset discovery accepts OpenAI-style `data` list envelopes
   alongside bare lists and named envelopes. Named lists keep precedence,
   non-object entries are filtered, and invalid response shapes still fail.
