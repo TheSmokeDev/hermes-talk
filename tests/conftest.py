@@ -13,6 +13,13 @@ import wallclock
 from run_workers import RunWorkers
 
 
+@pytest.fixture(autouse=True)
+def isolated_talk_instructions(monkeypatch, tmp_path):
+    import talk_identity
+
+    monkeypatch.setattr(talk_identity, "TALK_INSTRUCTIONS_PATH", tmp_path / "TALK.md")
+
+
 @pytest.fixture
 def run_workers(monkeypatch):
     """Opt-in ownership of run threads; callers drain BEFORE registry reset.

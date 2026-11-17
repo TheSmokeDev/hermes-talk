@@ -44,6 +44,34 @@ hermes talk
 
 ## Upgrade
 
+### Versioned voice instructions for Git deployments
+
+An optional `TALK.md` next to `talk_identity.py` adds deployment-specific voice
+preferences to both Realtime and GPT-Live session instructions. Commit it in
+your fork: production, staging and development branches can carry different
+interlocutors and workflows without changing shared Python code. The file is
+resolved from the plugin checkout, never from the agent's working directory.
+This file convention targets Git/source installations, not standalone wheels.
+
+The file supplements the built-in execution and tool contracts. Its style and
+workflow preferences specialize defaults and older remembered preferences; they
+cannot grant tools or host permissions. Current operator constraints still apply.
+Do not put credentials in this versioned file. Changes affect new sessions only:
+leave and rejoin Talk after editing it. The gateway log reports `Loaded TALK.md`
+and its character count, without printing its contents.
+
+Use UTF-8, at most 6,000 characters. Missing or blank files retain the default
+prompt. Invalid, oversized or unreadable files prevent session setup rather than
+silently discarding deployment instructions. Source archives include the file
+when present. Keep runtime task progress in Hermes history, not in this file.
+
+Keep the loader commit separate from deployment-content commits. Cherry-pick
+shared fixes onto each environment branch and update that branch's `TALK.md`
+independently. Neither this file nor a prompt guarantees nonblocking execution:
+Hermes may still fall back to synchronous delegation when capacity is exhausted.
+
+### Updating the plugin
+
 ```bash
 hermes plugins update hermes-talk
 ```
