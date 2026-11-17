@@ -7,8 +7,8 @@ blocking or confirmation-gated). It skips cleanly otherwise, so the suite
 stays hermetic.
 
 To run the gate locally, point ``TALK_PLUGIN_GUARD_HOME`` at a directory
-whose ``tools/`` holds ``plugin_guard.py``, ``plugin_guard_context.py``,
-``skills_guard.py`` and ``skills_guard_credentials.py`` from
+holding the current ``hermes_cli/plugins_install_scan.py`` and its supporting
+modules, or the legacy ``tools/plugin_guard.py`` layout, from
 NousResearch/hermes-agent (keep it OUTSIDE this checkout — the scanner's
 own pattern table would otherwise be scanned as repo content).
 """
@@ -16,6 +16,7 @@ own pattern table would otherwise be scanned as repo content).
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,9 +31,10 @@ def _scanner_home() -> Path | None:
     if not raw:
         return None
     home = Path(raw)
-    if (home / "tools" / "plugin_guard.py").is_file() and (
-        home / "tools" / "skills_guard.py"
-    ).is_file():
+    scanner_present = (home / "hermes_cli" / "plugins_install_scan.py").is_file() or (
+        home / "tools" / "plugin_guard.py"
+    ).is_file()
+    if scanner_present and (home / "tools" / "skills_guard.py").is_file():
         return home
     return None
 
@@ -46,15 +48,15 @@ def test_repo_scans_clean_under_upstream_plugin_guard():
                 f"{SCANNER_HOME_ENV}={raw!r} is set but scanner files not found at that path"
             )
         pytest.skip(f"scanner not present locally; set {SCANNER_HOME_ENV} to run this gate")
-    sys.path.insert(0, str(home))
-    try:
-        from tools.plugin_guard import scan_plugin
-    finally:
-        sys.path.remove(str(home))
-
-    result = scan_plugin(REPO_ROOT, source="TheSmokeDev/hermes-talk (local gate)")
-
-    blocking = [f for f in result.findings if f.severity in ("critical", "high")]
-    assert not blocking, "\n".join(
-        f"{f.severity}: {f.pattern_id} at {f.file}:{f.line}" for f in blocking
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / ".github" / "plugin_guard_check.py"),
+            str(home),
+            str(REPO_ROOT),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    assert result.returncode == 0, result.stdout + result.stderr

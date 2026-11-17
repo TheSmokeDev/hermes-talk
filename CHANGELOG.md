@@ -34,6 +34,9 @@ a self-hosted model server.
   latency on an RTX 3090, and Windows notes are in `docs/LOCAL.md`.
 
 ### Fixed
+- Plugin Guard CI follows the upstream scanner's new module paths and includes
+  its shared threat-pattern module. Missing scanners and critical/high findings
+  continue to fail the gate.
 - REST skill and toolset discovery accepts OpenAI-style `data` list envelopes
   alongside bare lists and named envelopes. Named lists keep precedence,
   non-object entries are filtered, and invalid response shapes still fail.
