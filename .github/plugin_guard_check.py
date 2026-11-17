@@ -1,11 +1,10 @@
 """Run the upstream Hermes plugin_guard scanner against this repository.
 
-The plugin-guard workflow downloads ``tools/plugin_guard.py``,
-``tools/plugin_guard_context.py`` and ``tools/skills_guard.py`` from
-NousResearch/hermes-agent, pinned to the
-commit it resolved from upstream main, into a directory OUTSIDE this
-checkout (the scanner's own pattern table would otherwise be scanned as
-repo content). This script then runs that scanner over the checkout and
+The workflow downloads ``hermes_cli/plugins_install_scan.py`` and its
+context module, plus ``tools/skills_guard.py``, its credential helper, and
+``tools/threat_patterns.py`` from one resolved upstream commit into a directory
+OUTSIDE this checkout. Legacy local scanner layouts remain supported.
+This script then runs that scanner over the checkout and
 fails unless the scan comes back with zero critical and zero high
 findings — the two tiers upstream treats as blocking (dangerous) or
 confirmation-gated (caution).
@@ -17,6 +16,7 @@ where ``<scanner-home>`` is the directory containing ``tools/``.
 from __future__ import annotations
 
 import sys
+from importlib import import_module
 from pathlib import Path
 
 
@@ -26,8 +26,12 @@ def main(argv: list[str]) -> int:
         return 2
     scanner_home = Path(argv[1]).resolve()
     repo_root = Path(argv[2]).resolve()
-    if not (scanner_home / "tools" / "plugin_guard.py").is_file():
-        print(f"plugin-guard: no scanner at {scanner_home}/tools/plugin_guard.py")
+    if (scanner_home / "hermes_cli" / "plugins_install_scan.py").is_file():
+        module_name = "hermes_cli.plugins_install_scan"
+    elif (scanner_home / "tools" / "plugin_guard.py").is_file():
+        module_name = "tools.plugin_guard"
+    else:
+        print(f"plugin-guard: no scanner at {scanner_home}")
         return 2
     if not (scanner_home / "tools" / "skills_guard.py").is_file():
         print(f"plugin-guard: no skills_guard at {scanner_home}/tools/skills_guard.py")
@@ -35,14 +39,14 @@ def main(argv: list[str]) -> int:
 
     sys.path.insert(0, str(scanner_home))
     try:
-        from tools.plugin_guard import format_scan_report, scan_plugin
+        scanner = import_module(module_name)
     except ImportError as exc:
         print(f"plugin-guard: cannot import scanner — {exc}")
         return 2
 
     try:
-        result = scan_plugin(repo_root, source="TheSmokeDev/hermes-talk")
-        print(format_scan_report(result))
+        result = scanner.scan_plugin(repo_root, source="TheSmokeDev/hermes-talk")
+        print(scanner.format_scan_report(result))
     except Exception as exc:  # noqa: BLE001 — a crashed scanner must not read as a verdict
         print(f"plugin-guard: scanner crashed — {exc}")
         return 2

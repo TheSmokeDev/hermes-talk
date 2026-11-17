@@ -67,6 +67,9 @@ release that meets the current Hermes plugin catalog rules.
   `XAI_API_KEY`; `TALK_PREFER_XAI_OAUTH=true` now refuses with that reason.
 
 ### Fixed
+- Plugin Guard CI follows the upstream scanner's new module paths and includes
+  its shared threat-pattern module. Missing scanners and critical/high findings
+  continue to fail the gate.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
