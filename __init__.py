@@ -404,6 +404,15 @@ def register(ctx) -> None:
     REGISTRATION_FAILURES.clear()
     REGISTRATION_RECEIPTS.clear()
     talk_host.bind_ctx(ctx)
+    if callable(getattr(ctx, "register_tool", None)):
+        try:
+            try:
+                from .talk_phone.plugin import register as register_phone
+            except ImportError:
+                from talk_phone.plugin import register as register_phone
+            register_phone(ctx)
+        except Exception as exc:  # noqa: BLE001 - external boundary; keep host/provider details private
+            _record("optional Phone mode", "phone_mode", exc)
 
     if talk_core_realtime.core_provider_available():
         _attempt_boolean_registration(

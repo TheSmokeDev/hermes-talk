@@ -8,7 +8,7 @@ on:
   # ref by hand when event delivery drops.
   workflow_dispatch:
 
-# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads two
+# Least-privilege GITHUB_TOKEN. The job checks out this tree and reads scanner
 # files from a PUBLIC upstream repository through `gh api`; a token scoped to
 # contents:read on this repository can still read public repositories, and
 # the authenticated call is only there for the rate limit. Nothing is written
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   scan:
-    # The upstream plugin scanner (tools/plugin_guard.py in
+    # The upstream plugin scanner (hermes_cli/plugins_install_scan.py in
     # NousResearch/hermes-agent, shipped in Hermes v0.20.4) gates
     # `hermes plugins install`: one critical finding blocks the install and
     # --force does not override it. This job runs that exact scanner over
@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
@@ -47,8 +47,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          home="${RUNNER_TEMP}/plugin-guard"
-          mkdir -p "${home}/tools"
+          scanner_home="${RUNNER_TEMP}/plugin-guard"
+          mkdir -p "${scanner_home}/tools" "${scanner_home}/hermes_cli"
           # Fetch through the authenticated GitHub API, not the raw CDN
           # (raw.githubusercontent.com 429s persistently under load). Even the
           # API can bounce at a sliding rate window, so retry patiently —
@@ -56,7 +56,7 @@ jobs:
           fetch() {
             local path="$1" out="$2" attempt
             for attempt in 1 2 3 4 5 6; do
-              if gh api "repos/NousResearch/hermes-agent/contents/tools/${path}?ref=${{ steps.scanner.outputs.sha }}" \
+              if gh api "repos/NousResearch/hermes-agent/contents/${path}?ref=${{ steps.scanner.outputs.sha }}" \
                   -H "Accept: application/vnd.github.raw" > "$out"; then
                 return 0
               fi
@@ -65,10 +65,12 @@ jobs:
             done
             return 1
           }
-          fetch plugin_guard.py "${home}/tools/plugin_guard.py"
-          fetch plugin_guard_context.py "${home}/tools/plugin_guard_context.py"
-          fetch skills_guard.py "${home}/tools/skills_guard.py"
-          touch "${home}/tools/__init__.py"
+          fetch hermes_cli/plugins_install_scan.py "${scanner_home}/hermes_cli/plugins_install_scan.py"
+          fetch hermes_cli/plugins_install_scan_context.py "${scanner_home}/hermes_cli/plugins_install_scan_context.py"
+          fetch tools/skills_guard.py "${scanner_home}/tools/skills_guard.py"
+          fetch tools/skills_guard_credentials.py "${scanner_home}/tools/skills_guard_credentials.py"
+          fetch tools/threat_patterns.py "${scanner_home}/tools/threat_patterns.py"
+          touch "${scanner_home}/tools/__init__.py" "${scanner_home}/hermes_cli/__init__.py"
 
       - name: Scan this repository
         run: python .github/plugin_guard_check.py "${RUNNER_TEMP}/plugin-guard" .

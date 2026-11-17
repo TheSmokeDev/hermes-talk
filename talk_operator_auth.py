@@ -60,7 +60,9 @@ READ_ONLY_TALK_TOOLS = frozenset(
     }
 )
 MUTATING_TALK_TOOLS = frozenset(
-    {"delegate_task", "steer_agent", "redirect_agent", "stop_work", "resolve_approval"}
+    {"delegate_task", "steer_agent", "redirect_agent", "stop_work", "resolve_approval",
+     "phone_prepare", "phone_call", "phone_status", "phone_cancel", "phone_kill_switch",
+     "phone_inbox", "phone_reply"}
 )
 
 MUTATION_DENIAL = (
@@ -89,7 +91,11 @@ MUTATION_DENIAL = (
 VOICE_INLINE_SAFE = frozenset(
     {"session_search", "web_search", "web_extract", "vision_analyze"}
 )
-VOICE_PERMIT_GATED = frozenset({"computer_use"})
+# Phone handlers additionally enforce same-session, single-use human dial approval.
+# Even their read operations can reveal caller data, so none are room-safe inline tools.
+VOICE_PERMIT_GATED = frozenset({"computer_use"}) | frozenset(
+    name for name in MUTATING_TALK_TOOLS if name.startswith("phone_")
+)
 
 CLASS_INLINE = "inline"
 CLASS_PERMIT = "permit"

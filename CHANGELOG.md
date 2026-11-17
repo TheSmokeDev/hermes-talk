@@ -13,6 +13,18 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-11-17
+
+Continue your Hermes conversation over an optional Dograh phone call, using its
+existing history, memory and tools, with the catalog build's authentication rules.
+
+### Added
+- Optional native Phone mode powered by Dograh, inside Hermes Talk. Hermes plugin
+  settings, native review choices, the existing chat message stream and `/phone`
+  commands handle setup, approvals, caller questions and owner answers. Phone
+  tools are hidden by default. Explicit migration preserves the separate test
+  plugin's history and revokes its old call approvals and bridge grants.
+
 ## [0.22.1] — 2026-10-27 (catalog build)
 
 This is the Hermes plugin catalog build, published from the `catalog` branch.
@@ -55,6 +67,9 @@ release that meets the current Hermes plugin catalog rules.
   `XAI_API_KEY`; `TALK_PREFER_XAI_OAUTH=true` now refuses with that reason.
 
 ### Fixed
+- Plugin Guard CI follows the upstream scanner's new module paths and includes
+  its shared threat-pattern module. Missing scanners and critical/high findings
+  continue to fail the gate.
 - Live replay tests use a controlled authentication-lease clock and wait for the
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
