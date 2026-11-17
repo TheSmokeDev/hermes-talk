@@ -28,6 +28,9 @@ Discord playback, honest run outcomes, the transcript review loop and Gemini
 tool calls. Thanks to everyone who contributed and reported issues.
 
 ### Added
+- Git deployments can version optional `TALK.md` voice preferences in their
+  plugin branch. New Realtime and GPT-Live sessions load the bounded UTF-8 file
+  alongside the existing host contracts and identity sections.
 - `python -m talk_twilio_server` answers calls to your own Twilio number with
   a fresh Gemini Live voice session (no task, no tools), over Twilio Media
   Streams. It is a separate opt-in server, not the Dograh Phone mode, and
