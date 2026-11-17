@@ -13,6 +13,11 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-11-17
+
+Continue your Hermes conversation over an optional Dograh phone call, using its
+existing history, memory and tools, with the catalog build's authentication rules.
+
 ### Added
 - Optional native Phone mode powered by Dograh, inside Hermes Talk. Hermes plugin
   settings, native review choices, the existing chat message stream and `/phone`
