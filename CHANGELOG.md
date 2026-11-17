@@ -13,6 +13,11 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.23.1] — 2026-11-17
+
+Fix the intermittent CI failure caused by a test worker finishing after its
+fixture had reset the run registry and removed its process mocks.
+
 ### Fixed
 - Delegation and admission tests release their gates and join owned workers
   before resetting run IDs or removing mocks. Deterministic neighboring-test
