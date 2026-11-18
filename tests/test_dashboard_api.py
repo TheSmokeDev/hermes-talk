@@ -674,7 +674,7 @@ def test_journal_on_returns_a_call_id_and_accepts_events(minted, monkeypatch, tm
     import talk_call_journal
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    monkeypatch.setattr(api.talk_config, "plugin_setting", {"journal_enabled": True}.get)
     monkeypatch.setenv("TALK_PROVIDER", "local")
     body = call(api.create_session, FakeRequest(body={"surface": "desktop"}))
     call_id = body["journal"]["callId"]
@@ -690,6 +690,12 @@ def test_journal_on_returns_a_call_id_and_accepts_events(minted, monkeypatch, tm
     )
     assert answer == {"ok": True, "written": 1}
     assert talk_call_journal.read(call_id)[-1]["text"] == "Bonjour"
+
+
+def test_call_journal_switch_can_turn_off_an_existing_environment_setting(minted, monkeypatch):
+    monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    monkeypatch.setattr(api.talk_config, "plugin_setting", {"journal_enabled": False}.get)
+    assert "journal" not in call(api.create_session, FakeRequest(body={}))
 
 
 def test_journal_route_refuses_when_off_and_requires_dashboard_auth(monkeypatch):
@@ -739,7 +745,7 @@ def _gated(request, *, auth_required=True, session=_VERIFIED):
 
 
 def test_a_session_verified_by_the_dashboard_gate_needs_no_talk_token(monkeypatch):
-    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV, raising=False)
     api.require_dashboard_auth(_gated(FakeRequest(host="100.64.0.9")))
 
 
@@ -754,7 +760,7 @@ def test_a_session_verified_by_the_dashboard_gate_needs_no_talk_token(monkeypatc
 def test_the_gate_session_is_accepted_only_when_real_and_same_site(
     monkeypatch, auth_required, session, headers
 ):
-    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV, raising=False)
     request = _gated(
         FakeRequest(host="100.64.0.9", headers=headers),
         auth_required=auth_required,
@@ -762,7 +768,17 @@ def test_the_gate_session_is_accepted_only_when_real_and_same_site(
     )
     with pytest.raises(api.HTTPException) as refused:
         api.require_dashboard_auth(request)
+    assert refused.value.status_code == 403
+
+
+def test_an_explicit_talk_password_still_applies_after_dashboard_sign_in(monkeypatch):
+    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    with pytest.raises(api.HTTPException) as refused:
+        api.require_dashboard_auth(_gated(FakeRequest(host="100.64.0.9")))
     assert refused.value.status_code == 401
+    api.require_dashboard_auth(
+        _gated(FakeRequest(host="100.64.0.9", headers={"X-Talk-Token": "talk-only-token"}))
+    )
 
 
 def test_without_a_gate_a_remote_browser_still_needs_the_token(monkeypatch):

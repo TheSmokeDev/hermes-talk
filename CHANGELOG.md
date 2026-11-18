@@ -14,6 +14,9 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- Experimental controls in Hermes Talk plugin settings for a saved Echo,
+  the text-only call journal, and voice language. New users start with Echo
+  and Journal off and language on Auto.
 - Opt-in call journal (`TALK_CALL_JOURNAL=1`). A dashboard or Desktop Realtime
   call without a bound task leaves a text-only JSONL record on the Hermes host:
   final utterances on both sides, barge-ins, tool calls and results, the
@@ -36,7 +39,8 @@ named rather than smoothed.
 
 ### Changed
 - In gated mode (dashboard sign-in engaged), a request the dashboard's own
-  sign-in already verified no longer needs `TALK_DASHBOARD_TOKEN`: the Talk
+  sign-in already verified can open Talk. An explicit `TALK_DASHBOARD_TOKEN`
+  continues to protect deployments that configure one. The Talk
   tab works right after signing in, on any browser of a private network, with
   nothing to paste per tab. Cross-site requests (`Sec-Fetch-Site: cross-site`)
   are still refused; loopback and token behaviour without a gate are unchanged.

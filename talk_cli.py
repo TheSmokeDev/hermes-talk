@@ -2479,7 +2479,9 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         "echo",
         help="Serve an Echo running hassmic (Wyoming): each wake word is a Talk session",
     )
-    echo.add_argument("echo_host", metavar="HOST", help="the Echo's address")
+    echo.add_argument(
+        "echo_host", nargs="?", metavar="HOST", help="the Echo address or the saved speaker"
+    )
     echo.add_argument("--port", dest="echo_port", type=int, default=16700,
                       help="hassmic's Wyoming port (default 16700)")
     echo.add_argument("--idle", dest="echo_idle", type=float, default=20.0, metavar="SECONDS",
@@ -2589,12 +2591,22 @@ def cli_entry(
             raise SystemExit(code)
         return 0
     if command == "echo":
+        address = args.echo_host
+        if address is None:
+            saved = talk_config.plugin_setting("echo_address")
+            if talk_config.plugin_setting("echo_enabled") is True and isinstance(saved, str):
+                address = saved.strip()
+            if not address:
+                raise SystemExit(
+                    "Specify an Echo address or enable Use saved Echo and set its address "
+                    "in Hermes Talk plugin settings."
+                )
         try:
             from . import talk_echo
         except ImportError:  # pragma: no cover - flat-module fallback
             import talk_echo
         return talk_echo.cli_entry(
-            args.echo_host, args.echo_port, args.echo_idle, args.echo_barge_in
+            address, args.echo_port, args.echo_idle, args.echo_barge_in
         )
     if command == "diagnostics":
         bundle = getattr(args, "diagnostics_bundle", None)

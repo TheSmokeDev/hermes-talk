@@ -738,6 +738,38 @@ MAX_REPLY_LANGUAGE_CHARS = 40
 _REPLY_LANGUAGE_RE = re.compile(r"^[^\W\d_]+(?:[ '\-][^\W\d_]+)*$")
 
 
+_EXPERIMENTAL_LANGUAGE_CODES = {
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Portuguese": "pt",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
+}
+
+
+def plugin_setting(key: str):
+    """Read the active Hermes profile's native Talk settings, when available."""
+    try:
+        from hermes_cli.config import load_config_readonly
+    except ImportError:
+        return None
+
+    value = load_config_readonly()
+    for part in ("plugins", "entries", "hermes-talk", "settings", key):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _experimental_voice_language() -> str | None:
+    value = plugin_setting("voice_language")
+    return value if isinstance(value, str) and value in _EXPERIMENTAL_LANGUAGE_CODES else None
+
+
 def transcription_languages() -> tuple[str, ...]:
     """Expected spoken languages for input transcription (``TALK_TRANSCRIPTION_LANGUAGES``).
 
@@ -747,6 +779,9 @@ def transcription_languages() -> tuple[str, ...]:
     because a silently ignored hint looks exactly like a working one.
     """
 
+    language = _experimental_voice_language()
+    if language is not None:
+        return (_EXPERIMENTAL_LANGUAGE_CODES[language],)
     raw = os.environ.get("TALK_TRANSCRIPTION_LANGUAGES") or ""
     codes = tuple(dict.fromkeys(part.strip().lower() for part in raw.split(",") if part.strip()))
     invalid = [code for code in codes if not _LANGUAGE_CODE_RE.match(code)]
@@ -796,6 +831,9 @@ def reply_language() -> str | None:
     constrained by it.
     """
 
+    language = _experimental_voice_language()
+    if language is not None:
+        return language
     raw = (os.environ.get("TALK_REPLY_LANGUAGE") or "").strip()
     if not raw:
         return None

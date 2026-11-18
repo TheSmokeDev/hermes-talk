@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import array
 import asyncio
 import json
 
 import pytest
 
+import talk_cli
+import talk_config
 import talk_echo
 from talk_echo import EchoAudio, Upsampler, encode_event, read_event
 
@@ -284,3 +287,21 @@ def test_while_the_echo_speaks_only_a_voice_louder_than_its_echo_gets_through():
     audio.feed_microphone(leftover)
     assert set(audio.read_input_chunk()) != {0}
     assert "1 gated under 0.02" in audio.level_report()
+
+
+def test_echo_command_uses_saved_address_only_when_enabled(monkeypatch):
+    settings = {"echo_address": "echo.local", "echo_enabled": False}
+    monkeypatch.setattr(talk_config, "plugin_setting", settings.get)
+    connections = []
+    monkeypatch.setattr(talk_echo, "cli_entry", lambda address, *args: connections.append(address))
+    parser = argparse.ArgumentParser()
+    talk_cli.setup_cli(parser)
+
+    with pytest.raises(SystemExit, match="Use saved Echo"):
+        talk_cli.cli_entry(parser.parse_args(["echo"]))
+    assert connections == []
+
+    settings["echo_enabled"] = True
+    talk_cli.cli_entry(parser.parse_args(["echo"]))
+    talk_cli.cli_entry(parser.parse_args(["echo", "other.local"]))
+    assert connections == ["echo.local", "other.local"]

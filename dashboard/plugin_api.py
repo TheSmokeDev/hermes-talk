@@ -264,10 +264,9 @@ def _has_verified_dashboard_session(request) -> bool:
     In gated mode (a non-loopback bind or a public URL), Hermes's
     ``gated_auth_middleware`` verifies the session cookie or bearer with the
     configured sign-in provider before any plugin route runs, and only then
-    sets ``request.state.session``; a request without a valid session never
-    reaches this code. That operator is already authenticated by the host, so
-    asking for a second, Talk-only token adds friction without adding a
-    principal. The state is server-set, never read from the client.
+    sets ``request.state.session``. The state is server-set and allows Talk to
+    recognize that operator when the administrator has not configured a
+    separate Talk password.
 
     Cross-site requests are refused even with a session: the session cookie
     is ``SameSite=Lax``, and ``Sec-Fetch-Site: cross-site`` is an explicit
@@ -290,9 +289,9 @@ def require_dashboard_auth(request) -> None:
     A bool would let a handler forget to check it; a raise cannot be ignored.
     """
 
-    if _has_verified_dashboard_session(request):
-        return
     configured = dashboard_token()
+    if configured is None and _has_verified_dashboard_session(request):
+        return
     if configured is not None:
         presented = _presented_token(request)
         # compare_digest over bytes: unequal lengths return False rather than

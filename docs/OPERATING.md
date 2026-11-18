@@ -348,13 +348,31 @@ one of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
 `talk_live_config.py`. Live and native task variables are grouped in
 [the Live guide](GPT-LIVE.md#choose-billing-and-voice).
 
+### Experimental plugin settings
+
+Open **Hermes → Plugins → Hermes Talk → Settings** on a host that supports
+plugin settings. Ordinary Talk starts with the same defaults.
+
+- **Call journal** starts off. Turn it on before a new standalone dashboard
+  or Desktop Realtime call to save its text. Read it with `hermes talk journal`.
+- **Voice language** starts on **Auto**. Pick a language to guide OpenAI
+  transcription and replies for new calls. Auto uses the usual voice behavior
+  or any language overrides explicitly set in the environment.
+- **Use saved Echo** starts off. To use a compatible Echo, turn it on, enter
+  its local address, then run `hermes talk echo` when you want it. You can also
+  run `hermes talk echo HOST` to choose an address for that launch.
+
+On a dashboard with host-verified sign-in, that sign-in opens Talk. A server
+owner can explicitly require a separate Talk password with
+`TALK_DASHBOARD_TOKEN`.
+
 ### Session
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
-| `TALK_CALL_JOURNAL` | off | `1` or `on` keeps a **text-only** journal for dashboard or Desktop Realtime calls without a bound task. The Hermes host writes final utterances, interruptions, tool calls and results, errors and hang-up events to `$HERMES_HOME/state/talk-calls/<call_id>.jsonl`. Read it with `hermes talk journal`. |
+| `TALK_CALL_JOURNAL` | off | `1` or `on` keeps a **text-only** journal for dashboard or Desktop Realtime calls without a bound task. The Hermes host writes final utterances, interruptions, tool calls and results, errors and hang-up events to `$HERMES_HOME/state/talk-calls/<call_id>.jsonl`. Read it with `hermes talk journal`. A saved Call journal switch in Hermes Talk plugin settings takes precedence. |
 | `TALK_CALL_JOURNAL_DAYS` | `30` | Days a call journal is kept (1–3650). The host prunes older journals when the next journaled call starts. |
 | `TALK_TRANSCRIPTION_LANGUAGES` | unset | Comma-separated ISO 639-1/639-3 codes the operator speaks, e.g. `fr` or `fr,en` (OpenAI lanes). One code rides the transcription `language` field; several are sent as `languages` only to `gpt-live-transcribe` models and otherwise left to automatic detection (put the hint in the prompt below). **Fail-closed**: a malformed code refuses at mint. Unset sends no hint — the payload is byte-identical to before the knob. |
 | `TALK_TRANSCRIPTION_PROMPT` | unset | One-line context for the input transcriber (≤ 1000 characters): vocabulary, names, "mostly French, sometimes English". A hint, never required output. `hermes talk doctor` reports its length, never its text. |

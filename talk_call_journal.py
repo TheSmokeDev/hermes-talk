@@ -77,8 +77,11 @@ class JournalError(Exception):
 
 
 def enabled() -> bool:
-    """``TALK_CALL_JOURNAL``: off unless explicitly on. Fail-closed on junk."""
+    """Use the saved switch, then the environment for an explicit CLI setup."""
 
+    saved = talk_config.plugin_setting("journal_enabled")
+    if type(saved) is bool:
+        return saved
     raw = (os.environ.get("TALK_CALL_JOURNAL") or "").strip().lower()
     if raw in _TRUE:
         return True

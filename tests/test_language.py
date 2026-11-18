@@ -32,6 +32,20 @@ def test_unset_knobs_leave_the_transcription_block_untouched():
     assert _transcription(payload) == {"model": talk_wire.INPUT_TRANSCRIPTION_MODEL}
 
 
+def test_saved_voice_language_drives_the_realtime_prompt_and_transcriber(monkeypatch):
+    monkeypatch.setattr(talk_config, "plugin_setting", {"voice_language": "English"}.get)
+    payload = talk_wire.build_session_payload(instructions="x")
+    assert _transcription(payload)["language"] == "en"
+    assert talk_config.reply_language() == "English"
+
+
+def test_auto_voice_language_keeps_the_existing_default(monkeypatch):
+    monkeypatch.setattr(talk_config, "plugin_setting", {"voice_language": "Auto"}.get)
+    payload = talk_wire.build_session_payload(instructions="x")
+    assert _transcription(payload) == {"model": talk_wire.INPUT_TRANSCRIPTION_MODEL}
+    assert talk_config.reply_language() is None
+
+
 def test_one_language_rides_the_singular_field_of_the_default_model(monkeypatch):
     monkeypatch.setenv("TALK_TRANSCRIPTION_LANGUAGES", " FR ")
     assert _transcription(talk_wire.build_session_payload(instructions="x")) == {
