@@ -9,6 +9,11 @@ both the host and Talk; the plugin alone cannot add desktop control to a remote
 host. Availability is reported per application and per task. A discovered title
 or stored conversation is not proof that the task can receive instructions.
 
+The companion Hermes host implements live chat selection and delivery in
+[host PR 11](https://github.com/TheSmokeDev/hermes-agent/pull/11) and native
+history reads in [host PR 13](https://github.com/TheSmokeDev/hermes-agent/pull/13).
+Codex Desktop and Claude Code each need a chat the host can verify.
+
 ## Say what you want to address
 
 | Request | Result |

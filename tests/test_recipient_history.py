@@ -187,7 +187,9 @@ def test_switch_and_read_last_reply_replays_one_observation(bundle, app):
     assert [op for op, *_ in bundle.native.calls].count("history") == 1
 
 
-def test_switch_read_checks_older_pages_without_mistaking_them_for_latest(bundle):
+@pytest.mark.parametrize("timestamp", [NOW, None])
+@pytest.mark.parametrize("truncated", [True, False])
+def test_switch_read_uses_transcript_order_for_paged_history(bundle, timestamp, truncated):
     target = stored(bundle)
     def paged(operation, result):
         if operation == "history":
@@ -195,14 +197,16 @@ def test_switch_read_checks_older_pages_without_mistaking_them_for_latest(bundle
             if cursor is None:
                 result.update(next_cursor="another-page", truncated=True)
             else:
+                result["truncated"] = truncated
                 result["messages"] = [{
-                    **result["messages"][-1], "id": "older", "text": "Old reply",
-                    "timestamp": "2020-01-01T00:00:00Z",
+                    **result["messages"][-1], "id": "newer", "text": "Follow-up reply",
+                    "timestamp": timestamp,
                 }]
     bundle.native.mutate = paged
     body = {**bundle.context, "arguments": {**identity(target), "read_last_reply": True}}
     result = bundle.manager.recipients.select_recipient(bundle.request, body, operation_id="paged")
-    assert result["output"].endswith("Its last reply: Visible reply")
+    label = "Its last visible reply" if truncated else "Its last reply"
+    assert result["output"].endswith(f"{label}: Follow-up reply")
 
 
 @pytest.mark.parametrize("app", ["codex_desktop", "claude_code"])

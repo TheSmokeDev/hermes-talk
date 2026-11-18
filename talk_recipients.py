@@ -759,7 +759,7 @@ class RecipientService:
             return "This host cannot read replies from that chat."
         arguments = {key: target[key] for key in IDENTITY_FIELDS}
         arguments["limit"] = 50
-        page_replies = []
+        latest = None
         cursors = set()
         source = None
         for _ in range(10):
@@ -780,33 +780,26 @@ class RecipientService:
             reply = next(
                 (row for row in reversed(page["messages"]) if row["role"] == "assistant"), None,
             )
+            # The host cursor advances through native transcript order. Timestamps
+            # can be equal or absent, even on different pages of the same chat.
             if reply is not None:
-                page_replies.append(reply)
+                latest = reply
             cursor = page["next_cursor"]
-            if not cursor and not page["truncated"]:
+            if not cursor:
                 break
-            if not cursor or cursor in cursors:
+            if cursor in cursors:
                 return "The chat history is incomplete. I couldn't verify its last reply."
             cursors.add(cursor)
             arguments["cursor"] = cursor
         else:
             return "I couldn't verify the last reply within the available chat history."
-        if not page_replies:
+        if latest is None:
             return "There is no visible assistant reply in that chat yet."
-        latest = page_replies[0]
-        if len(page_replies) > 1:
-            # Pages may run back toward older messages. Compare actual instants, not cursor order.
-            try:
-                dated = [(datetime.fromisoformat(row["timestamp"]), row) for row in page_replies]
-                if any(stamp.utcoffset() is None for stamp, _ in dated):
-                    raise ValueError
-                newest = max(stamp for stamp, _ in dated)
-                latest, = (row for stamp, row in dated if stamp == newest)
-            except (TypeError, ValueError):
-                return "The chat history doesn't show which reply came last."
         excerpt = latest["text"][:2000]
         clipped = latest["truncated"] or len(excerpt) < len(latest["text"])
-        label = "Its last reply begins" if clipped else "Its last reply"
+        label = "Its last visible reply" if page["truncated"] else "Its last reply"
+        if clipped:
+            label += " begins"
         return f"{label}: {excerpt}"
 
 
