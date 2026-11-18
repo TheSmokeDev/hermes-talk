@@ -13,6 +13,16 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-11-17
+
+On a compatible Hermes host, say “Switch to my Codex chat and read its last
+reply,” then “Ask it to check mobile too.” The same flow works with Claude Code.
+The execution host must expose an authenticated recipient bridge. Reading
+requires chat history access, and sending requires a writable chat. See the
+[voice commands and host requirements](docs/recipient-routing.md). This release
+also carries the experimental settings, call journal, Echo surface and
+spoken-language knobs below.
+
 ### Added
 - `python -m talk_twilio_server` answers calls to your own Twilio number with
   a fresh Gemini Live voice session (no task, no tools), over Twilio Media
@@ -20,6 +30,11 @@ named rather than smoothed.
   normal Talk never loads it. Every webhook is signature-checked, callers
   must be on an allowlist (`*` for anyone), and refused calls are never
   answered. See [docs/TWILIO.md](docs/TWILIO.md). Experimental. Contributed by @computator1200.
+- Select an open Codex or Claude Code chat by app name alone when exactly one
+  matches. Talk asks which chat you mean when it finds several. A single spoken
+  request can select a chat and read its latest visible assistant reply.
+- GPT-Live directs follow-ups to the chat selected when it heard the request.
+  If the selection changes while Hermes decides, it asks you to select the chat again.
 - Experimental controls in Hermes Talk plugin settings for a saved Echo,
   the text-only call journal, and voice language. New users start with Echo
   and Journal off and language on Auto.

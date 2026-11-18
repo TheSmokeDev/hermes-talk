@@ -13,6 +13,9 @@ or stored conversation is not proof that the task can receive instructions.
 
 | Request | Result |
 |---|---|
+| "Switch to my Codex chat and tell me what it said." | If the host lists one open Codex chat, Talk selects it and reads its last visible assistant reply. If several are open, Talk asks which one. |
+| "Switch to the Claude Code chat named Website and read its last reply." | Talk selects that title in Claude Code. You hear when its replies are unavailable or only an excerpt is available. |
+| "Now ask it to check mobile too." | GPT-Live sends the follow-up to the selected chat if the host can deliver it. |
 | "List my Codex tasks" | Lists verified recipients on the selected execution host. |
 | "Select Codex task NAME" | Selects that exact recipient; duplicate names require a choice. |
 | "Tell Codex: focus on the login bug" | Sends to the selected existing Codex recipient. A selected Claude task cannot receive this request. |
