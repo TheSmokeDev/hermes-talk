@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
@@ -94,7 +95,7 @@ def retention_days() -> int:
     raw = (os.environ.get("TALK_CALL_JOURNAL_DAYS") or "").strip()
     if not raw:
         return DEFAULT_RETENTION_DAYS
-    if not raw.isdigit() or not 1 <= int(raw) <= MAX_RETENTION_DAYS:
+    if not raw.isdecimal() or len(raw) > 4 or not 1 <= int(raw) <= MAX_RETENTION_DAYS:
         raise talk_config.TalkConfigError(
             f"TALK_CALL_JOURNAL_DAYS must be a whole number of days from 1 to {MAX_RETENTION_DAYS}"
         )
@@ -170,7 +171,12 @@ def prune(*, days: int | None = None, clock=time.time) -> int:
 
 
 def start(
-    *, engine: dict, lane: str, host_session_id: str | None = None, clock=time.time
+    *,
+    engine: dict,
+    lane: str,
+    host_session_id: str | None = None,
+    days: int | None = None,
+    clock=time.time,
 ) -> str:
     """Create one call's journal and write its ``call_start`` line.
 
@@ -179,7 +185,7 @@ def start(
     conversation it was started from. It is an opaque, bounded token.
     """
 
-    prune(clock=clock)
+    prune(days=days, clock=clock)
     call_id = "call_" + secrets.token_hex(16)
     path = journal_dir() / f"{call_id}.jsonl"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -209,15 +215,18 @@ def record(call_id: str, events, *, clock=time.time) -> int:
         raise JournalError(f"send 1 to {MAX_EVENTS_PER_BATCH} events")
     rows = []
     for event in events:
-        if not isinstance(event, dict) or event.get("kind") not in CLIENT_KINDS:
+        kind = event.get("kind") if isinstance(event, dict) else None
+        if not isinstance(kind, str) or kind not in CLIENT_KINDS:
             raise JournalError("invalid journal event")
         seq = event.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or not 1 <= seq <= 10**7:
             raise JournalError("invalid journal sequence")
-        row = {"v": SCHEMA_VERSION, "seq": seq, "ts": _now_iso(clock), "kind": event["kind"]}
+        row = {"v": SCHEMA_VERSION, "seq": seq, "ts": _now_iso(clock), "kind": kind}
         client_ts = event.get("client_ts")
-        if isinstance(client_ts, (int, float)) and not isinstance(client_ts, bool):
+        if isinstance(client_ts, float) and math.isfinite(client_ts):
             row["client_ts"] = int(client_ts)
+        elif type(client_ts) is int:
+            row["client_ts"] = client_ts
         for key in ("tool", "tool_call_id", "item_id", "status", "session_id", "source"):
             value = _token(event.get(key))
             if value is not None:

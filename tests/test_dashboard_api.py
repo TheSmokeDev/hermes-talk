@@ -675,11 +675,13 @@ def test_journal_on_returns_a_call_id_and_accepts_events(minted, monkeypatch, tm
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    monkeypatch.setenv("TALK_PROVIDER", "local")
     body = call(api.create_session, FakeRequest(body={"surface": "desktop"}))
     call_id = body["journal"]["callId"]
     assert body["journal"]["enabled"] is True and call_id.startswith("call_")
     start = talk_call_journal.read(call_id)[0]
     assert start["lane"] == "desktop" and start["engine"]["auth"] == "configured"
+    assert start["engine"]["provider"] == "openai"
     assert RAW_KEY not in serialized(start)
 
     events = [{"kind": "user", "seq": 1, "text": "Bonjour"}]
@@ -706,4 +708,14 @@ def test_a_malformed_journal_switch_refuses_before_the_mint(minted, monkeypatch)
     with pytest.raises(api.HTTPException) as raised:
         call(api.create_session, FakeRequest(body={}))
     assert raised.value.status_code == 400
+    assert "auth_token" not in minted
+
+
+def test_invalid_journal_retention_refuses_before_the_mint(minted, monkeypatch):
+    monkeypatch.setenv("TALK_CALL_JOURNAL", "1")
+    monkeypatch.setenv("TALK_CALL_JOURNAL_DAYS", "never")
+    with pytest.raises(api.HTTPException) as raised:
+        call(api.create_session, FakeRequest(body={}))
+    assert raised.value.status_code == 400
+    assert "TALK_CALL_JOURNAL_DAYS" in str(raised.value.detail)
     assert "auth_token" not in minted

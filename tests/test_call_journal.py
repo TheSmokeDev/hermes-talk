@@ -108,6 +108,7 @@ def test_events_are_appended_bounded_redacted_and_ordered():
         [{"kind": "user", "seq": 0, "text": "x"}],
         [{"kind": "user", "seq": True, "text": "x"}],
         [{"kind": "audio", "seq": 1}],
+        [{"kind": [], "seq": 1}],
         "not a list",
     ],
 )

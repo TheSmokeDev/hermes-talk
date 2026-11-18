@@ -550,7 +550,11 @@ async def create_session(request: Request) -> dict:
     try:
         # Resolved before the mint so a malformed switch refuses without
         # spending a credential. Bound calls keep their canonical history.
-        journal = bound is None and talk_call_journal.enabled()
+        journal_days = (
+            talk_call_journal.retention_days()
+            if bound is None and talk_call_journal.enabled()
+            else None
+        )
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
@@ -617,10 +621,10 @@ async def create_session(request: Request) -> dict:
         # and plays the PCM that comes back.
         "voiceMode": voice_mode,
     }
-    if journal:
+    if journal_days is not None:
         surface = body.get("surface")
         engine = {
-            "provider": talk_config.talk_provider(),
+            "provider": "openai",
             "model": descriptor.model,
             "voice": descriptor.voice or None,
             "voice_mode": voice_mode,
@@ -630,8 +634,9 @@ async def create_session(request: Request) -> dict:
             call_id = await asyncio.to_thread(
                 talk_call_journal.start,
                 engine=engine,
-                lane=surface if surface in {"desktop", "dashboard"} else "browser",
+                lane=surface if surface in ("desktop", "dashboard") else "browser",
                 host_session_id=body.get("host_session_id"),
+                days=journal_days,
             )
         except OSError:
             # The call itself is healthy; say plainly that it is not journaled.
