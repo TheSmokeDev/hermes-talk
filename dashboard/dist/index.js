@@ -873,6 +873,53 @@ function createTalkSurface(SDK) {
    * PCM24k that comes back plays through an AudioContext. The ElevenLabs key
    * never touches this page — the server owns it.
    */
+  /**
+   * Opt-in call journal (TALK_CALL_JOURNAL). The mint created the journal and
+   * handed back its id; this page only reports FINAL text and event metadata,
+   * batched, in order. Delivery is best-effort: a failed post never touches
+   * the audio, and the server keeps every line it already accepted.
+   */
+  class CallJournal {
+    constructor(callId) {
+      this.callId = callId;
+      this.seq = 0;
+      this.queue = [];
+      this.timer = null;
+      this.tail = Promise.resolve();
+      this.failures = 0;
+      this.closed = false;
+    }
+
+    add(kind, fields) {
+      if (this.closed || !this.callId) return;
+      const event = Object.assign({ kind: kind, seq: ++this.seq, client_ts: Date.now() }, fields || {});
+      if (typeof event.text === "string" && event.text.length > 8000) event.text = event.text.slice(0, 8000);
+      this.queue.push(event);
+      if (this.queue.length >= 32) this.flush();
+      else if (!this.timer) this.timer = window.setTimeout(() => this.flush(), 400);
+    }
+
+    flush() {
+      if (this.timer) { window.clearTimeout(this.timer); this.timer = null; }
+      if (!this.queue.length) return this.tail;
+      const events = this.queue.splice(0, 64);
+      this.tail = this.tail.then(() => apiPost("/journal", { call_id: this.callId, events: events }, 8000))
+        .catch((err) => {
+          this.failures += 1;
+          if (this.failures === 1) globalThis.console?.warn?.("[hermes-talk] call journal write failed", errorText(err));
+        });
+      if (this.queue.length) return this.flush();
+      return this.tail;
+    }
+
+    end(reason) {
+      if (this.closed) return;
+      this.add("call_end", reason ? { status: reason } : {});
+      this.closed = true;
+      void this.flush();
+    }
+  }
+
   class TalkTransport {
     constructor(session, callbacks) {
       this.session = session;
@@ -915,6 +962,8 @@ function createTalkSurface(SDK) {
       // One receipt per session for a relay that failed for a real reason.
       this.cascadeFailureLogged = false;
       this.task = session && session.task ? new TaskContinuity(this, session.task) : null;
+      const journalId = session && session.journal && session.journal.callId;
+      this.journal = !this.task && typeof journalId === "string" ? new CallJournal(journalId) : null;
     }
 
     async start() {
@@ -1023,6 +1072,7 @@ function createTalkSurface(SDK) {
     }
 
     stop(beforeTaskClose) {
+      if (this.journal && !this.closed) this.journal.end();
       this.closed = true;
       if (this.startAbort) this.startAbort.abort();
       this.startAbort = null;
@@ -1133,6 +1183,7 @@ function createTalkSurface(SDK) {
         id: clientId("item_"), type: "message", role: "user", content: [{ type: "input_text", text: text.trim() }],
       } });
       this.cb.onTranscript("user", text.trim(), true);
+      if (this.journal) this.journal.add("user", { text: text.trim(), source: "typed" });
       this.send({ type: "response.create" });
       return true;
     }
@@ -1180,6 +1231,9 @@ function createTalkSurface(SDK) {
         case "conversation.item.input_audio_transcription.completed":
           if (this.task) { this.task.voice(event); return; }
           if (event.transcript) this.cb.onTranscript("user", event.transcript, true);
+          if (event.transcript && this.journal) {
+            this.journal.add("user", { text: event.transcript, item_id: event.item_id, source: "voice" });
+          }
           return;
         case "response.output_audio_transcript.delta":
           if (event.delta) this.cb.onTranscript("assistant", event.delta, false);
@@ -1187,6 +1241,9 @@ function createTalkSurface(SDK) {
         case "response.output_audio_transcript.done":
           if (this.task && event.transcript) this.task.final(event, event.transcript);
           if (event.transcript) this.cb.onTranscript("assistant", event.transcript, true);
+          if (event.transcript && this.journal) {
+            this.journal.add("assistant", { text: event.transcript, item_id: event.item_id });
+          }
           return;
         case "response.output_text.delta":
           // Cascade sessions: the model's answer arrives as TEXT, not audio.
@@ -1198,6 +1255,7 @@ function createTalkSurface(SDK) {
           const text = typeof event.text === "string" ? event.text : "";
           if (this.task && text) this.task.final(event, text);
           if (text) this.cb.onTranscript("assistant", text, true);
+          if (text && this.journal) this.journal.add("assistant", { text: text, item_id: event.item_id });
           if (this.cascade) {
             this.cascadeSend({ done: text });
             this.finishCascadeStream();
@@ -1210,8 +1268,12 @@ function createTalkSurface(SDK) {
           this.responseActive = true;
           this.cb.onStatus("Thinking…");
           return;
-        case "response.done":
+        case "response.done": {
           this.responseActive = false;
+          const doneStatus = event.response && event.response.status;
+          if (this.journal && doneStatus && doneStatus !== "completed") {
+            this.journal.add("response_done", { status: doneStatus });
+          }
           // A response that ends with its text stream still open was
           // interrupted upstream; its half-spoken answer dies with it.
           if (this.cascade && this.cascadeReq && this.cascadeReq.sink) this.abortCascade();
@@ -1219,12 +1281,14 @@ function createTalkSurface(SDK) {
           else this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
+        }
         case "output_audio_buffer.started":
         case "output_audio_buffer.stopped":
         case "output_audio_buffer.cleared":
           if (this.task) void this.task.presentation.drain();
           return;
         case "input_audio_buffer.speech_started":
+          if (this.journal && this.responseActive) this.journal.add("interrupted", { status: "barge_in" });
           if (this.task) {
             this.task.presentation.interrupt();
             if (this.responseActive || this.task.timing.nativePlaying) this.clearPlayback();
@@ -1270,6 +1334,7 @@ function createTalkSurface(SDK) {
         code: diagnostic(error?.code), param: diagnostic(error?.param),
       });
       const code = diagnostic(error?.code), param = diagnostic(error?.param);
+      if (this.journal) this.journal.add("error", { status: code, text: detail || "Realtime error." });
       this.cb.onError(detail ? "Realtime error [" + code + ";" + param + "]: " + detail : "Realtime error.");
     }
 
@@ -1589,6 +1654,8 @@ function createTalkSurface(SDK) {
         /* a malformed arguments blob executes with {} */
       }
       this.cb.onStatus("Using " + name + "…");
+      const journal = binding ? null : this.journal;
+      if (journal) journal.add("tool_call", { tool: name, tool_call_id: callId, text: JSON.stringify(args) });
       let output, selection;
       try {
         let res;
@@ -1621,6 +1688,15 @@ function createTalkSurface(SDK) {
       } catch (err) {
         if (binding) { this.task.report(errorText(err)); return null; }
         output = name + " failed: " + errorText(err);
+      }
+      if (journal) {
+        let sessionId;
+        try {
+          const parsed = JSON.parse(output);
+          if (parsed && typeof parsed.session_id === "string") sessionId = parsed.session_id;
+        } catch (e) { /* plain-text tool output */ }
+        if (!sessionId && typeof args.session_id === "string") sessionId = args.session_id;
+        journal.add("tool_result", { tool: name, tool_call_id: callId, session_id: sessionId, text: output });
       }
       return {
         output: output,
@@ -2419,6 +2495,10 @@ function createTalkSurface(SDK) {
           if (epoch !== connectionEpoch.current || controller.signal.aborted) return;
         }
         const body = voice ? { voice: voice } : {};
+        body.surface = SDK.desktopOwner ? "desktop" : "dashboard";
+        if (SDK.desktopOwner && SDK.desktopOwner.storedSessionId) {
+          body.host_session_id = String(SDK.desktopOwner.storedSessionId);
+        }
         if (targetId) body.task = { target_id: targetId, tab_id: tabId.current,
           page_reference: pageReference() };
         const session = await apiCall("/session", {

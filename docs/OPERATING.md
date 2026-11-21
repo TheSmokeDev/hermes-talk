@@ -348,12 +348,35 @@ one of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
 `talk_live_config.py`. Live and native task variables are grouped in
 [the Live guide](GPT-LIVE.md#choose-billing-and-voice).
 
+### Experimental plugin settings
+
+Open **Hermes → Plugins → Hermes Talk → Settings** on a host that supports
+plugin settings. Ordinary Talk starts with the same defaults.
+
+- **Call journal** starts off. Turn it on before a new standalone dashboard
+  or Desktop Realtime call to save its text. Read it with `hermes talk journal`.
+- **Voice language** starts on **Auto**. Pick a language to guide OpenAI
+  transcription and replies for new calls. Auto uses the usual voice behavior
+  or any language overrides explicitly set in the environment.
+- **Use saved Echo** starts off. To use a compatible Echo, turn it on, enter
+  its local address, then run `hermes talk echo` when you want it. You can also
+  run `hermes talk echo HOST` to choose an address for that launch.
+
+On a dashboard with host-verified sign-in, that sign-in opens Talk. A server
+owner can explicitly require a separate Talk password with
+`TALK_DASHBOARD_TOKEN`.
+
 ### Session
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
+| `TALK_CALL_JOURNAL` | off | `1` or `on` keeps a **text-only** journal for dashboard or Desktop Realtime calls without a bound task. The Hermes host writes final utterances, interruptions, tool calls and results, errors and hang-up events to `$HERMES_HOME/state/talk-calls/<call_id>.jsonl`. Read it with `hermes talk journal`. A saved Call journal switch in Hermes Talk plugin settings takes precedence. |
+| `TALK_CALL_JOURNAL_DAYS` | `30` | Days a call journal is kept (1–3650). The host prunes older journals whenever a dashboard or Desktop call starts, even with the journal off; a malformed value skips pruning with a log line and refuses only a journaled call. |
+| `TALK_TRANSCRIPTION_LANGUAGES` | unset | Comma-separated ISO 639-1/639-3 codes the operator speaks, e.g. `fr` or `fr,en` (OpenAI lanes). One code rides the transcription `language` field; several are sent as `languages` only to `gpt-live-transcribe` models and otherwise left to automatic detection (put the hint in the prompt below). **Fail-closed**: a malformed code refuses at mint. Unset sends no hint — the payload is byte-identical to before the knob. |
+| `TALK_TRANSCRIPTION_PROMPT` | unset | One-line context for the input transcriber (≤ 1000 characters): vocabulary, names, "mostly French, sometimes English". A hint, never required output. `hermes talk doctor` reports its length, never its text. |
+| `TALK_REPLY_LANGUAGE` | unset | Language **name** the voice speaks to the operator in (`French`, `français`). Adds one sentence after the preamble; function-call arguments and delegation briefs stay unconstrained. Letters, spaces, apostrophes and hyphens only (≤ 40), so the value cannot become a second instruction channel. Unset keeps the prompt byte-identical. |
 | `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, `gemini`, or `local` (a self-hosted server; see [LOCAL.md](LOCAL.md)). **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
 | `TALK_GROK_VOICE` | `ara` | **Fail-closed** against all 28 built-in [Grok voices](PROVIDERS.md#provider-details--openai-default-grok-or-gemini), including `carina`, `zagan`, `luna`, and `liora`. Case-insensitive friendly names only — the wire prefix is the adapter's job. |
@@ -816,6 +839,52 @@ or through a voice-server reconnect) while a session is live, the bridge
 is left pointing at the old connection and the call goes quiet — it
 fails to silence, never to a wrong answer. Say `/talk leave` and rejoin.
 Tracked as [#8](https://github.com/TheSmokeDev/hermes-talk/issues/8).
+
+## Amazon Echo — hassmic over Wyoming
+
+`hermes talk echo HOST` puts the session on an Amazon Echo running
+[echo-dot-assist](https://github.com/Gamer92000/echo-dot-assist)'s
+hassmic, with no Home Assistant between. The Echo keeps Amazon's echo
+canceller, beamforming and wake word engine; Talk is the Wyoming client
+that Home Assistant would otherwise be. Each wake word starts one session
+on the Echo's microphone and speaker, and the session ends after `--idle`
+seconds with nobody speaking and nothing playing.
+
+On the Echo, in `/data/local/hassmic/hassmic.conf`:
+
+```bash
+PROTO=wyoming
+ARGS="-D"
+```
+
+`-D` keeps the microphone streaming while a reply plays, so you can talk
+over it. Without it hassmic stops the microphone at the first reply and
+each wake word gives one exchange.
+
+On the Hermes host:
+
+```bash
+hermes talk echo 192.168.1.50              # the Echo's address
+hermes talk echo 192.168.1.50 --idle 30    # end after 30 s of quiet (default 20)
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--port` | `16700` | hassmic's Wyoming port |
+| `--idle` | `20` | seconds of quiet before the session ends |
+| `--barge-in-level` | `0.02` | while the Echo speaks, microphone chunks quieter than this RMS are replaced with silence. Raise it if the session answers its own replies, lower it if talking over a reply is not heard |
+
+Each session ends with one line on the microphone level while the Echo
+spoke and otherwise, which is what to tune `--barge-in-level` from.
+
+The Hermes host connects to the Echo, so the only network rule needed is TCP
+16700 from the host to the Echo. A dropped link is retried with backoff
+(1 s up to 30 s).
+
+Boundaries: Wyoming is plain TCP with no authentication, so keep the Echo
+and the host on a network you trust. The Echo hears a room, not a person:
+like the terminal lane, the session treats whoever speaks as the operator,
+and there is no per-speaker authorization as there is on Discord.
 
 ## Dashboard tab
 

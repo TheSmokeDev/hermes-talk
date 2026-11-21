@@ -44,6 +44,7 @@ try:
         talk_approvals,
         talk_audio,
         talk_auth,
+        talk_call_journal,
         talk_capabilities,
         talk_cascade_voice,
         talk_check,
@@ -75,6 +76,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_approvals
     import talk_audio
     import talk_auth
+    import talk_call_journal
     import talk_capabilities
     import talk_cascade_voice
     import talk_check
@@ -1645,6 +1647,7 @@ async def run_talk_session(
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
         capabilities=talk_capabilities.instruction_section(catalog_snapshot),
+        reply_language=talk_config.reply_language(),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
@@ -2430,6 +2433,23 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         default=None,
         help="check this live provider instead of TALK_PROVIDER (this process only)",
     )
+    journal = commands.add_parser(
+        "journal",
+        help="Read opt-in call journals (TALK_CALL_JOURNAL): list calls or print one as Markdown",
+    )
+    journal.add_argument(
+        "journal_call_id",
+        nargs="?",
+        default=None,
+        metavar="CALL_ID",
+        help="print this call as Markdown; omit to list recent calls",
+    )
+    journal.add_argument(
+        "--json",
+        action="store_true",
+        dest="journal_json",
+        help="emit the call list, or the call's raw events, as JSON",
+    )
     diagnostics = commands.add_parser(
         "diagnostics",
         help=(
@@ -2455,7 +2475,61 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
             "Talk state directory) and print where it went"
         ),
     )
+    echo = commands.add_parser(
+        "echo",
+        help="Serve an Echo running hassmic (Wyoming): each wake word is a Talk session",
+    )
+    echo.add_argument(
+        "echo_host", nargs="?", metavar="HOST", help="the Echo address or the saved speaker"
+    )
+    echo.add_argument("--port", dest="echo_port", type=int, default=16700,
+                      help="hassmic's Wyoming port (default 16700)")
+    echo.add_argument("--idle", dest="echo_idle", type=float, default=20.0, metavar="SECONDS",
+                      help="end a session after this long with nobody speaking (default 20)")
+    echo.add_argument("--barge-in-level", dest="echo_barge_in", type=float, default=0.02,
+                      metavar="RMS", help="mic level that may talk over the Echo (default 0.02)")
     subparser.set_defaults(talk_command="session")
+
+
+def _journal_entry(call_id: str | None, json_output: bool) -> int:
+    """``hermes talk journal [CALL_ID] [--json]`` (read-only)."""
+
+    try:
+        if call_id is None:
+            calls = talk_call_journal.list_calls()
+            if json_output:
+                print(json.dumps({"calls": calls}, ensure_ascii=False, indent=2))
+            elif not calls:
+                state = "on" if _journal_switch() else (
+                    'off (turn on "Experimental · Call journal" in Hermes Talk '
+                    "plugin settings, or set TALK_CALL_JOURNAL=1)"
+                )
+                print(f"No call journal yet. TALK_CALL_JOURNAL is {state}.")
+            else:
+                for row in calls:
+                    sessions = ", ".join(row["sessions"]) or "-"
+                    end = "" if row["ended"] else "  (no call_end)"
+                    print(
+                        f"{row['call_id']}  {row['started']}  "
+                        f"{row['engine'].get('model') or '?'}  events={row['events']}  "
+                        f"sessions={sessions}{end}"
+                    )
+            return 0
+        if json_output:
+            print(json.dumps(talk_call_journal.read(call_id), ensure_ascii=False, indent=2))
+        else:
+            print(talk_call_journal.render_markdown(call_id), end="")
+        return 0
+    except talk_call_journal.JournalError as exc:
+        print(f"hermes talk journal: {exc}", file=sys.stderr)
+        return 1
+
+
+def _journal_switch() -> bool:
+    try:
+        return talk_call_journal.enabled()
+    except talk_config.TalkConfigError:
+        return False
 
 
 def cli_entry(
@@ -2512,6 +2586,31 @@ def cli_entry(
         if code:
             raise SystemExit(code)
         return 0
+    if command == "journal":
+        code = _journal_entry(
+            getattr(args, "journal_call_id", None), bool(getattr(args, "journal_json", False))
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "echo":
+        address = args.echo_host
+        if address is None:
+            saved = talk_config.plugin_setting("echo_address")
+            if talk_config.plugin_setting("echo_enabled") is True and isinstance(saved, str):
+                address = saved.strip()
+            if not address:
+                raise SystemExit(
+                    "Specify an Echo address or enable Use saved Echo and set its address "
+                    "in Hermes Talk plugin settings."
+                )
+        try:
+            from . import talk_echo
+        except ImportError:  # pragma: no cover - flat-module fallback
+            import talk_echo
+        return talk_echo.cli_entry(
+            address, args.echo_port, args.echo_idle, args.echo_barge_in
+        )
     if command == "diagnostics":
         bundle = getattr(args, "diagnostics_bundle", None)
         code = talk_diagnostics.cli_entry(

@@ -131,3 +131,42 @@ def test_plugin_manifest_does_not_block_codex_oauth_only_installs():
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
 
     assert "requires_env:" not in manifest
+
+
+#: The ``type`` names the Hermes plugin manifest loader knows
+#: (``hermes_cli.plugins_manifest._CONFIG_SCHEMA_TYPES``). Any other name logs a
+#: warning on every plugin load; a ``str`` with ``choices`` renders as a picker.
+HERMES_CONFIG_SCHEMA_TYPES = frozenset({
+    "str", "string", "int", "integer", "float", "number", "bool", "boolean",
+    "list", "array", "dict", "object", "secret",
+})
+
+
+@pytest.fixture(scope="module")
+def config_schema() -> dict:
+    import yaml
+
+    plugin = yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    return plugin["config_schema"]
+
+
+def test_experimental_settings_ship_off_and_on_auto(config_schema):
+    """Pressing Talk behaves exactly as before until the operator opts in."""
+
+    import talk_config
+
+    assert config_schema["journal_enabled"]["default"] is False
+    assert config_schema["echo_enabled"]["default"] is False
+    language = config_schema["voice_language"]
+    assert language["default"] == "Auto"
+    assert set(language["choices"]) == {"Auto", *talk_config._EXPERIMENTAL_LANGUAGE_CODES}
+
+
+def test_every_setting_declares_a_type_the_hermes_loader_knows(config_schema):
+    unknown = {
+        key: spec.get("type")
+        for key, spec in config_schema.items()
+        if str(spec.get("type", "str")).lower() not in HERMES_CONFIG_SCHEMA_TYPES
+    }
+    assert unknown == {}
+    assert config_schema["voice_language"]["type"] == "str"

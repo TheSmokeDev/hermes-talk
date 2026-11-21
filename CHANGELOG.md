@@ -13,6 +13,40 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Experimental controls in Hermes Talk plugin settings for a saved Echo,
+  the text-only call journal, and voice language. New users start with Echo
+  and Journal off and language on Auto.
+- Opt-in call journal (`TALK_CALL_JOURNAL=1`). A dashboard or Desktop Realtime
+  call without a bound task leaves a text-only JSONL record on the Hermes host:
+  final utterances on both sides, barge-ins, tool calls and results, the
+  sessions it created, errors and the hang-up — written as the call happens.
+  `hermes talk journal` lists calls and prints one as Markdown. Retention is
+  bounded (`TALK_CALL_JOURNAL_DAYS`, default 30). Off by default.
+  Contributed by @Philibergus.
+- `hermes talk echo HOST` uses an Amazon Echo running echo-dot-assist's hassmic
+  in Wyoming mode as an optional Talk surface. Each wake word starts a session
+  on the Echo's microphone and speaker. The session ends after `--idle` seconds
+  of quiet. Full duplex needs hassmic's `-D`. Experimental: not yet confirmed
+  on physical Echo hardware. Thanks to
+  [@patrickhaahr](https://github.com/patrickhaahr).
+- Spoken-language knobs for OpenAI sessions: `TALK_TRANSCRIPTION_LANGUAGES`
+  (ISO codes for the input transcriber), `TALK_TRANSCRIPTION_PROMPT` (one-line
+  transcription context) and `TALK_REPLY_LANGUAGE` (the language the voice
+  answers in). A short greeting no longer gets answered in a guessed language.
+  All three are fail-closed, resolved at call time, and leave the wire and the
+  prompt byte-identical when unset. `hermes talk doctor` gains a `language`
+  check that reports the prompt's length, never its text. Contributed by @Philibergus.
+
+### Changed
+- In gated mode (dashboard sign-in engaged), a request the dashboard's own
+  sign-in already verified can open Talk. An explicit `TALK_DASHBOARD_TOKEN`
+  continues to protect deployments that configure one. The Talk
+  tab works right after signing in, on any browser of a private network, with
+  nothing to paste per tab. Cross-site requests (`Sec-Fetch-Site: cross-site`)
+  are still refused; loopback and token behaviour without a gate are unchanged.
+  Contributed by @Philibergus.
+
 ## [0.23.1] — 2026-11-17
 
 Fix the intermittent CI failure caused by a test worker finishing after its

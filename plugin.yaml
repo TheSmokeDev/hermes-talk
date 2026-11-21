@@ -23,6 +23,27 @@ provides_hooks:
   - pre_tool_call
   - pre_llm_call
 config_schema:
+  journal_enabled:
+    type: bool
+    default: false
+    label: "Experimental · Call journal"
+    description: Save text from standalone dashboard and Desktop Realtime calls. Off by default.
+  voice_language:
+    type: str
+    choices: [Auto, English, Spanish, French, German, Portuguese, Chinese, Japanese, Korean]
+    default: Auto
+    label: "Experimental · Voice language"
+    description: Auto follows the usual voice behavior. Choose a language to guide OpenAI transcription and replies on new calls.
+  echo_enabled:
+    type: bool
+    default: false
+    label: "Experimental · Use saved Echo"
+    description: Let the Echo command use your saved speaker. Echo only connects when you run the command.
+  echo_address:
+    type: str
+    default: ""
+    label: "Experimental · Echo address"
+    description: Hostname or local IP of a compatible Echo running hassmic. Used by hermes talk echo.
   phone_enabled:
     type: bool
     default: false
