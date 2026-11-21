@@ -253,7 +253,8 @@ class CascadeVoice:
     relay uses for provider audio; ``on_error`` takes one human sentence.
     ``on_stream_end`` is the relay-lane seam: a surface that streams one
     response's PCM back to a client (the dashboard route) needs to know when
-    that response's TTS run settled; the CLI and Discord lanes never subscribe.
+    that response's TTS run settled. The Discord lane subscribes too, so the
+    voice channel can play a reply's final partial frame.
     """
 
     def __init__(

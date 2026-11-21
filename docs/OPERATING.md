@@ -855,7 +855,8 @@ preserved even when the playback queue is full, and queued announcements can
 resume once the admitted audio drains. Canonical native and Live sessions use
 their output-completion events too. Barge-in discards pending audio and its
 boundary. Cascade TTS runs asynchronously: the provider's text-completion event
-does not signal that its audio has finished.
+does not signal that its audio has finished, so a cascade reply ends when its
+ElevenLabs stream settles instead.
 
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we

@@ -1791,12 +1791,17 @@ async def run_talk_session(
     # worker task running.
     cascade = None
     if cascade_config is not None:
+        # The provider's ResponseFinished arrives before the TTS audio, so a
+        # sink that holds a partial frame (Discord) is told the reply ended
+        # when its TTS stream settles instead.
+        finish_playback = getattr(audio, "finish_playback", None)
         cascade = talk_cascade_voice.CascadeVoice(
             api_key=cascade_config[0],
             voice_id=cascade_config[1],
             model=cascade_config[2],
             on_audio=audio.queue_playback,
             on_error=on_error,
+            on_stream_end=finish_playback if callable(finish_playback) else None,
             voice_settings=talk_config.elevenlabs_voice_settings(),
         )
     session = None
