@@ -1617,9 +1617,10 @@ async def run_talk_session(
 
     if delegated_binding is not None:
         try:
-            from . import talk_delegated
+            from . import talk_delegated, talk_hybrid
         except ImportError:
             import talk_delegated
+            import talk_hybrid
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
     # Start filling the capability catalog now so the instruction section below
@@ -1660,10 +1661,22 @@ async def run_talk_session(
     else:
         resume_control = None
 
+    host_catalog = []
     try:
+        if delegated_binding is not None and delegated_binding.hybrid:
+            catalog = await asyncio.to_thread(
+                delegated_binding.ctx.conversation_tools,
+                session_key=delegated_binding.session_key,
+                expected_session_id=delegated_binding.session_id,
+            )
+            if not catalog.get("ok"):
+                raise ValueError("The host refused the conversation tool catalog")
+            host_catalog = catalog["tools"]
         tools = (
             host_execution_attachment.tool_definitions()
             if host_execution_attachment is not None
+            else talk_hybrid.tools(host_catalog)
+            if delegated_binding is not None and delegated_binding.hybrid
             else talk_delegated.TOOLS if delegated_binding is not None
             else talk_tools.default_talk_tools(pausable=resume_control is not None)
         )
@@ -1698,6 +1711,7 @@ async def run_talk_session(
             # host carrying the core voice contract (hermes-talk#215).
             core_join=lane == "discord" and talk_core_realtime.core_provider_available(),
             delegated_work=delegated_binding is not None,
+            hybrid_work=delegated_binding is not None and delegated_binding.hybrid,
         )
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"talk: voice instructions could not be loaded ({type(exc).__name__})",
@@ -2053,7 +2067,11 @@ async def run_talk_session(
                         await announce_queue.put(QueuedAnnouncement(commands))
 
         delegated_relay = (
-            talk_delegated.SubmissionRelay(delegated_binding, authorization_ledger.authorize_tool)
+            (talk_hybrid.HybridRelay
+             if delegated_binding.hybrid else talk_delegated.SubmissionRelay)(
+                delegated_binding, authorization_ledger.authorize_tool,
+                **({"catalog": host_catalog} if delegated_binding.hybrid else {}),
+            )
             if delegated_binding is not None else None
         )
         tool_coordinator = ToolResponseCoordinator(

@@ -20,6 +20,11 @@ named rather than smoothed.
   Contributed by @tancou.
 
 ### Added
+- Experimental `/talk hybrid join` combines short host tool operations with native
+  background delegation in the current Discord conversation. Exact submitted turns
+  and native children have separate controls; background launch refuses inline
+  fallback. Requires the complementary host APIs; see `docs/hybrid-discord.md`.
+  Contributed by @tancou.
 - Opt-in `/talk delegate join` submits work to the current Discord conversation
   through the host's durable plugin submission API, keeps voice available, and
   brings exact turn results and background delegation updates into the call.

@@ -2361,7 +2361,8 @@ def start_session(
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
     if delegated_binding is not None:
-        return ("Starting same-chat delegated voice. Hermes automatic speech is off in this chat. "
+        mode = "hybrid" if delegated_binding.hybrid else "delegated"
+        return (f"Starting same-chat {mode} voice. Hermes automatic speech is off in this chat. "
                 "Use /talk status or /talk leave.")
     if native_task is not None:
         return "Starting canonical task voice; say `talk status` to check or `talk leave` to stop."

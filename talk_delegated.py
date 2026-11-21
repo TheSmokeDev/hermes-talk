@@ -65,9 +65,10 @@ class Binding:
     chat_id: str
     nonce: str = field(default_factory=lambda: uuid.uuid4().hex)
     guild_id: int | None = None
+    hybrid: bool = False
 
     @classmethod
-    def capture(cls, ctx, source, session_key, session_id, platform):
+    def capture(cls, ctx, source, session_key, session_id, platform, *, hybrid=False):
         if platform != "discord" or source is None or not session_key or not session_id:
             raise ValueError(
                 "Send Hermes a text message first, then use /talk delegate join in that chat."
@@ -76,6 +77,10 @@ class Binding:
             callable(getattr(ctx, name, None)) for name in ("submit_message", "submission_status")
         ):
             raise ValueError("This host does not provide plugin message submission and status.")
+        if hybrid and not all(callable(getattr(ctx, name, None)) for name in (
+            "control_submission", "conversation_tools", "execute_tools",
+        )):
+            raise ValueError("This host does not provide hybrid execution and submission controls.")
         user_id, chat_id = (
             str(getattr(source, "user_id", "") or ""),
             str(getattr(source, "chat_id", "") or ""),
@@ -95,6 +100,7 @@ class Binding:
             user_id,
             chat_id,
             guild_id=int(scope_id),
+            hybrid=hybrid,
         )
 
     def owns(self, source, session_key):

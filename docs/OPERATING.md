@@ -8,6 +8,9 @@ For GPT-Live subscription/API setup, Codex workers, task binding, the microphone
 acceptance matrix and rollback, use [GPT-LIVE.md](GPT-LIVE.md). The legacy
 provider checks below are not acceptance proof for those new capabilities.
 
+For experimental same-chat Discord execution, see [hybrid mode](hybrid-discord.md).
+It requires complementary host APIs and has separate approval and steering limits.
+
 ## Prerequisites
 
 - **Python ≥ 3.11** (the host's Python; `pyproject.toml` enforces it).
