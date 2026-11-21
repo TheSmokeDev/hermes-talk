@@ -840,7 +840,18 @@ function createTalkSurface(SDK) {
   }
 
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
+  /**
+   * True for a refusal that a pasted TALK_DASHBOARD_TOKEN can fix.
+   *
+   * The dashboard's `fetchJSON` throws an `ApiError` whose message is the
+   * route's `detail` text alone, with the HTTP code on `err.status`; only
+   * older hosts (and the Desktop IPC bridge) prefix the code to the message.
+   * Reading the message alone hid the token field on current dashboards, so a
+   * browser off loopback showed the refusal and no way to answer it.
+   */
   function isAuthError(err) {
+    const status = err && err.status;
+    if (status === 401 || status === 403) return true;
     return /^(401|403)\b/.test(String((err && err.message) || ""));
   }
 
@@ -3087,75 +3098,52 @@ function createTalkSurface(SDK) {
       refreshCatalog: () => { setCatalogReload((value) => value + 1); void refresh(); },
     });
 
-    return h("div", { className: "ht-page" },
-      h("div", { className: "ht-head" },
-        h("div", null,
-          h("h1", { className: "ht-title" }, "Talk"),
-          h("div", { className: "ht-sub" },
-            loading ? "Checking readiness…"
-              : ready ? "Ready via " + describeSource(status.source)
-              : (status && status.detail) || "Not configured"
-          )
-        ),
-        h("div", { className: "ht-actions" },
-          active || starting
-            ? h(C.Button, { onClick: stopTalk }, starting ? "Cancel connection" : "Stop")
-            : h(C.Button, { onClick: () => void startTalk(), disabled: !ready || loading ||
-                (status.voiceMode === "live" && !selectedTask) },
-                selectedTask ? "Join / resume task" : status && status.voiceMode === "live"
-                  ? "Start GPT-Live" : "Start legacy Talk")
-        )
-      ),
+    const startLabel = selectedTask ? "Join / resume task"
+      : status && status.voiceMode === "live" ? "Start GPT-Live" : "Start legacy Talk";
+    const orbLabel = active ? "Stop" : starting ? "Cancel connection" : startLabel;
+    const statusLine = loading ? "Checking readiness…" : starting ? "Connecting…"
+      : live ? live : active ? "Connected"
+      : ready ? startLabel : (status && status.detail) || "Not configured";
+    const disclosure = (title, body, hint) => h("details", { className: "ht-disclosure" },
+      h("summary", null, title, hint && h("span", { className: "ht-summary-hint" }, hint)),
+      h("div", { className: "ht-disclosure-body" }, body));
 
-      h("div", { className: "ht-note" },
-        h("label", { className: "ht-field" }, "Target source",
-          h("select", { className: "ht-select", value: peerId, disabled: starting || switching, "aria-label": "Target source",
-            onChange: (e) => { setPeerId(e.target.value); setProfile(e.target.value === "local" ? "" : "default"); setSelectedTask(""); } },
-            h("option", { value: "local" }, "Local host"),
-            peers.filter((peer) => peer.peer_id !== "local").map((peer) =>
-              h("option", { key: peer.peer_id, value: peer.peer_id }, peer.label + " · " + peer.peer_id)))),
-        h("label", { className: "ht-field" }, peerId === "local" ? "Local profile" : "Remote profile (explicit name)",
-          peerId === "local" ? h("select", { className: "ht-select", value: profile, disabled: starting || switching, "aria-label": "Local profile",
-            onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } },
-            h("option", { value: "" }, "All authorized local profiles"),
-            localProfiles.map((name) => h("option", { key: name, value: name }, name)))
-            : h(C.Input, { value: profile, disabled: starting || switching, placeholder: "default", "aria-label": "Remote profile",
-              onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } })),
-        h("label", { className: "ht-field" }, "Task or Bot target",
-          h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
-            onChange: (e) => setSelectedTask(e.target.value) },
-            h("option", { value: "", disabled: active }, status && status.voiceMode === "live"
-              ? "Choose a task for GPT-Live" : "Legacy unbound Talk (no task history)"),
-            tasks.map((task) => {
-              const id = task.target_id;
-              return id && h("option", { key: id, value: id,
-                disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
-                targetLabel(task));
-            }))),
-        h("div", { className: "ht-token-row" },
-          bound && h(C.Button, { disabled: !selectedTask || starting || switching,
-            onClick: () => void switchTarget({ target_id: selectedTask }) }, "Switch target"),
-          bound && h(C.Button, { disabled: returnDepth < 1 || starting || switching,
-            onClick: () => void switchTarget({ back: true }) }, "Return to previous (" + returnDepth + ")"),
-          h(C.Button, { disabled: starting || switching,
-            onClick: () => setCatalogReload((value) => value + 1) }, "Refresh targets / selection"),
-          switching && h(C.Button, { onClick: () => cancelSwitch() }, "Cancel switch")),
-        bound && h("form", { className: "ht-token-row", onSubmit: (event) => {
-          event.preventDefault(); void switchTarget({ reference: reference, peer_id: peerId, profile: profile });
-        } }, h(C.Input, { value: reference, disabled: starting || switching, placeholder: "Exact target name",
-          "aria-label": "Target reference", onChange: (e) => setReference(e.target.value) }),
-          h(C.Button, { type: "submit", disabled: !reference.trim() || starting || switching }, "Find and switch")),
-        choices.length > 0 && h("div", { className: "ht-out" }, "Choose a target:",
-          choices.map((choice) => h(C.Button, { key: choice.target_id, disabled: starting || switching,
-            onClick: () => void switchTarget({ target_id: choice.target_id }) }, targetLabel(choice)))),
-        selection && selection.current && !taskState && h("div", { className: "ht-out" },
-          "Saved selection: " + targetLabel(selection.current)),
-        selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
-        status && status.taskContinuity && !status.taskContinuity.supported &&
-          h("div", null, "Task continuity unavailable: " + status.taskContinuity.reason),
-        unavailable.map((item, index) => h("div", { key: index, className: "ht-out" },
-          item.peer_id + " / " + item.profile + ": " + item.reason)),
-        catalogError && h("div", { className: "ht-error" }, "Target list unavailable: " + catalogError)),
+    return h("div", { className: "ht-page" },
+      h("section", { className: "ht-hero",
+        "data-state": active ? "live" : starting ? "connecting" : ready ? "idle" : "off" },
+        h("div", { className: "ht-orb-wrap" },
+          h("span", { className: "ht-orb-halo", "aria-hidden": true }),
+          h("button", { type: "button", className: "ht-orb", title: orbLabel,
+            onClick: active || starting ? stopTalk : () => void startTalk(),
+            disabled: !(active || starting) && Boolean(!ready || loading ||
+              (status.voiceMode === "live" && !selectedTask)) },
+          h("span", { className: "ht-sr" }, orbLabel))),
+        h("div", { className: "ht-hero-text" },
+          h("div", { className: "ht-head" },
+            h("h1", { className: "ht-title" }, "Talk"),
+            status && status.source && h("span", { className: "ht-badge", "data-live": String(active),
+              title: "Voice provider" }, describeSource(status.source))),
+          h("div", { className: "ht-sub", role: "status" }, statusLine),
+          h("div", { className: "ht-target-row" },
+            h("label", { className: "ht-field" }, "Task or Bot target",
+              h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
+                onChange: (e) => setSelectedTask(e.target.value) },
+                h("option", { value: "", disabled: active }, status && status.voiceMode === "live"
+                  ? "Choose a task for GPT-Live" : "Legacy unbound Talk (no task history)"),
+                tasks.map((task) => {
+                  const id = task.target_id;
+                  return id && h("option", { key: id, value: id,
+                    disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
+                    targetLabel(task));
+                }))),
+            bound && h(C.Button, { disabled: !selectedTask || starting || switching,
+              onClick: () => void switchTarget({ target_id: selectedTask }) }, "Switch target"),
+            bound && h(C.Button, { disabled: returnDepth < 1 || starting || switching,
+              onClick: () => void switchTarget({ back: true }) }, "Return to previous (" + returnDepth + ")"),
+            switching && h(C.Button, { onClick: () => cancelSwitch() }, "Cancel switch")))),
+
+      catalogError && h("div", { className: "ht-error" }, "Target list unavailable: " + catalogError),
+      error && h("div", { className: "ht-error", role: "alert" }, error),
 
       needsToken && h("div", { className: "ht-note ht-note-warn" },
         h("div", { className: "ht-note-title" }, "This dashboard needs the hermes-talk token"),
@@ -3173,28 +3161,112 @@ function createTalkSurface(SDK) {
         )
       ),
 
-      h("div", { className: "ht-metrics" },
-        h(Metric, { label: "Auth", value: status ? describeSource(status.source) : "…" }),
-        h(Metric, { label: "Model", value: (status && status.model) || "…" }),
-        h(Metric, {
-          label: "Session",
-          value: active ? "live" : starting ? "connecting" : "idle",
-        }),
-        h(Metric, {
-          // Tri-state string from the backend: "attached" | "api-server" |
-          // "out of process". Rendered verbatim — it was a bool before, so a
-          // truthiness test here would read "out of process" as attached.
-          label: "Agent loop",
-          value: (status && status.agentLoop) || "…",
-        })
+      h("form", { className: "ht-token-row ht-compose", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
+        h(C.Input, { value: typed, disabled: sending || switching, placeholder: "Type to this Talk connection",
+          "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
+        h(C.Button, { type: "submit", disabled: !canSendTyped || !typed.trim() }, sending ? "Staging…" : "Send")),
+      inputError && h("div", { role: "alert", className: "ht-error" }, inputError),
+
+      h("div", { className: "ht-grid" },
+        h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, taskState ? "Live captions (not canonical history)" : "Transcript"),
+          transcript.length === 0
+            ? h("div", { className: "ht-empty" }, "No transcript yet. Start a session and speak.")
+            : transcript.map((row) =>
+                h("div", { key: row.id, className: "ht-row" },
+                  h("div", { className: "ht-role" },
+                    (row.role === "user" ? "You" : "Hermes") + (row.final ? "" : " …")),
+                  h("div", { className: "ht-text" }, row.text)))
+        ),
+        taskState ? h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, "Task jobs"),
+          !(taskState.jobs || []).length && h("div", { className: "ht-empty" }, "Nothing running."),
+          (taskState.jobs || []).map((job) => h("div", { key: job.run_id, className: "ht-row",
+            id: "ht-job-" + encodeURIComponent(job.run_id) },
+            h("div", { className: "ht-role" },
+              h("span", { className: "ht-status ht-status-" + job.status }, job.status),
+              " run " + job.run_id + " · action " + job.action_id),
+            h("div", { className: "ht-text" }, job.goal),
+            h("div", { className: "ht-out" }, steeringLabel(job.steering)),
+            h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
+            job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
+            results[job.run_id] && h("div", null,
+              h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
+              results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
+              h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
+              (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
+                h("div", { key: index },
+                  h("div", { className: "ht-role" }, "Artifact changes"),
+                  h("pre", { className: "ht-out" }, JSON.stringify(artifact, null, 2))))),
+            results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport."))))
+        : h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, "Background runs"),
+          runs.length === 0
+            ? h("div", { className: "ht-empty" }, "Nothing running.")
+            : runs.map((run) =>
+                h("div", { key: run.runId, className: "ht-row" },
+                  h("div", { className: "ht-role" },
+                    h("span", { className: "ht-status ht-status-" + run.status }, run.status),
+                    " run " + run.runId + " · " + (run.kind || "?")),
+                  h("div", { className: "ht-text" }, run.label || ""),
+                  run.output && h("div", { className: "ht-out" }, run.output)))
+        )
       ),
 
-      (status && status.voiceMode) === "cascade"
-        ? h("div", { className: "ht-field" },
-            h("div", { className: "ht-note" },
-              "Custom voice: the cascade speaks through ElevenLabs " +
-              "(TALK_ELEVENLABS_VOICE_ID on the server); the provider voice " +
-              "select sits out cascade sessions."))
+      disclosure("Target and connection", h(React.Fragment, null,
+        h("div", { className: "ht-token-row" },
+          h("label", { className: "ht-field" }, "Target source",
+            h("select", { className: "ht-select", value: peerId, disabled: starting || switching, "aria-label": "Target source",
+              onChange: (e) => { setPeerId(e.target.value); setProfile(e.target.value === "local" ? "" : "default"); setSelectedTask(""); } },
+              h("option", { value: "local" }, "Local host"),
+              peers.filter((peer) => peer.peer_id !== "local").map((peer) =>
+                h("option", { key: peer.peer_id, value: peer.peer_id }, peer.label + " · " + peer.peer_id)))),
+          h("label", { className: "ht-field" }, peerId === "local" ? "Local profile" : "Remote profile (explicit name)",
+            peerId === "local" ? h("select", { className: "ht-select", value: profile, disabled: starting || switching, "aria-label": "Local profile",
+              onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } },
+              h("option", { value: "" }, "All authorized local profiles"),
+              localProfiles.map((name) => h("option", { key: name, value: name }, name)))
+              : h(C.Input, { value: profile, disabled: starting || switching, placeholder: "default", "aria-label": "Remote profile",
+                onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } }))),
+        h("div", { className: "ht-token-row" },
+          h(C.Button, { disabled: starting || switching,
+            onClick: () => setCatalogReload((value) => value + 1) }, "Refresh targets / selection")),
+        bound && h("form", { className: "ht-token-row", onSubmit: (event) => {
+          event.preventDefault(); void switchTarget({ reference: reference, peer_id: peerId, profile: profile });
+        } }, h(C.Input, { value: reference, disabled: starting || switching, placeholder: "Exact target name",
+          "aria-label": "Target reference", onChange: (e) => setReference(e.target.value) }),
+          h(C.Button, { type: "submit", disabled: !reference.trim() || starting || switching }, "Find and switch")),
+        choices.length > 0 && h("div", { className: "ht-out" }, "Choose a target:",
+          choices.map((choice) => h(C.Button, { key: choice.target_id, disabled: starting || switching,
+            onClick: () => void switchTarget({ target_id: choice.target_id }) }, targetLabel(choice)))),
+        selection && selection.current && !taskState && h("div", { className: "ht-out" },
+          "Saved selection: " + targetLabel(selection.current)),
+        selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
+        status && status.taskContinuity && !status.taskContinuity.supported &&
+          h("div", { className: "ht-out" }, "Task continuity unavailable: " + status.taskContinuity.reason),
+        unavailable.map((item, index) => h("div", { key: index, className: "ht-out" },
+          item.peer_id + " / " + item.profile + ": " + item.reason)),
+        h("div", { className: "ht-metrics" },
+          h(Metric, { label: "Auth", value: status ? describeSource(status.source) : "…" }),
+          h(Metric, { label: "Model", value: (status && status.model) || "…" }),
+          h(Metric, {
+            label: "Session",
+            value: active ? "live" : starting ? "connecting" : "idle",
+          }),
+          h(Metric, {
+            // Tri-state string from the backend: "attached" | "api-server" |
+            // "out of process". Rendered verbatim — it was a bool before, so a
+            // truthiness test here would read "out of process" as attached.
+            label: "Agent loop",
+            value: (status && status.agentLoop) || "…",
+          })
+        )), peerId === "local" ? "Local host" : peerId),
+
+      disclosure("Voice", (status && status.voiceMode) === "cascade"
+        ? h("div", { className: "ht-note" },
+            "Custom voice: the cascade speaks through ElevenLabs " +
+            "(TALK_ELEVENLABS_VOICE_ID on the server); the provider voice " +
+            "select sits out cascade sessions.")
         : h("label", { className: "ht-field" }, "Voice",
             h("select", {
               className: "ht-select",
@@ -3203,19 +3275,17 @@ function createTalkSurface(SDK) {
               onChange: (e) => setVoice(e.target.value),
             }, ((status && status.voices) || []).map((name) =>
               h("option", { key: name, value: name }, name)))
-          ),
+          ), (status && status.voiceMode) === "cascade" ? "ElevenLabs" : voice),
 
-      live && h("div", { className: "ht-live" }, live),
-      error && h("div", { className: "ht-error" }, error),
-
-      taskState && h("section", { className: "ht-card" },
-        h("label", { className: "ht-row" }, "Spoken updates for this task ",
-          h("select", { value: (taskState.preferences || {}).update_mode || "important",
+      taskState && disclosure("Task details", h(React.Fragment, null,
+        h("label", { className: "ht-field" }, "Spoken updates for this task",
+          h("select", { className: "ht-select", value: (taskState.preferences || {}).update_mode || "important",
             disabled: !active, "aria-label": "Task update frequency",
             onChange: (event) => void saveUpdatePreference(event.target.value) },
           h("option", { value: "important" }, "Completion and important updates"),
           h("option", { value: "completion" }, "Completion only"),
           h("option", { value: "frequent" }, "Include meaningful milestones"))),
+        h("section", { className: "ht-card" },
         h("div", { className: "ht-card-head" }, "Bound task and server context"),
         h("div", { className: "ht-row ht-text" },
           targetLabel(taskState.task || {}) + " · session: " + ((taskState.task || {}).session_id || "unavailable") + "\n" +
@@ -3267,55 +3337,7 @@ function createTalkSurface(SDK) {
               h("div", { className: "ht-out" }, "Origin: ",
                 h(originLink ? "a" : "span", originLink ? { href: originLink } : null, value(event.origin_turn_id)),
                 " · action: ", h(actionLink ? "a" : "span", actionLink ? { href: actionLink } : null, value(event.action_id))));
-          }),
-        h("div", { className: "ht-card-head" }, "Task jobs"),
-        (taskState.jobs || []).map((job) => h("div", { key: job.run_id, className: "ht-row",
-          id: "ht-job-" + encodeURIComponent(job.run_id) },
-          h("div", { className: "ht-role" }, job.status + " · run " + job.run_id + " · action " + job.action_id),
-          h("div", { className: "ht-text" }, job.goal),
-          h("div", { className: "ht-out" }, steeringLabel(job.steering)),
-          h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
-          job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
-          results[job.run_id] && h("div", null,
-            h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
-            results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
-            h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
-            (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
-              h("div", { key: index },
-                h("div", { className: "ht-role" }, "Artifact changes"),
-                h("pre", { className: "ht-out" }, JSON.stringify(artifact, null, 2))))),
-          results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport.")))),
-
-      h("form", { className: "ht-token-row", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
-        h(C.Input, { value: typed, disabled: sending || switching, placeholder: "Type to this Talk connection",
-          "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
-        h(C.Button, { type: "submit", disabled: !canSendTyped || !typed.trim() }, sending ? "Staging…" : "Send")),
-      inputError && h("div", { role: "alert", className: "ht-error" }, inputError),
-
-      h("div", { className: "ht-grid" },
-        h("section", { className: "ht-card" },
-          h("div", { className: "ht-card-head" }, taskState ? "Live captions (not canonical history)" : "Transcript"),
-          transcript.length === 0
-            ? h("div", { className: "ht-empty" }, "No transcript yet. Start a session and speak.")
-            : transcript.map((row) =>
-                h("div", { key: row.id, className: "ht-row" },
-                  h("div", { className: "ht-role" },
-                    (row.role === "user" ? "You" : "Hermes") + (row.final ? "" : " …")),
-                  h("div", { className: "ht-text" }, row.text)))
-        ),
-        !taskState && h("section", { className: "ht-card" },
-          h("div", { className: "ht-card-head" }, "Background runs"),
-          runs.length === 0
-            ? h("div", { className: "ht-empty" }, "Nothing running.")
-            : runs.map((run) =>
-                h("div", { key: run.runId, className: "ht-row" },
-                  h("div", { className: "ht-role" },
-                    h("span", { className: "ht-status ht-status-" + run.status }, run.status),
-                    " run " + run.runId + " · " + (run.kind || "?")),
-                  h("div", { className: "ht-text" }, run.label || ""),
-                  run.output && h("div", { className: "ht-out" }, run.output)))
-        )
-      )
+          }))), targetLabel(taskState.task || {}))
     );
   }
 

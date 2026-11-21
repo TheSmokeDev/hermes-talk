@@ -47,6 +47,13 @@ named rather than smoothed.
   are still refused; loopback and token behaviour without a gate are unchanged.
   Contributed by @Philibergus.
 
+### Fixed
+- The dashboard Talk tab shows the `TALK_DASHBOARD_TOKEN` field again on
+  current Hermes dashboards. Their `fetchJSON` throws an `ApiError` whose
+  message is the route's detail alone, with the HTTP code on `status`; the tab
+  only matched a `401`/`403` prefix in the message, so a browser off loopback
+  got the refusal and no way to answer it. Contributed by @Philibergus.
+
 ## [0.23.1] — 2026-11-17
 
 Fix the intermittent CI failure caused by a test worker finishing after its

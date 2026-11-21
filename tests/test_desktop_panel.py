@@ -309,7 +309,7 @@ assert(text(tree).includes('Summary playback finished'));
 assert.equal(calls.filter(call=>call[0]==='send'||call[0]==='start').length,0);
 tree=render({taskState:{jobs:[job]},results:{},resultsReadable:false});
 assert.equal(button(tree,'Show result').props.disabled,true);
-assert(text(tree).includes('Connect this conversation to open the stored result.'));
+assert(text(tree).includes('Start talking to open the stored result.'));
 assert.deepEqual(calls,[['result',7],['replay','event-result']]);
 """)
 
@@ -353,14 +353,61 @@ let tree=render({active:true,live:'Unknown transport observation'});
 assert(statusText(tree).includes('Connected'));assert(!statusText(tree).includes('Listening'));
 tree=render({live:'Listening…'});assert(statusText(tree).includes('Listening…'));
 tree=render({live:'Thinking…'});assert(statusText(tree).includes('Thinking…'));
-tree=render({audioActivity:{output:true}});assert(statusText(tree).includes('Audio playing'));
+tree=render({audioActivity:{output:true}});assert(statusText(tree).includes('Hermes is speaking'));
 assert(!statusText(tree).includes('Thinking'));assert(!statusText(tree).includes('heard'));
-tree=render({muted:true});assert(statusText(tree).includes('Microphone muted'));
-assert(statusText(tree).includes('Audio playing'));
+tree=render({muted:true});assert(statusText(tree).includes('Muted'));
+assert(statusText(tree).includes('Hermes is speaking'));
 tree=render({audioActivity:{output:false},live:'Listening…'});
-assert(!statusText(tree).includes('Listening'));assert(!statusText(tree).includes('Audio playing'));
+assert(!statusText(tree).includes('Listening'));
+assert(!statusText(tree).includes('Hermes is speaking'));
 tree=render({muted:false,audioActivity:{input:true}});
-assert(statusText(tree).includes('Microphone audio detected'));
+assert(statusText(tree).includes('Hearing you'));
 tree=render({sleeping:true,audioActivity:{output:true}});
-assert(statusText(tree).includes('Sleeping'));assert(!statusText(tree).includes('Audio playing'));
+assert(statusText(tree).includes('Sleeping'));
+assert(!statusText(tree).includes('Hermes is speaking'));
+""")
+
+
+def test_idle_panel_leads_with_one_talk_control_and_folds_power_tools_away():
+    run_panel(r"""
+function statusText(tree) {return text(nodes(tree).find(node=>node.props?.role==='status'));}
+let tree=render({active:false,muted:false,sleeping:false,setMuted(){},setSleeping(){}});
+const talk=button(tree,'Start talking');
+assert.equal(talk.props.disabled,false);
+talk.props.onClick();assert.deepEqual(calls,[['start']]);
+assert.equal(statusText(tree),'Tap to talk');
+for(const label of ['Mute microphone','Sleep','Stop talking'])
+  assert(!nodes(tree).some(node=>node.type==='button'&&text(node)===label),
+    label+' only appears while connected');
+// Typing, routing and settings live in closed disclosures; nothing opens them by default.
+const folds=nodes(tree).filter(node=>node.type==='details'&&node.props.className==='htd-more');
+assert.deepEqual(folds.map(node=>text(node.children[0]).trim()),
+  ['Type a message To: This conversation','Settings']);
+assert(folds.every(node=>!('open' in node.props)));
+assert(nodes(folds[0]).includes(byLabel(tree,'Typed message')));
+assert(nodes(folds[0]).includes(byLabel(tree,'Addressed recipient')));
+assert(text(folds[1]).includes('Voice owner:'));
+tree=render({active:true});
+assert(button(tree,'Mute microphone'));assert(button(tree,'Sleep'));
+assert(button(tree,'Stop talking'));
+tree=render({active:false,starting:true});
+assert(button(tree,'Cancel connection'));assert.equal(statusText(tree),'Connecting…');
+""")
+
+
+def test_recipient_ui_is_absent_when_only_this_conversation_can_receive():
+    run_panel(r"""
+let tree=render({recipients:[],selectedRecipient:'',status:{source:'subscription',
+  taskContinuity:{supported:false}},inputCapabilities:{operations:['message']},
+  refreshRecipients(){calls.push(['refresh-recipients']);}});
+assert(!nodes(tree).some(node=>node.props?.['aria-label']==='Addressed recipient'));
+assert(!nodes(tree).some(node=>node.props?.['aria-label']==='Recipient action'),
+  'one available action needs no action list');
+assert(!text(tree).includes('To:'));
+assert(byLabel(tree,'Typed message'));
+tree=render({status:{source:'subscription',taskContinuity:{supported:true}}});
+const find=button(tree,'Find other apps');
+find.props.onClick();assert.deepEqual(calls,[['refresh-recipients']]);
+assert(!nodes(tree).some(node=>node.type==='select'&&
+  node.props['aria-label']==='Addressed recipient'),'an empty list is not a picker');
 """)
