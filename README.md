@@ -107,6 +107,8 @@ tools stay denied until you set `TALK_DISCORD_OPERATOR_USER_IDS`.
 
 Opt-in on hosts with plugin message submission: [same-chat delegated voice](docs/delegated-discord.md)
 (`/talk delegate join`) keeps the voice call responsive while Hermes works in that text chat.
+The experimental [hybrid mode](docs/hybrid-discord.md) (`/talk hybrid join`) adds
+direct host tools, native background children, and controls for observed work.
 
 **Dashboard** — browser audio, no local mic drivers:
 
