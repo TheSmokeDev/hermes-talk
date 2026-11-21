@@ -4,8 +4,9 @@ A Realtime session prompt is re-read on EVERY turn, so the per-section caps
 here are a budget, not a preference. The preamble is the behavioural contract
 and always ships; host identity sections are optional and additive.
 
-Fail-open is the rule: no sections, unreadable sections, or a host that
-cannot answer at all still yields a usable voice prompt.
+Host identity sections fail open: an unavailable host still yields a usable
+voice prompt. An explicitly supplied TALK.md must be readable, valid UTF-8
+and within its size budget; invalid deployment instructions fail startup.
 """
 
 from __future__ import annotations
