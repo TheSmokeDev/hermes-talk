@@ -818,7 +818,7 @@ _PCM_END = object()
 _FEED_DONE = object()
 
 
-def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
+def _resolve_cascade_relay_config() -> tuple[talk_config.CascadeVoiceConfig, dict]:
     """The cascade config for one relay call — fail-closed, HTTP-shaped.
 
     Delivery settings resolve HERE, beside the key and the voice, so a bad
@@ -841,8 +841,8 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
             ),
         )
     try:
-        api_key, voice_id, model = talk_config.cascade_voice_config(talk_config.talk_provider())
-        return (api_key, voice_id, model, talk_config.elevenlabs_voice_settings())
+        config = talk_config.cascade_voice_config(talk_config.talk_provider())
+        return (config, talk_config.elevenlabs_voice_settings())
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -897,7 +897,9 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
     )
 
 
-async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> AsyncIterator[bytes]:
+async def _cascade_pcm_stream(
+    request, config: tuple[talk_config.CascadeVoiceConfig, dict]
+) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
     A fresh CascadeVoice per request: one POST == one response's speech. The
@@ -911,11 +913,9 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> As
     """
 
     audio_queue: asyncio.Queue = asyncio.Queue()
-    api_key, voice_id, model, voice_settings = config
-    voice = talk_cascade_voice.CascadeVoice(
-        api_key=api_key,
-        voice_id=voice_id,
-        model=model,
+    voice_config, voice_settings = config
+    voice = talk_cascade_voice.build_cascade_voice(
+        voice_config,
         on_audio=audio_queue.put_nowait,
         on_error=lambda text: _log.warning("dashboard cascade relay: %s", text),
         on_stream_end=lambda: audio_queue.put_nowait(_PCM_END),

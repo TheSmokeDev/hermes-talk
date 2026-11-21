@@ -428,11 +428,31 @@ how it speaks on each surface — is in [CASCADE.md](CASCADE.md).
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_VOICE_MODE` | `native` | `native` = provider voice; `cascade` = ElevenLabs speaks the provider's text; `live` = the separate GPT-Live adapter. Invalid modes refuse. Cascade requires `TALK_PROVIDER=openai`; Live configuration is [separate](GPT-LIVE.md#choose-billing-and-voice). |
-| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider. **Fail-closed**; `elevenlabs` is the only value today. |
+| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider: `elevenlabs`, or the Experimental `openai` (any OpenAI-compatible `/audio/speech` server, below). **Fail-closed**: any other value refuses. Plugin setting: *Experimental · Cascade voice backend*. |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the other provider keys. The key rides the `xi-api-key` WebSocket header — never the URL, never a log line, never an error string. |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
 | `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane. `eleven_flash_v2_5` probed at ~490ms to first audio on PCM 24kHz (2026-08-28), which is the cascade's latency trade: roughly one extra half-second on the first sentence versus native; later sentences pipeline under playback. |
 | `TALK_CASCADE_SPEED` | unset | Delivery pace for the cascade voice, `0.7`–`1.2` (`1.0` is normal). **Fail-closed**: junk and out-of-range values refuse with the range rather than clamping, because a silently clamped pace is audible on every word and never says why. Unset sends no `speed` field at all — the wire frame stays byte-identical to a cascade that never had the knob, so turning it on is the only thing that changes what ElevenLabs receives. The bounds are the stream-input `RealtimeVoiceSettings` schema's own; the REST endpoint's wider `0.25`–`4.0` belongs to a different schema this lane never speaks. |
+
+#### Experimental: OpenAI-compatible cascade TTS
+
+Requested in #151. Off unless `TALK_CASCADE_TTS=openai` (or the plugin
+setting) is chosen; ElevenLabs stays the default. Each sentence chunk becomes
+one `POST {base}/audio/speech` with `{"model", "voice", "input",
+"response_format"}` (plus `speed` when `TALK_CASCADE_SPEED` is set), so
+self-hosted servers and LiteLLM gateways work without a new dependency.
+Chunking, barge-in and the text-only fallback are the same as the ElevenLabs
+lane. Each env variable wins over its plugin setting.
+
+| Variable | Default | Effect / failure mode |
+|---|---|---|
+| `TALK_CASCADE_OPENAI_BASE_URL` | unset | **Required**, e.g. `http://127.0.0.1:4000/v1`. Plain `http://` is refused off loopback, and so are credentials, a query or a fragment in the URL. Redirects are not followed. |
+| `TALK_CASCADE_OPENAI_MODEL` / `TALK_CASCADE_OPENAI_VOICE` | unset | **Required**: the model and voice ids your server expects. |
+| `TALK_CASCADE_OPENAI_API_KEY` | unset | Optional. Sent only as `Authorization: Bearer`, never in a URL, log or error. Set-but-blank refuses. It does **not** fall back to `OPENAI_API_KEY`, so your OpenAI key is never sent to a gateway you did not give it to. |
+| `TALK_CASCADE_OPENAI_FORMAT` | `pcm` | `pcm` (raw 24 kHz mono 16-bit, streamed to the speaker as it arrives) or `wav` (must be 24 kHz mono 16-bit; any other WAV refuses that answer). |
+
+`hermes talk doctor` checks these offline. On failure, the answer stays
+text-only and the receipt names only the HTTP status.
 
 Cascade mode applies to every Talk surface — terminal, Discord, and the
 dashboard tab share the same knobs and the same fail-closed resolution. On the
@@ -855,6 +875,20 @@ TALK_DISCORD_OPERATOR_USER_IDS=<your-immutable-discord-user-id>
 Use Discord's numeric user ID, not a username or display name. With the variable
 unset, every participant can converse and use read-only tools, while every
 mutating tool is denied.
+
+**Experimental: auto-join (#224).** Off by default, so `/talk join` keeps
+using only a voice connection the bot already holds (run `/voice join` first).
+Turn on *Experimental · Discord auto-join* in the plugin settings, or set
+`TALK_DISCORD_AUTO_JOIN=1`. When the bot is not yet in voice on that server,
+`/talk join` then connects to **your** current voice channel through the host's
+own join helper, using the invoking profile's bot only, and starts Talk. It
+refuses, and does not join, when you are not in
+`TALK_DISCORD_OPERATOR_USER_IDS` (an empty list refuses), when you are not in
+a voice channel on that server, when you run it from a DM, or when the bot
+lacks Connect and Speak permission. If the bot is already connected there,
+that connection is reused and never moved. A connection auto-join opened is
+closed when the start is refused or the Talk session ends. A connection that
+existed before is left alone.
 
 Native Discord replies finish on a 20 ms playback frame: when provider output
 ends, Talk pads any final partial frame with silence. The response boundary is

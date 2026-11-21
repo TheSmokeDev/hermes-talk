@@ -1633,7 +1633,7 @@ async def run_talk_session(
         # or socket is spent. The rules live in talk_config.cascade_voice_config
         # so every lane (terminal, Discord, dashboard) refuses identically.
         voice_mode = talk_config.voice_mode()
-        cascade_config: tuple[str, str, str] | None = None
+        cascade_config: talk_config.CascadeVoiceConfig | None = None
         if voice_mode == "cascade":
             cascade_config = talk_config.cascade_voice_config(provider)
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
@@ -1824,10 +1824,8 @@ async def run_talk_session(
         # sink that holds a partial frame (Discord) is told the reply ended
         # when its TTS stream settles instead.
         finish_playback = getattr(audio, "finish_playback", None)
-        cascade = talk_cascade_voice.CascadeVoice(
-            api_key=cascade_config[0],
-            voice_id=cascade_config[1],
-            model=cascade_config[2],
+        cascade = talk_cascade_voice.build_cascade_voice(
+            cascade_config,
             on_audio=audio.queue_playback,
             on_error=on_error,
             on_stream_end=finish_playback if callable(finish_playback) else None,
@@ -1937,7 +1935,8 @@ async def run_talk_session(
             f"{controls}\n"
             if cascade_config is None
             else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
-            f"via elevenlabs, auth {auth.source}). {controls}\n"
+            f"via {getattr(cascade_config, 'backend', 'elevenlabs')}, "
+            f"auth {auth.source}). {controls}\n"
         )
 
         async def send_microphone() -> None:
