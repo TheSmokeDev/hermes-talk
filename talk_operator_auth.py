@@ -352,11 +352,13 @@ class DiscordToolAuthorizationLedger:
         max_seen_response_ids: int = _DEFAULT_MAX_SEEN_RESPONSE_IDS,
         max_seen_call_ids: int = _DEFAULT_MAX_SEEN_CALL_IDS,
         echoes_response_metadata: bool = True,
+        initiating_user_id: str | None = None,
     ) -> None:
         # False for a provider whose response.created never returns the
         # metadata we sent (xAI Grok). Such a lane binds by order instead:
         # see note_response_created.
         self._echoes_response_metadata = bool(echoes_response_metadata)
+        self._initiating_user_id = initiating_user_id
         self._max_segments = max(1, int(max_segments))
         self._max_responses = max(1, int(max_responses))
         self._max_seen_item_ids = max(1, int(max_seen_item_ids))
@@ -866,6 +868,11 @@ class DiscordToolAuthorizationLedger:
                     "Open the slash-command picker in the linked Discord text channel. "
                     "If /skill is listed, select it and choose a skill by name."
                 )
+        if self._initiating_user_id is not None:
+            if trusted and str(binding.user_id) == self._initiating_user_id:
+                return None
+            return ("Only an attributable request from the user who joined this voice call "
+                    "may use its tools.")
         if name in READ_ONLY_TALK_TOOLS:
             return None
         if name in MUTATING_TALK_TOOLS:
