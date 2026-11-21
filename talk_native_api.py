@@ -7,7 +7,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import talk_config
+try:
+    from . import talk_config
+except ImportError:  # flat-module fallback (Hermes file-path load)
+    import talk_config
 
 
 class NativeTaskError(RuntimeError):

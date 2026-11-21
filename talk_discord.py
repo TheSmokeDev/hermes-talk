@@ -41,6 +41,7 @@ import queue
 import threading
 import time
 from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -573,12 +574,20 @@ class DiscordAudio:
         bridge = self._bridge
         if bridge is None:
             raise NativeTaskError("Discord voice bridge is unavailable")
+        # The guard also runs on the host's player and receiver threads, which
+        # carry no profile scope; on a multiplexed gateway the operator list
+        # must still come from the profile that bound this room. A fresh copy
+        # per call: one Context cannot be entered by two threads at once.
+        binding_scope = copy_context()
+
+        def operator_ids():
+            return binding_scope.copy().run(talk_config.discord_operator_user_ids)
 
         def authorized():
             try:
                 if (self._bridge is not bridge or bridge["guild_id"] != guild_id
                     or not self._published_bridge_is_exact(bridge)
-                    or operator not in talk_config.discord_operator_user_ids()
+                    or operator not in operator_ids()
                     or operator not in allowed_audience):
                     return False
                 voice = bridge["voice_client"]
