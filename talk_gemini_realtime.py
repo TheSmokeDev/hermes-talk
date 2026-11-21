@@ -12,10 +12,12 @@ operator key):
 - ``{"setup": {...}}`` is the first client message, acked with
   ``{"setupComplete": {}}``. Setup carries the model as ``models/<id>``,
   ``generationConfig.responseModalities: ["AUDIO"]`` with a prebuilt voice,
-  ``systemInstruction.parts[].text``, function tools whose parameter schema
-  types are UPPERCASE (``"OBJECT"``, ``"STRING"``), and empty
+  ``systemInstruction.parts[].text``, function tools, and empty
   ``outputAudioTranscription`` / ``inputAudioTranscription`` objects enabling
-  both transcript lanes.
+  both transcript lanes. The probe sent tool schemas in ``parameters`` with
+  UPPERCASE types (``"OBJECT"``, ``"STRING"``); that OpenAPI-style field
+  rejects ``additionalProperties`` with close code 1007 (#227), so tools now
+  send the unchanged JSON Schema in ``parametersJsonSchema`` instead.
 - Tool calls arrive as ``toolCall.functionCalls[]`` whose ``args`` are a
   PARSED DICT (OpenAI/xAI send a JSON string) and are answered with a
   ``toolResponse.functionResponses[]`` envelope keyed by the call ``id``;
