@@ -16,13 +16,15 @@ Boundaries, on purpose:
 - Bound task calls are NOT journaled here: they already persist canonical
   history through the task-origin contract.
 - Retention is bounded (``TALK_CALL_JOURNAL_DAYS``, default 30) and enforced
-  when the next call starts.
+  when the next dashboard or Desktop call starts, journaled or not, so turning
+  the journal off does not keep old transcripts forever.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -66,6 +68,7 @@ _TOKEN_RE = re.compile(rf"^[A-Za-z0-9_.:\-]{{1,{MAX_TOKEN_CHARS}}}$")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 _WRITE_LOCK = threading.Lock()
+_log = logging.getLogger(__name__)
 
 
 class JournalError(Exception):
@@ -103,6 +106,12 @@ def retention_days() -> int:
             f"TALK_CALL_JOURNAL_DAYS must be a whole number of days from 1 to {MAX_RETENTION_DAYS}"
         )
     return int(raw)
+
+
+def _journal_path() -> Path:
+    """Where journals live. Creates nothing."""
+
+    return talk_config.get_hermes_home() / "state" / "talk-calls"
 
 
 def journal_dir() -> Path:
@@ -158,12 +167,12 @@ def _append(path: Path, records: list[dict]) -> int:
     return len(records)
 
 
-def prune(*, days: int | None = None, clock=time.time) -> int:
-    """Delete journals older than the retention window. Returns the count."""
-
-    cutoff = clock() - (days or retention_days()) * 86400
+def _prune_in(directory: Path, days: int, clock) -> int:
+    cutoff = clock() - days * 86400
     removed = 0
-    for path in journal_dir().glob("call_*.jsonl"):
+    for path in directory.glob("call_*.jsonl"):
+        if not _CALL_ID_RE.match(path.stem):
+            continue  # only files this journal minted
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -171,6 +180,33 @@ def prune(*, days: int | None = None, clock=time.time) -> int:
         except OSError:
             continue
     return removed
+
+
+def prune(*, days: int | None = None, clock=time.time) -> int:
+    """Delete journals older than the retention window. Returns the count."""
+
+    return _prune_in(journal_dir(), days or retention_days(), clock)
+
+
+def prune_existing(*, clock=time.time) -> int:
+    """Retention for a call start that writes no journal. Never raises.
+
+    Runs whether or not the journal is on, so switching it off does not keep
+    old transcripts on disk forever. It never creates the journal folder just
+    to look inside it, and a malformed ``TALK_CALL_JOURNAL_DAYS`` is logged
+    and skipped: the call is healthy, and only a journaled call refuses on it.
+    """
+
+    directory = _journal_path()
+    try:
+        if not directory.is_dir():
+            return 0
+        return _prune_in(directory, retention_days(), clock)
+    except talk_config.TalkConfigError as exc:
+        _log.warning("Talk call journal retention skipped: %s", exc)
+    except OSError as exc:
+        _log.warning("Talk call journal retention skipped: %s", exc)
+    return 0
 
 
 def start(

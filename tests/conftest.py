@@ -191,3 +191,19 @@ def _ephemeral_runs_optin(monkeypatch):
     """
 
     monkeypatch.setenv("TALK_RUNS_ALLOW_EPHEMERAL", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_saved_plugin_settings(monkeypatch):
+    """Every test sees Talk's shipped defaults, never this machine's Hermes config.
+
+    ``talk_config.plugin_setting`` reads the active Hermes profile when
+    ``hermes_cli`` is importable, so on a developer box a saved Call journal or
+    Voice language switch would leak into tests that assert the defaults (and a
+    saved journal switch would write under the real ``HERMES_HOME``). A test
+    that exercises a saved setting patches ``plugin_setting`` itself, which
+    overrides this.
+    """
+    import talk_config
+
+    monkeypatch.setattr(talk_config, "plugin_setting", lambda key: None)

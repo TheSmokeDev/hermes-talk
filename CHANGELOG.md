@@ -27,7 +27,8 @@ named rather than smoothed.
 - `hermes talk echo HOST` uses an Amazon Echo running echo-dot-assist's hassmic
   in Wyoming mode as an optional Talk surface. Each wake word starts a session
   on the Echo's microphone and speaker. The session ends after `--idle` seconds
-  of quiet. Full duplex needs hassmic's `-D`. Thanks to
+  of quiet. Full duplex needs hassmic's `-D`. Experimental: not yet confirmed
+  on physical Echo hardware. Thanks to
   [@patrickhaahr](https://github.com/patrickhaahr).
 - Spoken-language knobs for OpenAI sessions: `TALK_TRANSCRIPTION_LANGUAGES`
   (ISO codes for the input transcriber), `TALK_TRANSCRIPTION_PROMPT` (one-line

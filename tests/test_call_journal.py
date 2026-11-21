@@ -195,6 +195,15 @@ def test_listing_reports_sessions_and_completion():
     json.dumps(listed)
 
 
+def test_cli_names_both_ways_to_turn_the_journal_on(capsys):
+    import talk_cli
+
+    assert talk_cli._journal_entry(None, False) == 0
+    out = capsys.readouterr().out
+    assert '"Experimental · Call journal"' in out
+    assert "TALK_CALL_JOURNAL=1" in out
+
+
 def test_cli_lists_calls_and_prints_one_as_markdown(capsys):
     import talk_cli
 

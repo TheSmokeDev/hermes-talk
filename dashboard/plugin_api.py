@@ -43,6 +43,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
+from typing import NamedTuple
 
 #: The dashboard loads this module by path, so ``talk_*`` is not importable by
 #: name until the plugin root is on the path. Done once, before the imports
@@ -193,6 +194,7 @@ LOOPBACK_ONLY_MESSAGE = (
     f"somewhere else — set {DASHBOARD_TOKEN_ENV} and send it as "
     f"`{DASHBOARD_TOKEN_HEADER}: <token>` to reach them remotely."
 )
+CROSS_SITE_MESSAGE = "hermes-talk dashboard routes refuse cross-site requests."
 
 #: How many runs the panel asks for. Fixed rather than caller-supplied: the
 #: registry is a status board, not a query surface.
@@ -258,8 +260,8 @@ def _has_desktop_auth(request, presented: str) -> bool:
     return True
 
 
-def _has_verified_dashboard_session(request) -> bool:
-    """True when the dashboard's own sign-in gate already verified this request.
+def _dashboard_session(request) -> str | None:
+    """``"verified"`` when the dashboard's own sign-in gate verified this request.
 
     In gated mode (a non-loopback bind or a public URL), Hermes's
     ``gated_auth_middleware`` verifies the session cookie or bearer with the
@@ -270,17 +272,20 @@ def _has_verified_dashboard_session(request) -> bool:
 
     Cross-site requests are refused even with a session: the session cookie
     is ``SameSite=Lax``, and ``Sec-Fetch-Site: cross-site`` is an explicit
-    second fence for any route a top-level navigation could reach.
+    second fence for any route a top-level navigation could reach. Such a
+    request answers ``"cross-site"`` so the gate refuses it outright instead
+    of letting it fall through to the loopback rule. Anything else is
+    ``None``: no gate, or no session it verified.
     """
 
     app = getattr(request, "app", None)
     if getattr(getattr(app, "state", None), "auth_required", False) is not True:
-        return False
+        return None
     if getattr(getattr(request, "state", None), "session", None) is None:
-        return False
+        return None
     getter = getattr(getattr(request, "headers", None), "get", None)
     site = (getter("sec-fetch-site") or "").strip().lower() if getter else ""
-    return site != "cross-site"
+    return "cross-site" if site == "cross-site" else "verified"
 
 
 def require_dashboard_auth(request) -> None:
@@ -290,7 +295,8 @@ def require_dashboard_auth(request) -> None:
     """
 
     configured = dashboard_token()
-    if configured is None and _has_verified_dashboard_session(request):
+    session = _dashboard_session(request)
+    if configured is None and session == "verified":
         return
     if configured is not None:
         presented = _presented_token(request)
@@ -306,6 +312,10 @@ def require_dashboard_auth(request) -> None:
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
     if configured is not None:
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
+    if session == "cross-site":
+        # The browser behind a signed-in session made a cross-site request;
+        # a loopback peer (a local reverse proxy) does not make it same-site.
+        raise HTTPException(status_code=403, detail=CROSS_SITE_MESSAGE)
     if _is_loopback(request):
         return
     raise HTTPException(status_code=403, detail=LOOPBACK_ONLY_MESSAGE)
@@ -399,12 +409,46 @@ def _session_tools(bound=None):
     return tools
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None):
+class _Languages(NamedTuple):
+    """The spoken-language knobs for one mint, resolved before anything is spent."""
+
+    reply_language: str | None
+    transcription_languages: tuple[str, ...]
+    transcription_prompt: str | None
+
+
+def _config_or_400(resolve):
+    """One Talk setting, or a 400 that names it — never a bare 500 later."""
+
+    try:
+        return resolve()
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _resolve_languages() -> _Languages:
+    return _Languages(
+        reply_language=_config_or_400(talk_config.reply_language),
+        transcription_languages=_config_or_400(talk_config.transcription_languages),
+        transcription_prompt=_config_or_400(talk_config.transcription_prompt),
+    )
+
+
+def _mint(
+    auth_token: str,
+    voice: str,
+    *,
+    languages: _Languages,
+    text_output: bool = False,
+    bound=None,
+):
     """Assemble instructions and mint. Blocking — called on a worker thread.
 
     ``text_output`` is the cascade lane: the minted session asks the provider
     for TEXT output instead of synthesized audio, and the browser streams the
     text deltas back through the cascade relay to be spoken server-side.
+    ``languages`` was resolved by the route, so a malformed knob has already
+    refused with a 400 before a task was joined or a credential spent.
     """
 
     tools = _session_tools(bound)
@@ -424,13 +468,15 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False, bound=None)
                 if bound is not None
                 else talk_capabilities.instruction_section()
             ),
-            reply_language=talk_config.reply_language(),
+            reply_language=languages.reply_language,
         )
         + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
         tools=tools,
         automatic_response=bound is None,
         turn_detection=_resolve_turn_detection(),
         text_output=text_output,
+        transcription_languages=languages.transcription_languages,
+        transcription_prompt=languages.transcription_prompt,
     )
 
 
@@ -552,6 +598,12 @@ async def create_session(request: Request) -> dict:
     require_dashboard_auth(request)
     body = await _json_body(request)
     _resolve_turn_detection()
+    languages = _resolve_languages()
+    # Retention runs on every call start, journaled or not, so switching the
+    # journal off never leaves old transcripts on disk. It never creates the
+    # folder and never fails the call; a journaled call prunes again, with its
+    # validated window, when its own journal starts.
+    await asyncio.to_thread(talk_call_journal.prune_existing)
     if isinstance(body.get("task"), dict) and "target_id" in body["task"]:
         return await _target_session(request, body, initial=True)
     bound = None
@@ -597,6 +649,7 @@ async def create_session(request: Request) -> dict:
             _mint,
             auth.token,
             voice,
+            languages=languages,
             text_output=text_output,
             **({"bound": bound} if bound is not None else {}),
         )
@@ -1050,6 +1103,7 @@ async def _target_session(request, body, *, initial=False):
     if _resolve_voice_mode() == "live":
         return await _target_live_session(request, body, initial=initial)
     _resolve_turn_detection()
+    languages = _resolve_languages()
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
     if text_output:
@@ -1082,7 +1136,8 @@ async def _target_session(request, body, *, initial=False):
     activated = False
     try:
         descriptor = await asyncio.to_thread(
-            _mint, auth.token, voice, text_output=text_output, bound=prepared.bound
+            _mint, auth.token, voice, languages=languages, text_output=text_output,
+            bound=prepared.bound,
         )
         if hasattr(request, "is_disconnected") and await request.is_disconnected():
             raise HTTPException(
@@ -1122,6 +1177,11 @@ async def native_task_attach(request: Request):
         raise HTTPException(
             status_code=400, detail=DashboardTaskError("invalid_event", 400).detail()
         )
+    # Resolved before any target is reserved or activated: a malformed
+    # TALK_REPLY_LANGUAGE is a 400 that leaves no half-bound task behind.
+    reply_language = (
+        _config_or_400(talk_config.reply_language) if input_mode == "voice" else None
+    )
     previous = (await _task_call(TASKS.binding, request, body)
                 if "connection_id" in body else None)
     selection_body = {key: value for key, value in body.items()
@@ -1172,13 +1232,13 @@ async def native_task_attach(request: Request):
                 None, lane=surface_context["surface"],
                 capabilities=TASKS.live_capabilities(bound),
                 task_context=TASKS.live_instructions(bound),
-                reply_language=talk_config.reply_language(),
+                reply_language=reply_language,
             )
         else:
             instructions = talk_identity.build_instructions(
                 None, tools=tools, lane=surface_context["surface"], canonical_task=True,
                 capabilities="Canonical task tools and linked child work are available.",
-                reply_language=talk_config.reply_language(),
+                reply_language=reply_language,
             ) + "\n\n" + TASKS.instructions(bound)
         return {**result, "instructions": instructions, "tools": tools}
     finally:

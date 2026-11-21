@@ -29,7 +29,7 @@ config_schema:
     label: "Experimental · Call journal"
     description: Save text from standalone dashboard and Desktop Realtime calls. Off by default.
   voice_language:
-    type: enum
+    type: str
     choices: [Auto, English, Spanish, French, German, Portuguese, Chinese, Japanese, Korean]
     default: Auto
     label: "Experimental · Voice language"

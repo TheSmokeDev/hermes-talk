@@ -237,12 +237,17 @@ def mint_ephemeral_session(
     automatic_response: bool = True,
     turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
+    transcription_languages: tuple[str, ...] | None = None,
+    transcription_prompt: str | None = None,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
 
     The caller resolves auth and assembles instructions; this function owns
     only the wire exchange. The returned descriptor carries the ephemeral
-    secret — never the auth token that minted it.
+    secret — never the auth token that minted it. A caller that already
+    resolved the transcription knobs (the dashboard, which must refuse a
+    malformed one with a 400 before it spends anything) passes them here;
+    left at ``None`` they resolve at call time as before.
     """
 
     session = build_session_payload(
@@ -253,6 +258,8 @@ def mint_ephemeral_session(
         automatic_response=automatic_response,
         text_output=text_output,
         turn_detection=turn_detection,
+        transcription_languages=transcription_languages,
+        transcription_prompt=transcription_prompt,
     )
     payload = post_client_secret(auth_token, session)
     secret, expires_at_ms = parse_client_secret(payload)

@@ -2500,7 +2500,10 @@ def _journal_entry(call_id: str | None, json_output: bool) -> int:
             if json_output:
                 print(json.dumps({"calls": calls}, ensure_ascii=False, indent=2))
             elif not calls:
-                state = "on" if _journal_switch() else "off (set TALK_CALL_JOURNAL=1)"
+                state = "on" if _journal_switch() else (
+                    'off (turn on "Experimental · Call journal" in Hermes Talk '
+                    "plugin settings, or set TALK_CALL_JOURNAL=1)"
+                )
                 print(f"No call journal yet. TALK_CALL_JOURNAL is {state}.")
             else:
                 for row in calls:

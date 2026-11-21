@@ -14,9 +14,12 @@ import asyncio
 import hmac
 import importlib.util
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,9 +90,11 @@ def serialized(payload) -> str:
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
     """Every test starts detached, credential-scoped, and token-free."""
 
+    # Every mint runs call-journal retention, so no test reaches the real home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV, raising=False)
     monkeypatch.delenv("TALK_VOICE", raising=False)
     monkeypatch.delenv("TALK_MODEL", raising=False)
@@ -727,6 +732,126 @@ def test_invalid_journal_retention_refuses_before_the_mint(minted, monkeypatch):
     assert "auth_token" not in minted
 
 
+def _journal_folder(tmp_path) -> Path:
+    return tmp_path / "hermes" / "state" / "talk-calls"
+
+
+def _aged_journal(folder: Path, name: str, age_days: float) -> Path:
+    path = folder / f"call_{name * 32}.jsonl"
+    path.write_text('{"kind":"call_start"}\n', encoding="utf-8")
+    stamp = time.time() - age_days * 86400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_retention_runs_at_every_call_start_even_with_the_journal_off(
+    minted, monkeypatch, tmp_path
+):
+    import talk_call_journal
+
+    monkeypatch.delenv("TALK_CALL_JOURNAL", raising=False)
+    folder = _journal_folder(tmp_path)
+    folder.mkdir(parents=True)
+    expired = _aged_journal(folder, "a", talk_call_journal.DEFAULT_RETENTION_DAYS + 1)
+    recent = _aged_journal(folder, "b", 1)
+    foreign = folder / "call_notes.jsonl"
+    foreign.write_text("kept\n", encoding="utf-8")
+    stamp = expired.stat().st_mtime
+    os.utime(foreign, (stamp, stamp))
+
+    body = call(api.create_session, FakeRequest(body={"surface": "desktop"}))
+
+    assert "journal" not in body
+    assert not expired.exists()
+    assert recent.exists()
+    assert foreign.exists(), "only journals the mint created are ever pruned"
+
+
+def test_a_call_with_no_journal_folder_does_not_create_one(minted, monkeypatch, tmp_path):
+    monkeypatch.delenv("TALK_CALL_JOURNAL", raising=False)
+    call(api.create_session, FakeRequest(body={}))
+    assert not _journal_folder(tmp_path).exists()
+
+
+def test_a_malformed_retention_never_fails_an_unjournaled_call(
+    minted, monkeypatch, tmp_path, caplog
+):
+    monkeypatch.delenv("TALK_CALL_JOURNAL", raising=False)
+    monkeypatch.setenv("TALK_CALL_JOURNAL_DAYS", "never")
+    folder = _journal_folder(tmp_path)
+    folder.mkdir(parents=True)
+    kept = _aged_journal(folder, "c", 400)
+
+    with caplog.at_level("WARNING"):
+        body = call(api.create_session, FakeRequest(body={}))
+
+    assert body["ok"] is True and "auth_token" in minted
+    assert kept.exists()
+    assert "TALK_CALL_JOURNAL_DAYS" in caplog.text
+
+
+# -- spoken-language knobs refuse as a 400, before anything is spent ----------
+
+_BAD_LANGUAGE_KNOBS = [
+    ("TALK_REPLY_LANGUAGE", "French2"),
+    ("TALK_TRANSCRIPTION_LANGUAGES", "english"),
+    ("TALK_TRANSCRIPTION_PROMPT", "x" * 1001),
+]
+
+
+def _forbidden(*_args, **_kwargs):
+    pytest.fail("a malformed language knob must refuse before this runs")
+
+
+@pytest.mark.parametrize(("name", "value"), _BAD_LANGUAGE_KNOBS)
+def test_a_malformed_language_knob_refuses_the_mint_with_a_400(
+    minted, monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(api.talk_auth, "resolve_auth", _forbidden)
+    monkeypatch.setattr(api, "TASKS", SimpleNamespace(join=_forbidden))
+    for body in ({}, {"task": {"connection_id": "c-1"}}):
+        with pytest.raises(api.HTTPException) as raised:
+            call(api.create_session, FakeRequest(body=body))
+        assert raised.value.status_code == 400
+        assert name in str(raised.value.detail)
+    assert "auth_token" not in minted
+
+
+@pytest.mark.parametrize(("name", "value"), _BAD_LANGUAGE_KNOBS)
+def test_a_malformed_language_knob_refuses_a_switch_before_the_target_is_prepared(
+    monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(api.talk_auth, "resolve_auth", _forbidden)
+    monkeypatch.setattr(api, "TARGETS", SimpleNamespace(prepare=_forbidden))
+    with pytest.raises(api.HTTPException) as raised:
+        call(api.task_switch, FakeRequest(body={"target_id": "t-1"}))
+    assert raised.value.status_code == 400
+    assert name in str(raised.value.detail)
+
+
+def test_a_malformed_reply_language_refuses_a_voice_attach_before_activation(monkeypatch):
+    monkeypatch.setenv("TALK_REPLY_LANGUAGE", "French2")
+    reserved = {"ok": False, "reason": "fixture stops after preparation"}
+    monkeypatch.setattr(api, "TASKS", SimpleNamespace(binding=_forbidden))
+    monkeypatch.setattr(
+        api,
+        "TARGETS",
+        SimpleNamespace(prepare=_forbidden, activate=_forbidden, cancel=_forbidden),
+    )
+    with pytest.raises(api.HTTPException) as raised:
+        call(api.native_task_attach, FakeRequest(body={"input_mode": "voice"}))
+    assert raised.value.status_code == 400
+    assert "TALK_REPLY_LANGUAGE" in str(raised.value.detail)
+
+    # Typed input never speaks, so the knob does not stand in its way.
+    monkeypatch.setattr(
+        api, "TARGETS", SimpleNamespace(prepare=lambda *_args, **_kwargs: reserved)
+    )
+    assert call(api.native_task_attach, FakeRequest(body={"input_mode": "typed"})) == reserved
+
+
 # -- dashboard sign-in as the Talk credential ----------------------------------
 
 
@@ -769,6 +894,32 @@ def test_the_gate_session_is_accepted_only_when_real_and_same_site(
     with pytest.raises(api.HTTPException) as refused:
         api.require_dashboard_auth(request)
     assert refused.value.status_code == 403
+
+
+def test_a_cross_site_request_with_a_gate_session_is_refused_even_from_loopback(monkeypatch):
+    monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV, raising=False)
+    request = _gated(FakeRequest(host="127.0.0.1", headers={"Sec-Fetch-Site": "cross-site"}))
+    with pytest.raises(api.HTTPException) as refused:
+        api.require_dashboard_auth(request)
+    assert refused.value.status_code == 403
+    # The same browser, same-site, is still the signed-in operator.
+    api.require_dashboard_auth(
+        _gated(FakeRequest(host="127.0.0.1", headers={"Sec-Fetch-Site": "same-origin"}))
+    )
+
+
+def test_a_cross_site_gate_session_leaves_the_token_paths_unchanged(monkeypatch):
+    cross = {"Sec-Fetch-Site": "cross-site"}
+    monkeypatch.setenv(api.DASHBOARD_TOKEN_ENV, "talk-only-token")
+    api.require_dashboard_auth(
+        _gated(FakeRequest(host="127.0.0.1", headers={**cross, "X-Talk-Token": "talk-only-token"}))
+    )
+    monkeypatch.delenv(api.DASHBOARD_TOKEN_ENV)
+    with pytest.raises(api.HTTPException) as refused:
+        api.require_dashboard_auth(
+            _gated(FakeRequest(host="127.0.0.1", headers={**cross, api.DESKTOP_TOKEN_HEADER: "x"}))
+        )
+    assert refused.value.status_code == 401
 
 
 def test_an_explicit_talk_password_still_applies_after_dashboard_sign_in(monkeypatch):
