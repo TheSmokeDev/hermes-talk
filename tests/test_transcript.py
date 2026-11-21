@@ -154,8 +154,12 @@ def test_other_process_skips_live_capture_then_recovers_it_after_force_kill(tmp_
             "time.sleep(60)",
         ]
     )
+    # The Windows venv launcher can exit while its Python child still owns the lease.
+    executable = (
+        getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
+    )
     child = subprocess.Popen(
-        [sys.executable, "-c", code],
+        [executable, "-c", code],
         cwd=Path(__file__).parents[1],
         stdout=subprocess.PIPE,
         text=True,
