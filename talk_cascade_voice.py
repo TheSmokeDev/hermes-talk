@@ -714,15 +714,16 @@ class OpenAICompatibleCascadeVoice(CascadeVoice):
         self, post: Callable[..., AsyncIterator[bytes]], text: str, generation: int
     ) -> None:
         body = post(self._url, self._headers(), self._payload(text))
-        if self._format == "wav":
-            self._emit(wav_to_pcm24(b"".join([part async for part in body])), generation)
-            return
-        carry = b""
-        async for part in body:
-            data = carry + part
-            cut = len(data) - (len(data) % 2)  # never split a 16-bit sample
-            carry = data[cut:]
-            self._emit(data[:cut], generation)
+        async with contextlib.aclosing(body):  # a sink failure still closes the request
+            if self._format == "wav":
+                self._emit(wav_to_pcm24(b"".join([part async for part in body])), generation)
+                return
+            carry = b""
+            async for part in body:
+                data = carry + part
+                cut = len(data) - (len(data) % 2)  # never split a 16-bit sample
+                carry = data[cut:]
+                self._emit(data[:cut], generation)
 
     def _emit(self, pcm: bytes, generation: int) -> None:
         # Same belt as the socket lane: audio decoded before a barge-in but

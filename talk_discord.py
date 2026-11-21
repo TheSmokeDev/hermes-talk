@@ -417,18 +417,46 @@ async def join_caller_voice_channel() -> tuple[int, Any | None]:
         raise TalkDiscordError(
             "I don't have permission to connect and speak in your voice channel."
         )
+    if clients.get(guild_id) is not None:
+        return guild_id, None  # someone connected while we looked: borrow, never own
     try:
         joined = await join(voice_channel)
     except Exception as exc:  # noqa: BLE001 - host join failure is speakable
+        _release_if_created(adapter, guild_id)
         raise TalkDiscordError(
             f"I couldn't join your voice channel ({_safe_exception_name(exc)})."
         ) from None
+    except BaseException:  # cancelled mid-join: never leave an unowned connection
+        _release_if_created(adapter, guild_id)
+        raise
     created = clients.get(guild_id)
     if not joined or created is None:
         raise TalkDiscordError(
             "I couldn't join your voice channel — check my Connect and Speak permissions."
         )
     return guild_id, created
+
+
+def _release_if_created(adapter: Any, guild_id: int) -> None:
+    clients = getattr(adapter, "_voice_clients", None)
+    created = clients.get(guild_id) if isinstance(clients, dict) else None
+    if created is not None:
+        release_auto_joined(guild_id, created)
+
+
+_AUTO_JOIN_LOCK: Any = None
+
+
+def auto_join_lock() -> Any:
+    """One auto-join at a time, so two overlapping `/talk join`s never both
+    claim the connection the first one opened."""
+
+    global _AUTO_JOIN_LOCK
+    if _AUTO_JOIN_LOCK is None:
+        import asyncio
+
+        _AUTO_JOIN_LOCK = asyncio.Lock()
+    return _AUTO_JOIN_LOCK
 
 
 def release_auto_joined(guild_id: int, joined_client: Any) -> None:
@@ -449,6 +477,9 @@ def release_auto_joined(guild_id: int, joined_client: Any) -> None:
     leave = getattr(adapter, "leave_voice_channel", None)
     if not isinstance(clients, dict) or clients.get(guild_id) is not joined_client:
         return
+    bound = getattr(adapter, "_voice_text_channels", None)
+    if isinstance(bound, dict) and bound.get(guild_id) is not None:
+        return  # `/voice join` adopted this connection: it is the host's now
     if not callable(leave):
         return
     loop = _running_loop()
@@ -457,6 +488,15 @@ def release_auto_joined(guild_id: int, joined_client: Any) -> None:
     task = loop.create_task(leave(guild_id))
     _NOTIFICATION_TASKS.add(task)
     task.add_done_callback(_NOTIFICATION_TASKS.discard)
+    task.add_done_callback(_log_leave_failure)
+
+
+def _log_leave_failure(task: Any) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log.debug("auto-joined voice leave failed (%s)", _safe_exception_name(error))
 
 
 def session_task() -> Any:
@@ -1738,11 +1778,13 @@ __all__ = [
     "DiscordAudio",
     "InputAudioPacket",
     "TalkDiscordError",
+    "auto_join_lock",
     "discord_to_session",
     "join_caller_voice_channel",
     "native_command",
     "native_session_active",
     "pause_session",
+    "release_auto_joined",
     "release_auto_joined_when_done",
     "reset_for_tests",
     "resolve_voice_bridge",
@@ -2336,7 +2378,9 @@ def stop_session() -> str:
 
 
 def reset_for_tests() -> None:
-    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
+    global _AUTO_JOIN_LOCK, _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
+
+    _AUTO_JOIN_LOCK = None
 
     with _SESSION_LOCK:
         _SESSION.clear()

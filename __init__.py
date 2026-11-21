@@ -302,15 +302,21 @@ async def _auto_join_then_start(invocation) -> str:
     if the start refuses or when the Talk session it started ends.
     """
 
-    try:
-        guild_id, joined = await talk_discord.join_caller_voice_channel()
-    except talk_discord.TalkDiscordError as exc:
-        return str(exc)
-    previous = talk_discord.session_task()
-    receipt = _start_discord_session(invocation, guild_id)
-    if joined is not None:
-        talk_discord.release_auto_joined_when_done(guild_id, joined, previous)
-    return receipt
+    async with talk_discord.auto_join_lock():
+        try:
+            guild_id, joined = await talk_discord.join_caller_voice_channel()
+        except talk_discord.TalkDiscordError as exc:
+            return str(exc)
+        previous = talk_discord.session_task()
+        try:
+            receipt = _start_discord_session(invocation, guild_id)
+        except BaseException:
+            if joined is not None:
+                talk_discord.release_auto_joined(guild_id, joined)
+            raise
+        if joined is not None:
+            talk_discord.release_auto_joined_when_done(guild_id, joined, previous)
+        return receipt
 
 
 

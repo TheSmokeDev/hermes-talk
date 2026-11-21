@@ -217,3 +217,79 @@ def test_empty_operator_list_refuses(plugin, monkeypatch):
     calls, _ = _record_start(monkeypatch, plugin)
     assert "Talk operators" in asyncio.run(_join(plugin))
     assert calls == [] and adapter.joins == []
+
+
+def test_overlapping_joins_never_close_the_first_sessions_connection(plugin, monkeypatch):
+    monkeypatch.setenv("TALK_DISCORD_AUTO_JOIN", "1")
+    adapter = _FakeAdapter()
+    gate = asyncio.Event()
+    real_join = adapter.join_voice_channel
+
+    async def slow_join(channel):
+        await gate.wait()  # the host is still connecting when the retry lands
+        if GUILD in adapter._voice_clients:
+            return True  # the host returns the same client for a second join
+        return await real_join(channel)
+
+    adapter.join_voice_channel = slow_join
+    _install_host(monkeypatch, adapter)
+    starts: list = []
+
+    def start_session(**kwargs):
+        if plugin.talk_discord._SESSION.get("task") is not None:
+            return "I'm already live."
+        task = asyncio.get_running_loop().create_future()
+        plugin.talk_discord._SESSION["task"] = task
+        starts.append(kwargs)
+        return "Starting voice."
+
+    monkeypatch.setattr(plugin.talk_discord, "start_session", start_session)
+
+    async def run():
+        first = asyncio.ensure_future(_join(plugin))
+        second = asyncio.ensure_future(_join(plugin))
+        await _settle()
+        gate.set()
+        receipts = await asyncio.gather(first, second)
+        await _settle()
+        return receipts
+
+    assert asyncio.run(run()) == ["Starting voice.", "I'm already live."]
+    assert adapter.leaves == []  # the live session keeps its connection
+    assert len(starts) == 1
+
+
+def test_start_that_raises_does_not_strand_the_bot(plugin, monkeypatch):
+    monkeypatch.setenv("TALK_DISCORD_AUTO_JOIN", "1")
+    adapter = _FakeAdapter()
+    _install_host(monkeypatch, adapter)
+
+    def boom(**_kwargs):
+        raise RuntimeError("host refused")
+
+    monkeypatch.setattr(plugin.talk_discord, "start_session", boom)
+
+    async def run():
+        with pytest.raises(RuntimeError):
+            await _join(plugin)
+        await _settle()
+
+    asyncio.run(run())
+    assert adapter.leaves == [GUILD]
+
+
+def test_connection_adopted_by_voice_join_is_left_to_the_host(plugin, monkeypatch):
+    monkeypatch.setenv("TALK_DISCORD_AUTO_JOIN", "1")
+    adapter = _FakeAdapter()
+    adapter._voice_text_channels = {}
+    _install_host(monkeypatch, adapter)
+    _, holder = _record_start(monkeypatch, plugin)
+
+    async def run():
+        await _join(plugin)
+        adapter._voice_text_channels[GUILD] = CHAT  # `/voice join` bound it meanwhile
+        holder["task"].set_result(0)
+        await _settle()
+
+    asyncio.run(run())
+    assert adapter.leaves == []
