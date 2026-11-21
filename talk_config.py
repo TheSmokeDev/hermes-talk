@@ -819,7 +819,7 @@ def transcription_languages() -> tuple[str, ...]:
     language = _experimental_voice_language()
     if language is not None:
         return (_EXPERIMENTAL_LANGUAGE_CODES[language],)
-    raw = os.environ.get("TALK_TRANSCRIPTION_LANGUAGES") or ""
+    raw = _talk_env_get("TALK_TRANSCRIPTION_LANGUAGES") or ""
     codes = tuple(dict.fromkeys(part.strip().lower() for part in raw.split(",") if part.strip()))
     invalid = [code for code in codes if not _LANGUAGE_CODE_RE.match(code)]
     if invalid:
@@ -843,7 +843,7 @@ def transcription_prompt() -> str | None:
     sends nothing. Control characters and over-long values refuse.
     """
 
-    raw = (os.environ.get("TALK_TRANSCRIPTION_PROMPT") or "").strip()
+    raw = (_talk_env_get("TALK_TRANSCRIPTION_PROMPT") or "").strip()
     if not raw:
         return None
     if len(raw) > MAX_TRANSCRIPTION_PROMPT_CHARS:
@@ -871,7 +871,7 @@ def reply_language() -> str | None:
     language = _experimental_voice_language()
     if language is not None:
         return language
-    raw = (os.environ.get("TALK_REPLY_LANGUAGE") or "").strip()
+    raw = (_talk_env_get("TALK_REPLY_LANGUAGE") or "").strip()
     if not raw:
         return None
     if len(raw) > MAX_REPLY_LANGUAGE_CHARS or not _REPLY_LANGUAGE_RE.match(raw):
@@ -1055,7 +1055,7 @@ def agent_timeout_s() -> int:
 def _positive_float(name: str, default: float) -> float:
     """A positive float knob. Junk and non-positive values take the default."""
 
-    raw = (os.environ.get(name) or "").strip()
+    raw = (_talk_env_get(name) or "").strip()
     if raw:
         try:
             parsed = float(raw)

@@ -62,7 +62,7 @@ OUTPUT_ECHO_RATIO = 0.65
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
+    raw = (talk_config._talk_env_get(name) or "").strip()
     if not raw:
         return default
     try:

@@ -15,14 +15,19 @@ from __future__ import annotations
 import builtins
 import contextvars
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+import talk_audio
+import talk_call_journal
 import talk_config
 import talk_discord
+import talk_doctor
+import talk_host
 
 # ---------------------------------------------------------------------------
 # A fake multiplexed host: one process, one context-local profile scope
@@ -369,6 +374,192 @@ class TestUnscopedSecretErrorPropagation:
         fresh = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fresh)
         assert fresh._hermes_get_secret is _multiplexed_get_secret
+
+
+# ---------------------------------------------------------------------------
+# Two profiles, one gateway
+# ---------------------------------------------------------------------------
+
+_PROFILE_A = {
+    "TALK_VOICE": "marin",
+    "TALK_PROVIDER": "openai",
+    "OPENAI_API_KEY": "key-a",
+    "TALK_REPLY_LANGUAGE": "French",
+    "TALK_API_SERVER_PROBE_TIMEOUT_S": "4",
+    "TALK_ECHO_GATE_RATIO": "0.5",
+    "TALK_CALL_JOURNAL": "1",
+    "TALK_DISCORD_OPERATOR_USER_IDS": "111",
+}
+_PROFILE_B = {
+    "TALK_VOICE": "verse",
+    "OPENAI_API_KEY": "key-b",
+    "TALK_DISCORD_OPERATOR_USER_IDS": "222",
+}
+
+
+def _settings():
+    return {
+        "voice": talk_config.talk_voice(),
+        "provider": talk_config.talk_provider(),
+        "openai_key": talk_config.resolve_openai_key(),
+        "reply_language": talk_config.reply_language(),
+        "probe_timeout": talk_config.api_server_probe_timeout_s(),
+        "echo_ratio": talk_audio._env_float("TALK_ECHO_GATE_RATIO", 0.65),
+        "journal": talk_call_journal.enabled(),
+        "operators": talk_config.discord_operator_user_ids(),
+    }
+
+
+class TestTwoProfilesOneGateway:
+    """Two profiles served by one process never see each other's settings,
+    and neither sees the process environment's values."""
+
+    def test_each_profile_reads_only_its_own_settings(self, multiplexed, monkeypatch):
+        monkeypatch.setenv("TALK_ECHO_GATE_RATIO", "0.9")
+        monkeypatch.setenv("TALK_CALL_JOURNAL", "0")
+        monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", "999")
+        assert _as_profile("a", _PROFILE_A, _settings) == {
+            "voice": "marin",
+            "provider": "openai",
+            "openai_key": "key-a",
+            "reply_language": "French",
+            "probe_timeout": 4.0,
+            "echo_ratio": 0.5,
+            "journal": True,
+            "operators": frozenset({111}),
+        }
+        # B leaves most knobs unset: it gets the shipped defaults, never A's
+        # values and never the process environment's.
+        assert _as_profile("b", _PROFILE_B, _settings) == {
+            "voice": "verse",
+            "provider": talk_config.DEFAULT_TALK_PROVIDER,
+            "openai_key": "key-b",
+            "reply_language": None,
+            "probe_timeout": talk_config.DEFAULT_API_SERVER_PROBE_TIMEOUT_S,
+            "echo_ratio": 0.65,
+            "journal": False,
+            "operators": frozenset({222}),
+        }
+
+    def test_doctor_reports_the_profiles_shared_key_not_the_process_one(
+        self, multiplexed, monkeypatch,
+    ):
+        monkeypatch.setenv("GEMINI_API_KEY", "process-gemini")
+
+        def gemini_auth():
+            return talk_doctor._gemini_auth_check()
+
+        with_key = _as_profile("a", {"GEMINI_API_KEY": "gemini-a"}, gemini_auth)
+        without = _as_profile("b", {}, gemini_auth)
+        assert with_key["details"]["source"] == "GEMINI_API_KEY"
+        assert without["details"]["source"] is None
+        assert without["details"]["keys"]["shared"] == "absent"
+
+    def test_concurrent_turns_do_not_cross(self, multiplexed):
+        barrier = threading.Barrier(2, timeout=5)
+        seen: dict[str, tuple] = {}
+
+        def turn(profile, secrets):
+            def read():
+                barrier.wait()  # both turns are bound before either reads
+                return talk_config.talk_voice(), talk_config.resolve_openai_key()
+
+            seen[profile] = _as_profile(profile, secrets, read)
+
+        workers = [
+            threading.Thread(target=turn, args=("a", _PROFILE_A)),
+            threading.Thread(target=turn, args=("b", _PROFILE_B)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+        assert seen == {"a": ("marin", "key-a"), "b": ("verse", "key-b")}
+
+    def test_background_worker_keeps_the_dispatching_profile(self, multiplexed):
+        """A worker dispatched in A's turn reads A's settings even after the
+        dispatching context has moved on to B (#216 composed with #220)."""
+        go = threading.Event()
+        done = threading.Event()
+        seen: dict = {}
+
+        def worker():
+            assert go.wait(5)
+            try:
+                seen["read"] = (talk_config.talk_voice(), talk_config.resolve_openai_key())
+            except Exception as exc:  # noqa: BLE001 — recorded for the assertion
+                seen["read"] = exc
+            done.set()
+
+        def dispatch_then_switch():
+            talk_host._spawn_daemon(worker, name="talk-profile-probe")
+            _SECRET_SCOPE.set(_PROFILE_B)
+            _SESSION_PROFILE.set("b")
+            go.set()
+            assert done.wait(5)
+
+        _as_profile("a", _PROFILE_A, dispatch_then_switch)
+        assert seen["read"] == ("marin", "key-a")
+
+    def test_a_worker_without_the_turns_context_fails_closed(self, multiplexed):
+        """A plain thread loses the scope: the read refuses rather than falling
+        back to the process environment's key."""
+        seen: dict = {}
+
+        def worker():
+            try:
+                seen["read"] = talk_config.resolve_openai_key()
+            except Exception as exc:  # noqa: BLE001 — recorded for the assertion
+                seen["read"] = exc
+
+        def dispatch_plain():
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(5)
+
+        _as_profile("a", _PROFILE_A, dispatch_plain)
+        assert isinstance(seen["read"], UnscopedSecretError)
+
+    def test_each_profile_speaks_through_its_own_discord_bot(self, multiplexed, monkeypatch):
+        def adapter(guild):
+            return SimpleNamespace(_voice_clients={guild: object()}, _voice_receivers={})
+
+        default_bot, bot_a, bot_b = adapter(1), adapter(2), adapter(3)
+        runner = SimpleNamespace(
+            adapters={"discord": default_bot},
+            _profile_adapters={"a": {"discord": bot_a}, "b": {"discord": bot_b}},
+            _primary_profile_name="default",
+        )
+        run_module = types.ModuleType("gateway.run")
+        run_module._gateway_runner_ref = lambda: runner
+        multiplexed.run = run_module
+        monkeypatch.setitem(sys.modules, "gateway.run", run_module)
+        for name in ("gateway.config", "models", "gateway.platform_registry"):
+            monkeypatch.setitem(sys.modules, name, None)
+
+        assert _as_profile("a", _PROFILE_A, talk_discord.resolve_voice_bridge)["adapter"] is bot_a
+        assert _as_profile("b", _PROFILE_B, talk_discord.resolve_voice_bridge)["adapter"] is bot_b
+        assert talk_discord.resolve_voice_bridge()["adapter"] is default_bot
+
+    def test_a_profile_without_a_bot_never_borrows_another(self, multiplexed, monkeypatch):
+        bot_a = SimpleNamespace(_voice_clients={2: object()}, _voice_receivers={})
+        runner = SimpleNamespace(
+            adapters={"discord": SimpleNamespace(_voice_clients={1: object()},
+                                                 _voice_receivers={})},
+            _profile_adapters={"a": {"discord": bot_a}, "b": {}},
+            _primary_profile_name="default",
+        )
+        run_module = types.ModuleType("gateway.run")
+        run_module._gateway_runner_ref = lambda: runner
+        multiplexed.run = run_module
+        monkeypatch.setitem(sys.modules, "gateway.run", run_module)
+        for name in ("gateway.config", "models", "gateway.platform_registry"):
+            monkeypatch.setitem(sys.modules, name, None)
+
+        with pytest.raises(talk_discord.TalkDiscordError, match="profile 'b'"):
+            _as_profile("b", _PROFILE_B, talk_discord.resolve_voice_bridge)
+        with pytest.raises(talk_discord.TalkDiscordError, match="isn't loaded"):
+            _as_profile("ghost", {}, talk_discord.resolve_voice_bridge)
 
 
 # ---------------------------------------------------------------------------

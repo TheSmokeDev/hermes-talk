@@ -209,7 +209,7 @@ def _provider_check() -> dict[str, Any]:
 
     if provider == "gemini":
         scoped = talk_config._talk_env_get("TALK_GEMINI_API_KEY")
-        shared = os.environ.get("GEMINI_API_KEY")
+        shared = talk_config._talk_env_get("GEMINI_API_KEY")
         keys = {
             "scoped": _key_presence(scoped),
             "shared": _key_presence(shared),
@@ -273,7 +273,7 @@ def _provider_check() -> dict[str, Any]:
         )
 
     scoped = talk_config._talk_env_get("TALK_XAI_API_KEY")
-    shared = os.environ.get("XAI_API_KEY")
+    shared = talk_config._talk_env_get("XAI_API_KEY")
     keys = {
         "scoped": _key_presence(scoped),
         "shared": _key_presence(shared),
@@ -481,7 +481,7 @@ def _gemini_auth_check() -> dict[str, Any]:
     """Use session-time key precedence without network access or foreign auth stores."""
 
     scoped = talk_config._talk_env_get("TALK_GEMINI_API_KEY")
-    shared = os.environ.get("GEMINI_API_KEY")
+    shared = talk_config._talk_env_get("GEMINI_API_KEY")
     source = (
         "TALK_GEMINI_API_KEY" if scoped is not None
         else "GEMINI_API_KEY" if shared is not None else None
@@ -850,7 +850,7 @@ def _cascade_check() -> dict[str, Any]:
         )
 
     scoped = talk_config._talk_env_get("TALK_ELEVENLABS_API_KEY")
-    shared = os.environ.get("ELEVENLABS_API_KEY")
+    shared = talk_config._talk_env_get("ELEVENLABS_API_KEY")
     keys = {"scoped": _key_presence(scoped), "shared": _key_presence(shared)}
     voice_id_raw = talk_config._talk_env_get("TALK_ELEVENLABS_VOICE_ID")
     voice_id = (voice_id_raw or "").strip() or None

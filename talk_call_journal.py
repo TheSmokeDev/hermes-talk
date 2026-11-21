@@ -85,7 +85,7 @@ def enabled() -> bool:
     saved = talk_config.plugin_setting("journal_enabled")
     if type(saved) is bool:
         return saved
-    raw = (os.environ.get("TALK_CALL_JOURNAL") or "").strip().lower()
+    raw = (talk_config._talk_env_get("TALK_CALL_JOURNAL") or "").strip().lower()
     if raw in _TRUE:
         return True
     if raw in _FALSE:
@@ -98,7 +98,7 @@ def enabled() -> bool:
 def retention_days() -> int:
     """``TALK_CALL_JOURNAL_DAYS``: whole days a journal is kept (1-3650)."""
 
-    raw = (os.environ.get("TALK_CALL_JOURNAL_DAYS") or "").strip()
+    raw = (talk_config._talk_env_get("TALK_CALL_JOURNAL_DAYS") or "").strip()
     if not raw:
         return DEFAULT_RETENTION_DAYS
     if not raw.isdecimal() or len(raw) > 4 or not 1 <= int(raw) <= MAX_RETENTION_DAYS:
