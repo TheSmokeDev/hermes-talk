@@ -147,7 +147,7 @@ def test_arriving_audio_restarts_the_stall_bound():
     assert not audio.playback_pending
 
 
-def test_barge_in_resets_the_stall_bound():
+def test_barge_in_leaves_no_stale_stall_count():
     audio = _audio()
     audio._outbound.put_nowait(b"a" * 20)
     for _ in range(HELD):

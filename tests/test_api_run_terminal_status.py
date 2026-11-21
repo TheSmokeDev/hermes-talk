@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import wallclock
 
 import talk_apiserver
 import talk_approvals
@@ -67,18 +68,18 @@ def _run_worker(*, during_poll=None):
 
     def gated(run_id):
         entered.set()
-        assert release.wait(3)
+        assert release.wait(wallclock.stretch(3))
         return worker(run_id)
 
     run_id = talk_runs.start_run("agent", "terminal outcome", gated)
-    assert entered.wait(3)
+    assert entered.wait(wallclock.stretch(3))
     thread = next(t for t in threading.enumerate() if t.name == f"talk-run-agent-{run_id}")
     try:
         if during_poll:
             during_poll(run_id)
     finally:
         release.set()
-        thread.join(3)
+        thread.join(wallclock.stretch(3))
     assert not thread.is_alive()
     return talk_runs.get_run(run_id)
 
@@ -125,7 +126,7 @@ def test_http_outcome_reaches_registry_history_and_announcement(lane, status):
 def test_terminal_exception_carries_run_identity_and_status(lane, status):
     respond, _ = lane
     respond({"status": status})
-    with pytest.raises(talk_apiserver.TalkApiServerError) as caught:
+    with pytest.raises(talk_apiserver.TalkApiRunError) as caught:
         talk_apiserver.run_to_completion("task")
     assert caught.value.run_id == "remote-run"
     assert caught.value.status == status

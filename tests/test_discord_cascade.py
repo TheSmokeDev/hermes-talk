@@ -468,7 +468,7 @@ def test_cascade_stream_end_flushes_partial_discord_frame(monkeypatch):
         pcm24 = b"\x01\x00" * 10  # 80 Discord bytes after conversion
         ws.feed_audio(pcm24)
         ws.feed_final()
-        assert await asyncio.wait_for(task, 3) == 0
+        assert await asyncio.wait_for(task, wallclock.stretch(3)) == 0
 
         converted, _carry = talk_discord.session_to_discord(pcm24)
         assert len(converted) < talk_discord.DISCORD_FRAME_BYTES
