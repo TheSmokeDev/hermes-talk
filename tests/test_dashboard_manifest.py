@@ -163,6 +163,15 @@ def test_experimental_settings_ship_off_and_on_auto(config_schema):
     language = config_schema["voice_language"]
     assert language["default"] == "Auto"
     assert set(language["choices"]) == {"Auto", *talk_config._EXPERIMENTAL_LANGUAGE_CODES}
+    auto_join = config_schema["discord_auto_join"]
+    assert auto_join["type"] == "bool" and auto_join["default"] is False
+    backend = config_schema["cascade_tts"]
+    assert backend["default"] == talk_config.DEFAULT_CASCADE_TTS == "elevenlabs"
+    assert tuple(backend["choices"]) == talk_config.TALK_CASCADE_TTS_PROVIDERS
+    for key in ("cascade_openai_base_url", "cascade_openai_model", "cascade_openai_voice"):
+        assert config_schema[key]["default"] == ""
+    for key in ("discord_auto_join", "cascade_tts", "cascade_openai_base_url"):
+        assert config_schema[key]["label"].startswith("Experimental · ")
 
 
 def test_every_setting_declares_a_type_the_hermes_loader_knows(config_schema):

@@ -872,7 +872,10 @@ def _cascade_check() -> dict[str, Any]:
             "fail",
             "configured cascade TTS provider is not supported",
             details,
-            ("Set TALK_CASCADE_TTS to elevenlabs, or unset it.",),
+            (
+                f"Set TALK_CASCADE_TTS to {' or '.join(talk_config.TALK_CASCADE_TTS_PROVIDERS)}, "
+                "or unset it.",
+            ),
         )
     try:
         provider = talk_config.talk_provider()
@@ -886,6 +889,33 @@ def _cascade_check() -> dict[str, Any]:
             f"cascade voice mode requires the openai provider, not {provider}",
             details,
             ("Set TALK_PROVIDER=openai for cascade mode, or use TALK_VOICE_MODE=native.",),
+        )
+    if details["tts"] == "openai":
+        # Experimental OpenAI-compatible backend: the ElevenLabs key and voice
+        # do not apply. Resolution is offline (no request is made) and its
+        # refusal sentences never carry the key.
+        openai_key = talk_config._talk_env_get("TALK_CASCADE_OPENAI_API_KEY")
+        details.update(
+            keys={"scoped": _key_presence(openai_key)},
+            voice_id=None,
+            model=None,
+        )
+        try:
+            config = talk_config.cascade_voice_config("openai")
+        except talk_config.TalkConfigError as exc:
+            return _check(
+                "cascade",
+                "fail",
+                "the OpenAI-compatible cascade TTS is not fully configured",
+                details,
+                (str(exc),),
+            )
+        details.update(voice_id=config.voice_id, model=config.model)
+        return _check(
+            "cascade",
+            "pass",
+            f"cascade voice mode is configured (tts openai-compatible, model {config.model})",
+            details,
         )
     if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
         return _check(

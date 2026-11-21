@@ -13,6 +13,20 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- `/talk join` on Discord can connect to the voice channel you are in when the
+  bot is not in one yet, then start Talk. Off by default; turn on
+  *Experimental · Discord auto-join* or `TALK_DISCORD_AUTO_JOIN=1`. It works
+  only for users in `TALK_DISCORD_OPERATOR_USER_IDS`, uses the invoking
+  profile's bot, refuses clearly when you are not in voice or the bot lacks
+  permission, and closes only a connection it opened. Experimental. Requested by @Akm0d (#224).
+- Cascade mode can speak through any OpenAI-compatible `/audio/speech` server
+  (self-hosted models, LiteLLM gateways): `TALK_CASCADE_TTS=openai` with
+  `TALK_CASCADE_OPENAI_BASE_URL`, `_MODEL`, `_VOICE` and an optional `_API_KEY`,
+  or the matching *Experimental* settings. ElevenLabs stays the default. No new
+  dependency, plain `http://` only on loopback, and the key never falls back
+  to `OPENAI_API_KEY`. Experimental. Requested by @HearthCore (#151).
+
 ## [0.24.0] — 2026-11-21
 
 A big community release. Talk gets a one-button panel in Hermes Desktop and the

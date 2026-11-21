@@ -134,10 +134,17 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: guesses silently would spend the wrong metered TTS key.
 TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
-#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
-#: today; the list exists so a typo refuses instead of silently selecting.
-TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs",)
+#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. The list
+#: exists so a typo refuses instead of silently selecting. ``openai`` is the
+#: Experimental OpenAI-compatible ``POST {base}/audio/speech`` backend
+#: (self-hosted servers, LiteLLM gateways — hermes-talk#151).
+TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs", "openai")
 DEFAULT_CASCADE_TTS = "elevenlabs"
+#: Audio formats the OpenAI-compatible backend may ask for. Both must carry
+#: 24 kHz mono 16-bit PCM — the playback sink's format — and a WAV that
+#: does not refuses instead of playing at the wrong pitch.
+CASCADE_OPENAI_FORMATS = ("pcm", "wav")
+DEFAULT_CASCADE_OPENAI_FORMAT = "pcm"
 #: ElevenLabs TTS model for the cascade lane, probed against the live
 #: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
@@ -886,15 +893,14 @@ def reply_language() -> str | None:
 def cascade_tts() -> str:
     """Cascade TTS provider, resolved at call time. Fail-closed.
 
-    Only ``elevenlabs`` exists today; the knob is still validated so a typo
+    ``elevenlabs`` is the default; ``openai`` is the Experimental
+    OpenAI-compatible backend. ``TALK_CASCADE_TTS`` wins when set, otherwise
+    the plugin setting ``cascade_tts``. The knob is validated so a typo
     refuses with the valid values instead of guessing at a provider (and its
     metered key) the operator did not name.
     """
 
-    raw = (
-        (_talk_env_get("TALK_CASCADE_TTS") or DEFAULT_CASCADE_TTS).strip().lower()
-        or DEFAULT_CASCADE_TTS
-    )
+    raw = _env_or_saved("TALK_CASCADE_TTS", "cascade_tts").lower() or DEFAULT_CASCADE_TTS
     if raw not in TALK_CASCADE_TTS_PROVIDERS:
         raise TalkConfigError(
             f"TALK_CASCADE_TTS '{raw}' is not a cascade TTS provider "
@@ -1008,7 +1014,7 @@ def elevenlabs_voice_settings() -> dict:
     return settings
 
 
-def cascade_voice_config(provider: str) -> tuple[str, str, str]:
+def cascade_voice_config(provider: str) -> CascadeVoiceConfig:
     """The resolved cascade TTS triple — (key, voice id, model). Fail-closed.
 
     Every lane that opens a cascade session resolves through HERE so the
@@ -1026,12 +1032,191 @@ def cascade_voice_config(provider: str) -> tuple[str, str, str]:
             f"'{provider}' is configured — grok/gemini text-output modes are "
             "not wired into the cascade yet"
         )
-    cascade_tts()  # fail-closed; elevenlabs is the only value today
-    return (
+    backend = cascade_tts()
+    if backend == "openai":
+        return CascadeVoiceConfig(
+            resolve_cascade_openai_key(),
+            _cascade_openai_required("TALK_CASCADE_OPENAI_VOICE", "cascade_openai_voice", "voice"),
+            _cascade_openai_required("TALK_CASCADE_OPENAI_MODEL", "cascade_openai_model", "model"),
+            backend=backend,
+            base_url=cascade_openai_base_url(),
+            response_format=cascade_openai_format(),
+            speed=elevenlabs_speed(),
+        )
+    return CascadeVoiceConfig(
         resolve_elevenlabs_key(),
         elevenlabs_voice_id(),
         elevenlabs_model(),
     )
+
+
+class CascadeVoiceConfig(tuple):
+    """The resolved cascade config: still the ``(key, voice id, model)`` triple
+    every lane unpacks, plus the backend and its extras.
+
+    The repr never shows the key — a config that reaches a log line or a test
+    failure must not carry the secret with it.
+    """
+
+    def __new__(
+        cls,
+        api_key: str | None,
+        voice_id: str,
+        model: str,
+        *,
+        backend: str = DEFAULT_CASCADE_TTS,
+        base_url: str | None = None,
+        response_format: str = DEFAULT_CASCADE_OPENAI_FORMAT,
+        speed: float | None = None,
+    ):
+        self = super().__new__(cls, (api_key, voice_id, model))
+        self.backend = backend
+        self.base_url = base_url
+        self.response_format = response_format
+        self.speed = speed
+        return self
+
+    @property
+    def api_key(self) -> str | None:
+        return self[0]
+
+    @property
+    def voice_id(self) -> str:
+        return self[1]
+
+    @property
+    def model(self) -> str:
+        return self[2]
+
+    def __repr__(self) -> str:
+        return (
+            f"CascadeVoiceConfig(backend={self.backend!r}, voice_id={self.voice_id!r}, "
+            f"model={self.model!r}, key={'set' if self.api_key else 'none'})"
+        )
+
+
+def _saved_str(key: str) -> str:
+    """One Experimental plugin setting as a stripped string ('' when unset/unreadable)."""
+
+    try:
+        value = plugin_setting(key)
+    except Exception:  # noqa: BLE001 - an unreadable setting falls back to the env
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _env_or_saved(env: str, key: str) -> str:
+    """``env`` wins when set; otherwise the Experimental plugin setting ``key``."""
+
+    return (_talk_env_get(env) or "").strip() or _saved_str(key)
+
+
+def _cascade_openai_required(env: str, key: str, what: str) -> str:
+    value = _env_or_saved(env, key)
+    if not value:
+        raise TalkConfigError(
+            f"TALK_CASCADE_TTS=openai needs {env} — the {what} your "
+            "OpenAI-compatible TTS server expects"
+        )
+    return value
+
+
+def cascade_openai_base_url() -> str:
+    """Base URL of the OpenAI-compatible TTS server (``TALK_CASCADE_OPENAI_BASE_URL``).
+
+    Required, e.g. ``http://127.0.0.1:4000/v1`` for a local LiteLLM gateway;
+    the request goes to ``{base}/audio/speech``. Plain ``http://`` is refused
+    off loopback, like ``TALK_LOCAL_URL``: the reply text and any key would
+    cross the network unencrypted. Credentials, queries and fragments in the
+    URL refuse too — the key belongs in ``TALK_CASCADE_OPENAI_API_KEY``.
+    """
+
+    from urllib.parse import urlsplit
+
+    raw = _env_or_saved("TALK_CASCADE_OPENAI_BASE_URL", "cascade_openai_base_url")
+    if not raw:
+        raise TalkConfigError(
+            "TALK_CASCADE_TTS=openai needs TALK_CASCADE_OPENAI_BASE_URL — e.g. "
+            "http://127.0.0.1:4000/v1 for a local LiteLLM gateway"
+        )
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        parts, host, has_userinfo = None, "", False
+    if parts is None or parts.scheme not in ("http", "https") or not host:
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_BASE_URL must be an http:// or https:// URL with a host"
+        )
+    if has_userinfo or parts.query or parts.fragment:
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_BASE_URL must not carry credentials, a query or a "
+            "fragment — put the key in TALK_CASCADE_OPENAI_API_KEY"
+        )
+    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise TalkConfigError(
+            f"TALK_CASCADE_OPENAI_BASE_URL uses plain http:// to '{host}'; "
+            "use https:// off loopback"
+        )
+    return raw.rstrip("/")
+
+
+def cascade_openai_format() -> str:
+    """Audio format asked of the OpenAI-compatible server (``TALK_CASCADE_OPENAI_FORMAT``)."""
+
+    raw = _env_or_saved("TALK_CASCADE_OPENAI_FORMAT", "cascade_openai_format").lower()
+    raw = raw or DEFAULT_CASCADE_OPENAI_FORMAT
+    if raw not in CASCADE_OPENAI_FORMATS:
+        raise TalkConfigError(
+            f"TALK_CASCADE_OPENAI_FORMAT '{raw}' is not supported "
+            f"({', '.join(CASCADE_OPENAI_FORMATS)})"
+        )
+    return raw
+
+
+def resolve_cascade_openai_key() -> str | None:
+    """Optional key for the OpenAI-compatible TTS server, or ``None``.
+
+    Only ``TALK_CASCADE_OPENAI_API_KEY``. Deliberately NO fall-through to
+    ``OPENAI_API_KEY``: this endpoint is often a self-hosted or third-party
+    gateway, and handing it the operator's real OpenAI key would leak a
+    metered secret to a host that never asked for it. Set-but-blank refuses,
+    like every other Talk key; the key rides the ``Authorization`` header only.
+    """
+
+    scoped = _talk_env_get("TALK_CASCADE_OPENAI_API_KEY")
+    if scoped is None:
+        return None
+    if not scoped.strip():
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_API_KEY is set but empty — set a real key or unset it"
+        )
+    return scoped.strip()
+
+
+def discord_auto_join() -> bool:
+    """Experimental: whether ``/talk join`` may join the caller's voice channel.
+
+    Off by default, so ``/talk join`` keeps borrowing only the connection the
+    host already holds (hermes-talk#224). ``TALK_DISCORD_AUTO_JOIN`` wins when
+    set (junk refuses); otherwise the plugin setting ``discord_auto_join``.
+    """
+
+    raw = (_talk_env_get("TALK_DISCORD_AUTO_JOIN") or "").strip().lower()
+    if raw:
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise TalkConfigError(
+            f"TALK_DISCORD_AUTO_JOIN '{raw}' is not a switch: use 1/true/on or 0/false/off"
+        )
+    try:
+        saved = plugin_setting("discord_auto_join")
+    except Exception:  # noqa: BLE001 - an unreadable setting keeps today's behaviour
+        return False
+    return saved is True
 
 
 def agent_timeout_s() -> int:
@@ -1237,6 +1422,7 @@ def trust_declared_read_only() -> bool:
 
 
 __all__ = [
+    "CASCADE_OPENAI_FORMATS",
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
     "DEFAULT_API_SERVER_PROBE_TIMEOUT_S",
@@ -1245,6 +1431,7 @@ __all__ = [
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_APPROVAL_PROMPT_TIMEOUT_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_CASCADE_OPENAI_FORMAT",
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_CATALOG_STARTUP_WAIT_S",
     "DEFAULT_ELEVENLABS_MODEL",
@@ -1273,6 +1460,7 @@ __all__ = [
     "TALK_CASCADE_TTS_PROVIDERS",
     "TALK_PROVIDERS",
     "TALK_VOICE_MODES",
+    "CascadeVoiceConfig",
     "TalkConfigError",
     "agent_profile",
     "agent_timeout_s",
@@ -1285,10 +1473,13 @@ __all__ = [
     "approval_prompt_timeout_s",
     "audio_input_device",
     "audio_output_device",
+    "cascade_openai_base_url",
+    "cascade_openai_format",
     "cascade_tts",
     "cascade_voice_config",
     "catalog_startup_wait_s",
     "detect_agent_profile",
+    "discord_auto_join",
     "discord_operator_user_ids",
     "elevenlabs_model",
     "elevenlabs_speed",
@@ -1300,6 +1491,7 @@ __all__ = [
     "realtime_model_compatibility",
     "realtime_model_valid",
     "reply_language",
+    "resolve_cascade_openai_key",
     "resolve_elevenlabs_key",
     "resolve_gemini_key",
     "resolve_local_key",

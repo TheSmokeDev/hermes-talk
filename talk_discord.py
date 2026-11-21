@@ -301,20 +301,8 @@ def _resolve_current_profile() -> str | None:
     return None
 
 
-def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
-    """Find the host's live Discord voice connection. Raises on any miss.
-
-    Returns ``{guild_id, voice_client, receiver, adapter}``. Every lookup
-    is guarded: this reaches into host internals that carry no stability
-    promise, so a rename must surface as one refusal sentence rather than a
-    traceback on the voice path.
-
-    Profile-aware: under a multiplexed gateway the Discord adapter is looked
-    up in the invoking profile's map
-    (``runner._profile_adapters[profile]``) rather than the default profile's
-    ``runner.adapters``.  A missing secondary-profile adapter is a hard error
-    rather than silently using the default profile's Discord bot.
-    """
+def _invoking_profile_adapter() -> Any:
+    """The invoking profile's Discord adapter — never another profile's bot."""
 
     try:
         from gateway.run import _gateway_runner_ref  # host-only, lazy by design
@@ -333,7 +321,183 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     adapter = _resolve_discord_adapter_for_profile(runner, profile_name)
     if adapter is None:
         raise TalkDiscordError("the Discord adapter isn't loaded on this gateway")
+    return adapter
 
+
+def _session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return ""
+    return str(get_session_env(name) or "").strip()
+
+
+def _session_int(name: str) -> int | None:
+    raw = _session_env(name)
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 20:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+async def join_caller_voice_channel() -> tuple[int, Any | None]:
+    """Experimental (hermes-talk#224): connect to the caller's voice channel.
+
+    Returns ``(guild_id, joined_client)``. ``joined_client`` is the voice
+    client THIS call created, or ``None`` when the invoking profile's bot was
+    already connected in the caller's server (today's borrow path, untouched).
+    Raises :class:`TalkDiscordError` with one speakable refusal otherwise.
+
+    Boundaries, each deliberate:
+
+    - Only the invoking profile's adapter (:func:`_invoking_profile_adapter`),
+      so a multiplexed gateway never borrows another profile's bot (#185).
+    - Only a caller listed in ``TALK_DISCORD_OPERATOR_USER_IDS`` — moving
+      the bot into a voice channel is a state change, gated like the
+      state-changing Talk tools. An empty list refuses; it never means "anyone".
+    - Only the caller's own voice channel in the server the command came
+      from, through the host's own ``get_user_voice_channel`` /
+      ``join_voice_channel`` (no textual ``/voice join`` is dispatched).
+      No caller channel, a DM, or missing Connect/Speak permission refuses.
+    - An existing connection in that server is reused as-is, never moved.
+    """
+
+    if _session_env("HERMES_SESSION_PLATFORM").lower() != "discord":
+        raise TalkDiscordError("Auto-join only works from a Discord server channel.")
+    user_id = _session_int("HERMES_SESSION_USER_ID")
+    chat_id = _session_int("HERMES_SESSION_CHAT_ID")
+    if user_id is None or chat_id is None:
+        raise TalkDiscordError(
+            "Auto-join couldn't tell who ran the command — run `/voice join` first."
+        )
+    if user_id not in talk_config.discord_operator_user_ids():
+        raise TalkDiscordError(
+            "Auto-join is limited to Talk operators (TALK_DISCORD_OPERATOR_USER_IDS) — "
+            "run `/voice join` first."
+        )
+    adapter = _invoking_profile_adapter()
+    clients = getattr(adapter, "_voice_clients", None)
+    find_channel = getattr(adapter, "get_user_voice_channel", None)
+    join = getattr(adapter, "join_voice_channel", None)
+    client = getattr(adapter, "_client", None)
+    if not isinstance(clients, dict) or not callable(find_channel) or not callable(join):
+        raise TalkDiscordError(
+            "This Hermes version can't join voice channels for Talk — run `/voice join` first."
+        )
+    try:
+        text_channel = client.get_channel(chat_id) if client is not None else None
+    except Exception:  # noqa: BLE001 - host internals; refuse instead of guessing
+        text_channel = None
+    guild = getattr(text_channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if type(guild_id) is not int:
+        raise TalkDiscordError("Auto-join only works from a server text channel, not a DM.")
+
+    existing = clients.get(guild_id)
+    if existing is not None:
+        return guild_id, None  # already connected here: today's borrow path
+
+    try:
+        voice_channel = await find_channel(guild_id, str(user_id))
+    except Exception as exc:  # noqa: BLE001 - host lookup failure is speakable
+        raise TalkDiscordError(
+            f"I couldn't look up your voice channel ({_safe_exception_name(exc)})."
+        ) from None
+    channel_guild_id = getattr(getattr(voice_channel, "guild", None), "id", None)
+    if voice_channel is None or channel_guild_id != guild_id:
+        raise TalkDiscordError(
+            "You're not in a voice channel on this server — join one, then run `/talk join`."
+        )
+    try:
+        permissions = voice_channel.permissions_for(guild.me)
+        allowed = bool(permissions.connect) and bool(permissions.speak)
+    except Exception:  # noqa: BLE001 - unknown permission shape refuses closed
+        allowed = False
+    if not allowed:
+        raise TalkDiscordError(
+            "I don't have permission to connect and speak in your voice channel."
+        )
+    try:
+        joined = await join(voice_channel)
+    except Exception as exc:  # noqa: BLE001 - host join failure is speakable
+        raise TalkDiscordError(
+            f"I couldn't join your voice channel ({_safe_exception_name(exc)})."
+        ) from None
+    created = clients.get(guild_id)
+    if not joined or created is None:
+        raise TalkDiscordError(
+            "I couldn't join your voice channel — check my Connect and Speak permissions."
+        )
+    return guild_id, created
+
+
+def release_auto_joined(guild_id: int, joined_client: Any) -> None:
+    """Leave a voice connection auto-join created, once Talk is done with it.
+
+    Talk owns only the connection it opened: if the host (or `/voice join`)
+    has since replaced the client for that server, the connection is not
+    Talk's to close and is left alone. Called when a start refuses outright
+    and again when the session it started ends, so a failed start never
+    strands the bot in a channel.
+    """
+
+    try:
+        adapter = _invoking_profile_adapter()
+    except TalkDiscordError:
+        return
+    clients = getattr(adapter, "_voice_clients", None)
+    leave = getattr(adapter, "leave_voice_channel", None)
+    if not isinstance(clients, dict) or clients.get(guild_id) is not joined_client:
+        return
+    if not callable(leave):
+        return
+    loop = _running_loop()
+    if loop is None:
+        return  # off-loop: nothing safe to schedule the host's leave on
+    task = loop.create_task(leave(guild_id))
+    _NOTIFICATION_TASKS.add(task)
+    task.add_done_callback(_NOTIFICATION_TASKS.discard)
+
+
+def session_task() -> Any:
+    """The current Discord Talk session task, or ``None``."""
+
+    with _SESSION_LOCK:
+        return _SESSION.get("task")
+
+
+def release_auto_joined_when_done(guild_id: int, joined_client: Any, previous_task: Any) -> None:
+    """Tie an auto-joined connection's lifetime to the session just started.
+
+    ``previous_task`` is the session task from before the start: when the
+    start refused, the slot still holds that one (or nothing), so the
+    connection is released now instead of riding an unrelated session.
+    """
+
+    with _SESSION_LOCK:
+        running = _SESSION.get("task")
+    if running is None or running is previous_task or running.done():
+        release_auto_joined(guild_id, joined_client)
+        return
+    running.add_done_callback(lambda _task: release_auto_joined(guild_id, joined_client))
+
+
+def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
+    """Find the host's live Discord voice connection. Raises on any miss.
+
+    Returns ``{guild_id, voice_client, receiver, adapter}``. Every lookup
+    is guarded: this reaches into host internals that carry no stability
+    promise, so a rename must surface as one refusal sentence rather than a
+    traceback on the voice path.
+
+    Profile-aware: under a multiplexed gateway the Discord adapter is looked
+    up in the invoking profile's map
+    (``runner._profile_adapters[profile]``) rather than the default profile's
+    ``runner.adapters``.  A missing secondary-profile adapter is a hard error
+    rather than silently using the default profile's Discord bot.
+    """
+
+    adapter = _invoking_profile_adapter()
     clients = getattr(adapter, "_voice_clients", None)
     receivers = getattr(adapter, "_voice_receivers", None)
     if not isinstance(clients, dict) or not isinstance(receivers, dict):
@@ -1575,13 +1739,16 @@ __all__ = [
     "InputAudioPacket",
     "TalkDiscordError",
     "discord_to_session",
+    "join_caller_voice_channel",
     "native_command",
     "native_session_active",
     "pause_session",
+    "release_auto_joined_when_done",
     "reset_for_tests",
     "resolve_voice_bridge",
     "resume_session",
     "session_status",
+    "session_task",
     "session_to_discord",
     "start_core_session",
     "start_session",

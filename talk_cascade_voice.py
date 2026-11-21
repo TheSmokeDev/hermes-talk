@@ -1,4 +1,4 @@
-"""Custom-voice cascade — the provider thinks in text, ElevenLabs speaks.
+"""Custom-voice cascade — the provider thinks in text, a streaming TTS speaks.
 
 Native mode lets the realtime provider synthesize its own voice. Cascade mode
 opens the provider session in TEXT-output mode instead: the model keeps
@@ -31,9 +31,11 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import io
 import json
+import wave
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -603,11 +605,206 @@ class CascadeVoice:
                 self._on_audio(pcm)
 
 
+
+#: Per-request read budget for the OpenAI-compatible backend: a self-hosted
+#: model may take a while on a long sentence, but a server that goes silent
+#: must not hold the answer forever.
+SPEECH_READ_TIMEOUT_S = 30.0
+
+#: The sink takes 24 kHz mono 16-bit little-endian PCM — what OpenAI's
+#: ``response_format: "pcm"`` returns. A WAV in any other shape refuses
+#: rather than playing at the wrong pitch or speed.
+_SINK_RATE = 24_000
+
+
+def speech_url(base_url: str) -> str:
+    """The OpenAI-compatible speech endpoint under ``base_url``."""
+
+    return f"{base_url.rstrip('/')}/audio/speech"
+
+
+def wav_to_pcm24(body: bytes) -> bytes:
+    """The PCM frames of a 24 kHz mono 16-bit WAV body; anything else refuses."""
+
+    try:
+        with wave.open(io.BytesIO(body), "rb") as clip:
+            shape = (clip.getframerate(), clip.getnchannels(), clip.getsampwidth())
+            frames = clip.readframes(clip.getnframes())
+    except (wave.Error, EOFError) as exc:
+        raise CascadeTTSError("TTS endpoint returned malformed WAV") from exc
+    if shape != (_SINK_RATE, 1, 2):
+        raise CascadeTTSError(
+            "TTS endpoint returned WAV that is not 24 kHz mono 16-bit — "
+            "set TALK_CASCADE_OPENAI_FORMAT=pcm or configure the server's output"
+        )
+    return frames
+
+
+class OpenAICompatibleCascadeVoice(CascadeVoice):
+    """Experimental cascade backend: OpenAI-compatible ``POST /audio/speech``.
+
+    Everything that makes the cascade safe is inherited unchanged — the
+    sentence chunker, the shared playback sink, the generation-counter
+    barge-in, one-receipt-per-response degradation. Only the wire differs:
+    the OpenAI TTS contract is request/response, so each chunk is one POST
+    and its body is PCM (streamed straight to the sink) or a WAV (decoded,
+    then emitted). A barge-in cancels the in-flight request exactly the way
+    it cancels the ElevenLabs socket.
+
+    The optional key rides the ``Authorization`` header only, never the URL,
+    a log line or a receipt; redirects are refused so the header cannot be
+    carried to a host the operator did not configure. Upstream error bodies
+    are never read into an error string — only the HTTP status is named.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str | None,
+        voice_id: str,
+        model: str,
+        response_format: str = "pcm",
+        speed: float | None = None,
+        http_post: Callable[..., AsyncIterator[bytes]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(api_key=api_key or "", voice_id=voice_id, model=model, **kwargs)
+        self._url = speech_url(base_url)
+        self._voice = voice_id
+        self._model = model
+        self._format = response_format
+        self._speed = speed
+        #: Test seam: an async-generator function (url, headers, payload)
+        #: yielding body bytes. The real path opens one aiohttp session per
+        #: response and POSTs each chunk through it.
+        self._http_post = http_post
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _payload(self, text: str) -> dict:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "voice": self._voice,
+            "input": text,
+            "response_format": self._format,
+        }
+        if self._speed is not None:
+            payload["speed"] = self._speed
+        return payload
+
+    async def _stream(self, first_chunk: str) -> None:
+        """Speak one response: POST each chunk in order until the flush sentinel."""
+
+        generation = self._generation
+        async with self._poster() as post:
+            chunk = first_chunk
+            while True:
+                await self._speak(post, chunk, generation)
+                item = await self._queue.get()
+                if item is _FLUSH:
+                    return
+                chunk = item
+
+    async def _speak(
+        self, post: Callable[..., AsyncIterator[bytes]], text: str, generation: int
+    ) -> None:
+        body = post(self._url, self._headers(), self._payload(text))
+        if self._format == "wav":
+            self._emit(wav_to_pcm24(b"".join([part async for part in body])), generation)
+            return
+        carry = b""
+        async for part in body:
+            data = carry + part
+            cut = len(data) - (len(data) % 2)  # never split a 16-bit sample
+            carry = data[cut:]
+            self._emit(data[:cut], generation)
+
+    def _emit(self, pcm: bytes, generation: int) -> None:
+        # Same belt as the socket lane: audio decoded before a barge-in but
+        # emitted after it must not speak over the operator.
+        if pcm and generation == self._generation:
+            self._on_audio(pcm)
+
+    @contextlib.asynccontextmanager
+    async def _poster(self):
+        if self._http_post is not None:
+            yield self._http_post
+            return
+        aiohttp = self._aiohttp or _import_aiohttp()
+        timeout = aiohttp.ClientTimeout(
+            total=None, sock_connect=CONNECT_TIMEOUT_S, sock_read=SPEECH_READ_TIMEOUT_S
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+            async def post(url: str, headers: dict, payload: dict):
+                async with session.post(
+                    url, headers=headers, json=payload, allow_redirects=False
+                ) as response:
+                    if response.status != 200:
+                        raise CascadeTTSError(f"TTS endpoint answered HTTP {response.status}")
+                    async for data in response.content.iter_chunked(4800):
+                        yield data
+
+            yield post
+
+
+# -- backend registry ---------------------------------------------------------
+#
+# Cascade TTS backends by ``TALK_CASCADE_TTS`` value. A new backend (an
+# edge-tts adapter, hermes-talk#127) is one more ``CascadeVoice`` subclass
+# overriding ``_stream``, plus one entry here and in talk_config's list.
+
+
+def _elevenlabs_voice(config: Any, kwargs: dict) -> CascadeVoice:
+    return CascadeVoice(api_key=config[0], voice_id=config[1], model=config[2], **kwargs)
+
+
+def _openai_voice(config: Any, kwargs: dict) -> CascadeVoice:
+    kwargs.pop("voice_settings", None)  # ElevenLabs-only BOS settings
+    return OpenAICompatibleCascadeVoice(
+        base_url=config.base_url,
+        api_key=config[0],
+        voice_id=config[1],
+        model=config[2],
+        response_format=config.response_format,
+        speed=config.speed,
+        **kwargs,
+    )
+
+
+_BACKENDS: dict[str, Callable[[Any, dict], CascadeVoice]] = {
+    "elevenlabs": _elevenlabs_voice,
+    "openai": _openai_voice,
+}
+
+
+def build_cascade_voice(config: Any, **kwargs: Any) -> CascadeVoice:
+    """The cascade voice for a resolved ``talk_config.cascade_voice_config``.
+
+    A plain ``(key, voice id, model)`` triple is ElevenLabs, as it always was.
+    """
+
+    backend = getattr(config, "backend", "elevenlabs")
+    factory = _BACKENDS.get(backend)
+    if factory is None:
+        raise CascadeTTSError(f"cascade TTS backend '{backend}' is not wired")
+    return factory(config, dict(kwargs))
+
+
 __all__ = [
     "CLAUSE_BUDGET_CHARS",
     "CONNECT_TIMEOUT_S",
     "CascadeTTSError",
     "CascadeVoice",
+    "OpenAICompatibleCascadeVoice",
     "SentenceChunker",
+    "build_cascade_voice",
+    "speech_url",
     "stream_input_url",
+    "wav_to_pcm24",
 ]
