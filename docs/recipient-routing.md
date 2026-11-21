@@ -13,7 +13,9 @@ The companion Hermes host implements live chat selection and delivery in
 [host PR 11](https://github.com/TheSmokeDev/hermes-agent/pull/11) and native
 history reads in [host PR 13](https://github.com/TheSmokeDev/hermes-agent/pull/13).
 [Host PR 19](https://github.com/TheSmokeDev/hermes-agent/pull/19) confirms
-delivery to Claude Code 2.1.330 chats. Codex Desktop and Claude Code each need a
+delivery to Claude Code 2.1.330 chats, and
+[host PR 20](https://github.com/TheSmokeDev/hermes-agent/pull/20) supports the
+Codex Desktop 26.1117 chat layout. Codex Desktop and Claude Code each need a
 chat the host can verify. On Windows, run the host as the same user as those
 chats and outside any sandbox. A sandboxed host can read a Claude Code chat but
 cannot send to it.
