@@ -1,88 +1,91 @@
-# Twilio telephony (`talk_twilio`)
+# Twilio phone server (`talk_twilio_server`), experimental
 
-Talk over a phone line. Twilio Programmable Voice terminates the call and opens
-a bidirectional **Media Stream** to this process; `talk_twilio` converts the
-8 kHz G.711 µ-law frames into the PCM16 the realtime provider expects, drives a
-normal Talk session, and converts the agent's audio back into µ-law frames.
+> **Experimental.** This is a separate, opt-in server for people who host their
+> own Twilio number. It is **not** the built-in Phone mode, which uses Dograh
+> (see the README's *Optional native Phone mode* section). Pressing Talk never
+> starts it and nothing in the plugin imports it. It has not been confirmed on
+> a real phone call yet.
 
-This is the transport only. The session, tools, memory and approvals are the
-same ones the terminal and Discord lanes use.
-
-## Why it isn't wired into the CLI yet
-
-Issue [#44](https://github.com/TheSmokeDev/hermes-talk/issues/44) extracts a
-channel-neutral transport contract (mic frames in, PCM out, speaker identity
-evidence, join/leave lifecycle). This module is written to that shape but ships
-as a standalone server so it can land without changing the CLI's audio path:
-
-```bash
-python -m talk_twilio_server   # see "Running it" below
-```
-
-Once #44 lands, `TwilioCallBridge` becomes one implementation of the contract and
-the duplicated plumbing goes away.
-
-## What it does
+Each inbound call to your Twilio number gets a fresh Gemini Live voice session.
+That session has no Hermes task, no tools and no memory. It only talks.
 
 ```
-caller ──PSTN──> Twilio ──WSS──> talk_twilio ──> talk_realtime session
-                    ▲                                    │
-                    └────── µ-law frames ◄───────────────┘
+caller ──PSTN──> Twilio ──WSS──> talk_twilio_server ──> Gemini Live session
+                    ▲                                          │
+                    └────────── µ-law frames ◄─────────────────┘
 ```
 
-* Inbound `media` frames are decoded µ-law → PCM16 8 kHz, upsampled to the
-  provider's input rate (16 kHz for Gemini Live, 24 kHz for OpenAI Realtime) and
-  sent as `AppendInputAudio`.
-* `OutputAudio` events are downsampled to 8 kHz, encoded to µ-law and emitted as
-  20 ms frames (160 bytes), which is what Twilio's jitter buffer expects.
-* `OutputInterrupted` becomes a Twilio `clear` message, so barge-in stops audio
-  already buffered on Twilio's side rather than letting it finish.
-* Webhook requests are verified with `X-Twilio-Signature` (HMAC-SHA1 over the
-  URL plus sorted POST parameters) and compared in constant time.
+## How a call is handled
 
-## No local VAD, by design
+1. Twilio posts the call to `/twilio/voice`. The server checks the
+   `X-Twilio-Signature` header against your auth token, then checks the caller's
+   number against `TALK_TWILIO_ALLOWED_CALLERS`. A refused call gets `<Reject>`,
+   so it is never answered and never billed.
+2. An accepted call gets TwiML that opens a bidirectional Media Stream, carrying
+   a single-use token tied to that call. The stream socket opens a provider
+   session only for that token, so nobody can use the socket directly.
+3. Caller audio (8 kHz µ-law) is decoded and resampled to the session's 24 kHz
+   PCM. The agent's audio goes back as 20 ms µ-law frames. When the caller talks
+   over the agent, Twilio is told to drop the audio it has buffered.
+4. The call ends when either side hangs up, when the provider session ends, or
+   after 15 minutes. At most 2 calls run at once; more are declined as busy.
 
-Twilio does not detect speech. Gemini Live and the OpenAI Realtime lane both do
-server-side endpointing, so inbound audio is forwarded continuously and the
-provider decides when the caller has finished. That also means there is no
-client-side echo gate here — a phone line has no speaker-to-mic loop to gate.
+There is no local VAD: Gemini Live detects end of speech on its side, and a
+phone line has no speaker-to-mic echo to gate.
 
 ## Running it
 
-1. Buy or reuse a voice-capable number in Twilio (SMS is not needed).
-2. Point the number's **voice webhook** at `https://<your-host>/twilio/voice`.
-   Regional routing matters: if the console shows a region as *active* (for
-   example Ireland/IE1), configure that region's voice URL, not US1 — an edit to
-   an inactive region is silently inert.
-3. Expose the process publicly over TLS. Caddy or nginx in front of
-   `127.0.0.1:8767` is enough; the WebSocket path needs upgrade support.
-4. Run the server with the environment below.
+You need a voice-capable Twilio number, its account's primary **Auth Token**
+(Twilio Console, Account, API keys & tokens), a Gemini API key, and an HTTPS
+tunnel or reverse proxy on the same machine. Quick tunnels such as
+`cloudflared tunnel --url http://127.0.0.1:8767` or `ngrok http 8767` work and
+carry WebSockets.
 
 ```bash
-export TWILIO_AUTH_TOKEN=...            # signature verification
-export TALK_PUBLIC_BASE_URL=https://voice.example.com
-export TALK_PROVIDER=gemini             # or openai/grok/local
-export GEMINI_API_KEY=...               # for the Gemini lane
-python -m talk_twilio_server --port 8767
+export TALK_PUBLIC_BASE_URL=https://your-tunnel.example.com
+export TWILIO_AUTH_TOKEN=...
+export TALK_TWILIO_ALLOWED_CALLERS=+15551234567   # your own phone, E.164
+export GEMINI_API_KEY=...
+python -m talk_twilio_server --check   # prints the webhook URL for Twilio
+python -m talk_twilio_server           # listens on 127.0.0.1:8767
 ```
+
+In the Twilio Console, open the number's **Voice configuration** and set
+*A call comes in* to **Webhook**, the printed `voice webhook` URL, **HTTP POST**.
+The URL must match exactly, or the signature check returns 403. Regional
+routing matters: if the console shows a region such as Ireland (IE1) as active,
+set that region's voice URL; an edit to an inactive region does nothing.
+
+If the number already serves something else (for example a Dograh Phone mode
+line), use a different number, or put the old webhook back when you are done.
+
+The caller speaks first: the agent answers once you say something.
 
 | Variable | Meaning |
 | --- | --- |
-| `TWILIO_AUTH_TOKEN` | Twilio auth token, used for webhook signatures |
-| `TALK_PUBLIC_BASE_URL` | Public origin Twilio calls back on (`https://…`) |
-| `TALK_TWILIO_INPUT_RATE` | Provider input rate, default `16000` |
-| `TALK_TWILIO_OUTPUT_RATE` | Provider output rate, default `24000` |
-| `TALK_TWILIO_ALLOW_UNSIGNED` | `1` disables signature checks — local tunnels only |
+| `TALK_PUBLIC_BASE_URL` | Public `https://` origin Twilio calls (plain `http://` only for loopback) |
+| `TWILIO_AUTH_TOKEN` | Required. Every webhook is signature-checked; there is no unsigned mode |
+| `TALK_TWILIO_ALLOWED_CALLERS` | Required. Comma-separated E.164 numbers, or `*` for anyone |
+| `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` | The Gemini Live key; only Gemini is supported here |
+| `TALK_TWILIO_MODEL`, `TALK_TWILIO_VOICE`, `TALK_TWILIO_INSTRUCTIONS` | Optional overrides |
+
+The server binds loopback only, because it speaks plain HTTP. It logs call
+start and end, never caller numbers, tokens or keys, and keeps no access log.
 
 ## Known limits
 
-* **8 kHz is the ceiling.** The caller's audio is never better than a phone
-  line, and the agent's reply is downsampled to it. Names, postcodes and order
-  numbers transcribe markedly worse than they do on the terminal lane.
-* **Weak identity.** A PSTN caller proves a phone number, not a person. Per #44,
-  a transport with this evidence quality should default to
-  **conversational-only**: the agent may talk, but must not run tool actions on
-  the caller's say-so.
-* **One call per stream.** Each Media Stream gets its own session; there is no
-  shared audio bus and no mixing.
-* **No DTMF handling yet.** `dtmf` messages parse, but nothing consumes them.
+* **8 kHz is the ceiling.** Names, postcodes and order numbers transcribe
+  markedly worse than on the terminal lane.
+* **Caller ID is weak.** It can be spoofed, so the allowlist is a cost guard,
+  not authentication. That is why the agent has no tools here.
+* **Barge-in is best effort.** Gemini sends a reply faster than it plays, and
+  Twilio buffers it. Talking over the agent clears that buffer while Gemini is
+  still generating, but not once Gemini has finished the reply.
+* **Gemini only.** Its server-side endpointing is what makes a line work
+  without local VAD; other providers are refused with a clear error.
+* **No DTMF.** `dtmf` messages parse, but nothing uses them.
+
+The transport follows the shape issue
+[#44](https://github.com/TheSmokeDev/hermes-talk/issues/44) describes for a
+channel-neutral transport, so it can become one implementation of that
+contract later.
