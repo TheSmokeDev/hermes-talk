@@ -115,9 +115,12 @@ _TRANSCRIPT_CONTRACT = (
     "This limited legacy provider-owned call keeps a temporary local transcript while live. "
     "It is handed off after the call closes for durable-memory review; it is not a live "
     "searchable or user-facing archive. Current-call search unavailability is not evidence about "
-    "whether capture occurred. Canonical core-session persistence is separate; users "
-    "who need full Hermes parity should use /talk core join."
+    "whether capture occurred. Canonical core-session persistence is separate."
 )
+#: Rides the legacy contract ONLY where `/talk core join` can actually run: the
+#: Discord gateway lane on a host that carries the core voice contract
+#: (hermes-talk#215). The caller decides; this module stays host-free.
+_CORE_JOIN_POINTER = "Users who need full Hermes parity can use /talk core join."
 _HOST_TRANSCRIPT_CONTRACT = (
     "This provider-owned Realtime call executes tools through the canonical Hermes host. "
     "Ordinary speech and native PCM remain provider-owned; they are never routed through "
@@ -317,6 +320,7 @@ def build_instructions(
     host_summary: str | None = None,
     capabilities: str | None = None,
     reply_language: str | None = None,
+    core_join: bool = False,
 ) -> str:
     """Assemble the Realtime session prompt.
 
@@ -335,6 +339,11 @@ def build_instructions(
     CAPABILITIES_CAP and rendered just ahead of the lane line. ``None``
     fails open to the plain prompt — exactly what sessions shipped before
     the section existed.
+
+    ``core_join`` adds the `/talk core join` pointer to the limited legacy
+    lane's transcript contract. The caller passes True only on the Discord
+    lane of a host with the core voice contract; everywhere else the command
+    cannot run, so the prompt never offers it (hermes-talk#215).
     """
 
     sections: list[str] = []
@@ -369,12 +378,15 @@ def build_instructions(
     # perishable thing in the prompt, and a session with no host sections at
     # all should still be able to say what day it is.
     sections.append(current_moment())
-    contracts = [
-        _tool_contract(tools, host_execution=host_execution),
-        _TASK_TRANSCRIPT_CONTRACT
-        if canonical_task
-        else (_HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT),
-    ]
+    if canonical_task:
+        transcript_contract = _TASK_TRANSCRIPT_CONTRACT
+    elif host_execution:
+        transcript_contract = _HOST_TRANSCRIPT_CONTRACT
+    else:
+        transcript_contract = _TRANSCRIPT_CONTRACT + (
+            " " + _CORE_JOIN_POINTER if core_join else ""
+        )
+    contracts = [_tool_contract(tools, host_execution=host_execution), transcript_contract]
     language_line = reply_language_line(reply_language)
     if language_line:
         contracts.insert(0, language_line)

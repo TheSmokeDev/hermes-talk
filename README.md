@@ -152,7 +152,7 @@ Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
 | OpenAI Realtime (`TALK_PROVIDER=openai`, default) | ChatGPT subscription through `codex login`, or `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | `gpt-realtime-2.1` | every surface |
 | GPT-Live (`TALK_VOICE_MODE=live`) | `TALK_LIVE_AUTH=subscription` (the default, on the Codex subscription) or explicitly chosen `api` billing; no automatic paid fallback | `gpt-live-1-codex` (subscription) / `gpt-live-1` (API) | terminal, Discord, dashboard, Desktop — on an explicit task |
 | xAI Grok Voice (`TALK_PROVIDER=grok`) | an X Premium or SuperGrok login (`hermes auth add xai-oauth`) — **no API key** — or `TALK_XAI_API_KEY` / `XAI_API_KEY` | `grok-voice-latest` | terminal + Discord |
-| Gemini Live (`TALK_PROVIDER=gemini`) | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | `gemini-3.1-flash-live-preview` | terminal + `hermes realtime`; Discord refuses it for now |
+| Gemini Live (`TALK_PROVIDER=gemini`) | `GEMINI_API_KEY` / `TALK_GEMINI_API_KEY` — free-tier AI Studio keys work | `gemini-3.1-flash-live-preview` | terminal; Discord refuses it for now |
 | Local models (`TALK_PROVIDER=local`) | none by default — any self-hosted OpenAI-Realtime-compatible server, e.g. [speech-to-speech](https://github.com/huggingface/speech-to-speech) with an Ollama LLM | the server's own | terminal (Discord not yet verified) |
 | Cascade voice (`TALK_VOICE_MODE=cascade`) | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY`, on top of the OpenAI Realtime lane | `eleven_flash_v2_5` | terminal, Discord, dashboard |
 
@@ -239,15 +239,16 @@ The three that shaped everything else:
 
 ## Background
 
-Hermes Talk began as a plugin and became a reference implementation for the
-speech-to-speech contract Hermes core now carries:
+Hermes Talk began as a plugin and became a reference implementation for a
+proposed speech-to-speech contract for Hermes core:
 
 - [RFC NousResearch/hermes-agent#77111](https://github.com/NousResearch/hermes-agent/issues/77111)
   — filed from this repo: a `RealtimeVoiceProvider` ABC for Hermes core.
 - [PR NousResearch/hermes-agent#101808](https://github.com/NousResearch/hermes-agent/pull/101808)
-  — the core contract, orchestrator, and first built-in provider, ported from
-  this plugin's orchestrator and OpenAI transport. hermes-talk already publishes
-  its three lanes on that contract
+  — the proposed core contract, orchestrator, and first built-in provider,
+  ported from this plugin's orchestrator and OpenAI transport. It was closed
+  without merging, so no Hermes release carries the contract today. hermes-talk
+  feature-detects it and publishes its three lanes only on a host that has it
   ([details](docs/OPERATING.md#hermes-core-realtime-contract)).
 - [PR NousResearch/hermes-agent#97325](https://github.com/NousResearch/hermes-agent/pull/97325)
   — a pointer to this plugin on the official Voice Mode docs page.

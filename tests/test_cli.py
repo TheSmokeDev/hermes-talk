@@ -2299,6 +2299,29 @@ def test_a_caller_named_lane_buys_no_summary(monkeypatch, tmp_path):
     assert talk_identity.LANE_LINES["discord"] in seen["instructions"]
 
 
+@pytest.mark.parametrize(
+    "lane,core_available,offered",
+    [
+        ("cli", False, False),
+        ("cli", True, False),
+        ("discord", False, False),
+        ("discord", True, True),
+    ],
+)
+def test_core_join_is_offered_only_on_discord_with_the_core_contract(
+    monkeypatch, tmp_path, lane, core_available, offered
+):
+    """hermes-talk#215: a terminal call kept telling the operator to run /talk core join."""
+
+    monkeypatch.setattr(talk_cli.talk_core_realtime, "core_provider_available",
+                        lambda: core_available)
+    seen = _capture_instructions(monkeypatch, tmp_path)
+
+    assert asyncio.run(talk_cli.run_talk_session(lane=lane)) == 1
+    assert seen["core_join"] is offered
+    assert ("core join" in seen["instructions"]) is offered
+
+
 @pytest.mark.parametrize("provider,mode", [("grok", "semantic_vad"), ("gemini", "server_vad")])
 def test_unsupported_endpointing_refuses_before_resolving_credentials(monkeypatch, provider, mode):
     monkeypatch.setenv("TALK_PROVIDER", provider)

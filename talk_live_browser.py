@@ -376,8 +376,16 @@ class BrowserBinding:
             if delegation_id is not None:
                 self.job_delegations[str(run_id)] = delegation_id
         text = str(result.get("output") or "No task action was needed.")[:16000]
-        command = (rt.SubmitDelegationResult(delegation_id, text) if delegation_id is not None
-                   else rt.AppendLiveContext(text, kind="message"))
+        # A "context" result (nothing new happened) is reference for the model,
+        # never a line to speak (hermes-talk#202).
+        silent = result.get("kind") == "context"
+        command = (
+            rt.SubmitDelegationResult(
+                delegation_id, text, kind="context" if silent else "commentary"
+            )
+            if delegation_id is not None
+            else rt.AppendLiveContext(text, kind="context" if silent else "message")
+        )
         await self.deliver(result.get("operation_id") or delegation_id or input_id,
                            [command], delegation_id=delegation_id,
                            operation_id=result.get("operation_id"))

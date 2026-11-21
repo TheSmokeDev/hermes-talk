@@ -47,11 +47,13 @@ Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
-Between the receipt and the landing, the session speaks bounded progress
-milestones: "accepted", "executing — Reading files", "waiting on an approval",
-and periodic "still working" heartbeats. The only detail that can name what a
-job is doing is a safe label from a fixed table — never the tool's arguments,
-paths, or output.
+Between the receipt and the landing, the session stays quiet unless a
+milestone is news: "waiting on an approval", or a labelled step such as
+"executing — Reading files". It says one acknowledgement when the work starts,
+then nothing until there is something new — no "accepted" echo of that
+acknowledgement and no periodic "still working" (#202). Ask and `check_work`
+answers. The only detail that can name what a job is doing is a safe label from
+a fixed table — never the tool's arguments, paths, or output.
 
 Known limitation: delivery is bound to the exact session that started the
 work. If you disconnect before it lands, reconnecting on the *same* Hermes

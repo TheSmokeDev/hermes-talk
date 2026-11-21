@@ -44,6 +44,11 @@ config_schema:
     default: ""
     label: "Experimental · Echo address"
     description: Hostname or local IP of a compatible Echo running hassmic. Used by hermes talk echo.
+  echo_gate_hold_ms:
+    type: int
+    default: 0
+    label: "Experimental · Speaker echo hold (ms)"
+    description: Terminal calls on loudspeakers with output delay, such as a TV over HDMI. Keeps the echo gate closed this many milliseconds after the voice stops so its last words are not heard as you. 0 keeps today's behavior.
   phone_enabled:
     type: bool
     default: false

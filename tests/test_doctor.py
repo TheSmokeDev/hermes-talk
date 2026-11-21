@@ -181,6 +181,25 @@ def test_doctor_does_not_create_missing_home_or_codex_directories(monkeypatch, t
     assert not codex_home.exists()
 
 
+def test_headless_host_reports_missing_audio_device_instead_of_crashing(headless_sounddevice):
+    # hermes-talk#236: doctor and check aborted with a PortAudioError traceback.
+    import talk_check
+
+    audio = _checks(talk_doctor.collect_report())["audio"]
+
+    assert audio["status"] == "warn"
+    assert "no audio device" in audio["summary"]
+    assert "Discord voice may still be usable" in audio["summary"]
+    assert audio["details"]["dependency_available"] is False
+    assert any("headless" in action for action in audio["remediation"])
+    assert not any("pip install" in action for action in audio["remediation"])
+
+    step = talk_check.run_static_step()
+    folded = {check["id"]: check for check in step["details"]["checks"]}
+    assert folded["audio"]["status"] == "warn"
+    assert "no audio device" in folded["audio"]["summary"]
+
+
 def test_blank_oauth_is_reported_without_tokens(monkeypatch, tmp_path):
     access = ""
     _write_oauth(tmp_path / "codex", access=access)

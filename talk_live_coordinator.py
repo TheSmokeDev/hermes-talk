@@ -706,9 +706,11 @@ class LiveCoordinator:
 
     @staticmethod
     def _empty():
+        # Reference context, not speech (hermes-talk#202): nothing happened, so
+        # the voice model is told so without being handed a line to say.
         return {
             "ok": True,
-            "kind": "commentary",
+            "kind": "context",
             "output": "No new operator input was captured. No task action was taken.",
         }
 

@@ -34,6 +34,15 @@ def test_lazy_import_failure_names_the_extra(monkeypatch):
         talk_audio.import_sounddevice()
     assert talk_audio.audio_available() is False
 
+def test_headless_portaudio_failure_is_a_talk_audio_error(headless_sounddevice):
+    # hermes-talk#236: PortAudioError escaped audio_available() as a traceback.
+    with pytest.raises(talk_audio.TalkAudioDeviceError, match="no audio device") as caught:
+        talk_audio.import_sounddevice()
+    assert isinstance(caught.value, talk_audio.TalkAudioError)
+    assert type(caught.value.__cause__).__name__ == "PortAudioError"
+    assert talk_audio.audio_available() is False
+
+
 def test_audio_availability_only_requires_sounddevice(monkeypatch):
     monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: object())
 
@@ -318,6 +327,74 @@ def test_echo_gate_ignores_invalid_env_values(monkeypatch):
 
     assert audio._min_barge_in_level == talk_audio.MIN_BARGE_IN_LEVEL
     assert audio._output_echo_ratio == talk_audio.OUTPUT_ECHO_RATIO
+
+
+class _Monotonic:
+    def __init__(self) -> None:
+        self.now = 500.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _speak_then_go_quiet(audio) -> None:
+    """One loud playback block, then the output callback drains to silence."""
+
+    playback = _pcm16(20_000, 2_400)
+    audio.queue_playback(playback)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+    audio._output_callback(_Buffer(len(playback)), 2_400, None, None)
+
+
+def test_echo_gate_hold_is_off_by_default_and_the_gate_opens_when_playback_stops(monkeypatch):
+    clock = _Monotonic()
+    monkeypatch.setattr(talk_audio, "time", clock)
+    audio = talk_audio.DuplexAudio()
+    _speak_then_go_quiet(audio)
+    late_echo = _pcm16(1_000, 2_400)  # below the barge-in floor
+
+    audio._input_callback(late_echo, 2_400, None, None)
+
+    assert audio._echo_gate_hold_s == 0
+    assert audio.read_input_chunk() == late_echo
+
+
+def test_echo_gate_hold_drops_the_delayed_tail_but_keeps_barge_in(monkeypatch):
+    """hermes-talk#228: an HDMI TV plays the model back ~200 ms late."""
+
+    clock = _Monotonic()
+    monkeypatch.setattr(talk_audio, "time", clock)
+    monkeypatch.setenv("TALK_ECHO_GATE_HOLD_MS", "700")
+    audio = talk_audio.DuplexAudio()
+    _speak_then_go_quiet(audio)
+    late_echo = _pcm16(1_000, 2_400)
+    operator = _pcm16(5_000, 2_400)  # above the barge-in floor
+
+    clock.now += 0.2
+    audio._input_callback(late_echo, 2_400, None, None)
+    assert audio.read_input_chunk() is None
+    audio._input_callback(operator, 2_400, None, None)
+    assert audio.read_input_chunk() == operator
+
+    clock.now += 0.6  # past the hold: the gate opens as it always did
+    audio._input_callback(late_echo, 2_400, None, None)
+    assert audio.read_input_chunk() == late_echo
+
+
+def test_echo_gate_hold_reads_env_first_then_the_saved_setting(monkeypatch):
+    monkeypatch.setattr(talk_audio.talk_config, "plugin_setting", {"echo_gate_hold_ms": 300}.get)
+    assert talk_audio.DuplexAudio()._echo_gate_hold_s == pytest.approx(0.3)
+
+    monkeypatch.setenv("TALK_ECHO_GATE_HOLD_MS", "450")
+    assert talk_audio.DuplexAudio()._echo_gate_hold_s == pytest.approx(0.45)
+
+    for junk in ("soon", "-5"):
+        monkeypatch.setenv("TALK_ECHO_GATE_HOLD_MS", junk)
+        assert talk_audio.DuplexAudio()._echo_gate_hold_s == 0
+
+    monkeypatch.delenv("TALK_ECHO_GATE_HOLD_MS")
+    monkeypatch.setattr(talk_audio.talk_config, "plugin_setting", {"echo_gate_hold_ms": True}.get)
+    assert talk_audio.DuplexAudio()._echo_gate_hold_s == 0
 
 
 def test_microphone_audio_passes_when_playback_is_silent():

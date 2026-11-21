@@ -105,6 +105,7 @@ def test_outputs_future_input_and_conflicting_events_cannot_authorize_work(envir
         output = {**body["fragments"][0], "role": "assistant"}
         response = await coordinator.delegation(request, {**body, "fragments": [output]})
         assert "No new operator input" in response["output"]
+        assert response["kind"] == "context"  # hermes-talk#202: nothing to say aloud
         future = {**body["fragments"][0], "end_ms": 1200}
         await coordinator.delegation(request, {**body, "fragments": [future]})
         assert not host.jobs and not decide.calls

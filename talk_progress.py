@@ -92,11 +92,6 @@ PHASES = frozenset(
 #: SPOKEN by the phase path — the terminal announcement owns that sentence.
 TERMINAL_PHASES = frozenset({PHASE_COMPLETE, PHASE_FAILED, PHASE_STOPPED})
 
-#: Spoken-lane liveness bound: at most one "still working" per run per
-#: minute, and only after a full interval with no milestone speech of any
-#: kind. Long quiet work should sound alive; it should never sound busy.
-HEARTBEAT_S = 60.0
-
 #: The api_server poll payload's ``last_event`` → phase (tier 2). Only events
 #: the host actually stamps on the run status are mapped: ``run.queued`` is
 #: the documented creation event and ``run.started`` is the first transition
@@ -522,9 +517,10 @@ class RunProgressWatch:
     """One watcher's progress-speech state for one registry run.
 
     ``poll`` is called once per watch tick with a fresh run snapshot and
-    answers the ONLY question the spoken lane asks: what, if anything, is due
-    to be said right now. It returns a milestone kind — a phase name for a
-    phase change, ``"heartbeat"`` for a bounded liveness note, or ``None``.
+    answers the ONLY question the spoken lane asks: has this run's phase
+    changed? It returns the new non-terminal phase name, or ``None``. Which
+    of those phases are worth a spoken line is the speech builder's call
+    (``talk_cli.run_phase_commands``).
 
     - Phase speech fires on CHANGE only: a run holding ``executing`` for
       forty polls says it once.
@@ -532,38 +528,29 @@ class RunProgressWatch:
       spoken by the watcher's existing terminal branch off the registry's
       authoritative status; a phase built from the same host event is the
       receipt, not the sentence.
-    - Heartbeats are bounded to one per :data:`HEARTBEAT_S` of speech
-      silence per run — the clock is speech, not polls, so an active run
-      earning milestones is not also interrupted by liveness notes.
-    - A run with no phase at all (the detached lane, whose only host signal
-      is the exit code) gets exactly the heartbeat — liveness, nothing more.
+    - No change, nothing due. There is no time-based liveness note: a
+      "still working" line once a minute told the operator nothing the
+      WORK_STARTED receipt had not, and each one forced a spoken response
+      over the conversation (hermes-talk#202). ``check_work`` answers
+      "how's it going?" when the operator actually asks.
     """
 
-    def __init__(self, *, heartbeat_s: float = HEARTBEAT_S, now=time.monotonic) -> None:
-        self._heartbeat_s = heartbeat_s
-        self._now = now
+    def __init__(self) -> None:
         self._phase: str | None = None
-        # Speech silence is measured from the watch's birth: the WORK_STARTED
-        # receipt was just spoken, so a fresh watcher owes nothing yet.
-        self._last_spoke = now()
 
     def poll(self, run: dict) -> str | None:
-        """The milestone due this tick — a phase name, ``"heartbeat"``, or None."""
+        """The phase change due this tick — a non-terminal phase name, or None."""
 
         meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
         phase = meta.get("phase")
-        if isinstance(phase, str) and phase in PHASES and phase != self._phase:
-            self._phase = phase
-            if phase in TERMINAL_PHASES:
-                # Recorded so it is not re-evaluated every tick, but never
-                # spoken from here: the terminal artifact owns that speech.
-                return None
-            self._last_spoke = self._now()
-            return phase
-        if self._now() - self._last_spoke >= self._heartbeat_s:
-            self._last_spoke = self._now()
-            return "heartbeat"
-        return None
+        if not isinstance(phase, str) or phase not in PHASES or phase == self._phase:
+            return None
+        self._phase = phase
+        if phase in TERMINAL_PHASES:
+            # Recorded so it is not re-evaluated every tick, but never
+            # spoken from here: the terminal artifact owns that speech.
+            return None
+        return phase
 
 
 def reset_for_tests() -> None:
@@ -578,7 +565,6 @@ def reset_for_tests() -> None:
 
 __all__ = [
     "EVENT_SUBAGENT_PHASE",
-    "HEARTBEAT_S",
     "PHASES",
     "PHASE_ACCEPTED",
     "PHASE_BLOCKED",

@@ -483,10 +483,11 @@ live listen, not a code change.
 | `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL` | `0.015` | Playback RMS above which the gate considers the speaker "active" at all. Below it nothing is dropped. |
 | `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL` | `0.04` | Absolute floor a microphone block must clear to count as barge-in, however quiet the playback is. |
 | `TALK_ECHO_GATE_RATIO` | `0.65` | Fraction of the current playback RMS a block must also clear. The effective threshold is the **larger** of this and the floor above, so raising either only makes the gate stricter. |
+| `TALK_ECHO_GATE_HOLD_MS` | `0` (off) | Experimental. Keeps the gate closed this many milliseconds after playback goes quiet. For loudspeakers with output latency (a TV over HDMI, some Bluetooth speakers), where the model's words come back through the microphone after they were written and the tail of its speech would otherwise be taken as you talking. Start around `300`-`700`. While the hold runs, playback is already quiet, so a block only has to clear `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL` — you can still interrupt by speaking up. `0` is exactly the gate as it always was. Also settable as **Experimental · Speaker echo hold (ms)** in the plugin settings; the variable wins when set. |
 
-All four are read when the audio stream is CONSTRUCTED — once per session, not
+All five are read when the audio stream is CONSTRUCTED — once per session, not
 per block and not at import — so a change lands on the next call, never the
-live one. The three numeric knobs fail soft: blank, unparseable, or negative
+live one. The four numeric knobs fail soft: blank, unparseable, or negative
 silently takes the default (`0` is honored, and on the ratio it means "the
 floor decides alone"). There is no receipt for a typo, so read them back with
 `hermes talk diagnostics` — it reports the NAMES you have set.
@@ -781,11 +782,13 @@ run-history tee so test suites can't write into a real Hermes home.)
 
 ## Hermes core realtime contract
 
-Hermes core now defines its own provider-neutral speech-to-speech contract
-(`agent/realtime_voice_provider.py`, API v2 — NousResearch/hermes-agent#101808)
-and drives any registered backend from `hermes realtime`. hermes-talk publishes
-all three of its lanes there, so the same OpenAI, Grok, and Gemini sessions this
-plugin already speaks are available to core's own orchestrator:
+NousResearch/hermes-agent#101808 proposed a provider-neutral speech-to-speech
+contract for Hermes core (`agent/realtime_voice_provider.py`, API v2) that
+drives any registered backend from `hermes realtime`. That PR was closed without
+merging, so no Hermes release carries the contract or the `hermes realtime`
+command today. On a host that does carry it, hermes-talk publishes all three of
+its lanes there, so the same OpenAI, Grok, and Gemini sessions this plugin
+already speaks are available to core's own orchestrator:
 
 ```bash
 hermes realtime --list

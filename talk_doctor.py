@@ -925,6 +925,18 @@ def _cascade_check() -> dict[str, Any]:
     )
 
 
+def _audio_device_missing() -> bool:
+    """True when sounddevice imports but PortAudio found no audio system (hermes-talk#236)."""
+
+    try:
+        talk_audio.import_sounddevice()
+    except talk_audio.TalkAudioDeviceError:
+        return True
+    except talk_audio.TalkAudioError:
+        return False
+    return False
+
+
 def _audio_check() -> dict[str, Any]:
     available = talk_audio.audio_available()
     details = {
@@ -938,6 +950,18 @@ def _audio_check() -> dict[str, Any]:
             "pass",
             "terminal audio dependency is importable; devices remain unopened",
             details,
+        )
+    if _audio_device_missing():
+        return _check(
+            "audio",
+            "warn",
+            "terminal audio has no device: PortAudio found no audio device or sound "
+            "server; Discord voice may still be usable",
+            details,
+            (
+                "Expected on a headless host. Terminal /talk needs a working sound "
+                "device or server (PulseAudio, PipeWire or ALSA).",
+            ),
         )
     return _check(
         "audio",

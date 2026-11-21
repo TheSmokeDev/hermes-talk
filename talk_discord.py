@@ -1634,18 +1634,21 @@ def _public_exception_failure(error: BaseException) -> str:
 #: plugin-side configuration or connect refusal is exactly what it routes
 #: around. An audio refusal is the voice channel itself — core join opens the
 #: same channel and fails the same way — so pointing there would just waste the
-#: operator's next attempt.
+#: operator's next attempt. And on a host without the core voice contract the
+#: command cannot run at all, so :func:`_startup_refusal_failure` drops the
+#: pointer there (hermes-talk#215).
 #: Keyed by literal so this module keeps its lazy ``talk_cli`` import (the
 #: import runs inside :func:`start_session` to avoid a cycle). The keys are
 #: pinned to ``talk_cli.STARTUP_REFUSAL_REASONS`` by a test, so a new reason
 #: cannot ship without a sentence and every sentence has a live reason.
+_CORE_JOIN_OFFER = "try `/talk core join`, or "
 _STARTUP_REFUSAL_FAILURES = {
     "configuration": (
-        "voice is not configured on this host — try `/talk core join`, or run "
+        f"voice is not configured on this host — {_CORE_JOIN_OFFER}run "
         "`hermes talk doctor` to see which setting is missing"
     ),
     "provider": (
-        "the voice provider refused the connection — try `/talk core join`, or "
+        f"the voice provider refused the connection — {_CORE_JOIN_OFFER}"
         "run `hermes talk doctor` to check the provider is reachable"
     ),
     "audio": "the voice channel would not open",
@@ -1660,12 +1663,25 @@ _STARTUP_REFUSAL_FAILURES = {
 }
 
 
+def _core_join_available() -> bool:
+    """`/talk core join` can run only on a host with the core voice contract (hermes-talk#215)."""
+
+    try:
+        from . import talk_core_realtime
+    except ImportError:
+        import talk_core_realtime
+    return talk_core_realtime.core_provider_available()
+
+
 def _startup_refusal_failure(reason: str | None) -> str | None:
     """Map a bounded refusal reason to its speakable line, or None."""
 
     if reason is None:
         return None
-    return _STARTUP_REFUSAL_FAILURES.get(reason)
+    line = _STARTUP_REFUSAL_FAILURES.get(reason)
+    if line is not None and not _core_join_available():
+        line = line.replace(_CORE_JOIN_OFFER, "")
+    return line
 
 
 JOIN_USAGE = (
@@ -1712,10 +1728,14 @@ def session_status() -> str:
             f"Provider-owned Realtime voice with canonical Hermes tools is live on server "
             f"{guild_id}. Say `talk leave` to stop.{paused}"
         )
+    core_join = (
+        "Use `/talk core join` for full canonical Hermes parity; say"
+        if _core_join_available()
+        else "Say"
+    )
     return (
         f"Limited legacy provider-owned voice is live on server {guild_id}. "
-        "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
-        f"{paused}"
+        f"{core_join} `talk leave` to stop.{paused}"
     )
 
 
@@ -2120,9 +2140,14 @@ def start_session(
             "Starting provider-owned Realtime voice with canonical Hermes tools; say "
             "`talk status` to check or `talk leave` to stop."
         )
+    if _core_join_available():
+        return (
+            "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
+            "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
+        )
     return (
-        "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
-        "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
+        "Starting limited legacy provider-owned voice; say `talk status` to check or "
+        "`talk leave` to stop."
     )
 
 

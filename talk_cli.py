@@ -48,6 +48,7 @@ try:
         talk_cascade_voice,
         talk_check,
         talk_config,
+        talk_core_realtime,
         talk_diagnostics,
         talk_doctor,
         talk_gemini_realtime,
@@ -80,6 +81,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_cascade_voice
     import talk_check
     import talk_config
+    import talk_core_realtime
     import talk_diagnostics
     import talk_doctor
     import talk_gemini_realtime
@@ -932,7 +934,22 @@ def subagent_stop_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
 #: talk_progress's mapping table. There is no field for args, paths, URLs,
 #: output text, or approval commands to ride in on — redaction here is
 #: positional, not textual.
+#:
+#: Every milestone forces a spoken response, so only a phase change that
+#: tells the operator something new earns one (hermes-talk#202): an approval
+#: they must answer, or a labelled step ("executing — Running tests").
+#: ``accepted`` repeats the WORK_STARTED receipt the model just spoke, and an
+#: ``executing`` with no label (or only the generic "Working") says only
+#: "still going" — both stay silent. The phase is still recorded in run meta
+#: for check_work and the dashboard.
 _PROGRESS_LABEL_CHARS = 60
+
+
+def _progress_news_label(raw: object) -> str:
+    """A milestone's safe tool label, or "" when it names no actual step."""
+
+    label = str(raw or "").strip()[:_PROGRESS_LABEL_CHARS]
+    return "" if label == talk_progress.TOOL_LABEL_FALLBACK else label
 
 
 def run_phase_messages(run: dict, kind: str) -> list[dict]:
@@ -945,14 +962,15 @@ def run_phase_messages(run: dict, kind: str) -> list[dict]:
 
 
 def run_phase_commands(run: dict, kind: str) -> list[talk_realtime.RealtimeCommand]:
-    """Contained milestone speech for one run's phase change or heartbeat.
+    """Contained milestone speech for one run's phase change, or nothing.
 
-    ``kind`` is a non-terminal phase name or ``"heartbeat"``. Terminal phases
-    build nothing: the watcher's terminal branch speaks the outcome off the
-    registry's authoritative status, and a phase-path copy would be a
-    completion claim built from telemetry. Announcements NEVER claim
-    delivery — a milestone is ephemeral speech, re-sayable on every attach,
-    unlike the result, which is exactly-once.
+    ``kind`` is a non-terminal phase name. Terminal phases build nothing: the
+    watcher's terminal branch speaks the outcome off the registry's
+    authoritative status, and a phase-path copy would be a completion claim
+    built from telemetry. ``accepted`` and an unlabelled ``executing`` build
+    nothing either — they carry no news (see above). Announcements NEVER
+    claim delivery — a milestone is ephemeral speech, re-sayable on every
+    attach, unlike the result, which is exactly-once.
     """
 
     run_id = run.get("runId")
@@ -960,15 +978,12 @@ def run_phase_commands(run: dict, kind: str) -> list[talk_realtime.RealtimeComma
         return []
     label = str(run.get("label") or "").strip()[:_PROGRESS_LABEL_CHARS]
     label_part = f" ({label})" if label else ""
-    if kind == "heartbeat":
-        headline = f"Background run #{run_id}{label_part} is still working."
-    elif kind == talk_progress.PHASE_ACCEPTED:
-        headline = f"Background run #{run_id}{label_part} was accepted."
-    elif kind == talk_progress.PHASE_EXECUTING:
+    if kind == talk_progress.PHASE_EXECUTING:
         meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
-        detail = str(meta.get("phase_detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
-        headline = f"Background run #{run_id}{label_part} is executing"
-        headline += f" — {detail}." if detail else "."
+        detail = _progress_news_label(meta.get("phase_detail"))
+        if not detail:
+            return []
+        headline = f"Background run #{run_id}{label_part} is executing — {detail}."
     elif kind == talk_progress.PHASE_BLOCKED:
         headline = f"Background run #{run_id}{label_part} is waiting on an approval."
     else:
@@ -989,7 +1004,9 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     """Contained milestone speech for an attached child's phase change.
 
     Same containment as :func:`subagent_stop_commands` minus the quoted
-    summary — a milestone carries no child-authored text at all.
+    summary — a milestone carries no child-authored text at all. Same news
+    rule as :func:`run_phase_commands`: ``accepted`` and an unlabelled
+    ``executing`` stay silent (hermes-talk#202).
     """
 
     subagent_id = str(event.get("subagent_id") or "")
@@ -998,12 +1015,11 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     phase = str(event.get("phase") or "")
     role = str(event.get("role") or "").strip()
     role_part = f" ({role})" if role else ""
-    if phase == talk_progress.PHASE_ACCEPTED:
-        headline = f"Background agent {subagent_id}{role_part} was accepted."
-    elif phase == talk_progress.PHASE_EXECUTING:
-        detail = str(event.get("detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
-        headline = f"Background agent {subagent_id}{role_part} is executing"
-        headline += f" — {detail}." if detail else "."
+    if phase == talk_progress.PHASE_EXECUTING:
+        detail = _progress_news_label(event.get("detail"))
+        if not detail:
+            return []
+        headline = f"Background agent {subagent_id}{role_part} is executing — {detail}."
     elif phase == talk_progress.PHASE_BLOCKED:
         headline = (
             f"Background agent {subagent_id}{role_part} is waiting on an approval."
@@ -1669,6 +1685,9 @@ async def run_talk_session(
         host_summary=_host_summary_line() if lane == "cli" else None,
         capabilities=talk_capabilities.instruction_section(catalog_snapshot),
         reply_language=talk_config.reply_language(),
+        # `/talk core join` exists only on the Discord gateway, and only on a
+        # host carrying the core voice contract (hermes-talk#215).
+        core_join=lane == "discord" and talk_core_realtime.core_provider_available(),
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by

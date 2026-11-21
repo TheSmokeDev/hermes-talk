@@ -157,6 +157,9 @@ def test_experimental_settings_ship_off_and_on_auto(config_schema):
 
     assert config_schema["journal_enabled"]["default"] is False
     assert config_schema["echo_enabled"]["default"] is False
+    hold = config_schema["echo_gate_hold_ms"]
+    assert hold["type"] == "int" and hold["default"] == 0
+    assert hold["label"].startswith("Experimental · ")
     language = config_schema["voice_language"]
     assert language["default"] == "Auto"
     assert set(language["choices"]) == {"Auto", *talk_config._EXPERIMENTAL_LANGUAGE_CODES}

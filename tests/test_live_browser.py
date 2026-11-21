@@ -184,10 +184,17 @@ def test_sideband_decisions_preserve_captured_partials_and_duplicate_events_are_
         assert fixture.host.rows[("default", "task-a")][-1]["content"].startswith(
             "[Captured Live transcript fragments; this is not a finalized utterance.]"
         )
-        assert any(
-            isinstance(command, rt.SubmitDelegationResult)
+        results = {
+            command.delegation_id: command.kind
             for command in fixture.browser.session.commands
-        )
+            if isinstance(command, rt.SubmitDelegationResult)
+        }
+        # hermes-talk#202: the real decision is speakable; the re-delegation
+        # that captured nothing new is reference context, not a filler line.
+        assert results == {
+            "delegation-one": "commentary",
+            "different-id-no-new-input": "context",
+        }
         await binding.close()
         assert len(fixture.host.jobs) == 1
         assert not any(path.endswith("/stop") for _, path, _, _ in fixture.host.requests)
