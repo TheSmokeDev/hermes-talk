@@ -26,6 +26,9 @@ named rather than smoothed.
   or the matching *Experimental* settings. ElevenLabs stays the default. No new
   dependency, plain `http://` only on loopback, and the key never falls back
   to `OPENAI_API_KEY`. Experimental. Requested by @HearthCore (#151).
+- Git deployments can version optional `TALK.md` voice preferences in their
+  plugin branch. New Realtime and GPT-Live sessions load the bounded UTF-8 file
+  alongside the existing host contracts and identity sections.
 
 ## [0.24.0] — 2026-11-21
 

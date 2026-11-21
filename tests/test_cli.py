@@ -2342,3 +2342,26 @@ def test_cli_mint_keeps_manual_response_and_semantic_detection(monkeypatch):
                            automatic_response=False, turn_detection=detection)
     assert seen[0]["automatic_response"] is False
     assert seen[0]["turn_detection"] is detection
+
+
+@pytest.mark.parametrize("contents", [b"\xff", b"x" * 6001])
+def test_invalid_talk_instructions_refuse_before_audio_and_release_host(
+    monkeypatch, capsys, contents,
+):
+    monkeypatch.setenv("TALK_OPENAI_API_KEY", "sk-test")
+    talk_identity.TALK_INSTRUCTIONS_PATH.write_bytes(contents)
+    closed, refused = [], []
+    attachment = types.SimpleNamespace(
+        tool_definitions=lambda: [], close=lambda: closed.append(True))
+
+    def never():
+        pytest.fail("audio started despite invalid deployment instructions")
+
+    code = asyncio.run(talk_cli.run_talk_session(
+        audio=types.SimpleNamespace(start=never), host_execution_attachment=attachment,
+        on_refusal=refused.append,
+    ))
+    assert code == 1
+    assert refused == [talk_cli.STARTUP_REFUSAL_CONFIGURATION]
+    assert closed == [True]
+    assert "voice instructions could not be loaded" in capsys.readouterr().err
