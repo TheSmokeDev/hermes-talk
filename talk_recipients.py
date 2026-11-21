@@ -83,10 +83,11 @@ def recipient_tools():
         ),
         (
             "select_recipient",
-            "Address one existing recipient by exact title or recipient ID. "
-            "Duplicate names require a named choice. This does not switch the Hermes voice task "
-            "and cannot create a new worker or substitute another app.",
-            {"reference": {"type": "string"}, **identity},
+            "Switch the chat you are talking to. Give the exact title, recipient ID, or just "
+            "codex_desktop or claude_code for the only open chat in that app. If there are "
+            "several, ask which one. Set read_last_reply when also asked what the chat said. "
+            "This keeps the Hermes call open and never starts a worker.",
+            {"reference": {"type": "string"}, **identity, "read_last_reply": {"type": "boolean"}},
             [],
         ),
         (
@@ -94,7 +95,7 @@ def recipient_tools():
             "Send instructions to the explicitly selected existing recipient. "
             "Use the factual delivery receipt: posted is not acceptance or completion. "
             "An uncertain delivery must be reconciled with its original operation, never resent.",
-            {"message": {"type": "string"}, "app": app},
+            {"message": {"type": "string"}, **identity},
             ["message"],
         ),
         (
@@ -391,7 +392,7 @@ class RecipientService:
     def _arguments(name, arguments):
         allowed = {
             "list_recipients": {"app"},
-            "select_recipient": {"reference", *IDENTITY_FIELDS},
+            "select_recipient": {"reference", "read_last_reply", *IDENTITY_FIELDS},
             "send_agent_message": {"message", "app", *IDENTITY_FIELDS},
             "inspect_screen": set(),
             "catalog_recipients": {"app", "limit", "cursor"},
@@ -406,14 +407,19 @@ class RecipientService:
         ):
             raise DashboardTaskError("invalid_event", 400)
         if name == "select_recipient":
+            fields = set(arguments) - {"read_last_reply"}
+            if type(arguments.get("read_last_reply", False)) is not bool:
+                raise DashboardTaskError("invalid_event", 400)
             if "reference" in arguments:
-                if set(arguments) - {"reference", "app"}:
+                if fields - {"reference", "app"}:
                     raise DashboardTaskError("invalid_event", 400)
                 bounded_text(arguments.get("reference"), maximum=512)
-            elif set(arguments) != set(IDENTITY_FIELDS):
+            elif fields != set(IDENTITY_FIELDS) and not (
+                fields == {"app"} and arguments["app"] in HISTORY_APPS
+            ):
                 raise DashboardTaskError("invalid_event", 400)
         if name in {"read_recipient_history", "recipient_status"} or (
-            name == "select_recipient" and "reference" not in arguments
+            name == "select_recipient" and "recipient_id" in arguments
         ):
             for key in IDENTITY_FIELDS:
                 bounded_text(arguments.get(key), maximum=512)
@@ -694,23 +700,31 @@ class RecipientService:
         previous = store.operation(operation_id, "select_recipient", arguments)
         if previous:
             return self._return(request, body, bound, previous)
-        if "reference" in arguments:
-            rows, _ = self._catalog(request, body, bound, backend, app=arguments.get("app"))
-            reference = arguments["reference"].strip().casefold()
+        incomplete = False
+        if "recipient_id" in arguments:
+            rows = matches = [self._cached_target(bound, arguments)]
+        else:
+            rows, truncated = self._catalog(request, body, bound, backend, app=arguments.get("app"))
+            reference = arguments.get("reference", "").strip().casefold()
             matches = [
                 row for row in rows
-                if reference in {row["recipient_id"].casefold(), row["title"].casefold()}
+                if not reference
+                or reference in {row["recipient_id"].casefold(), row["title"].casefold()}
             ]
-        else:
-            rows = matches = [self._cached_target(bound, arguments)]
-        target = matches[0] if len(matches) == 1 else None
+            # An unseen row could have the same title or be a second chat in the same app.
+            incomplete = truncated and not any(
+                row["recipient_id"].casefold() == reference for row in matches
+            )
+        target = matches[0] if len(matches) == 1 and not incomplete else None
         record, created = store.prepare(operation_id, "select_recipient", arguments, target=target)
         if not created:
             return self._return(request, body, bound, record)
         if target is None:
             result = self._choice_result(
-                "ambiguous" if matches else "missing", matches or rows, operation_id
+                "ambiguous" if matches or incomplete else "missing", matches or rows, operation_id
             )
+            if incomplete:
+                result["output"] = "The host returned a partial list. " + result["output"]
             return self._return(request, body, bound, store.finish(record, result))
         self._binding(request, body, bound)
         record, claimed = store.claim(record)
@@ -731,12 +745,62 @@ class RecipientService:
                 "output": f"Addressing {target['title']} ({target['app']}). "
                 "The Hermes voice task is unchanged.",
             }
+            if arguments.get("read_last_reply"):
+                result["output"] += " " + self._last_reply(request, body, bound, target)
             record = store.finish(record, result, selected=target)
         except DashboardTaskError:
             raise
         except (OSError, TimeoutError):
             record = store.finish(record, self._delivery_result(record, "unknown"))
         return self._return(request, body, bound, record)
+
+    def _last_reply(self, request, body, bound, target):
+        if "history" not in target["operations"] or target["app"] not in HISTORY_APPS:
+            return "This host cannot read replies from that chat."
+        arguments = {key: target[key] for key in IDENTITY_FIELDS}
+        arguments["limit"] = 50
+        latest = None
+        cursors = set()
+        source = None
+        for _ in range(10):
+            try:
+                page = self.read_recipient_history(
+                    request, {**body, "arguments": arguments}, bound=bound,
+                )
+            except DashboardTaskError as error:
+                if error.code not in {
+                    "recipient_history_unsupported", "recipient_history_unavailable",
+                    "recipient_history_stale",
+                }:
+                    raise
+                return str(error)
+            if source is not None and page["source"] != source:
+                return "The chat history changed while I was reading it. Ask again for its reply."
+            source = page["source"]
+            reply = next(
+                (row for row in reversed(page["messages"]) if row["role"] == "assistant"), None,
+            )
+            # The host cursor advances through native transcript order. Timestamps
+            # can be equal or absent, even on different pages of the same chat.
+            if reply is not None:
+                latest = reply
+            cursor = page["next_cursor"]
+            if not cursor:
+                break
+            if cursor in cursors:
+                return "The chat history is incomplete. I couldn't verify its last reply."
+            cursors.add(cursor)
+            arguments["cursor"] = cursor
+        else:
+            return "I couldn't verify the last reply within the available chat history."
+        if latest is None:
+            return "There is no visible assistant reply in that chat yet."
+        excerpt = latest["text"][:2000]
+        clipped = latest["truncated"] or len(excerpt) < len(latest["text"])
+        label = "Its last visible reply" if page["truncated"] else "Its last reply"
+        if clipped:
+            label += " begins"
+        return f"{label}: {excerpt}"
 
 
     @staticmethod
