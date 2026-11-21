@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import ClassVar
@@ -55,14 +56,23 @@ MAX_PLAYBACK_BYTES = SAMPLE_RATE * FRAME_BYTES * 20
 #   TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL=0.015 playback RMS that counts as "active"
 #   TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL=0.04   floor a mic block must clear
 #   TALK_ECHO_GATE_RATIO=0.65                 fraction of playback RMS a block must clear
+#   TALK_ECHO_GATE_HOLD_MS=0                  keep the gate closed this long after playback
 # Read when DuplexAudio is constructed, not at import.
 OUTPUT_ACTIVE_LEVEL = 0.015
 MIN_BARGE_IN_LEVEL = 0.04
 OUTPUT_ECHO_RATIO = 0.65
+#: Off by default: the gate opens the moment playback goes quiet, as it always
+#: has. A loudspeaker with output latency (a TV over HDMI) plays the model's
+#: words back ~200 ms after they were written, so the gate must stay closed a
+#: little longer there or the tail of its own speech reaches the provider as
+#: the operator talking (hermes-talk#228).
+ECHO_GATE_HOLD_MS = 0.0
+#: Upper bound: a typo (70000 for 700) must not hold the gate for a minute.
+MAX_ECHO_GATE_HOLD_MS = 5_000.0
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
+    raw = (talk_config._talk_env_get(name) or "").strip()
     if not raw:
         return default
     try:
@@ -75,7 +85,7 @@ def _env_float(name: str, default: float) -> float:
 def _echo_gate_settings() -> tuple[bool, float, float, float]:
     """(enabled, output_active_level, min_barge_in_level, echo_ratio) from env."""
 
-    raw = (os.environ.get("TALK_ECHO_GATE") or "").strip().lower()
+    raw = (talk_config._talk_env_get("TALK_ECHO_GATE") or "").strip().lower()
     enabled = raw not in {"0", "off", "false", "no", "disabled"}
     return (
         enabled,
@@ -84,14 +94,45 @@ def _echo_gate_settings() -> tuple[bool, float, float, float]:
         _env_float("TALK_ECHO_GATE_RATIO", OUTPUT_ECHO_RATIO),
     )
 
+
+def _echo_gate_hold_s() -> float:
+    """Seconds the gate stays closed after playback goes quiet (0 = today's gate).
+
+    ``TALK_ECHO_GATE_HOLD_MS`` wins when set; otherwise the Experimental
+    plugin setting ``echo_gate_hold_ms``. Junk or negative values are ignored,
+    like the other gate knobs.
+    """
+
+    if (talk_config._talk_env_get("TALK_ECHO_GATE_HOLD_MS") or "").strip():
+        hold_ms = _env_float("TALK_ECHO_GATE_HOLD_MS", ECHO_GATE_HOLD_MS)
+    else:
+        try:
+            saved = talk_config.plugin_setting("echo_gate_hold_ms")
+            valid = isinstance(saved, (int, float)) and not isinstance(saved, bool)
+            hold_ms = float(saved) if valid and saved > 0 else ECHO_GATE_HOLD_MS
+        except Exception:  # noqa: BLE001 - an unreadable setting must not cost the call its audio
+            hold_ms = ECHO_GATE_HOLD_MS
+    return min(hold_ms, MAX_ECHO_GATE_HOLD_MS) / 1000.0
+
+
 _INSTALL_HINT = (
     'audio support is not installed — run: pip install "hermes-talk[audio]" '
     "(needs PortAudio; on Debian/Ubuntu also: apt install libportaudio2)"
 )
 
 
+_NO_DEVICE_HINT = (
+    "PortAudio could not start: no audio device or sound server was found "
+    "(expected on a headless host; Discord voice does not need it)"
+)
+
+
 class TalkAudioError(Exception):
     """Audio devices are unusable."""
+
+
+class TalkAudioDeviceError(TalkAudioError):
+    """sounddevice is installed, but PortAudio found no usable audio system."""
 
 
 def import_sounddevice():
@@ -101,6 +142,14 @@ def import_sounddevice():
         import sounddevice as sd
     except (ImportError, OSError) as exc:
         raise TalkAudioError(f"{_INSTALL_HINT} ({exc})") from exc
+    except Exception as exc:
+        # `import sounddevice` runs Pa_Initialize(); with no PulseAudio/ALSA
+        # (a headless host) it raises PortAudioError, which is neither of the
+        # two above and would otherwise escape doctor/check as a traceback.
+        # It cannot be named here: the class only exists once this import works.
+        if type(exc).__name__ == "PortAudioError":
+            raise TalkAudioDeviceError(f"{_NO_DEVICE_HINT} ({exc})") from exc
+        raise TalkAudioError(f"sounddevice failed to load ({type(exc).__name__}: {exc})") from exc
     return sd
 
 
@@ -279,6 +328,7 @@ class DuplexAudio:
         self._discarded_playback_bytes = 0
         self._played_frames = 0
         self._output_level = 0.0
+        self._output_held_until = 0.0
         self._input_paused = False
         self._in_stream = None
         self._out_stream = None
@@ -289,6 +339,7 @@ class DuplexAudio:
             self._min_barge_in_level,
             self._output_echo_ratio,
         ) = _echo_gate_settings()
+        self._echo_gate_hold_s = _echo_gate_hold_s()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -364,6 +415,7 @@ class DuplexAudio:
         with self._lock:
             output_level = self._output_level
             paused = self._input_paused
+            held = self._echo_gate_hold_s > 0 and time.monotonic() < self._output_held_until
         if paused:
             # Paused capture is DROPPED here, not queued and skipped later: a
             # block that sits in the queue through a pause would be the first
@@ -371,7 +423,9 @@ class DuplexAudio:
             # the flag; resume_input drains it.)
             return
         if self._echo_gate_enabled and not self._pulse_webrtc.active:
-            output_active = output_level > self._output_active_level
+            # While held, playback is already quiet, so the threshold falls to
+            # the barge-in floor: the operator can still interrupt.
+            output_active = output_level > self._output_active_level or held
             echo_threshold = max(
                 self._min_barge_in_level,
                 output_level * self._output_echo_ratio,
@@ -398,6 +452,8 @@ class DuplexAudio:
         output_level = _pcm16_rms(chunk)
         with self._lock:
             self._output_level = output_level
+            if self._echo_gate_hold_s > 0 and output_level > self._output_active_level:
+                self._output_held_until = time.monotonic() + self._echo_gate_hold_s
         outdata[: len(chunk)] = chunk
         if len(chunk) < wanted:
             outdata[len(chunk) :] = b"\x00" * (wanted - len(chunk))
@@ -586,6 +642,7 @@ __all__ = [
     "SAMPLE_WIDTH",
     "DuplexAudio",
     "PlaybackProgress",
+    "TalkAudioDeviceError",
     "TalkAudioError",
     "audio_available",
     "import_sounddevice",

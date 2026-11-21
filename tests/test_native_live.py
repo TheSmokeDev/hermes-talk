@@ -10,6 +10,7 @@ import httpx
 import pytest
 from test_native_controller import Audio, Session
 
+import talk_discord
 import talk_live_protocol
 import talk_realtime as rt
 from talk_native_api import NativeTaskAPI, NativeTaskError
@@ -56,6 +57,60 @@ async def connected(*, held=None, supports_context=True, speech=None, response_c
 async def close(handle):
     await handle.controller.close()
     await handle.client.aclose()
+
+
+def test_live_discord_output_completion_flushes_partial_audio_after_interruption():
+    async def scenario():
+        h = await connected()
+        audio = talk_discord.DiscordAudio()
+        audio._source = talk_discord._RealtimeSource(audio._outbound)
+        h.controller.audio = audio
+        try:
+            pcm = b"\x01\x00" * 5
+            await h.controller.handle(rt.OutputAudio(pcm))
+            await h.controller.handle(rt.OutputInterrupted())
+            await h.controller.handle(rt.OutputTurnCompleted())
+            assert not audio.playback_pending
+            await h.controller.handle(rt.OutputAudio(pcm))
+            assert audio._source.read() == talk_discord.SILENCE_FRAME
+            await h.controller.handle(rt.OutputTurnCompleted())
+            expected, _ = talk_discord.session_to_discord(pcm)
+            assert audio._source.read() == expected + bytes(3840 - len(expected))
+            assert not audio.playback_pending
+            await h.controller.handle(rt.OutputTurnCompleted())
+            assert not audio.playback_pending
+        finally:
+            await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_gpt_live_discord_tail_plays_and_opens_the_quiet_gate_without_a_turn_event():
+    """GPT-Live's decoder emits audio but no output-turn event (#239 on Live)."""
+
+    async def scenario():
+        h = await connected()
+        audio = talk_discord.DiscordAudio()
+        audio._source = talk_discord._RealtimeSource(audio._outbound)
+        h.controller.audio = audio
+        try:
+            assert not getattr(h.session, "emits_output_lifecycle", False)
+            pcm = b"\x01\x00" * 5
+            await h.controller.handle(rt.OutputAudio(pcm))
+            for _ in range(talk_discord.HELD_FRAGMENT_UNDERRUNS):
+                assert audio._source.read() == talk_discord.SILENCE_FRAME
+            await h.controller.tick()
+            assert h.controller.provider_response_active  # its tail is unplayed
+            assert not h.controller._quiet()
+            expected, _ = talk_discord.session_to_discord(pcm)
+            assert audio._source.read() == expected + bytes(3840 - len(expected))
+            await h.controller.tick()
+            assert not h.controller.provider_response_active
+            assert h.controller._quiet()
+        finally:
+            await close(h)
+
+    asyncio.run(scenario())
 
 
 def test_partial_live_transcripts_keep_wire_finality_and_original_source_text():
@@ -605,6 +660,9 @@ def test_no_input_tool_proposals_get_one_exact_refusal_and_bounded_loop_shutdown
         assert len(h.session.sent) == 1
         assert h.session.sent[0].delegation_id == "real-first-call"
         assert "No action or approval" in h.session.sent[0].content
+        # hermes-talk#202: reference context, never a line to speak; a model
+        # re-delegating while work is pending used to voice each refusal.
+        assert h.session.sent[0].kind == "context"
         assert not h.requests
         await h.controller.handle(rt.DelegationRequested("real-second-call"))
         await h.controller.handle(rt.DelegationRequested("real-third-call"))

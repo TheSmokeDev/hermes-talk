@@ -596,8 +596,18 @@ def _describe_age(run: dict) -> str:
     return f" {seconds // 3600}h"
 
 
+#: A failed run that was proven stopped or interrupted is reported as such.
+_FAILED_RUN_WORDS = {
+    talk_runs.OUTCOME_STOPPED: "was stopped",
+    talk_runs.OUTCOME_INTERRUPTED: "was interrupted",
+}
+
+
 def _describe_run(run: dict) -> str:
-    line = f"run {run.get('runId')} ({run.get('kind')}) {run.get('status')}"
+    status = run.get("status")
+    if status == "failed":
+        status = _FAILED_RUN_WORDS.get(talk_runs.terminal_outcome(run), status)
+    line = f"run {run.get('runId')} ({run.get('kind')}) {status}"
     if run.get("status") == "running":
         line += _describe_age(run)
         # What a live run holds (hermes-talk#101), so "why was that refused?"
@@ -796,7 +806,13 @@ def _handle_talk_status(arguments: dict) -> str:
         "legacy_lane": "legacy-provider-executor",
         "legacy_session": {
             "scope": "limited provider-owned session",
-            "full_parity_command": "/talk core join",
+            # Offered only where it can run (hermes-talk#215): the command is
+            # Discord-gateway-only and needs the host's core voice contract.
+            "full_parity_command": (
+                "/talk core join (Discord voice channel only)"
+                if talk_core_realtime.core_provider_available()
+                else None
+            ),
         },
         "transcript": {
             "current_call": "temporary local capture",

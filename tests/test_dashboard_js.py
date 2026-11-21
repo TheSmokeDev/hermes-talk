@@ -2555,3 +2555,100 @@ def test_live_start_on_a_host_without_task_context_names_the_missing_support():
     assert result["prepareCalls"] == 0
     assert result["sessionRequests"] == []
     assert "GPT-Live needs a Hermes host with task context support" in result["text"]
+
+
+def test_an_unbound_call_reports_final_text_tools_and_its_end_to_the_journal():
+    """Final captions, barge-in, tool exchange and hang-up reach /journal, in
+    order, under the mint's call id. Partial deltas never do."""
+
+    script = (
+        TASK_HARNESS
+        + r"""
+(async () => {
+  const id = "call_" + "a".repeat(32);
+  const t = new Transport({ journal: { enabled: true, callId: id } }, callbacks);
+  t.channel = { readyState: "open", send(s) { sent.push(JSON.parse(s)); }, close() {} };
+  assert.equal(t.task, null);
+  emit(t, { type: "response.output_audio_transcript.delta", delta: "Bonj" });
+  emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "i1",
+    transcript: "Ouvre une session de test." });
+  emit(t, { type: "response.output_audio_transcript.done", item_id: "i2",
+    transcript: "Je m'en occupe." });
+  t.responseActive = true;
+  emit(t, { type: "input_audio_buffer.speech_started" });
+  await t.handleFunctionCall({ name: "hermes_status", call_id: "fc_1", arguments: "{}" });
+  t.stop();
+  await waitFor(() => requests.some((r) => r.url.endsWith("/journal") &&
+    r.body.events.some((e) => e.kind === "call_end")));
+  const posted = requests.filter((r) => r.url.endsWith("/journal"));
+  assert(posted.every((r) => r.body.call_id === "call_" + "a".repeat(32)));
+  const kinds = posted.flatMap((r) => r.body.events).sort((a, b) => a.seq - b.seq)
+    .map((e) => e.kind);
+  assert.deepEqual(kinds, ["user", "assistant", "interrupted", "tool_call", "tool_result",
+    "call_end"]);
+  const texts = posted.flatMap((r) => r.body.events).map((e) => e.text || "").join("|");
+  assert(!texts.includes("Bonj|"), "partial delta journaled");
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_call_without_a_journal_id_posts_nothing_to_the_journal():
+    script = (
+        TASK_HARNESS
+        + r"""
+(async () => {
+  const t = new Transport({}, callbacks);
+  t.channel = { readyState: "open", send(s) { sent.push(JSON.parse(s)); }, close() {} };
+  emit(t, { type: "conversation.item.input_audio_transcription.completed", item_id: "i1",
+    transcript: "Bonjour" });
+  t.stop();
+  await drain(); await drain(); await drain();
+  assert.equal(requests.filter((r) => r.url.endsWith("/journal")).length, 0);
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+    )
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_structured_401_from_the_dashboard_host_still_offers_the_token_field():
+    """Current dashboards throw an ApiError whose message is the route's
+    detail alone and whose HTTP code rides on `status`. The token field must
+    appear for that shape too, or a browser off loopback has no way in."""
+
+    script = PAGE_HARNESS + r"""
+(async()=>{
+const tokens=new Map();
+window.sessionStorage={getItem:key=>tokens.get(key)||'',
+  setItem:(key,value)=>tokens.set(key,value),removeItem:key=>tokens.delete(key)};
+fetchOverride=()=>{
+  const err=new Error('hermes-talk dashboard routes require the TALK_DASHBOARD_TOKEN token');
+  err.name='ApiError'; err.status=401; throw err;
+};
+render(); await drain();
+const tree=render();
+assert(button(tree,'Use token'),'A structured 401 must expose token entry');
+assert(nodes(tree).find(node=>node.props.placeholder==='TALK_DASHBOARD_TOKEN'));
+process.exit(0);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

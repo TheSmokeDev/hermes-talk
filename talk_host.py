@@ -43,11 +43,14 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import queue
 import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +79,27 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
 
 _log = logging.getLogger(__name__)
 
+class _CatalogRead:
+    """One in-process catalog read for one profile.
+
+    ``delivered`` is set once some caller received the result inside its
+    budget; a read that finishes undelivered outlived every caller's timeout,
+    and its result is kept for the next probe of the same profile.
+    """
+
+    __slots__ = ("delivered", "finished_at", "future")
+
+    def __init__(self) -> None:
+        self.future: Future[dict | None] = Future()
+        self.finished_at: float | None = None
+        self.delivered = False
+
+
+_CATALOG_PROBE_LOCK = threading.Lock()
+#: Latest read per profile home. One profile's stuck read never blocks, or
+#: answers for, another profile on the same multiplexed gateway.
+_CATALOG_READS: dict[str, _CatalogRead] = {}
+
 #: How long a stop verb politely waits for its confirmation before detaching
 #: (hermes-talk#2). Long enough that the common fast path (an HTTP 2xx or a
 #: child dying on SIGTERM) speaks the REAL result; short enough that a wedged
@@ -95,7 +119,119 @@ def _spawn_daemon(fn, *args, name: str = "talk-stop") -> None:
     never stall process exit (ThreadPoolExecutor threads are non-daemon and
     joined at shutdown — exactly the wrong contract for this)."""
 
-    threading.Thread(target=fn, args=args, daemon=True, name=name).start()
+    # Capture at dispatch: a worker may outlive the invoking profile's turn.
+    context = copy_context()
+    threading.Thread(target=context.run, args=(fn, *args), daemon=True, name=name).start()
+
+
+def _catalog_profile_key() -> str:
+    """The profile a catalog read answers for: the Hermes home this context
+    resolves, which is where the registries read skills and config from."""
+
+    try:
+        return str(talk_config.get_hermes_home())
+    except Exception:  # noqa: BLE001 — an unresolvable home still gets one key
+        return ""
+
+
+def _start_catalog_read(key: str) -> _CatalogRead:
+    """Start one read for ``key``. Caller holds ``_CATALOG_PROBE_LOCK``.
+
+    ``_spawn_daemon`` captures the caller's context, so the read runs in the
+    calling profile's scope even after the caller's turn has moved on.
+    """
+
+    entry = _CatalogRead()
+
+    def read() -> None:
+        try:
+            result = _catalog_from_host_modules()
+        except BaseException as exc:  # never leave the read unresolved
+            entry.finished_at = time.monotonic()
+            if isinstance(exc, Exception):
+                entry.future.set_exception(exc)
+            else:
+                # A waiting caller must see an ordinary failure, not SystemExit.
+                entry.future.set_exception(
+                    RuntimeError(f"catalog read aborted: {type(exc).__name__}")
+                )
+                raise
+        else:
+            entry.finished_at = time.monotonic()
+            entry.future.set_result(result)
+
+    # Registered only once the worker exists: an entry with no worker would
+    # never finish and would pin this profile's probes to the full budget.
+    _spawn_daemon(read, name="talk-catalog-probe")
+    _CATALOG_READS[key] = entry
+    return entry
+
+
+def _late_catalog(entry: _CatalogRead) -> dict | None:
+    """The result of a finished, undelivered read, if it is still fresh.
+
+    Fresh means younger than the capability snapshot TTL: an older answer
+    would already be stale by the snapshot cache's own rule.
+    """
+
+    if entry.future.exception() is not None:
+        return None
+    try:
+        max_age = talk_config.capability_catalog_ttl_s()
+    except Exception:  # noqa: BLE001 — an unreadable TTL makes the late result stale
+        return None
+    finished = entry.finished_at
+    if finished is None or time.monotonic() - finished > max_age:
+        return None
+    return entry.future.result()
+
+
+def _catalog_probe_bounded() -> dict | None:
+    """Bound registry discovery without spawning more readers while one is stuck.
+
+    Reads are kept per profile. A read that outlives its caller's budget keeps
+    running on its one daemon worker; probes of the same profile share it
+    instead of starting more. When it finishes undelivered, the next probe
+    takes its result once and starts the following read, so a host that is
+    always slower than the budget still answers from the in-process tier.
+    """
+
+    try:
+        budget = talk_config.api_server_probe_timeout_s()
+    except Exception as exc:  # noqa: BLE001 — the probe NEVER raises; REST answers instead
+        _log.debug("host catalog probe budget unreadable: %s", type(exc).__name__)
+        return None
+    key = _catalog_profile_key()
+    with _CATALOG_PROBE_LOCK:
+        entry = _CATALOG_READS.get(key)
+        if entry is not None and entry.future.done():
+            late = None if entry.delivered else _late_catalog(entry)
+            entry.delivered = True
+            try:
+                entry = _start_catalog_read(key)
+            except Exception as exc:  # noqa: BLE001 — no worker: answer late or fall through
+                _log.debug("host catalog read not started: %s", type(exc).__name__)
+                return late
+            if late is not None:
+                return late
+        elif entry is None:
+            try:
+                entry = _start_catalog_read(key)
+            except Exception as exc:  # noqa: BLE001 — no worker: REST answers instead
+                _log.debug("host catalog read not started: %s", type(exc).__name__)
+                return None
+
+    try:
+        payload = entry.future.result(timeout=budget)
+    except TimeoutError:
+        return None
+    except Exception as exc:  # noqa: BLE001 — an unreadable catalog falls through to REST
+        entry.delivered = True
+        _log.debug("host catalog probe failed: %s", type(exc).__name__)
+        return None
+    entry.delivered = True
+    return payload
+
 
 #: Hermes's ``memory`` tool is a WRITE surface (add/replace/remove against the
 #: durable memory file); saved memory itself is injected into every turn rather
@@ -530,8 +666,19 @@ def _api_server_worker(task: str, *, session_id: str | None) -> Any:
                 on_event=_on_poll,
             )[: talk_runs.HISTORY_OUTPUT_CAP]
         except talk_apiserver.TalkApiServerError as exc:
-            message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
-            talk_runs.finish_run(run_id, "failed", message)
+            terminal_meta = None
+            if isinstance(exc, talk_apiserver.TalkApiRunError):
+                # Keep the status prefix even when the server's reason is long.
+                message = str(exc)[: talk_runs.HISTORY_OUTPUT_CAP]
+                terminal_meta = {"api_run_status": exc.status}
+            elif remote.get("api_run_id"):
+                # A local tracking failure is not a verdict on remote execution.
+                message = (
+                    f"I stopped tracking the run; its remote outcome is unknown — {exc}"
+                )[: talk_runs.HISTORY_OUTPUT_CAP]
+            else:
+                message = str(exc)[-talk_runs.HISTORY_OUTPUT_CAP :]
+            talk_runs.finish_run(run_id, "failed", message, meta=terminal_meta)
             return message
 
     return worker
@@ -931,7 +1078,7 @@ class HostAdapter:
         one.
         """
 
-        payload = _catalog_from_host_modules()
+        payload = _catalog_probe_bounded()
         if payload is None:
             return None
         try:
@@ -1221,12 +1368,15 @@ class HostAdapter:
                 outcome = talk_apiserver.run_to_completion(
                     prompt, session_id=None, session_key=session_key
                 )
+            except talk_apiserver.TalkApiRunError as exc:
+                return f"I couldn't finish that work — {exc}"
+            except talk_apiserver.TalkApiServerError as exc:
+                return (
+                    "I couldn't confirm that work finished; its remote outcome "
+                    f"is unknown — {exc}"
+                )
             except Exception as exc:  # noqa: BLE001 — the flush did not land
                 return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
-            # run_to_completion's documented failure shape is returned text,
-            # not an exception: "the agent run failed/cancelled: ...".
-            if outcome.startswith("the agent run "):
-                return f"I couldn't finish that work — {outcome}"
             _log.info("transcript memory handoff completed: %.200s", outcome)
             return "FLUSH_DONE — memory review completed through the api server"
 
@@ -1241,6 +1391,7 @@ class HostAdapter:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env={**os.environ, talk_transcript.REVIEW_CHILD_ENV: "1"},
                 )
             except Exception as exc:  # noqa: BLE001 — a spawn failure is a failure
                 return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
@@ -1611,6 +1762,12 @@ class HostAdapter:
             # reaps the child, and a confirm that re-looks-up by run id would
             # then read a successful death as "never confirmed".
             proc = talk_runs.get_process(run_id)
+            # Recorded BEFORE the signal: the worker can reap the child and
+            # write the terminal record before terminate() even returns, and
+            # that record is what the announcement reads. A detached run has
+            # no remote status, so this is how it is announced as stopped
+            # rather than failed (talk_runs.terminal_outcome).
+            talk_runs.annotate_run(run_id, tee=True, stop_requested=True)
             if talk_runs.terminate_process(run_id):
                 # terminate() is a signal, not a wait — confirm within the
                 # bounded budget, and keep confirming off-thread past it
@@ -1649,6 +1806,7 @@ class HostAdapter:
                     f"Sent the stop for run {run.get('runId')} — it's winding "
                     "down; I'll have the death receipt next time you ask."
                 )
+            talk_runs.annotate_run(run_id, tee=True, stop_requested=False)
             return (
                 "I couldn't stop that one — I don't hold a handle to its "
                 "process anymore."

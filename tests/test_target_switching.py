@@ -347,7 +347,9 @@ def test_late_child_receipt_after_switch_stays_with_original_action(fleet):
     assert len(fleet.hosts["local"].jobs) == 1
 
 
-def test_api_switch_mint_failure_then_success_and_tool_intent(fleet, monkeypatch):
+def test_api_switch_mint_failure_then_success_and_tool_intent(fleet, monkeypatch, tmp_path):
+    # Every /session start runs call-journal retention; keep it off the real home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     source = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
     spec = importlib.util.spec_from_file_location("target_api_fixture", source)
     api = importlib.util.module_from_spec(spec)

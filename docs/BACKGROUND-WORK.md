@@ -47,11 +47,13 @@ Say "go audit the site and tell me what's broken" and it starts a real agent,
 then keeps talking to you. When the work lands, Talk speaks the result
 unprompted. Ask "how's that going?" in the meantime and `check_work` answers.
 
-Between the receipt and the landing, the session speaks bounded progress
-milestones: "accepted", "executing — Reading files", "waiting on an approval",
-and periodic "still working" heartbeats. The only detail that can name what a
-job is doing is a safe label from a fixed table — never the tool's arguments,
-paths, or output.
+Between the receipt and the landing, the session stays quiet unless a
+milestone is news: "waiting on an approval", or a labelled step such as
+"executing — Reading files". It says one acknowledgement when the work starts,
+then nothing until there is something new — no "accepted" echo of that
+acknowledgement and no periodic "still working" (#202). Ask and `check_work`
+answers. The only detail that can name what a job is doing is a safe label from
+a fixed table — never the tool's arguments, paths, or output.
 
 Known limitation: delivery is bound to the exact session that started the
 work. If you disconnect before it lands, reconnecting on the *same* Hermes
@@ -69,6 +71,33 @@ silently does less than you asked:
 3. **A detached `hermes -z` one-shot** — needs nothing enabled, so this is the
    lane that always exists as long as `hermes` is on the PATH.
 4. None available — a refusal naming all three missing lanes.
+
+## Profile context across background work
+
+Talk captures the caller's context variables separately at every dispatch to a
+host/run worker, transcript handoff, approval worker or SSE reader, approval
+timeout timer (including a rearmed timer), and API/catalog refresh. A later
+change to the caller's context does not retarget that work. Existing stop,
+approval-generation and transcript-lease rules still govern late callbacks.
+
+This preserves an installed Hermes profile scope; it does not install a scope
+where none was bound. Talk settings and keys resolved through `talk_config`
+read that scope (Hermes's `get_secret`), so a worker reads the dispatching
+profile's values; a thread that lost the scope fails closed on a multiplexed
+gateway instead of reading the process environment. Discord voice resolves
+the turn's own profile bot. In-process catalog discovery keeps one pending
+read per profile home. The OpenAI, Grok and GPT-Live auth resolvers
+(`talk_auth`, `talk_grok_auth`, `talk_live_config`) still read the process
+environment directly.
+
+The API verdict and capability snapshot caches, including their in-flight
+refresh guards, remain module globals. Callers sharing one module instance also
+share its cached result, even under different contexts. Separate module
+instances have separate caches; the offline tests model that arrangement but
+do not verify an installed host's loader or its dependency imports. Context
+propagation alone therefore does not establish complete profile isolation.
+Live credential resolution still requires a receipt from the exact plugin and
+host revisions under test.
 
 ## Two jobs, one checkout — admission control
 

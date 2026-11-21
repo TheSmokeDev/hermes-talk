@@ -819,13 +819,13 @@ cleanup();
     (
         '404: {"detail":"target_missing"}',
         "stock",
-        "Send one message in this conversation first, then Connect.",
+        "Send one message in this conversation first, then try again.",
         True,
     ),
     (
         '404: {"detail":"target_missing"}',
         None,
-        "Send one message in this conversation first, then Connect.",
+        "Send one message in this conversation first, then try again.",
         True,
     ),
     (
@@ -1014,14 +1014,16 @@ function text(node) {
   return (node?.children||[]).flat(Infinity).map(text).join(' ');
 }
 const refused = '503: ' + JSON.stringify({detail:{code:'context_unavailable',message:'x'}});
+// Without task context this conversation is the only recipient, so the panel
+// shows no recipient controls at all rather than a disabled picker and a note.
 const stock = view(false, refused);
-assert(text(stock).includes('Other recipients need task context support on this Hermes host.'));
 assert(!text(stock).includes('The recipient could not be loaded'),
   'an expected refusal on this host is not an error');
-const refresh = nodes(stock).find(node=>node.type==='button' && text(node)==='Refresh recipients');
-assert.equal(refresh.props.disabled,true);
+assert(!nodes(stock).some(node=>node.props?.['aria-label']==='Addressed recipient'));
+assert(!nodes(stock).some(node=>node.type==='button' &&
+  ['Refresh recipients','Find other apps'].includes(text(node))));
 const bound = view(true, refused);
-assert(!text(bound).includes('Other recipients need task context support'));
+assert(nodes(bound).some(node=>node.type==='button' && text(node)==='Find other apps'));
 assert(text(bound).includes('The recipient could not be loaded. Refresh the list and try ' +
   'again. Error code: 503 context_unavailable'));
 """, source="ui/desktop-view.js")

@@ -2299,6 +2299,29 @@ def test_a_caller_named_lane_buys_no_summary(monkeypatch, tmp_path):
     assert talk_identity.LANE_LINES["discord"] in seen["instructions"]
 
 
+@pytest.mark.parametrize(
+    "lane,core_available,offered",
+    [
+        ("cli", False, False),
+        ("cli", True, False),
+        ("discord", False, False),
+        ("discord", True, True),
+    ],
+)
+def test_core_join_is_offered_only_on_discord_with_the_core_contract(
+    monkeypatch, tmp_path, lane, core_available, offered
+):
+    """hermes-talk#215: a terminal call kept telling the operator to run /talk core join."""
+
+    monkeypatch.setattr(talk_cli.talk_core_realtime, "core_provider_available",
+                        lambda: core_available)
+    seen = _capture_instructions(monkeypatch, tmp_path)
+
+    assert asyncio.run(talk_cli.run_talk_session(lane=lane)) == 1
+    assert seen["core_join"] is offered
+    assert ("core join" in seen["instructions"]) is offered
+
+
 @pytest.mark.parametrize("provider,mode", [("grok", "semantic_vad"), ("gemini", "server_vad")])
 def test_unsupported_endpointing_refuses_before_resolving_credentials(monkeypatch, provider, mode):
     monkeypatch.setenv("TALK_PROVIDER", provider)
@@ -2319,3 +2342,26 @@ def test_cli_mint_keeps_manual_response_and_semantic_detection(monkeypatch):
                            automatic_response=False, turn_detection=detection)
     assert seen[0]["automatic_response"] is False
     assert seen[0]["turn_detection"] is detection
+
+
+@pytest.mark.parametrize("contents", [b"\xff", b"x" * 6001])
+def test_invalid_talk_instructions_refuse_before_audio_and_release_host(
+    monkeypatch, capsys, contents,
+):
+    monkeypatch.setenv("TALK_OPENAI_API_KEY", "sk-test")
+    talk_identity.TALK_INSTRUCTIONS_PATH.write_bytes(contents)
+    closed, refused = [], []
+    attachment = types.SimpleNamespace(
+        tool_definitions=lambda: [], close=lambda: closed.append(True))
+
+    def never():
+        pytest.fail("audio started despite invalid deployment instructions")
+
+    code = asyncio.run(talk_cli.run_talk_session(
+        audio=types.SimpleNamespace(start=never), host_execution_attachment=attachment,
+        on_refusal=refused.append,
+    ))
+    assert code == 1
+    assert refused == [talk_cli.STARTUP_REFUSAL_CONFIGURATION]
+    assert closed == [True]
+    assert "voice instructions could not be loaded" in capsys.readouterr().err

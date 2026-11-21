@@ -169,6 +169,46 @@ def stored(bundle, app="codex_desktop"):
                 if row["read_only"] and row["app"] == app)
 
 
+@pytest.mark.parametrize("app", ["claude_code", "codex_desktop"])
+def test_switch_and_read_last_reply_replays_one_observation(bundle, app):
+    target = stored(bundle, app)
+    last = bundle.native.messages[-1]
+    bundle.native.messages.append({**last, "role": "user", "id": "later", "text": "new question"})
+    args = {**identity(target), "read_last_reply": True}
+    body = {**bundle.context, "arguments": args}
+    service = bundle.manager.recipients
+    result = service.select_recipient(bundle.request, body, operation_id="switch-read")
+    assert result["state"] == "selected" and result["recipient"]["read_only"]
+    assert result["output"].endswith("Its last reply: Visible reply")
+    assert "new question" not in result["output"]
+    assert service.snapshot(bundle.bound)["selected"]["recipient_id"] == target["recipient_id"]
+    last["text"] = "Later answer"
+    assert service.select_recipient(bundle.request, body, operation_id="switch-read") == result
+    assert [op for op, *_ in bundle.native.calls].count("history") == 1
+
+
+@pytest.mark.parametrize("timestamp", [NOW, None])
+@pytest.mark.parametrize("truncated", [True, False])
+def test_switch_read_uses_transcript_order_for_paged_history(bundle, timestamp, truncated):
+    target = stored(bundle)
+    def paged(operation, result):
+        if operation == "history":
+            cursor = bundle.native.calls[-1][1].get("cursor")
+            if cursor is None:
+                result.update(next_cursor="another-page", truncated=True)
+            else:
+                result["truncated"] = truncated
+                result["messages"] = [{
+                    **result["messages"][-1], "id": "newer", "text": "Follow-up reply",
+                    "timestamp": timestamp,
+                }]
+    bundle.native.mutate = paged
+    body = {**bundle.context, "arguments": {**identity(target), "read_last_reply": True}}
+    result = bundle.manager.recipients.select_recipient(bundle.request, body, operation_id="paged")
+    label = "Its last visible reply" if truncated else "Its last reply"
+    assert result["output"].endswith(f"{label}: Follow-up reply")
+
+
 @pytest.mark.parametrize("app", ["codex_desktop", "claude_code"])
 def test_authenticated_catalog_history_status_keep_identity_and_visible_text(bundle, app):
     owner = bundle.bound.token.owner

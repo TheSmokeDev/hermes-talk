@@ -4,9 +4,9 @@ What is being proved: host events map to the bounded phase vocabulary and
 NOWHERE else; the only job-specific detail that can leave the module is a
 safe tool label; projections key on exact correlators (never recency), so
 concurrent jobs cannot cross-route; terminal phases are durable receipts
-that never flip registry authority; the watcher speaks on phase CHANGE only
-plus bounded heartbeats; and replaying history after a restart still reads
-the phase off meta.
+that never flip registry authority; the watcher speaks on phase CHANGE only,
+and only when the change is news (no heartbeat, no echo of the receipt); and
+replaying history after a restart still reads the phase off meta.
 """
 
 from __future__ import annotations
@@ -81,17 +81,6 @@ class _StubLoop:
     def call_soon_threadsafe(self, callback, *args):
         self.marshalled += 1
         callback(*args)
-
-
-class _Clock:
-    def __init__(self) -> None:
-        self.t = 1_000.0
-
-    def __call__(self) -> float:
-        return self.t
-
-    def advance(self, seconds: float) -> None:
-        self.t += seconds
 
 
 def _run_snapshot(run_id: int, phase: str | None = None, detail: str = "") -> dict:
@@ -228,16 +217,49 @@ def test_the_spoken_milestone_is_contained_and_carries_no_routing_metadata():
         assert leaked not in text
 
 
-def test_heartbeat_and_blocked_and_accepted_speech():
-    run = _run_snapshot(9)
-    texts = {
-        kind: _spoken_text(talk_cli.run_phase_commands(run, kind))
-        for kind in ("heartbeat", "accepted", "blocked")
-    }
-    assert "still working" in texts["heartbeat"]
-    assert "was accepted" in texts["accepted"]
-    assert "waiting on an approval" in texts["blocked"]
-    assert "#9" in texts["heartbeat"]
+def test_only_news_builds_milestone_speech():
+    """hermes-talk#202: every milestone forces a spoken turn, so empty ones are fillers.
+
+    ``accepted`` repeats the WORK_STARTED receipt the model just spoke; an
+    unlabelled ``executing`` (or one labelled only with the generic fallback)
+    and the old once-a-minute heartbeat say "still going" and nothing else.
+    """
+
+    assert talk_cli.run_phase_commands(_run_snapshot(9), "heartbeat") == []
+    assert talk_cli.run_phase_commands(_run_snapshot(9, "accepted"), "accepted") == []
+    for detail in ("", talk_progress.TOOL_LABEL_FALLBACK):
+        run = _run_snapshot(9, "executing", detail)
+        assert talk_cli.run_phase_commands(run, "executing") == []
+    blocked = _spoken_text(talk_cli.run_phase_commands(_run_snapshot(9, "blocked"), "blocked"))
+    assert "#9" in blocked and "waiting on an approval" in blocked
+    labelled = _run_snapshot(9, "executing", "Running tests")
+    assert "executing \u2014 Running tests" in _spoken_text(
+        talk_cli.run_phase_commands(labelled, "executing")
+    )
+
+
+def test_a_long_pending_run_speaks_once_per_piece_of_news():
+    """The watch-to-speech path for one delegated job, poll by poll (hermes-talk#202)."""
+
+    watch = talk_progress.RunProgressWatch()
+    feed = (
+        [_run_snapshot(4, "accepted")] * 50
+        + [_run_snapshot(4, "executing", "Working")] * 50
+        + [_run_snapshot(4, "blocked")] * 20
+        + [_run_snapshot(4, "executing", "Running tests")] * 50
+        + [_run_snapshot(4, "complete")] * 5
+    )
+    spoken = []
+    for run in feed:
+        milestone = watch.poll(run)
+        if milestone is not None:
+            text = _spoken_text(talk_cli.run_phase_commands(run, milestone))
+            if text:
+                spoken.append(text)
+
+    assert len(spoken) == 2
+    assert "waiting on an approval" in spoken[0]
+    assert "Running tests" in spoken[1]
 
 
 def test_terminal_phases_build_no_milestone_speech():
@@ -537,8 +559,7 @@ def test_hooks_never_raise_into_the_host():
 
 
 def test_the_watch_speaks_on_phase_change_only():
-    clock = _Clock()
-    watch = talk_progress.RunProgressWatch(now=clock)
+    watch = talk_progress.RunProgressWatch()
 
     assert watch.poll(_run_snapshot(1, "accepted")) == "accepted"
     assert watch.poll(_run_snapshot(1, "accepted")) is None
@@ -548,8 +569,7 @@ def test_the_watch_speaks_on_phase_change_only():
 
 
 def test_the_watch_never_speaks_a_terminal_phase():
-    clock = _Clock()
-    watch = talk_progress.RunProgressWatch(now=clock)
+    watch = talk_progress.RunProgressWatch()
 
     # The annotate->finish gap: meta already says complete, the registry not
     # yet. The watch records the phase but leaves the sentence to the
@@ -559,8 +579,7 @@ def test_the_watch_never_speaks_a_terminal_phase():
 
 
 def test_the_watch_ignores_a_phase_it_cannot_vouch_for():
-    clock = _Clock()
-    watch = talk_progress.RunProgressWatch(now=clock)
+    watch = talk_progress.RunProgressWatch()
 
     assert watch.poll(_run_snapshot(1, "inspecting")) is None
     assert watch.poll(_run_snapshot(1, "garbage")) is None
@@ -568,40 +587,22 @@ def test_the_watch_ignores_a_phase_it_cannot_vouch_for():
     assert watch.poll(_run_snapshot(1, "executing")) == "executing"
 
 
-def test_heartbeats_are_bounded_to_one_per_interval():
-    clock = _Clock()
-    watch = talk_progress.RunProgressWatch(heartbeat_s=60.0, now=clock)
+def test_an_unchanged_or_phaseless_run_is_never_due_anything():
+    """No change, nothing due, however long the run stays pending (hermes-talk#202)."""
 
-    assert watch.poll(_run_snapshot(1)) is None
-    clock.advance(59.9)
-    assert watch.poll(_run_snapshot(1)) is None
-    clock.advance(0.1)
-    assert watch.poll(_run_snapshot(1)) == "heartbeat"
-    clock.advance(30)
-    assert watch.poll(_run_snapshot(1)) is None
-    clock.advance(30)
-    assert watch.poll(_run_snapshot(1)) == "heartbeat"
-
-
-def test_milestone_speech_resets_the_heartbeat_clock():
-    clock = _Clock()
-    watch = talk_progress.RunProgressWatch(heartbeat_s=60.0, now=clock)
-
-    clock.advance(59)
-    assert watch.poll(_run_snapshot(1, "executing")) == "executing"
-    # The milestone just spoke; a heartbeat one second later would be noise.
-    clock.advance(59)
-    assert watch.poll(_run_snapshot(1, "executing")) is None
-    clock.advance(1)
-    assert watch.poll(_run_snapshot(1, "executing")) == "heartbeat"
+    watch = talk_progress.RunProgressWatch()
+    for _ in range(100):
+        assert watch.poll(_run_snapshot(1)) is None
+    assert watch.poll(_run_snapshot(1, "executing", "Reading files")) == "executing"
+    for _ in range(100):
+        assert watch.poll(_run_snapshot(1, "executing", "Reading files")) is None
 
 
 def test_interleaved_jobs_keep_their_own_milestone_order():
     """Two watchers, interleaved polls: per-run order is each run's own."""
 
-    clock = _Clock()
-    watch_a = talk_progress.RunProgressWatch(now=clock)
-    watch_b = talk_progress.RunProgressWatch(now=clock)
+    watch_a = talk_progress.RunProgressWatch()
+    watch_b = talk_progress.RunProgressWatch()
     feed_a = ["accepted", "executing", "blocked"]
     feed_b = ["accepted", "blocked"]
     heard_a: list[str] = []
@@ -810,29 +811,29 @@ def test_subagent_phase_speech_names_the_agent_its_role_and_its_phase():
     """The child milestone sentences themselves.
 
     The run-side wording is pinned above; the child side only had "terminal
-    phases build nothing". These are the three sentences an operator actually
-    hears, including the two shapes that are easy to get wrong: an executing
-    child with no tool detail yet (the sentence must still end), and a child
-    with no role (no empty parentheses).
+    phases build nothing". These are the sentences an operator actually
+    hears, including the shape that is easy to get wrong: a child with no
+    role (no empty parentheses). A child's ``accepted`` and an executing
+    child with no real tool label carry no news and stay silent
+    (hermes-talk#202).
     """
 
     base = {"subagent_id": "sa-0-aaaa", "role": "researcher"}
     assert (
-        "Background agent sa-0-aaaa (researcher) was accepted."
-        in _child_spoken(**base, phase="accepted")
-    )
-    assert (
         "Background agent sa-0-aaaa (researcher) is executing \u2014 Reading files."
         in _child_spoken(**base, phase="executing", detail="Reading files")
     )
-    assert "is executing." in _child_spoken(**base, phase="executing")
     assert "waiting on an approval" in _child_spoken(**base, phase="blocked")
     assert (
-        "Background agent sa-0-aaaa was accepted."
-        in _child_spoken(subagent_id="sa-0-aaaa", phase="accepted")
+        "Background agent sa-0-aaaa is waiting on an approval."
+        in _child_spoken(subagent_id="sa-0-aaaa", phase="blocked")
     )
+    assert talk_cli.subagent_phase_commands({**base, "phase": "accepted"}) == []
+    for detail in ("", talk_progress.TOOL_LABEL_FALLBACK):
+        event = {**base, "phase": "executing", "detail": detail}
+        assert talk_cli.subagent_phase_commands(event) == []
     # No id is no subject: nothing is spoken rather than a nameless sentence.
-    assert talk_cli.subagent_phase_commands({"phase": "accepted"}) == []
+    assert talk_cli.subagent_phase_commands({"phase": "blocked"}) == []
 
 
 def test_subagent_phase_speech_carries_no_routing_metadata():
@@ -882,9 +883,9 @@ def test_spoken_labels_are_truncated_to_the_progress_label_cap():
     assert "L" * cap in text and "L" * (cap + 1) not in text
     assert "D" * cap in text and "D" * (cap + 1) not in text
 
-    # The heartbeat carries the label too, on the same cap.
-    beat = _spoken_text(talk_cli.run_phase_commands(run, "heartbeat"))
-    assert "L" * cap in beat and "L" * (cap + 1) not in beat
+    # The approval milestone carries the run label too, on the same cap.
+    blocked = _spoken_text(talk_cli.run_phase_commands(run, "blocked"))
+    assert "L" * cap in blocked and "L" * (cap + 1) not in blocked
 
     child = _child_spoken(subagent_id="sa-0-aaaa", phase="executing", detail=long_detail)
     assert "D" * cap in child and "D" * (cap + 1) not in child

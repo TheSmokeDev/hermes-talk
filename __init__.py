@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import shlex
 
 try:
@@ -167,9 +166,9 @@ def _register_talk_command(ctx) -> None:
     kwargs = {
         "handler": _talk_command,
         "description": (
-            "Start provider-owned voice with canonical Hermes tools (join), or the "
-            "canonical core voice lane (core join); "
-            "gateway also supports pause, resume, leave and status"
+            "Start provider-owned voice with canonical Hermes tools (join); the "
+            "Discord gateway also supports pause, resume, leave, status and, on "
+            "hosts with the core voice contract, core join"
         ),
         "args_hint": (
             "[join [TARGET [PEER PROFILE]]|select TARGET|return|reconnect|"
@@ -238,7 +237,7 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
     requested = raw.split(maxsplit=1)[0].lower() if raw else "join"
     explicit_target = requested == "join" and len(raw.split(maxsplit=1)) > 1
     native_join = requested == "join" and (
-        explicit_target or os.environ.get("TALK_TASK_TARGET")
+        explicit_target or talk_config._talk_env_get("TALK_TASK_TARGET")
         or talk_config.voice_mode() == "live"
     )
     if canonical or native_join or requested in {
@@ -268,15 +267,56 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
             return f"Canonical core voice was refused by the host ({type(exc).__name__})."
         return talk_discord.start_core_session(factory)
     if sub in {"", "join"}:
-        capture = getattr(invocation, "capture_realtime_execution_attachment", None)
-        if callable(capture):
-            try:
-                attachment = capture()
-            except Exception as exc:  # noqa: BLE001 - capability refusal is speakable
-                return f"Provider-owned voice was refused by the host ({type(exc).__name__})."
-            return talk_discord.start_session(host_execution_attachment=attachment)
-        return talk_discord.start_session()
+        try:
+            auto_join = talk_config.discord_auto_join()
+        except talk_config.TalkConfigError as exc:
+            return str(exc)
+        if auto_join:
+            return _auto_join_then_start(invocation)
+        return _start_discord_session(invocation)
     return talk_discord.JOIN_USAGE
+
+
+def _start_discord_session(invocation, guild_id=None) -> str:
+    """The plain ``/talk join`` start, on the connection the host holds."""
+
+    # The call is byte-identical to the pre-auto-join one unless auto-join
+    # picked a server, so the default path does not change at all.
+    target = {} if guild_id is None else {"guild_id": guild_id}
+    capture = getattr(invocation, "capture_realtime_execution_attachment", None)
+    if callable(capture):
+        try:
+            attachment = capture()
+        except Exception as exc:  # noqa: BLE001 - capability refusal is speakable
+            return f"Provider-owned voice was refused by the host ({type(exc).__name__})."
+        return talk_discord.start_session(**target, host_execution_attachment=attachment)
+    return talk_discord.start_session(**target)
+
+
+async def _auto_join_then_start(invocation) -> str:
+    """Experimental (hermes-talk#224): join the caller's voice channel, then start.
+
+    Off unless ``discord_auto_join`` / ``TALK_DISCORD_AUTO_JOIN`` is on. A
+    connection the bot already holds in the caller's server is reused exactly
+    as plain ``/talk join`` does; a connection this call opens is closed again
+    if the start refuses or when the Talk session it started ends.
+    """
+
+    async with talk_discord.auto_join_lock():
+        try:
+            guild_id, joined = await talk_discord.join_caller_voice_channel()
+        except talk_discord.TalkDiscordError as exc:
+            return str(exc)
+        previous = talk_discord.session_task()
+        try:
+            receipt = _start_discord_session(invocation, guild_id)
+        except BaseException:
+            if joined is not None:
+                talk_discord.release_auto_joined(guild_id, joined)
+            raise
+        if joined is not None:
+            talk_discord.release_auto_joined_when_done(guild_id, joined, previous)
+        return receipt
 
 
 
@@ -314,7 +354,8 @@ def _canonical_discord_command(raw, invocation):
         profile = arguments[2] if len(arguments) == 3 else context.get("profile", "default")
         task = {
             "target_id": (arguments[0] if arguments else
-                          os.environ.get("TALK_TASK_TARGET") or context["anchor_session_id"]),
+                          talk_config._talk_env_get("TALK_TASK_TARGET")
+                          or context["anchor_session_id"]),
             "peer_id": peer, "profile": profile,
             "tab_id": "discord-" + "-".join(str(value) for value in identifiers.values()),
             "surface_context": {

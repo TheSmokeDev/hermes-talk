@@ -21,6 +21,7 @@ import pytest
 
 import talk_audio
 import talk_cli
+import talk_core_realtime
 import talk_core_session
 import talk_discord
 
@@ -461,7 +462,13 @@ def test_status_with_no_session():
     assert "No live voice session" in talk_discord.session_status()
 
 
+def _core_contract(monkeypatch, available: bool) -> None:
+    monkeypatch.setattr(talk_core_realtime, "core_provider_available", lambda: available)
+
+
 def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(monkeypatch):
+    _core_contract(monkeypatch, True)
+
     async def scenario():
         _wired_host(monkeypatch)
         gate = asyncio.Event()
@@ -479,6 +486,34 @@ def test_legacy_join_receipt_and_status_label_the_limited_lane_and_core_parity(m
             assert "limited legacy provider-owned" in text.lower()
             assert "/talk core join" in text.lower()
         assert len(receipt) < 240
+        gate.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_legacy_join_never_offers_core_join_without_the_core_contract(monkeypatch):
+    """hermes-talk#215: the pointer named a command this host cannot run."""
+
+    _core_contract(monkeypatch, False)
+
+    async def scenario():
+        _wired_host(monkeypatch)
+        gate = asyncio.Event()
+
+        async def keep_open(audio, **_kwargs):
+            await gate.wait()
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", keep_open)
+
+        receipt = talk_discord.start_session(7)
+        status = talk_discord.session_status()
+
+        for text in (receipt, status):
+            assert "limited legacy provider-owned" in text.lower()
+            assert "core join" not in text.lower()
+            assert "`talk leave`" in text
         gate.set()
         await asyncio.sleep(0)
 
@@ -519,6 +554,8 @@ def test_a_startup_refusal_is_spoken_with_its_reason_and_the_core_join_route(mon
     the reason was the one who never got it.
     """
 
+    _core_contract(monkeypatch, True)
+
     async def scenario():
         delivered = _refusing_legacy_join(monkeypatch, talk_cli.STARTUP_REFUSAL_CONFIGURATION)
 
@@ -541,6 +578,17 @@ def test_a_startup_refusal_is_spoken_with_its_reason_and_the_core_join_route(mon
         assert "Traceback" not in failure and "Error" not in failure
 
     asyncio.run(scenario())
+
+
+def test_refusals_drop_the_core_join_route_without_the_core_contract(monkeypatch):
+    """hermes-talk#215: core join cannot route around anything on a host that lacks it."""
+
+    _core_contract(monkeypatch, False)
+    for reason in (talk_cli.STARTUP_REFUSAL_CONFIGURATION, talk_cli.STARTUP_REFUSAL_PROVIDER):
+        line = talk_discord._startup_refusal_failure(reason)
+        assert line is not None
+        assert "core join" not in line.lower()
+        assert "run `hermes talk doctor`" in line
 
 
 def test_an_audio_refusal_does_not_send_the_operator_to_core_join(monkeypatch):
@@ -611,9 +659,10 @@ def test_a_clean_legacy_session_never_delivers_a_failure_receipt(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_every_startup_refusal_reason_has_exactly_one_speakable_line():
+def test_every_startup_refusal_reason_has_exactly_one_speakable_line(monkeypatch):
     """The mapping is keyed by literal (talk_cli imports lazily) — pin it."""
 
+    _core_contract(monkeypatch, True)
     assert set(talk_discord._STARTUP_REFUSAL_FAILURES) == set(
         talk_cli.STARTUP_REFUSAL_REASONS
     )

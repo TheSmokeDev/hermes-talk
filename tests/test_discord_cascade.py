@@ -195,6 +195,10 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
         monkeypatch.setattr(talk_cascade_voice, "_import_aiohttp", lambda: tts)
 
         audio = talk_discord.DiscordAudio(7)
+        completions = []
+        monkeypatch.setattr(
+            audio, "finish_playback", lambda: completions.append(True), raising=False
+        )
         fake = _HeldProvider(
             [
                 rt.SessionReady(session_id="session-1"),
@@ -203,7 +207,8 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
                 fr.rt_transcript_done("Hello Discord.", response_id="resp-1"),
                 rt.ResponseFinished(response_id="resp-1"),
             ],
-            until=lambda: bool(tts.sockets) and tts.sockets[0].closed,
+            # Held until the TTS stream has settled AND signalled the end.
+            until=lambda: bool(tts.sockets) and tts.sockets[0].closed and bool(completions),
         )
         task = asyncio.create_task(
             talk_cli.run_talk_session(
@@ -220,6 +225,7 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
         assert ws.sent[2] == {"text": ""}
         assert tts.dials[0]["headers"] == {"xi-api-key": FAKE_KEY}
         assert FAKE_KEY not in tts.dials[0]["url"]
+        assert completions == []  # provider done is earlier than TTS audio
 
         # One 20 ms session-rate frame (480 samples of a 440 Hz tone).
         pcm24 = _tone(480, rate=24_000)
@@ -239,6 +245,8 @@ def test_cascade_pcm_reaches_the_voice_channel_through_real_discord_audio(monkey
         assert frame != talk_discord.SILENCE_FRAME
         # Nothing else was ever queued — the next read is synthesized silence.
         assert source.read() == talk_discord.SILENCE_FRAME
+        # The reply ended once, when its TTS stream settled.
+        assert completions == [True]
         _no_leaked_tasks()  # aclose() stopped the cascade worker at teardown
 
     asyncio.run(scenario())
@@ -357,6 +365,119 @@ def test_native_mode_discord_never_dials_elevenlabs(monkeypatch):
         assert played_sources, "the room never got a player source"
         assert played_sources[0].read() == expected
         assert tts.dials == []
+        _no_leaked_tasks()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("response_id", ["resp-1", None])
+def test_native_completion_flushes_partial_discord_frame(monkeypatch, response_id):
+    async def scenario():
+        _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+        audio = talk_discord.DiscordAudio(7)
+        pcm = b"\x01\x00" * 5  # 40 Discord bytes after conversion
+        fake = FakeProviderSession([
+            rt.SessionReady(session_id="session-1"),
+            rt.ResponseStarted(response_id=response_id),
+            fr.rt_audio(pcm, response_id=response_id),
+            rt.ResponseFinished(response_id=response_id),
+        ])
+        sources = []
+        original = vc.play
+        vc.play = lambda source: (sources.append(source), original(source))[1]
+        assert await talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: fake, lane="discord"
+        ) == 0
+        converted, _ = talk_discord.session_to_discord(pcm)
+        assert sources[0].read() == converted + bytes(talk_discord.DISCORD_FRAME_BYTES - 40)
+        assert not sources[0].carrying
+        _no_leaked_tasks()
+
+    asyncio.run(scenario())
+
+
+def test_stale_native_completion_does_not_flush_next_response(monkeypatch):
+    async def scenario():
+        _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+        audio = talk_discord.DiscordAudio(7)
+        sources = []
+        original = vc.play
+        vc.play = lambda source: (sources.append(source), original(source))[1]
+        fake = FakeProviderSession([
+            rt.ResponseStarted(response_id="old"),
+            rt.SpeechStarted(input_id="input-1", offset_ms=0),
+            rt.ResponseStarted(response_id="new"),
+            fr.rt_audio(b"\x01\x00" * 5, response_id="new"),
+            rt.ResponseFinished(response_id="old"),
+        ])
+        assert await talk_cli.run_talk_session(
+            audio=audio, session_factory=lambda _auth: fake, lane="discord"
+        ) == 0
+        assert sources[0].read() == talk_discord.SILENCE_FRAME
+        assert sources[0].carrying
+        _no_leaked_tasks()
+
+    asyncio.run(scenario())
+
+
+def test_cascade_stream_end_flushes_partial_discord_frame(monkeypatch):
+    """A cascade reply's last partial frame plays once its TTS stream settles.
+
+    The provider's ResponseFinished arrives before any TTS audio, so it cannot
+    be the boundary. Without the stream-end signal the 80-byte tail stays held
+    and ``playback_pending`` never clears, which starves announcements.
+    """
+
+    async def scenario():
+        _connection, _receiver, vc, _adapter = _wired_host(monkeypatch)
+        _cascade_env(monkeypatch)
+        tts = _FakeTtsModule()
+        monkeypatch.setattr(talk_cascade_voice, "_import_aiohttp", lambda: tts)
+
+        audio = talk_discord.DiscordAudio(7)
+        completions = []
+        real_finish = audio.finish_playback
+
+        def finish_playback():
+            completions.append(True)
+            real_finish()
+
+        monkeypatch.setattr(audio, "finish_playback", finish_playback)
+        fake = _HeldProvider(
+            [
+                rt.SessionReady(session_id="session-1"),
+                rt.ResponseStarted(response_id="resp-1"),
+                fr.rt_transcript_delta("Short. ", response_id="resp-1"),
+                fr.rt_transcript_done("Short.", response_id="resp-1"),
+                rt.ResponseFinished(response_id="resp-1"),
+            ],
+            until=lambda: bool(completions),
+        )
+        task = asyncio.create_task(
+            talk_cli.run_talk_session(
+                audio=audio, session_factory=lambda _auth: fake, lane="discord"
+            )
+        )
+        await _wait_for(lambda: vc.playing is not None)
+        source = vc.playing
+        await _wait_for(lambda: len(tts.sockets) == 1)
+        ws = tts.sockets[0]
+        await _wait_for(lambda: len(ws.sent) == 3)
+        assert audio._outbound.empty() and completions == []  # provider done flushed nothing
+
+        pcm24 = b"\x01\x00" * 10  # 80 Discord bytes after conversion
+        ws.feed_audio(pcm24)
+        ws.feed_final()
+        assert await asyncio.wait_for(task, wallclock.stretch(3)) == 0
+
+        converted, _carry = talk_discord.session_to_discord(pcm24)
+        assert len(converted) < talk_discord.DISCORD_FRAME_BYTES
+        assert source.read() == converted + bytes(
+            talk_discord.DISCORD_FRAME_BYTES - len(converted)
+        )
+        assert not source.carrying
+        assert source.read() == talk_discord.SILENCE_FRAME
+        assert completions == [True]
         _no_leaked_tasks()
 
     asyncio.run(scenario())

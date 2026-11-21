@@ -13,6 +13,13 @@ import wallclock
 from run_workers import RunWorkers
 
 
+@pytest.fixture(autouse=True)
+def isolated_talk_instructions(monkeypatch, tmp_path):
+    import talk_identity
+
+    monkeypatch.setattr(talk_identity, "TALK_INSTRUCTIONS_PATH", tmp_path / "TALK.md")
+
+
 @pytest.fixture
 def run_workers(monkeypatch):
     """Opt-in ownership of run threads; callers drain BEFORE registry reset.
@@ -31,6 +38,28 @@ def run_workers(monkeypatch):
         yield workers
     finally:
         workers.join_all()
+
+
+@pytest.fixture
+def headless_sounddevice(tmp_path, monkeypatch):
+    """``import sounddevice`` the way a host with no PulseAudio/ALSA answers it.
+
+    The real module runs ``Pa_Initialize()`` at import and raises its own
+    ``PortAudioError`` (an ``Exception`` subclass, not ImportError/OSError)
+    when no audio system exists (hermes-talk#236).
+    """
+    root = tmp_path / "headless-audio"
+    root.mkdir()
+    (root / "sounddevice.py").write_text(
+        "class PortAudioError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "raise PortAudioError(\"Error initializing PortAudio: [PaErrorCode -9999]: "
+        "'PulseAudio_Initialize: Can't connect to server'\")\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.syspath_prepend(str(root))
 
 
 @pytest.fixture
@@ -191,3 +220,19 @@ def _ephemeral_runs_optin(monkeypatch):
     """
 
     monkeypatch.setenv("TALK_RUNS_ALLOW_EPHEMERAL", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_saved_plugin_settings(monkeypatch):
+    """Every test sees Talk's shipped defaults, never this machine's Hermes config.
+
+    ``talk_config.plugin_setting`` reads the active Hermes profile when
+    ``hermes_cli`` is importable, so on a developer box a saved Call journal or
+    Voice language switch would leak into tests that assert the defaults (and a
+    saved journal switch would write under the real ``HERMES_HOME``). A test
+    that exercises a saved setting patches ``plugin_setting`` itself, which
+    overrides this.
+    """
+    import talk_config
+
+    monkeypatch.setattr(talk_config, "plugin_setting", lambda key: None)

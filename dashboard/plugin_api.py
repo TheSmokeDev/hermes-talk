@@ -43,6 +43,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
+from typing import NamedTuple
 
 #: The dashboard loads this module by path, so ``talk_*`` is not importable by
 #: name until the plugin root is on the path. Done once, before the imports
@@ -55,6 +56,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 import talk_apiserver  # noqa: E402
 import talk_auth  # noqa: E402
+import talk_call_journal  # noqa: E402
 import talk_capabilities  # noqa: E402
 import talk_cascade_voice  # noqa: E402
 import talk_config  # noqa: E402
@@ -192,6 +194,7 @@ LOOPBACK_ONLY_MESSAGE = (
     f"somewhere else — set {DASHBOARD_TOKEN_ENV} and send it as "
     f"`{DASHBOARD_TOKEN_HEADER}: <token>` to reach them remotely."
 )
+CROSS_SITE_MESSAGE = "hermes-talk dashboard routes refuse cross-site requests."
 
 #: How many runs the panel asks for. Fixed rather than caller-supplied: the
 #: registry is a status board, not a query surface.
@@ -257,6 +260,34 @@ def _has_desktop_auth(request, presented: str) -> bool:
     return True
 
 
+def _dashboard_session(request) -> str | None:
+    """``"verified"`` when the dashboard's own sign-in gate verified this request.
+
+    In gated mode (a non-loopback bind or a public URL), Hermes's
+    ``gated_auth_middleware`` verifies the session cookie or bearer with the
+    configured sign-in provider before any plugin route runs, and only then
+    sets ``request.state.session``. The state is server-set and allows Talk to
+    recognize that operator when the administrator has not configured a
+    separate Talk password.
+
+    Cross-site requests are refused even with a session: the session cookie
+    is ``SameSite=Lax``, and ``Sec-Fetch-Site: cross-site`` is an explicit
+    second fence for any route a top-level navigation could reach. Such a
+    request answers ``"cross-site"`` so the gate refuses it outright instead
+    of letting it fall through to the loopback rule. Anything else is
+    ``None``: no gate, or no session it verified.
+    """
+
+    app = getattr(request, "app", None)
+    if getattr(getattr(app, "state", None), "auth_required", False) is not True:
+        return None
+    if getattr(getattr(request, "state", None), "session", None) is None:
+        return None
+    getter = getattr(getattr(request, "headers", None), "get", None)
+    site = (getter("sec-fetch-site") or "").strip().lower() if getter else ""
+    return "cross-site" if site == "cross-site" else "verified"
+
+
 def require_dashboard_auth(request) -> None:
     """Gate one request. Returns on success, raises otherwise — never a bool.
 
@@ -264,6 +295,9 @@ def require_dashboard_auth(request) -> None:
     """
 
     configured = dashboard_token()
+    session = _dashboard_session(request)
+    if configured is None and session == "verified":
+        return
     if configured is not None:
         presented = _presented_token(request)
         # compare_digest over bytes: unequal lengths return False rather than
@@ -278,6 +312,10 @@ def require_dashboard_auth(request) -> None:
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
     if configured is not None:
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
+    if session == "cross-site":
+        # The browser behind a signed-in session made a cross-site request;
+        # a loopback peer (a local reverse proxy) does not make it same-site.
+        raise HTTPException(status_code=403, detail=CROSS_SITE_MESSAGE)
     if _is_loopback(request):
         return
     raise HTTPException(status_code=403, detail=LOOPBACK_ONLY_MESSAGE)
@@ -371,10 +409,36 @@ def _session_tools(bound=None):
     return tools
 
 
+class _Languages(NamedTuple):
+    """The spoken-language knobs for one mint, resolved before anything is spent."""
+
+    reply_language: str | None
+    transcription_languages: tuple[str, ...]
+    transcription_prompt: str | None
+
+
+def _config_or_400(resolve):
+    """One Talk setting, or a 400 that names it — never a bare 500 later."""
+
+    try:
+        return resolve()
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _resolve_languages() -> _Languages:
+    return _Languages(
+        reply_language=_config_or_400(talk_config.reply_language),
+        transcription_languages=_config_or_400(talk_config.transcription_languages),
+        transcription_prompt=_config_or_400(talk_config.transcription_prompt),
+    )
+
+
 def _mint(
     auth_token: str,
     voice: str,
     *,
+    languages: _Languages,
     text_output: bool = False,
     bound=None,
     hermes_signed: bool = False,
@@ -387,6 +451,8 @@ def _mint(
     ``text_output`` is the cascade lane: the minted session asks the provider
     for TEXT output instead of synthesized audio, and the browser streams the
     text deltas back through the cascade relay to be spoken server-side.
+    ``languages`` was resolved by the route, so a malformed knob has already
+    refused with a 400 before a task was joined or a credential spent.
     """
 
     tools = _session_tools(bound)
@@ -407,12 +473,15 @@ def _mint(
                 if bound is not None
                 else talk_capabilities.instruction_section()
             ),
+            reply_language=languages.reply_language,
         )
         + ("\n\n" + TASKS.instructions(bound) if bound is not None else ""),
         tools=tools,
         automatic_response=bound is None,
         turn_detection=_resolve_turn_detection(),
         text_output=text_output,
+        transcription_languages=languages.transcription_languages,
+        transcription_prompt=languages.transcription_prompt,
     )
 
 
@@ -534,6 +603,12 @@ async def create_session(request: Request) -> dict:
     require_dashboard_auth(request)
     body = await _json_body(request)
     _resolve_turn_detection()
+    languages = _resolve_languages()
+    # Retention runs on every call start, journaled or not, so switching the
+    # journal off never leaves old transcripts on disk. It never creates the
+    # folder and never fails the call; a journaled call prunes again, with its
+    # validated window, when its own journal starts.
+    await asyncio.to_thread(talk_call_journal.prune_existing)
     if isinstance(body.get("task"), dict) and "target_id" in body["task"]:
         return await _target_session(request, body, initial=True)
     bound = None
@@ -558,6 +633,16 @@ async def create_session(request: Request) -> dict:
     else:
         voice = _resolve_voice(body.get("voice"))
     try:
+        # Resolved before the mint so a malformed switch refuses without
+        # spending a credential. Bound calls keep their canonical history.
+        journal_days = (
+            talk_call_journal.retention_days()
+            if bound is None and talk_call_journal.enabled()
+            else None
+        )
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         auth = talk_auth.resolve_auth()
     except talk_auth.TalkAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -569,6 +654,7 @@ async def create_session(request: Request) -> dict:
             _mint,
             auth.token,
             voice,
+            languages=languages,
             text_output=text_output,
             hermes_signed=auth.source == talk_auth.SOURCE_CODEX_OAUTH,
             **({"bound": bound} if bound is not None else {}),
@@ -617,7 +703,7 @@ async def create_session(request: Request) -> dict:
         operator=f"dashboard:{auth.source}",
         profile=talk_config.agent_profile(),
     )
-    return {
+    response = {
         "ok": True,
         **descriptor.to_wire(),
         "authSource": auth.source,
@@ -626,6 +712,50 @@ async def create_session(request: Request) -> dict:
         # and plays the PCM that comes back.
         "voiceMode": voice_mode,
     }
+    if journal_days is not None:
+        surface = body.get("surface")
+        engine = {
+            "provider": "openai",
+            "model": descriptor.model,
+            "voice": descriptor.voice or None,
+            "voice_mode": voice_mode,
+            "auth": auth.source,
+        }
+        try:
+            call_id = await asyncio.to_thread(
+                talk_call_journal.start,
+                engine=engine,
+                lane=surface if surface in ("desktop", "dashboard") else "browser",
+                host_session_id=body.get("host_session_id"),
+                days=journal_days,
+            )
+        except OSError:
+            # The call itself is healthy; say plainly that it is not journaled.
+            _log.warning("Talk call journal could not be created; this call is not journaled")
+            response["journal"] = {"enabled": True, "callId": None}
+        else:
+            response["journal"] = {"enabled": True, "callId": call_id}
+    return response
+
+
+@router.post("/journal")
+async def journal_events(request: Request) -> dict:
+    """Append page-reported events to a journal the mint created (opt-in)."""
+
+    require_dashboard_auth(request)
+    body = await _json_body(request)
+    try:
+        if not talk_call_journal.enabled():
+            raise HTTPException(status_code=409, detail="TALK_CALL_JOURNAL is off")
+    except talk_config.TalkConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        written = await asyncio.to_thread(
+            talk_call_journal.record, body.get("call_id"), body.get("events")
+        )
+    except talk_call_journal.JournalError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"ok": True, "written": written}
 
 
 @router.post("/tool")
@@ -698,7 +828,7 @@ _PCM_END = object()
 _FEED_DONE = object()
 
 
-def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
+def _resolve_cascade_relay_config() -> tuple[talk_config.CascadeVoiceConfig, dict]:
     """The cascade config for one relay call — fail-closed, HTTP-shaped.
 
     Delivery settings resolve HERE, beside the key and the voice, so a bad
@@ -721,8 +851,8 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
             ),
         )
     try:
-        api_key, voice_id, model = talk_config.cascade_voice_config(talk_config.talk_provider())
-        return (api_key, voice_id, model, talk_config.elevenlabs_voice_settings())
+        config = talk_config.cascade_voice_config(talk_config.talk_provider())
+        return (config, talk_config.elevenlabs_voice_settings())
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -777,7 +907,9 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
     )
 
 
-async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> AsyncIterator[bytes]:
+async def _cascade_pcm_stream(
+    request, config: tuple[talk_config.CascadeVoiceConfig, dict]
+) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
     A fresh CascadeVoice per request: one POST == one response's speech. The
@@ -791,11 +923,9 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> As
     """
 
     audio_queue: asyncio.Queue = asyncio.Queue()
-    api_key, voice_id, model, voice_settings = config
-    voice = talk_cascade_voice.CascadeVoice(
-        api_key=api_key,
-        voice_id=voice_id,
-        model=model,
+    voice_config, voice_settings = config
+    voice = talk_cascade_voice.build_cascade_voice(
+        voice_config,
         on_audio=audio_queue.put_nowait,
         on_error=lambda text: _log.warning("dashboard cascade relay: %s", text),
         on_stream_end=lambda: audio_queue.put_nowait(_PCM_END),
@@ -983,6 +1113,7 @@ async def _target_session(request, body, *, initial=False):
     if _resolve_voice_mode() == "live":
         return await _target_live_session(request, body, initial=initial)
     _resolve_turn_detection()
+    languages = _resolve_languages()
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
     if text_output:
@@ -1018,6 +1149,7 @@ async def _target_session(request, body, *, initial=False):
             _mint,
             auth.token,
             voice,
+            languages=languages,
             text_output=text_output,
             bound=prepared.bound,
             hermes_signed=auth.source == talk_auth.SOURCE_CODEX_OAUTH,
@@ -1062,6 +1194,11 @@ async def native_task_attach(request: Request):
         raise HTTPException(
             status_code=400, detail=DashboardTaskError("invalid_event", 400).detail()
         )
+    # Resolved before any target is reserved or activated: a malformed
+    # TALK_REPLY_LANGUAGE is a 400 that leaves no half-bound task behind.
+    reply_language = (
+        _config_or_400(talk_config.reply_language) if input_mode == "voice" else None
+    )
     previous = (await _task_call(TASKS.binding, request, body)
                 if "connection_id" in body else None)
     selection_body = {key: value for key, value in body.items()
@@ -1112,11 +1249,13 @@ async def native_task_attach(request: Request):
                 None, lane=surface_context["surface"],
                 capabilities=TASKS.live_capabilities(bound),
                 task_context=TASKS.live_instructions(bound),
+                reply_language=reply_language,
             )
         else:
             instructions = talk_identity.build_instructions(
                 None, tools=tools, lane=surface_context["surface"], canonical_task=True,
                 capabilities="Canonical task tools and linked child work are available.",
+                reply_language=reply_language,
             ) + "\n\n" + TASKS.instructions(bound)
         return {**result, "instructions": instructions, "tools": tools}
     finally:
@@ -1215,6 +1354,7 @@ TEXT_INPUT_ROUTE_HANDLERS = talk_text_input.mount_text_input_routes(
 ROUTE_HANDLERS = (
     talk_status,
     create_session,
+    journal_events,
     run_tool,
     cascade_tts,
     list_runs,

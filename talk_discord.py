@@ -41,6 +41,7 @@ import queue
 import threading
 import time
 from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,13 @@ DISCORD_FRAME_BYTES = 3_840
 #: an empty read ends the host's player thread, and the session goes mute
 #: for good with no error anywhere.
 SILENCE_FRAME = b"\x00" * DISCORD_FRAME_BYTES
+
+#: Underrun reads (20 ms each) a partial frame may wait for its reply's end
+#: marker before it is padded and played anyway. Some lanes never send that
+#: marker (GPT-Live has no output-turn event), and a held fragment keeps
+#: ``playback_pending`` true, which starves announcements (#239). A stall
+#: this long is already an audible gap, so playing the fragment costs nothing.
+HELD_FRAGMENT_UNDERRUNS = 10
 
 #: One 20 ms frame of the session's own format (24 kHz mono s16le), and the
 #: silence we synthesize when Discord goes quiet.
@@ -177,14 +185,124 @@ def session_to_discord(pcm24_mono: bytes, *, carry: int | None = None) -> tuple[
 # -- the host's voice surface -------------------------------------------------
 
 
-def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
-    """Find the host's live Discord voice connection. Raises on any miss.
+def _resolve_discord_adapter_for_profile(runner, profile_name: str | None) -> Any:
+    """Find the Discord adapter, respecting the profile's adapter map.
 
-    Returns ``{guild_id, voice_client, receiver, adapter}``. Every lookup
-    is guarded: this reaches into host internals that carry no stability
-    promise, so a rename must surface as one refusal sentence rather than a
-    traceback on the voice path.
+    Hermes v0.22.6+ multiplexed gateways expose:
+      - ``runner._primary_profile_name`` — the profile that owns ``runner.adapters``.
+        Under multiplexing this is always ``"default"``, under standalone it is the
+        actual launch profile name.
+      - ``runner._profile_adapters`` — dict mapping *secondary* profile names to
+        their own adapter maps.  The primary profile is NOT in this dict.
+
+    Rules (mirrors ``authz_mixin.py:_adapters_for_profile``):
+      - ``profile_name`` is ``None`` or ``"default"`` → use the primary map
+        (``runner.adapters``).
+      - ``profile_name`` is in ``_profile_adapters`` → resolve only from that
+        profile's map.  A missing Discord adapter is a **hard error** — never
+        silently fall back to the default bot (issue #185).
+      - ``profile_name`` is not in ``_profile_adapters`` but equals
+        ``_primary_profile_name`` → the caller identified the primary by name;
+        use ``runner.adapters``.
+      - ``profile_name`` is not in ``_profile_adapters`` and does NOT equal
+        ``_primary_profile_name`` → it is an unknown secondary profile.  **Fail
+        closed**: return ``None`` so the caller reports "no Discord adapter on
+        this profile".
+      - No ``_profile_adapters`` attribute (standalone/legacy host) → use
+        ``runner.adapters``.
     """
+
+    def _find_in_map(adapter_map: dict) -> Any:
+        """Search one adapter map for the Discord adapter.
+
+        The Platform enum has lived in more than one module across host
+        versions; we try each candidate and fall back to a label match.
+        """
+        adapter = None
+        for module_name in ("gateway.config", "models", "gateway.platform_registry"):
+            try:
+                module = __import__(module_name, fromlist=["Platform"])
+                adapter = adapter_map.get(module.Platform.DISCORD)
+            except Exception:  # noqa: BLE001 — try the next candidate
+                continue
+            if adapter is not None:
+                break
+        if adapter is None:
+            # Last resort: match on the key's own name, so a host that moves or
+            # renames the enum entirely still resolves.
+            for key, value in adapter_map.items():
+                label = getattr(key, "value", None) or getattr(key, "name", None) or key
+                if str(label).strip().lower() == "discord":
+                    adapter = value
+                    break
+        return adapter
+
+    # --- Determine which adapter map to use -----------------------------------
+    adapters_map: dict = {}  # always set before use
+    # Track whether the profile had an explicit map entry (even if empty).
+    # This distinguishes "known profile that simply has no Discord adapter"
+    # from "unknown profile / no map available" so we can produce the right error.
+    profile_has_explicit_map: bool = False
+
+    profile_adapters = getattr(runner, "_profile_adapters", None)
+
+    # 1. Trivial cases: no profile name, or the canonical default name.
+    clean_name = (profile_name or "").strip() or None
+    if clean_name is None or clean_name == "default" or profile_adapters is None:
+        adapters_map = getattr(runner, "adapters", {}) or {}
+    # 3. Secondary profile with an explicit map.
+    elif clean_name in profile_adapters:
+        adapters_map = profile_adapters[clean_name]
+        profile_has_explicit_map = True
+    # 4. Named profile not in _profile_adapters — check _primary_profile_name.
+    else:
+        primary = getattr(runner, "_primary_profile_name", None)
+        if primary and clean_name == primary:
+            # The caller identified the primary by its real name.
+            adapters_map = getattr(runner, "adapters", {}) or {}
+        else:
+            # Unknown secondary profile under multiplexing: fail closed.
+            # Return empty map; let resolve_voice_bridge produce the generic
+            # "adapter isn't loaded on this gateway" error — we do NOT borrow
+            # the default profile's Discord bot (issue #185).
+            adapters_map = {}
+
+    # --- Search the chosen map ------------------------------------------------
+    adapter = _find_in_map(adapters_map)
+    if adapter is not None:
+        return adapter
+
+    # A known profile with an explicit adapter map entry was queried but has no
+    # Discord adapter.  Raise a specific error so the operator knows which
+    # profile is misconfigured rather than getting a misleading "gateway" error.
+    if profile_name and profile_has_explicit_map:
+        raise TalkDiscordError(
+            f"Discord adapter is not loaded on profile {profile_name!r}; "
+            "this profile does not have a Discord bot."
+        )
+    return None
+
+
+def _resolve_current_profile() -> str | None:
+    """Return the active profile name, or ``None`` for standalone.
+
+    Under multiplexing the gateway sets ``HERMES_SESSION_PROFILE`` on every
+    turn.  When ``talk_discord`` is invoked from the CLI (standalone) the
+    context variable is absent and we return ``None`` so the legacy
+    ``runner.adapters`` path is taken.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        name = get_session_env("HERMES_SESSION_PROFILE")
+        if name:
+            return name
+    except ImportError:
+        pass  # standalone / test without session_context module
+    return None
+
+
+def _invoking_profile_adapter() -> Any:
+    """The invoking profile's Discord adapter — never another profile's bot."""
 
     try:
         from gateway.run import _gateway_runner_ref  # host-only, lazy by design
@@ -197,31 +315,229 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     if runner is None:
         raise TalkDiscordError("the Hermes gateway isn't running in this process")
 
-    # Find the Discord adapter without pinning one import path. The enum has
-    # lived in more than one module across host versions, and guessing wrong
-    # is indistinguishable from "Discord isn't running" — which is how this
-    # first shipped, refusing on a gateway that was connected fine.
-    adapters = getattr(runner, "adapters", None) or {}
-    adapter = None
-    for module_name in ("gateway.config", "models", "gateway.platform_registry"):
-        try:
-            module = __import__(module_name, fromlist=["Platform"])
-            adapter = adapters.get(module.Platform.DISCORD)
-        except Exception:  # noqa: BLE001 — try the next candidate
-            continue
-        if adapter is not None:
-            break
-    if adapter is None:
-        # Last resort: match on the key's own name, so a host that moves or
-        # renames the enum entirely still resolves.
-        for key, value in adapters.items():
-            label = getattr(key, "value", None) or getattr(key, "name", None) or key
-            if str(label).strip().lower() == "discord":
-                adapter = value
-                break
+    # Resolve the invoking profile so we can pick the correct adapter map.
+    profile_name = _resolve_current_profile()
+
+    adapter = _resolve_discord_adapter_for_profile(runner, profile_name)
     if adapter is None:
         raise TalkDiscordError("the Discord adapter isn't loaded on this gateway")
+    return adapter
 
+
+def _session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return ""
+    return str(get_session_env(name) or "").strip()
+
+
+def _session_int(name: str) -> int | None:
+    raw = _session_env(name)
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 20:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+async def join_caller_voice_channel() -> tuple[int, Any | None]:
+    """Experimental (hermes-talk#224): connect to the caller's voice channel.
+
+    Returns ``(guild_id, joined_client)``. ``joined_client`` is the voice
+    client THIS call created, or ``None`` when the invoking profile's bot was
+    already connected in the caller's server (today's borrow path, untouched).
+    Raises :class:`TalkDiscordError` with one speakable refusal otherwise.
+
+    Boundaries, each deliberate:
+
+    - Only the invoking profile's adapter (:func:`_invoking_profile_adapter`),
+      so a multiplexed gateway never borrows another profile's bot (#185).
+    - Only a caller listed in ``TALK_DISCORD_OPERATOR_USER_IDS`` — moving
+      the bot into a voice channel is a state change, gated like the
+      state-changing Talk tools. An empty list refuses; it never means "anyone".
+    - Only the caller's own voice channel in the server the command came
+      from, through the host's own ``get_user_voice_channel`` /
+      ``join_voice_channel`` (no textual ``/voice join`` is dispatched).
+      No caller channel, a DM, or missing Connect/Speak permission refuses.
+    - An existing connection in that server is reused as-is, never moved.
+    """
+
+    if _session_env("HERMES_SESSION_PLATFORM").lower() != "discord":
+        raise TalkDiscordError("Auto-join only works from a Discord server channel.")
+    user_id = _session_int("HERMES_SESSION_USER_ID")
+    chat_id = _session_int("HERMES_SESSION_CHAT_ID")
+    if user_id is None or chat_id is None:
+        raise TalkDiscordError(
+            "Auto-join couldn't tell who ran the command — run `/voice join` first."
+        )
+    if user_id not in talk_config.discord_operator_user_ids():
+        raise TalkDiscordError(
+            "Auto-join is limited to Talk operators (TALK_DISCORD_OPERATOR_USER_IDS) — "
+            "run `/voice join` first."
+        )
+    adapter = _invoking_profile_adapter()
+    clients = getattr(adapter, "_voice_clients", None)
+    find_channel = getattr(adapter, "get_user_voice_channel", None)
+    join = getattr(adapter, "join_voice_channel", None)
+    client = getattr(adapter, "_client", None)
+    if not isinstance(clients, dict) or not callable(find_channel) or not callable(join):
+        raise TalkDiscordError(
+            "This Hermes version can't join voice channels for Talk — run `/voice join` first."
+        )
+    try:
+        text_channel = client.get_channel(chat_id) if client is not None else None
+    except Exception:  # noqa: BLE001 - host internals; refuse instead of guessing
+        text_channel = None
+    guild = getattr(text_channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if type(guild_id) is not int:
+        raise TalkDiscordError("Auto-join only works from a server text channel, not a DM.")
+
+    existing = clients.get(guild_id)
+    if existing is not None:
+        return guild_id, None  # already connected here: today's borrow path
+
+    try:
+        voice_channel = await find_channel(guild_id, str(user_id))
+    except Exception as exc:  # noqa: BLE001 - host lookup failure is speakable
+        raise TalkDiscordError(
+            f"I couldn't look up your voice channel ({_safe_exception_name(exc)})."
+        ) from None
+    channel_guild_id = getattr(getattr(voice_channel, "guild", None), "id", None)
+    if voice_channel is None or channel_guild_id != guild_id:
+        raise TalkDiscordError(
+            "You're not in a voice channel on this server — join one, then run `/talk join`."
+        )
+    try:
+        permissions = voice_channel.permissions_for(guild.me)
+        allowed = bool(permissions.connect) and bool(permissions.speak)
+    except Exception:  # noqa: BLE001 - unknown permission shape refuses closed
+        allowed = False
+    if not allowed:
+        raise TalkDiscordError(
+            "I don't have permission to connect and speak in your voice channel."
+        )
+    if clients.get(guild_id) is not None:
+        return guild_id, None  # someone connected while we looked: borrow, never own
+    try:
+        joined = await join(voice_channel)
+    except Exception as exc:  # noqa: BLE001 - host join failure is speakable
+        _release_if_created(adapter, guild_id)
+        raise TalkDiscordError(
+            f"I couldn't join your voice channel ({_safe_exception_name(exc)})."
+        ) from None
+    except BaseException:  # cancelled mid-join: never leave an unowned connection
+        _release_if_created(adapter, guild_id)
+        raise
+    created = clients.get(guild_id)
+    if not joined or created is None:
+        raise TalkDiscordError(
+            "I couldn't join your voice channel — check my Connect and Speak permissions."
+        )
+    return guild_id, created
+
+
+def _release_if_created(adapter: Any, guild_id: int) -> None:
+    clients = getattr(adapter, "_voice_clients", None)
+    created = clients.get(guild_id) if isinstance(clients, dict) else None
+    if created is not None:
+        release_auto_joined(guild_id, created)
+
+
+_AUTO_JOIN_LOCK: Any = None
+
+
+def auto_join_lock() -> Any:
+    """One auto-join at a time, so two overlapping `/talk join`s never both
+    claim the connection the first one opened."""
+
+    global _AUTO_JOIN_LOCK
+    if _AUTO_JOIN_LOCK is None:
+        import asyncio
+
+        _AUTO_JOIN_LOCK = asyncio.Lock()
+    return _AUTO_JOIN_LOCK
+
+
+def release_auto_joined(guild_id: int, joined_client: Any) -> None:
+    """Leave a voice connection auto-join created, once Talk is done with it.
+
+    Talk owns only the connection it opened: if the host (or `/voice join`)
+    has since replaced the client for that server, the connection is not
+    Talk's to close and is left alone. Called when a start refuses outright
+    and again when the session it started ends, so a failed start never
+    strands the bot in a channel.
+    """
+
+    try:
+        adapter = _invoking_profile_adapter()
+    except TalkDiscordError:
+        return
+    clients = getattr(adapter, "_voice_clients", None)
+    leave = getattr(adapter, "leave_voice_channel", None)
+    if not isinstance(clients, dict) or clients.get(guild_id) is not joined_client:
+        return
+    bound = getattr(adapter, "_voice_text_channels", None)
+    if isinstance(bound, dict) and bound.get(guild_id) is not None:
+        return  # `/voice join` adopted this connection: it is the host's now
+    if not callable(leave):
+        return
+    loop = _running_loop()
+    if loop is None:
+        return  # off-loop: nothing safe to schedule the host's leave on
+    task = loop.create_task(leave(guild_id))
+    _NOTIFICATION_TASKS.add(task)
+    task.add_done_callback(_NOTIFICATION_TASKS.discard)
+    task.add_done_callback(_log_leave_failure)
+
+
+def _log_leave_failure(task: Any) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log.debug("auto-joined voice leave failed (%s)", _safe_exception_name(error))
+
+
+def session_task() -> Any:
+    """The current Discord Talk session task, or ``None``."""
+
+    with _SESSION_LOCK:
+        return _SESSION.get("task")
+
+
+def release_auto_joined_when_done(guild_id: int, joined_client: Any, previous_task: Any) -> None:
+    """Tie an auto-joined connection's lifetime to the session just started.
+
+    ``previous_task`` is the session task from before the start: when the
+    start refused, the slot still holds that one (or nothing), so the
+    connection is released now instead of riding an unrelated session.
+    """
+
+    with _SESSION_LOCK:
+        running = _SESSION.get("task")
+    if running is None or running is previous_task or running.done():
+        release_auto_joined(guild_id, joined_client)
+        return
+    running.add_done_callback(lambda _task: release_auto_joined(guild_id, joined_client))
+
+
+def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
+    """Find the host's live Discord voice connection. Raises on any miss.
+
+    Returns ``{guild_id, voice_client, receiver, adapter}``. Every lookup
+    is guarded: this reaches into host internals that carry no stability
+    promise, so a rename must surface as one refusal sentence rather than a
+    traceback on the voice path.
+
+    Profile-aware: under a multiplexed gateway the Discord adapter is looked
+    up in the invoking profile's map
+    (``runner._profile_adapters[profile]``) rather than the default profile's
+    ``runner.adapters``.  A missing secondary-profile adapter is a hard error
+    rather than silently using the default profile's Discord bot.
+    """
+
+    adapter = _invoking_profile_adapter()
     clients = getattr(adapter, "_voice_clients", None)
     receivers = getattr(adapter, "_voice_receivers", None)
     if not isinstance(clients, dict) or not isinstance(receivers, dict):
@@ -247,6 +563,27 @@ def resolve_voice_bridge(guild_id: int | None = None) -> dict[str, Any]:
     }
 
 
+class _FinalAudio(bytes):
+    """The last admitted PCM chunk of one provider response."""
+
+
+class _PlaybackQueue(queue.Queue):
+    """Bounded PCM queue whose response boundary never needs a free slot."""
+
+    def finish_response(self) -> None:
+        # Queue's mutex also serializes put/get. Mark the last admitted chunk
+        # in place, so saturation cannot lose the boundary or drop any audio.
+        # If the player already took it, an empty marker follows its carry.
+        with self.not_empty:
+            if self.queue:
+                if not isinstance(self.queue[-1], _FinalAudio):
+                    self.queue[-1] = _FinalAudio(self.queue[-1])
+            else:
+                self._put(_FinalAudio())
+                self.unfinished_tasks += 1
+                self.not_empty.notify()
+
+
 class _RealtimeSource:
     """The host's outbound audio, fed live instead of from a finished file.
 
@@ -261,6 +598,8 @@ class _RealtimeSource:
     def __init__(self, frames: queue.Queue) -> None:
         self._frames = frames
         self._carry = bytearray()
+        self._response_finished = False
+        self._held_underruns = 0
         # read() runs on the host's player thread; cleanup() runs on the
         # event loop during barge-in — which is exactly when both fire at
         # once. An unguarded bytearray tears there, and an exception inside
@@ -288,17 +627,34 @@ class _RealtimeSource:
             self.discard_pending()
             return SILENCE_FRAME
         with self._carry_lock:
-            while len(self._carry) < DISCORD_FRAME_BYTES:
+            took_audio = False
+            while len(self._carry) < DISCORD_FRAME_BYTES and not self._response_finished:
                 try:
-                    self._carry += self._frames.get_nowait()
+                    chunk = self._frames.get_nowait()
                 except queue.Empty:
                     break
+                took_audio = took_audio or bool(chunk)
+                self._carry += chunk
+                self._response_finished = isinstance(chunk, _FinalAudio) or not chunk
+            partial = 0 < len(self._carry) < DISCORD_FRAME_BYTES
+            if partial and not self._response_finished:
+                # No end marker yet. Count reads that brought nothing new; past
+                # the bound, play the fragment rather than hold it forever.
+                self._held_underruns = 0 if took_audio else self._held_underruns + 1
+            if partial and (
+                self._response_finished or self._held_underruns >= HELD_FRAGMENT_UNDERRUNS
+            ):
+                self._carry.extend(bytes(DISCORD_FRAME_BYTES - len(self._carry)))
             if len(self._carry) >= DISCORD_FRAME_BYTES:
+                self._held_underruns = 0
                 frame = bytes(self._carry[:DISCORD_FRAME_BYTES])
                 del self._carry[:DISCORD_FRAME_BYTES]
+                if not self._carry:
+                    self._response_finished = False
                 with self._served_lock:
                     self._frames_served += 1
                 return frame
+            self._response_finished = False
         # Underrun: silence, never b"". An empty read retires the player
         # thread and the call goes permanently mute.
         return SILENCE_FRAME
@@ -310,11 +666,15 @@ class _RealtimeSource:
         with self._carry_lock:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
+            self._response_finished = False
+            self._held_underruns = 0
 
     def discard_pending(self) -> None:
         with self._carry_lock:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
+            self._response_finished = False
+            self._held_underruns = 0
             while True:
                 try:
                     self._discarded_bytes += len(self._frames.get_nowait())
@@ -400,7 +760,7 @@ class DiscordAudio:
         self._bridge: dict[str, Any] | None = None
         self._source: _RealtimeSource | None = None
         self._inbound: queue.Queue[InputAudioPacket] = queue.Queue(maxsize=MAX_INPUT_FRAMES)
-        self._outbound: queue.Queue[bytes] = queue.Queue(maxsize=MAX_OUTPUT_FRAMES)
+        self._outbound = _PlaybackQueue(maxsize=MAX_OUTPUT_FRAMES)
         self._lock = threading.Lock()
         # Serialize every externally visible lifecycle mutation, including
         # the host listener registry calls below. Reentrant because startup
@@ -469,12 +829,20 @@ class DiscordAudio:
         bridge = self._bridge
         if bridge is None:
             raise NativeTaskError("Discord voice bridge is unavailable")
+        # The guard also runs on the host's player and receiver threads, which
+        # carry no profile scope; on a multiplexed gateway the operator list
+        # must still come from the profile that bound this room. A fresh copy
+        # per call: one Context cannot be entered by two threads at once.
+        binding_scope = copy_context()
+
+        def operator_ids():
+            return binding_scope.copy().run(talk_config.discord_operator_user_ids)
 
         def authorized():
             try:
                 if (self._bridge is not bridge or bridge["guild_id"] != guild_id
                     or not self._published_bridge_is_exact(bridge)
-                    or operator not in talk_config.discord_operator_user_ids()
+                    or operator not in operator_ids()
                     or operator not in allowed_audience):
                     return False
                 voice = bridge["voice_client"]
@@ -1321,6 +1689,11 @@ class DiscordAudio:
                 self._discarded_playback_bytes += len(converted)
             _log.debug("discord playback queue full — dropping a chunk")
 
+    def finish_playback(self) -> None:
+        """Flush a final partial Discord frame once provider output is complete."""
+        if not self._capture_only:
+            self._outbound.finish_response()
+
     def drain_playback(self) -> None:
         """Barge-in: drop everything not yet spoken."""
 
@@ -1405,14 +1778,19 @@ __all__ = [
     "DiscordAudio",
     "InputAudioPacket",
     "TalkDiscordError",
+    "auto_join_lock",
     "discord_to_session",
+    "join_caller_voice_channel",
     "native_command",
     "native_session_active",
     "pause_session",
+    "release_auto_joined",
+    "release_auto_joined_when_done",
     "reset_for_tests",
     "resolve_voice_bridge",
     "resume_session",
     "session_status",
+    "session_task",
     "session_to_discord",
     "start_core_session",
     "start_session",
@@ -1465,18 +1843,21 @@ def _public_exception_failure(error: BaseException) -> str:
 #: plugin-side configuration or connect refusal is exactly what it routes
 #: around. An audio refusal is the voice channel itself — core join opens the
 #: same channel and fails the same way — so pointing there would just waste the
-#: operator's next attempt.
+#: operator's next attempt. And on a host without the core voice contract the
+#: command cannot run at all, so :func:`_startup_refusal_failure` drops the
+#: pointer there (hermes-talk#215).
 #: Keyed by literal so this module keeps its lazy ``talk_cli`` import (the
 #: import runs inside :func:`start_session` to avoid a cycle). The keys are
 #: pinned to ``talk_cli.STARTUP_REFUSAL_REASONS`` by a test, so a new reason
 #: cannot ship without a sentence and every sentence has a live reason.
+_CORE_JOIN_OFFER = "try `/talk core join`, or "
 _STARTUP_REFUSAL_FAILURES = {
     "configuration": (
-        "voice is not configured on this host — try `/talk core join`, or run "
+        f"voice is not configured on this host — {_CORE_JOIN_OFFER}run "
         "`hermes talk doctor` to see which setting is missing"
     ),
     "provider": (
-        "the voice provider refused the connection — try `/talk core join`, or "
+        f"the voice provider refused the connection — {_CORE_JOIN_OFFER}"
         "run `hermes talk doctor` to check the provider is reachable"
     ),
     "audio": "the voice channel would not open",
@@ -1491,12 +1872,25 @@ _STARTUP_REFUSAL_FAILURES = {
 }
 
 
+def _core_join_available() -> bool:
+    """`/talk core join` can run only on a host with the core voice contract (hermes-talk#215)."""
+
+    try:
+        from . import talk_core_realtime
+    except ImportError:
+        import talk_core_realtime
+    return talk_core_realtime.core_provider_available()
+
+
 def _startup_refusal_failure(reason: str | None) -> str | None:
     """Map a bounded refusal reason to its speakable line, or None."""
 
     if reason is None:
         return None
-    return _STARTUP_REFUSAL_FAILURES.get(reason)
+    line = _STARTUP_REFUSAL_FAILURES.get(reason)
+    if line is not None and not _core_join_available():
+        line = line.replace(_CORE_JOIN_OFFER, "")
+    return line
 
 
 JOIN_USAGE = (
@@ -1543,10 +1937,14 @@ def session_status() -> str:
             f"Provider-owned Realtime voice with canonical Hermes tools is live on server "
             f"{guild_id}. Say `talk leave` to stop.{paused}"
         )
+    core_join = (
+        "Use `/talk core join` for full canonical Hermes parity; say"
+        if _core_join_available()
+        else "Say"
+    )
     return (
         f"Limited legacy provider-owned voice is live on server {guild_id}. "
-        "Use `/talk core join` for full canonical Hermes parity; say `talk leave` to stop."
-        f"{paused}"
+        f"{core_join} `talk leave` to stop.{paused}"
     )
 
 
@@ -1951,9 +2349,14 @@ def start_session(
             "Starting provider-owned Realtime voice with canonical Hermes tools; say "
             "`talk status` to check or `talk leave` to stop."
         )
+    if _core_join_available():
+        return (
+            "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
+            "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
+        )
     return (
-        "Starting limited legacy provider-owned voice. Use `/talk core join` for full "
-        "canonical Hermes parity; say `talk status` to check or `talk leave` to stop."
+        "Starting limited legacy provider-owned voice; say `talk status` to check or "
+        "`talk leave` to stop."
     )
 
 
@@ -1975,7 +2378,9 @@ def stop_session() -> str:
 
 
 def reset_for_tests() -> None:
-    global _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
+    global _AUTO_JOIN_LOCK, _LAST_FAILURE, _LAST_FAILURE_GENERATION, _SESSION_GENERATION
+
+    _AUTO_JOIN_LOCK = None
 
     with _SESSION_LOCK:
         _SESSION.clear()

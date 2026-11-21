@@ -17,11 +17,13 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from contextvars import copy_context
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
 MIN_TURNS = 2
 MIN_CHARS = 200
+REVIEW_CHILD_ENV = "TALK_TRANSCRIPT_REVIEW_CHILD"
 _ACTIVE_TRANSCRIPTS: set[Path] = set()
 _ACTIVE_LOCK = threading.RLock()
 _HANDOFF_STATUS: dict[str, str] = {"state": "unknown"}
@@ -401,9 +403,10 @@ def _finish_claim(
 def _start_default_handoff(claimed: Path, transcript_fd: int, lease: _Lease) -> None:
     """Detach the host handoff while retaining its descriptor and OS lease."""
 
+    context = copy_context()
     worker = threading.Thread(
-        target=_finish_claim,
-        args=(claimed, transcript_fd, lease, _default_run_agent),
+        target=context.run,
+        args=(_finish_claim, claimed, transcript_fd, lease, _default_run_agent),
         daemon=True,
         name="talk-memory-handoff",
     )
@@ -497,6 +500,11 @@ def sweep_transcripts(
     run_agent: Callable[[str], object] | None = None,
 ) -> None:
     """Fail-open public sweep; root discovery can never delay or fail a call."""
+
+    # A detached review may outlive the process that held its claim's lease.
+    # Its own teardown must not reclaim that transcript and launch another review.
+    if os.environ.get(REVIEW_CHILD_ENV) == "1":
+        return
 
     try:
         _sweep_transcripts(hermes_home, run_agent)

@@ -45,6 +45,34 @@ hermes talk
 
 ## Upgrade
 
+### Versioned voice instructions for Git deployments
+
+An optional `TALK.md` next to `talk_identity.py` adds deployment-specific voice
+preferences to both Realtime and GPT-Live session instructions. Commit it in
+your fork: production, staging and development branches can carry different
+interlocutors and workflows without changing shared Python code. The file is
+resolved from the plugin checkout, never from the agent's working directory.
+This file convention targets Git/source installations, not standalone wheels.
+
+The file supplements the built-in execution and tool contracts. Its style and
+workflow preferences specialize defaults and older remembered preferences; they
+cannot grant tools or host permissions. Current operator constraints still apply.
+Do not put credentials in this versioned file. Changes affect new sessions only:
+leave and rejoin Talk after editing it. The gateway log reports `Loaded TALK.md`
+and its character count, without printing its contents.
+
+Use UTF-8, at most 6,000 characters. Missing or blank files retain the default
+prompt. Invalid, oversized or unreadable files prevent session setup rather than
+silently discarding deployment instructions. Source archives include the file
+when present. Keep runtime task progress in Hermes history, not in this file.
+
+Keep the loader commit separate from deployment-content commits. Cherry-pick
+shared fixes onto each environment branch and update that branch's `TALK.md`
+independently. Neither this file nor a prompt guarantees nonblocking execution:
+Hermes may still fall back to synchronous delegation when capacity is exhausted.
+
+### Updating the plugin
+
 ```bash
 hermes plugins update hermes-talk
 ```
@@ -349,13 +377,36 @@ one of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
 `talk_live_config.py`. Live and native task variables are grouped in
 [the Live guide](GPT-LIVE.md#choose-billing-and-voice).
 
+### Experimental plugin settings
+
+Open **Hermes → Plugins → Hermes Talk → Settings** on a host that supports
+plugin settings. Ordinary Talk starts with the same defaults.
+
+- **Call journal** starts off. Turn it on before a new standalone dashboard
+  or Desktop Realtime call to save its text. Read it with `hermes talk journal`.
+- **Voice language** starts on **Auto**. Pick a language to guide OpenAI
+  transcription and replies for new calls. Auto uses the usual voice behavior
+  or any language overrides explicitly set in the environment.
+- **Use saved Echo** starts off. To use a compatible Echo, turn it on, enter
+  its local address, then run `hermes talk echo` when you want it. You can also
+  run `hermes talk echo HOST` to choose an address for that launch.
+
+On a dashboard with host-verified sign-in, that sign-in opens Talk. A server
+owner can explicitly require a separate Talk password with
+`TALK_DASHBOARD_TOKEN`.
+
 ### Session
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_MODEL` | `gpt-realtime-2.1` | Doctor certifies only exact ids in its bounded duplex-audio + function-calling policy. Known transcription/translation-only models fail; other Realtime-shaped ids are an honest `syntax-only` / compatibility-unknown warning, not a validity claim. |
 | `TALK_VOICE` | `cedar` | **Fail-closed**: any id outside the known voice list refuses with the valid names rather than letting the API pick silently. |
-| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, or `gemini`. **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
+| `TALK_CALL_JOURNAL` | off | `1` or `on` keeps a **text-only** journal for dashboard or Desktop Realtime calls without a bound task. The Hermes host writes final utterances, interruptions, tool calls and results, errors and hang-up events to `$HERMES_HOME/state/talk-calls/<call_id>.jsonl`. Read it with `hermes talk journal`. A saved Call journal switch in Hermes Talk plugin settings takes precedence. |
+| `TALK_CALL_JOURNAL_DAYS` | `30` | Days a call journal is kept (1–3650). The host prunes older journals whenever a dashboard or Desktop call starts, even with the journal off; a malformed value skips pruning with a log line and refuses only a journaled call. |
+| `TALK_TRANSCRIPTION_LANGUAGES` | unset | Comma-separated ISO 639-1/639-3 codes the operator speaks, e.g. `fr` or `fr,en` (OpenAI lanes). One code rides the transcription `language` field; several are sent as `languages` only to `gpt-live-transcribe` models and otherwise left to automatic detection (put the hint in the prompt below). **Fail-closed**: a malformed code refuses at mint. Unset sends no hint — the payload is byte-identical to before the knob. |
+| `TALK_TRANSCRIPTION_PROMPT` | unset | One-line context for the input transcriber (≤ 1000 characters): vocabulary, names, "mostly French, sometimes English". A hint, never required output. `hermes talk doctor` reports its length, never its text. |
+| `TALK_REPLY_LANGUAGE` | unset | Language **name** the voice speaks to the operator in (`French`, `français`). Adds one sentence after the preamble; function-call arguments and delegation briefs stay unconstrained. Letters, spaces, apostrophes and hyphens only (≤ 40), so the value cannot become a second instruction channel. Unset keeps the prompt byte-identical. |
+| `TALK_PROVIDER` | `openai` | Realtime voice provider: `openai`, `grok`, `gemini`, or `local` (a self-hosted server; see [LOCAL.md](LOCAL.md)). **Fail-closed** on any other value; never inferred from which keys exist. Terminal and Discord lanes honor it — except Gemini on Discord, which refuses: the gated-response authorization flow (`automatic_response=False`) has no Live wire equivalent, so connect fails closed rather than answering unvetted speakers. The dashboard lane does not honor the knob (Phase 2). |
 | `TALK_GROK_MODEL` | `grok-voice-latest` | Grok realtime model. Rides the socket URL query, never the session update. |
 | `TALK_GROK_VOICE` | `ara` | **Fail-closed** against all 28 built-in [Grok voices](PROVIDERS.md#provider-details--openai-default-grok-or-gemini), including `carina`, `zagan`, `luna`, and `liora`. Case-insensitive friendly names only — the wire prefix is the adapter's job. |
 | `TALK_XAI_API_KEY` / `XAI_API_KEY` | unset | xAI key for the Grok lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the OpenAI keys. The `xai-oauth` subscription login is not used until Hermes signs xAI requests for plugins. |
@@ -363,6 +414,10 @@ one of them. Canonical sources include `talk_config.py`, `talk_auth.py` and
 | `TALK_GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model. Configure the bare id — the adapter adds the `models/` wire prefix. Fallback line: `gemini-2.5-flash-native-audio-latest`. |
 | `TALK_GEMINI_VOICE` | `Puck` | **Fail-closed** against the Gemini Live voice list: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`. **Case-sensitive** — the knob never case-folds, because the wire does not. |
 | `TALK_GEMINI_API_KEY` / `GEMINI_API_KEY` | unset | Gemini key for the Gemini lane, Talk-scoped first (free-tier keys work). Set-but-blank is a hard refusal, same rule as the OpenAI keys. The key rides the WebSocket URL query on this lane, so the URL is treated as a secret: assembled at connect, never logged, scrubbed out of transport errors. The Live protocol has no client cancel/truncate command — barge-in degrades to local playback handling with a logged receipt. |
+| `TALK_LOCAL_URL` | `ws://127.0.0.1:8765/v1/realtime` | Local lane server socket. **Fail-closed**: plain `ws://` only to loopback hosts; anything else must be `wss://`; no query string. |
+| `TALK_LOCAL_MODEL` | `local` | Sent as the local server's `?model=` query; speech-to-speech uses its own `--model_name` instead. |
+| `TALK_LOCAL_VOICE` | `default` | `default` keeps the server's speaker; other names pass through to the server's TTS unchanged. |
+| `TALK_LOCAL_API_KEY` | unset | Optional local-server bearer. Unset sends no `Authorization` header; set-but-blank refuses. |
 
 ### Gemini diagnostics and setup
 
@@ -402,11 +457,31 @@ how it speaks on each surface — is in [CASCADE.md](CASCADE.md).
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_VOICE_MODE` | `native` | `native` = provider voice; `cascade` = ElevenLabs speaks the provider's text; `live` = the separate GPT-Live adapter. Invalid modes refuse. Cascade requires `TALK_PROVIDER=openai`; Live configuration is [separate](GPT-LIVE.md#choose-billing-and-voice). |
-| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider. **Fail-closed**; `elevenlabs` is the only value today. |
+| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider: `elevenlabs`, or the Experimental `openai` (any OpenAI-compatible `/audio/speech` server, below). **Fail-closed**: any other value refuses. Plugin setting: *Experimental · Cascade voice backend*. |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first. Set-but-blank is a hard refusal, same rule as the other provider keys. The key rides the `xi-api-key` WebSocket header — never the URL, never a log line, never an error string. |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with. **Required in cascade mode** — unset or blank refuses with remediation, because a cascade with no voice would have nothing to synthesize against and guessing at an account's voices would speak with a voice the operator did not choose. Voice ids are semi-public identifiers (printing them is fine; the KEY is the secret). Stock and cloned voices both work; cloning is done in ElevenLabs VoiceLab, not here. |
 | `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane. `eleven_flash_v2_5` probed at ~490ms to first audio on PCM 24kHz (2026-08-28), which is the cascade's latency trade: roughly one extra half-second on the first sentence versus native; later sentences pipeline under playback. |
 | `TALK_CASCADE_SPEED` | unset | Delivery pace for the cascade voice, `0.7`–`1.2` (`1.0` is normal). **Fail-closed**: junk and out-of-range values refuse with the range rather than clamping, because a silently clamped pace is audible on every word and never says why. Unset sends no `speed` field at all — the wire frame stays byte-identical to a cascade that never had the knob, so turning it on is the only thing that changes what ElevenLabs receives. The bounds are the stream-input `RealtimeVoiceSettings` schema's own; the REST endpoint's wider `0.25`–`4.0` belongs to a different schema this lane never speaks. |
+
+#### Experimental: OpenAI-compatible cascade TTS
+
+Requested in #151. Off unless `TALK_CASCADE_TTS=openai` (or the plugin
+setting) is chosen; ElevenLabs stays the default. Each sentence chunk becomes
+one `POST {base}/audio/speech` with `{"model", "voice", "input",
+"response_format"}` (plus `speed` when `TALK_CASCADE_SPEED` is set), so
+self-hosted servers and LiteLLM gateways work without a new dependency.
+Chunking, barge-in and the text-only fallback are the same as the ElevenLabs
+lane. Each env variable wins over its plugin setting.
+
+| Variable | Default | Effect / failure mode |
+|---|---|---|
+| `TALK_CASCADE_OPENAI_BASE_URL` | unset | **Required**, e.g. `http://127.0.0.1:4000/v1`. Plain `http://` is refused off loopback, and so are credentials, a query or a fragment in the URL. Redirects are not followed. |
+| `TALK_CASCADE_OPENAI_MODEL` / `TALK_CASCADE_OPENAI_VOICE` | unset | **Required**: the model and voice ids your server expects. |
+| `TALK_CASCADE_OPENAI_API_KEY` | unset | Optional. Sent only as `Authorization: Bearer`, never in a URL, log or error. Set-but-blank refuses. It does **not** fall back to `OPENAI_API_KEY`, so your OpenAI key is never sent to a gateway you did not give it to. |
+| `TALK_CASCADE_OPENAI_FORMAT` | `pcm` | `pcm` (raw 24 kHz mono 16-bit, streamed to the speaker as it arrives) or `wav` (must be 24 kHz mono 16-bit; any other WAV refuses that answer). |
+
+`hermes talk doctor` checks these offline. On failure, the answer stays
+text-only and the receipt names only the HTTP status.
 
 Cascade mode applies to every Talk surface — terminal, Discord, and the
 dashboard tab share the same knobs and the same fail-closed resolution. On the
@@ -457,10 +532,11 @@ live listen, not a code change.
 | `TALK_ECHO_GATE_OUTPUT_ACTIVE_LEVEL` | `0.015` | Playback RMS above which the gate considers the speaker "active" at all. Below it nothing is dropped. |
 | `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL` | `0.04` | Absolute floor a microphone block must clear to count as barge-in, however quiet the playback is. |
 | `TALK_ECHO_GATE_RATIO` | `0.65` | Fraction of the current playback RMS a block must also clear. The effective threshold is the **larger** of this and the floor above, so raising either only makes the gate stricter. |
+| `TALK_ECHO_GATE_HOLD_MS` | `0` (off) | Experimental. Keeps the gate closed this many milliseconds after playback goes quiet. For loudspeakers with output latency (a TV over HDMI, some Bluetooth speakers), where the model's words come back through the microphone after they were written and the tail of its speech would otherwise be taken as you talking. Start around `300`-`700`; values are capped at `5000`. While the hold runs, playback is already quiet, so a block only has to clear `TALK_ECHO_GATE_MIN_BARGE_IN_LEVEL` — you can still interrupt by speaking up. `0` is exactly the gate as it always was. Also settable as **Experimental · Speaker echo hold (ms)** in the plugin settings; the variable wins when set. |
 
-All four are read when the audio stream is CONSTRUCTED — once per session, not
+All five are read when the audio stream is CONSTRUCTED — once per session, not
 per block and not at import — so a change lands on the next call, never the
-live one. The three numeric knobs fail soft: blank, unparseable, or negative
+live one. The four numeric knobs fail soft: blank, unparseable, or negative
 silently takes the default (`0` is honored, and on the ratio it means "the
 floor decides alone"). There is no receipt for a typo, so read them back with
 `hermes talk diagnostics` — it reports the NAMES you have set.
@@ -649,6 +725,32 @@ none itself afterwards. Model-facing contract:
 
 ### api-server lane
 
+Only a remote `completed` status produces a successful Talk result. Remote
+`failed`, `cancelled`, and `interrupted` statuses map to Talk's local `failed`
+state with the remote status and reason in the report. Memory handoffs also
+require `completed`; a failed handoff keeps its transcript for a later retry.
+Completion announcements use the recorded local outcome and claim delivery
+once. The words follow the proven outcome: "Background run #N finished",
+"failed", "was stopped" (remote `cancelled`, which is how a `stop_work` stop
+ends; a detached run that `stop_work` signalled), or "was interrupted" (remote
+`interrupted`: the gateway shut down or restarted). `check_work` reports a
+stopped or interrupted run the same way. If a local terminal transition races a remote result, the first recorded
+transition wins.
+
+The confirmed remote failure status is stored as terminal metadata in that
+same transition and retained in history. Spoken reports keep that status even
+when a long reason is shortened to the 1,500-character announcement budget;
+successful answer text is never interpreted as a remote failure status.
+
+A connection loss or polling deadline ends local tracking as `failed`, with
+an explicit unknown remote outcome; it does not prove the remote work stopped.
+The API run id remains in the run metadata for addressing that same run.
+Automatic reconnection is not added. A terminal parent does not prove its
+delegated children finished or stopped. Existing result truncation still
+applies (4,000 characters from the API lane, 2,000 in Talk's run history).
+These rules use the existing run endpoints without a new capability or
+submission field; they do not require an inline-delegation host contract.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Gateway base URL; trailing slash stripped. |
@@ -660,6 +762,24 @@ none itself afterwards. Model-facing contract:
 | `TALK_API_SERVER_POLL_S` | `1.0` | Poll interval while waiting on a run. |
 
 ### Capability catalog
+
+The REST fallback for `/v1/skills` and `/v1/toolsets` accepts bare lists,
+named envelopes (`{"skills": [...]}` / `{"toolsets": [...]}`), and `data`
+envelopes, including `{"object": "list", "data": [...]}`. A list under the
+endpoint's named key takes precedence over `data`, even when empty; otherwise
+a `data` list is used. Entries that are not objects are ignored. Unrecognized
+response shapes remain errors, rather than reporting an empty catalog.
+
+In-process registry discovery waits at most `TALK_API_SERVER_PROBE_TIMEOUT_S`
+before falling through to the API-server catalog. This also bounds the
+background-refresh path. A timed-out registry read continues on one daemon
+worker; repeated probes share that pending read rather than spawning more
+workers while it is stuck. When it finishes, the next probe takes its result
+(if younger than `TALK_CAPABILITY_CATALOG_TTL_S`) and starts the following
+read, so a host that is always slower than the budget still answers from the
+in-process tier. Reads are kept per profile (per resolved Hermes home): on a
+multiplexed gateway one profile's stuck read never blocks or answers another,
+and each read runs in its caller's profile context.
 
 | Variable | Default | Effect / failure mode |
 |---|---|---|
@@ -707,11 +827,13 @@ run-history tee so test suites can't write into a real Hermes home.)
 
 ## Hermes core realtime contract
 
-Hermes core now defines its own provider-neutral speech-to-speech contract
-(`agent/realtime_voice_provider.py`, API v2 — NousResearch/hermes-agent#101808)
-and drives any registered backend from `hermes realtime`. hermes-talk publishes
-all three of its lanes there, so the same OpenAI, Grok, and Gemini sessions this
-plugin already speaks are available to core's own orchestrator:
+NousResearch/hermes-agent#101808 proposed a provider-neutral speech-to-speech
+contract for Hermes core (`agent/realtime_voice_provider.py`, API v2) that
+drives any registered backend from `hermes realtime`. That PR was closed without
+merging, so no Hermes release carries the contract or the `hermes realtime`
+command today. On a host that does carry it, hermes-talk publishes all three of
+its lanes there, so the same OpenAI, Grok, and Gemini sessions this plugin
+already speaks are available to core's own orchestrator:
 
 ```bash
 hermes realtime --list
@@ -779,6 +901,32 @@ Use Discord's numeric user ID, not a username or display name. With the variable
 unset, every participant can converse and use read-only tools, while every
 mutating tool is denied.
 
+**Experimental: auto-join (#224).** Off by default, so `/talk join` keeps
+using only a voice connection the bot already holds (run `/voice join` first).
+Turn on *Experimental · Discord auto-join* in the plugin settings, or set
+`TALK_DISCORD_AUTO_JOIN=1`. When the bot is not yet in voice on that server,
+`/talk join` then connects to **your** current voice channel through the host's
+own join helper, using the invoking profile's bot only, and starts Talk. It
+refuses, and does not join, when you are not in
+`TALK_DISCORD_OPERATOR_USER_IDS` (an empty list refuses), when you are not in
+a voice channel on that server, when you run it from a DM, or when the bot
+lacks Connect and Speak permission. If the bot is already connected there,
+that connection is reused and never moved. A connection auto-join opened is
+closed when the start is refused or the Talk session ends. A connection that
+existed before is left alone.
+
+Native Discord replies finish on a 20 ms playback frame: when provider output
+ends, Talk pads any final partial frame with silence. The response boundary is
+preserved even when the playback queue is full, and queued announcements can
+resume once the admitted audio drains. Canonical native sessions, and Live
+sessions whose provider reports output turns, use their output-completion events
+too. Barge-in discards pending audio and its boundary. Cascade TTS runs
+asynchronously: the provider's text-completion event does not signal that its
+audio has finished, so a cascade reply ends when its ElevenLabs stream settles
+instead. A partial frame whose reply sends no end marker at all (GPT-Live does
+not report output turns) plays after ten silent 20 ms reads, about 200 ms, so
+it cannot hold announcements back.
+
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we
 borrow it, so it is one bot, one connection, and the host's own E2EE.
@@ -802,6 +950,52 @@ or through a voice-server reconnect) while a session is live, the bridge
 is left pointing at the old connection and the call goes quiet — it
 fails to silence, never to a wrong answer. Say `/talk leave` and rejoin.
 Tracked as [#8](https://github.com/TheSmokeDev/hermes-talk/issues/8).
+
+## Amazon Echo — hassmic over Wyoming
+
+`hermes talk echo HOST` puts the session on an Amazon Echo running
+[echo-dot-assist](https://github.com/Gamer92000/echo-dot-assist)'s
+hassmic, with no Home Assistant between. The Echo keeps Amazon's echo
+canceller, beamforming and wake word engine; Talk is the Wyoming client
+that Home Assistant would otherwise be. Each wake word starts one session
+on the Echo's microphone and speaker, and the session ends after `--idle`
+seconds with nobody speaking and nothing playing.
+
+On the Echo, in `/data/local/hassmic/hassmic.conf`:
+
+```bash
+PROTO=wyoming
+ARGS="-D"
+```
+
+`-D` keeps the microphone streaming while a reply plays, so you can talk
+over it. Without it hassmic stops the microphone at the first reply and
+each wake word gives one exchange.
+
+On the Hermes host:
+
+```bash
+hermes talk echo 192.168.1.50              # the Echo's address
+hermes talk echo 192.168.1.50 --idle 30    # end after 30 s of quiet (default 20)
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--port` | `16700` | hassmic's Wyoming port |
+| `--idle` | `20` | seconds of quiet before the session ends |
+| `--barge-in-level` | `0.02` | while the Echo speaks, microphone chunks quieter than this RMS are replaced with silence. Raise it if the session answers its own replies, lower it if talking over a reply is not heard |
+
+Each session ends with one line on the microphone level while the Echo
+spoke and otherwise, which is what to tune `--barge-in-level` from.
+
+The Hermes host connects to the Echo, so the only network rule needed is TCP
+16700 from the host to the Echo. A dropped link is retried with backoff
+(1 s up to 30 s).
+
+Boundaries: Wyoming is plain TCP with no authentication, so keep the Echo
+and the host on a network you trust. The Echo hears a room, not a person:
+like the terminal lane, the session treats whoever speaks as the operator,
+and there is no per-speaker authorization as there is on Discord.
 
 ## Dashboard tab
 

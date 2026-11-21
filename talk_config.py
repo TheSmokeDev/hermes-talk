@@ -21,6 +21,43 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+# -- profile-scoped env resolution ---------------------------------------------
+#
+# In a multiplexed gateway turn the profile's ``.env`` lives in a context-local
+# secret scope, not in ``os.environ``.  ``get_secret`` from Hermes core resolves
+# it correctly (read-scope → raise on routed-miss → fall-through to
+# ``os.environ`` in standalone mode).  On a standalone ``hermes`` invocation or
+# in tests that don't import the agent, fall back to ``os.environ`` directly.
+
+# Attempt the import once at module load so every function below reuses the
+# cached reference.  When ``agent.secret_scope`` is not importable (standalone
+# install, isolated tests) we fall through to plain ``os.environ``.
+_hermes_get_secret = None
+try:
+    from agent.secret_scope import get_secret as _hgs
+    _hermes_get_secret = _hgs
+except ImportError:
+    pass
+
+
+def _talk_env_get(key: str, default: str | None = None) -> str | None:
+    """Resolve a TALK_* config value, respecting profile-scoped secrets.
+
+    When the Hermes ``agent.secret_scope`` module is importable (multiplexed
+    gateway turn), delegates to ``get_secret`` which:
+      - returns the scoped value when a profile scope is installed,
+      - returns *default* when the scoped key is absent,
+      - raises ``UnscopedSecretError`` when multiplexed but scope is missing,
+      - falls through to ``os.environ`` in standalone mode.
+
+    On a standalone ``hermes`` invocation or in isolated tests without the agent,
+    falls back to ``os.environ.get(key, default)`` directly.
+    """
+    if _hermes_get_secret is not None:
+        return _hermes_get_secret(key, default=default)
+    return os.environ.get(key, default)
+
+
 DEFAULT_TALK_MODEL = "gpt-realtime-2.1"
 DEFAULT_TALK_VOICE = "cedar"
 DEFAULT_AGENT_TIMEOUT_S = 1_800
@@ -28,8 +65,18 @@ DEFAULT_AGENT_TIMEOUT_S = 1_800
 #: Realtime voice providers selectable through ``TALK_PROVIDER``. The list is
 #: fail-closed on purpose: a provider knob that guesses silently would spend
 #: the wrong metered key, which is a billing error, not a UX nicety.
-TALK_PROVIDERS = ("openai", "grok", "gemini")
+TALK_PROVIDERS = ("openai", "grok", "gemini", "local")
 DEFAULT_TALK_PROVIDER = "openai"
+#: A self-hosted server speaking the OpenAI Realtime protocol, e.g.
+#: huggingface/speech-to-speech (``speech-to-speech serve``). Plain ``ws://``
+#: is accepted only for loopback hosts; anything else must be ``wss://``.
+DEFAULT_LOCAL_URL = "ws://127.0.0.1:8765/v1/realtime"
+#: Sent as the ``?model=`` query; local servers pick their own models.
+DEFAULT_LOCAL_MODEL = "local"
+#: Sentinel voice: the session omits ``audio.output.voice`` so the server keeps
+#: its own default speaker.
+DEFAULT_LOCAL_VOICE = "default"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 #: xAI Grok Voice model alias, handshake-verified against the live endpoint
 #: 2026-08-28 (the alias resolved to a concrete voice model at session
 #: create). The model rides the socket URL query, never the session update.
@@ -88,10 +135,17 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: guesses silently would spend the wrong metered TTS key.
 TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
-#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
-#: today; the list exists so a typo refuses instead of silently selecting.
-TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs",)
+#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. The list
+#: exists so a typo refuses instead of silently selecting. ``openai`` is the
+#: Experimental OpenAI-compatible ``POST {base}/audio/speech`` backend
+#: (self-hosted servers, LiteLLM gateways — hermes-talk#151).
+TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs", "openai")
 DEFAULT_CASCADE_TTS = "elevenlabs"
+#: Audio formats the OpenAI-compatible backend may ask for. Both must carry
+#: 24 kHz mono 16-bit PCM — the playback sink's format — and a WAV that
+#: does not refuses instead of playing at the wrong pitch.
+CASCADE_OPENAI_FORMATS = ("pcm", "wav")
+DEFAULT_CASCADE_OPENAI_FORMAT = "pcm"
 #: ElevenLabs TTS model for the cascade lane, probed against the live
 #: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
@@ -386,7 +440,7 @@ def agent_profile() -> str | None:
     without editing any config.
     """
 
-    raw = os.environ.get("TALK_AGENT_PROFILE")
+    raw = _talk_env_get("TALK_AGENT_PROFILE")
     if raw is not None:
         return raw.strip() or None
     return detect_agent_profile()
@@ -414,7 +468,7 @@ def identity_include() -> tuple[str, ...] | None:
     narrow the prompt, never take the voice surface down with it.
     """
 
-    raw = (os.environ.get("TALK_IDENTITY_INCLUDE") or "").strip()
+    raw = (_talk_env_get("TALK_IDENTITY_INCLUDE") or "").strip()
     if not raw:
         return None
     names = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
@@ -448,7 +502,7 @@ def session_key() -> str | None:
     per-speaker scoping is a follow-up, not shipped.
     """
 
-    return (os.environ.get("TALK_SESSION_KEY") or "").strip() or None
+    return (_talk_env_get("TALK_SESSION_KEY") or "").strip() or None
 
 
 def turn_detection(provider: str | None = None):
@@ -459,12 +513,13 @@ def turn_detection(provider: str | None = None):
         import talk_realtime as rt
 
     provider = provider or talk_provider()
-    raw = os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
-    eagerness = os.environ.get("TALK_SEMANTIC_EAGERNESS")
+    raw = _talk_env_get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+    eagerness = _talk_env_get("TALK_SEMANTIC_EAGERNESS")
     supported = {
         "openai": {"provider_native", "server_vad", "semantic_vad"},
         "grok": {"provider_native", "server_vad"},
         "gemini": {"provider_native"},
+        "local": {"provider_native", "server_vad"},
     }
     if raw not in supported.get(provider, set()):
         raise TalkConfigError(f"TALK_TURN_DETECTION is invalid or unsupported for {provider}")
@@ -490,7 +545,7 @@ def talk_provider() -> str:
     """
 
     raw = (
-        (os.environ.get("TALK_PROVIDER") or DEFAULT_TALK_PROVIDER).strip().lower()
+        (_talk_env_get("TALK_PROVIDER") or DEFAULT_TALK_PROVIDER).strip().lower()
         or DEFAULT_TALK_PROVIDER
     )
     if raw not in TALK_PROVIDERS:
@@ -504,19 +559,19 @@ def talk_provider() -> str:
 def talk_model() -> str:
     """Realtime model, resolved at call time."""
 
-    return (os.environ.get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
+    return (_talk_env_get("TALK_MODEL") or DEFAULT_TALK_MODEL).strip() or DEFAULT_TALK_MODEL
 
 
 def talk_grok_model() -> str:
     """Grok realtime model, resolved at call time (``TALK_GROK_MODEL``)."""
 
-    return (os.environ.get("TALK_GROK_MODEL") or DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL
+    return (_talk_env_get("TALK_GROK_MODEL") or DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL
 
 
 def talk_grok_voice() -> str:
     """Grok realtime voice, fail-closed on unknown ids (``TALK_GROK_VOICE``)."""
 
-    raw = (os.environ.get("TALK_GROK_VOICE") or DEFAULT_GROK_VOICE).strip().lower()
+    raw = (_talk_env_get("TALK_GROK_VOICE") or DEFAULT_GROK_VOICE).strip().lower()
     raw = raw or DEFAULT_GROK_VOICE
     if raw not in GROK_REALTIME_VOICES:
         raise TalkConfigError(
@@ -526,11 +581,74 @@ def talk_grok_voice() -> str:
     return raw
 
 
+def talk_local_url() -> str:
+    """Local Realtime server URL (``TALK_LOCAL_URL``). Fail-closed.
+
+    Plain ``ws://`` is refused off loopback: the tool loop and transcripts
+    would cross the network unencrypted.
+    """
+
+    from urllib.parse import urlsplit
+
+    raw = (_talk_env_get("TALK_LOCAL_URL") or DEFAULT_LOCAL_URL).strip() or DEFAULT_LOCAL_URL
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        parts, host = None, ""
+    if parts is None or parts.scheme not in ("ws", "wss") or not host:
+        raise TalkConfigError(
+            f"TALK_LOCAL_URL '{raw}' must be a ws:// or wss:// URL with a host"
+        )
+    if parts.query or parts.fragment:
+        raise TalkConfigError("TALK_LOCAL_URL must not carry a query or fragment")
+    if parts.scheme == "ws" and host not in _LOOPBACK_HOSTS:
+        raise TalkConfigError(
+            f"TALK_LOCAL_URL uses plain ws:// to '{host}'; use wss:// off loopback"
+        )
+    return raw.rstrip("/")
+
+
+def talk_local_model() -> str:
+    """Model id sent to the local server (``TALK_LOCAL_MODEL``)."""
+
+    raw = (_talk_env_get("TALK_LOCAL_MODEL") or DEFAULT_LOCAL_MODEL).strip()
+    return raw or DEFAULT_LOCAL_MODEL
+
+
+def talk_local_voice() -> str:
+    """Local server voice (``TALK_LOCAL_VOICE``); ``default`` keeps the server's.
+
+    Voice names belong to whichever TTS the server runs, so there is no
+    closed list to validate against here.
+    """
+
+    raw = (_talk_env_get("TALK_LOCAL_VOICE") or DEFAULT_LOCAL_VOICE).strip()
+    return raw or DEFAULT_LOCAL_VOICE
+
+
+def resolve_local_key() -> str:
+    """Optional bearer for the local server (``TALK_LOCAL_API_KEY``).
+
+    Unset means no Authorization header. Set-but-blank refuses, like every
+    other Talk key: a blank value is a mistake, not a choice.
+    """
+
+    raw = _talk_env_get("TALK_LOCAL_API_KEY")
+    if raw is None:
+        return ""
+    if not raw.strip():
+        raise TalkConfigError(
+            "TALK_LOCAL_API_KEY is set but empty — set a real key or unset it"
+        )
+    return raw.strip()
+
+
 def talk_gemini_model() -> str:
     """Gemini Live model, resolved at call time (``TALK_GEMINI_MODEL``)."""
 
     return (
-        (os.environ.get("TALK_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+        (_talk_env_get("TALK_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
         or DEFAULT_GEMINI_MODEL
     )
 
@@ -544,7 +662,7 @@ def talk_gemini_voice() -> str:
     accept.
     """
 
-    raw = (os.environ.get("TALK_GEMINI_VOICE") or DEFAULT_GEMINI_VOICE).strip()
+    raw = (_talk_env_get("TALK_GEMINI_VOICE") or DEFAULT_GEMINI_VOICE).strip()
     raw = raw or DEFAULT_GEMINI_VOICE
     if raw not in GEMINI_LIVE_VOICES:
         raise TalkConfigError(
@@ -582,7 +700,7 @@ def realtime_model_valid(model: str) -> bool:
 def talk_voice() -> str:
     """Realtime voice, fail-closed on unknown ids."""
 
-    raw = (os.environ.get("TALK_VOICE") or DEFAULT_TALK_VOICE).strip().lower() or DEFAULT_TALK_VOICE
+    raw = (_talk_env_get("TALK_VOICE") or DEFAULT_TALK_VOICE).strip().lower() or DEFAULT_TALK_VOICE
     if raw not in OPENAI_REALTIME_VOICES:
         raise TalkConfigError(
             f"TALK_VOICE '{raw}' is not a built-in Realtime voice "
@@ -599,14 +717,14 @@ def resolve_openai_key() -> str:
     scoped a key expects that key to be used or the surface to say why not.
     """
 
-    scoped = secret("TALK_OPENAI_API_KEY")
+    scoped = _talk_env_get("TALK_OPENAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_OPENAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = secret("OPENAI_API_KEY")
+    shared = _talk_env_get("OPENAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("OPENAI_API_KEY is set but empty — set a real key or unset it")
@@ -625,14 +743,14 @@ def resolve_xai_key() -> str:
     the subscription lane lives in ``talk_grok_auth.resolve_grok_auth``.
     """
 
-    scoped = secret("TALK_XAI_API_KEY")
+    scoped = _talk_env_get("TALK_XAI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_XAI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = secret("XAI_API_KEY")
+    shared = _talk_env_get("XAI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("XAI_API_KEY is set but empty — set a real key or unset it")
@@ -650,14 +768,14 @@ def resolve_gemini_key() -> str:
     logged, and scrubbed out of transport errors before they surface.
     """
 
-    scoped = secret("TALK_GEMINI_API_KEY")
+    scoped = _talk_env_get("TALK_GEMINI_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_GEMINI_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = secret("GEMINI_API_KEY")
+    shared = _talk_env_get("GEMINI_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError("GEMINI_API_KEY is set but empty — set a real key or unset it")
@@ -679,7 +797,7 @@ def voice_mode() -> str:
     """
 
     raw = (
-        (os.environ.get("TALK_VOICE_MODE") or DEFAULT_VOICE_MODE).strip().lower()
+        (_talk_env_get("TALK_VOICE_MODE") or DEFAULT_VOICE_MODE).strip().lower()
         or DEFAULT_VOICE_MODE
     )
     if raw not in TALK_VOICE_MODES:
@@ -690,18 +808,135 @@ def voice_mode() -> str:
     return raw
 
 
+#: ISO 639-1 (two letters) or ISO 639-3 (three letters), lower case: the
+#: formats the OpenAI Realtime transcription field accepts. Anything else
+#: refuses here, at mint, instead of failing the session update upstream.
+_LANGUAGE_CODE_RE = re.compile(r"^[a-z]{2,3}$")
+MAX_TRANSCRIPTION_LANGUAGES = 8
+MAX_TRANSCRIPTION_PROMPT_CHARS = 1000
+MAX_REPLY_LANGUAGE_CHARS = 40
+_REPLY_LANGUAGE_RE = re.compile(r"^[^\W\d_]+(?:[ '\-][^\W\d_]+)*$")
+
+
+_EXPERIMENTAL_LANGUAGE_CODES = {
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Portuguese": "pt",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
+}
+
+
+def plugin_setting(key: str):
+    """Read the active Hermes profile's native Talk settings, when available."""
+    try:
+        from hermes_cli.config import load_config_readonly
+    except ImportError:
+        return None
+
+    value = load_config_readonly()
+    for part in ("plugins", "entries", "hermes-talk", "settings", key):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _experimental_voice_language() -> str | None:
+    value = plugin_setting("voice_language")
+    return value if isinstance(value, str) and value in _EXPERIMENTAL_LANGUAGE_CODES else None
+
+
+def transcription_languages() -> tuple[str, ...]:
+    """Expected spoken languages for input transcription (``TALK_TRANSCRIPTION_LANGUAGES``).
+
+    Comma-separated ISO codes, for example ``fr`` or ``fr,en``. Unset sends no
+    language hint at all, exactly the pre-knob payload. **Fail-closed**: a
+    malformed code refuses with the expected format instead of being dropped,
+    because a silently ignored hint looks exactly like a working one.
+    """
+
+    language = _experimental_voice_language()
+    if language is not None:
+        return (_EXPERIMENTAL_LANGUAGE_CODES[language],)
+    raw = _talk_env_get("TALK_TRANSCRIPTION_LANGUAGES") or ""
+    codes = tuple(dict.fromkeys(part.strip().lower() for part in raw.split(",") if part.strip()))
+    invalid = [code for code in codes if not _LANGUAGE_CODE_RE.match(code)]
+    if invalid:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_LANGUAGES has invalid code(s) {', '.join(invalid)}: "
+            "use comma-separated ISO 639-1 or 639-3 codes, e.g. 'fr' or 'fr,en'"
+        )
+    if len(codes) > MAX_TRANSCRIPTION_LANGUAGES:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_LANGUAGES lists {len(codes)} languages; "
+            f"at most {MAX_TRANSCRIPTION_LANGUAGES} are accepted"
+        )
+    return codes
+
+
+def transcription_prompt() -> str | None:
+    """Free-text context for input transcription (``TALK_TRANSCRIPTION_PROMPT``).
+
+    Vocabulary, names or "mostly French, sometimes English" help the
+    transcription model; they are hints, never required output. Unset or blank
+    sends nothing. Control characters and over-long values refuse.
+    """
+
+    raw = (_talk_env_get("TALK_TRANSCRIPTION_PROMPT") or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_TRANSCRIPTION_PROMPT_CHARS:
+        raise TalkConfigError(
+            f"TALK_TRANSCRIPTION_PROMPT is {len(raw)} characters; "
+            f"at most {MAX_TRANSCRIPTION_PROMPT_CHARS} are accepted"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise TalkConfigError(
+            "TALK_TRANSCRIPTION_PROMPT must be one line without control characters"
+        )
+    return raw
+
+
+def reply_language() -> str | None:
+    """Language the voice speaks to the operator in (``TALK_REPLY_LANGUAGE``).
+
+    A language NAME (``French``, ``français``), not a code: it is rendered into
+    the session prompt as written. Unset leaves the prompt byte-identical to a
+    session that never had the knob, and the model keeps guessing from the
+    first words it hears. Tool arguments and delegation briefs are not
+    constrained by it.
+    """
+
+    language = _experimental_voice_language()
+    if language is not None:
+        return language
+    raw = (_talk_env_get("TALK_REPLY_LANGUAGE") or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_REPLY_LANGUAGE_CHARS or not _REPLY_LANGUAGE_RE.match(raw):
+        raise TalkConfigError(
+            "TALK_REPLY_LANGUAGE must be a language name such as 'French' "
+            "(letters, spaces, apostrophes or hyphens; "
+            f"at most {MAX_REPLY_LANGUAGE_CHARS} characters)"
+        )
+    return raw
+
+
 def cascade_tts() -> str:
     """Cascade TTS provider, resolved at call time. Fail-closed.
 
-    Only ``elevenlabs`` exists today; the knob is still validated so a typo
+    ``elevenlabs`` is the default; ``openai`` is the Experimental
+    OpenAI-compatible backend. ``TALK_CASCADE_TTS`` wins when set, otherwise
+    the plugin setting ``cascade_tts``. The knob is validated so a typo
     refuses with the valid values instead of guessing at a provider (and its
     metered key) the operator did not name.
     """
 
-    raw = (
-        (os.environ.get("TALK_CASCADE_TTS") or DEFAULT_CASCADE_TTS).strip().lower()
-        or DEFAULT_CASCADE_TTS
-    )
+    raw = _env_or_saved("TALK_CASCADE_TTS", "cascade_tts").lower() or DEFAULT_CASCADE_TTS
     if raw not in TALK_CASCADE_TTS_PROVIDERS:
         raise TalkConfigError(
             f"TALK_CASCADE_TTS '{raw}' is not a cascade TTS provider "
@@ -719,14 +954,14 @@ def resolve_elevenlabs_key() -> str:
     ``xi-api-key`` WebSocket header — never the URL, never a log line.
     """
 
-    scoped = secret("TALK_ELEVENLABS_API_KEY")
+    scoped = _talk_env_get("TALK_ELEVENLABS_API_KEY")
     if scoped is not None:
         if not scoped.strip():
             raise TalkConfigError(
                 "TALK_ELEVENLABS_API_KEY is set but empty — set a real key or unset it"
             )
         return scoped.strip()
-    shared = secret("ELEVENLABS_API_KEY")
+    shared = _talk_env_get("ELEVENLABS_API_KEY")
     if shared is not None:
         if not shared.strip():
             raise TalkConfigError(
@@ -748,7 +983,7 @@ def elevenlabs_voice_id() -> str:
     an identifier, not a secret; the KEY is the secret.
     """
 
-    raw = (os.environ.get("TALK_ELEVENLABS_VOICE_ID") or "").strip()
+    raw = (_talk_env_get("TALK_ELEVENLABS_VOICE_ID") or "").strip()
     if not raw:
         raise TalkConfigError(
             "TALK_VOICE_MODE=cascade needs TALK_ELEVENLABS_VOICE_ID — set it to a "
@@ -761,7 +996,7 @@ def elevenlabs_model() -> str:
     """ElevenLabs TTS model for the cascade lane (``TALK_ELEVENLABS_MODEL``)."""
 
     return (
-        (os.environ.get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
+        (_talk_env_get("TALK_ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
         or DEFAULT_ELEVENLABS_MODEL
     )
 
@@ -780,7 +1015,7 @@ def elevenlabs_speed() -> float | None:
     audible on every single word.
     """
 
-    raw = (os.environ.get("TALK_CASCADE_SPEED") or "").strip()
+    raw = (_talk_env_get("TALK_CASCADE_SPEED") or "").strip()
     if not raw:
         return None
     try:
@@ -815,7 +1050,7 @@ def elevenlabs_voice_settings() -> dict:
     return settings
 
 
-def cascade_voice_config(provider: str) -> tuple[str, str, str]:
+def cascade_voice_config(provider: str) -> CascadeVoiceConfig:
     """The resolved cascade TTS triple — (key, voice id, model). Fail-closed.
 
     Every lane that opens a cascade session resolves through HERE so the
@@ -833,12 +1068,191 @@ def cascade_voice_config(provider: str) -> tuple[str, str, str]:
             f"'{provider}' is configured — grok/gemini text-output modes are "
             "not wired into the cascade yet"
         )
-    cascade_tts()  # fail-closed; elevenlabs is the only value today
-    return (
+    backend = cascade_tts()
+    if backend == "openai":
+        return CascadeVoiceConfig(
+            resolve_cascade_openai_key(),
+            _cascade_openai_required("TALK_CASCADE_OPENAI_VOICE", "cascade_openai_voice", "voice"),
+            _cascade_openai_required("TALK_CASCADE_OPENAI_MODEL", "cascade_openai_model", "model"),
+            backend=backend,
+            base_url=cascade_openai_base_url(),
+            response_format=cascade_openai_format(),
+            speed=elevenlabs_speed(),
+        )
+    return CascadeVoiceConfig(
         resolve_elevenlabs_key(),
         elevenlabs_voice_id(),
         elevenlabs_model(),
     )
+
+
+class CascadeVoiceConfig(tuple):
+    """The resolved cascade config: still the ``(key, voice id, model)`` triple
+    every lane unpacks, plus the backend and its extras.
+
+    The repr never shows the key — a config that reaches a log line or a test
+    failure must not carry the secret with it.
+    """
+
+    def __new__(
+        cls,
+        api_key: str | None,
+        voice_id: str,
+        model: str,
+        *,
+        backend: str = DEFAULT_CASCADE_TTS,
+        base_url: str | None = None,
+        response_format: str = DEFAULT_CASCADE_OPENAI_FORMAT,
+        speed: float | None = None,
+    ):
+        self = super().__new__(cls, (api_key, voice_id, model))
+        self.backend = backend
+        self.base_url = base_url
+        self.response_format = response_format
+        self.speed = speed
+        return self
+
+    @property
+    def api_key(self) -> str | None:
+        return self[0]
+
+    @property
+    def voice_id(self) -> str:
+        return self[1]
+
+    @property
+    def model(self) -> str:
+        return self[2]
+
+    def __repr__(self) -> str:
+        return (
+            f"CascadeVoiceConfig(backend={self.backend!r}, voice_id={self.voice_id!r}, "
+            f"model={self.model!r}, key={'set' if self.api_key else 'none'})"
+        )
+
+
+def _saved_str(key: str) -> str:
+    """One Experimental plugin setting as a stripped string ('' when unset/unreadable)."""
+
+    try:
+        value = plugin_setting(key)
+    except Exception:  # noqa: BLE001 - an unreadable setting falls back to the env
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _env_or_saved(env: str, key: str) -> str:
+    """``env`` wins when set; otherwise the Experimental plugin setting ``key``."""
+
+    return (_talk_env_get(env) or "").strip() or _saved_str(key)
+
+
+def _cascade_openai_required(env: str, key: str, what: str) -> str:
+    value = _env_or_saved(env, key)
+    if not value:
+        raise TalkConfigError(
+            f"TALK_CASCADE_TTS=openai needs {env} — the {what} your "
+            "OpenAI-compatible TTS server expects"
+        )
+    return value
+
+
+def cascade_openai_base_url() -> str:
+    """Base URL of the OpenAI-compatible TTS server (``TALK_CASCADE_OPENAI_BASE_URL``).
+
+    Required, e.g. ``http://127.0.0.1:4000/v1`` for a local LiteLLM gateway;
+    the request goes to ``{base}/audio/speech``. Plain ``http://`` is refused
+    off loopback, like ``TALK_LOCAL_URL``: the reply text and any key would
+    cross the network unencrypted. Credentials, queries and fragments in the
+    URL refuse too — the key belongs in ``TALK_CASCADE_OPENAI_API_KEY``.
+    """
+
+    from urllib.parse import urlsplit
+
+    raw = _env_or_saved("TALK_CASCADE_OPENAI_BASE_URL", "cascade_openai_base_url")
+    if not raw:
+        raise TalkConfigError(
+            "TALK_CASCADE_TTS=openai needs TALK_CASCADE_OPENAI_BASE_URL — e.g. "
+            "http://127.0.0.1:4000/v1 for a local LiteLLM gateway"
+        )
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        parts, host, has_userinfo = None, "", False
+    if parts is None or parts.scheme not in ("http", "https") or not host:
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_BASE_URL must be an http:// or https:// URL with a host"
+        )
+    if has_userinfo or parts.query or parts.fragment:
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_BASE_URL must not carry credentials, a query or a "
+            "fragment — put the key in TALK_CASCADE_OPENAI_API_KEY"
+        )
+    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise TalkConfigError(
+            f"TALK_CASCADE_OPENAI_BASE_URL uses plain http:// to '{host}'; "
+            "use https:// off loopback"
+        )
+    return raw.rstrip("/")
+
+
+def cascade_openai_format() -> str:
+    """Audio format asked of the OpenAI-compatible server (``TALK_CASCADE_OPENAI_FORMAT``)."""
+
+    raw = _env_or_saved("TALK_CASCADE_OPENAI_FORMAT", "cascade_openai_format").lower()
+    raw = raw or DEFAULT_CASCADE_OPENAI_FORMAT
+    if raw not in CASCADE_OPENAI_FORMATS:
+        raise TalkConfigError(
+            f"TALK_CASCADE_OPENAI_FORMAT '{raw}' is not supported "
+            f"({', '.join(CASCADE_OPENAI_FORMATS)})"
+        )
+    return raw
+
+
+def resolve_cascade_openai_key() -> str | None:
+    """Optional key for the OpenAI-compatible TTS server, or ``None``.
+
+    Only ``TALK_CASCADE_OPENAI_API_KEY``. Deliberately NO fall-through to
+    ``OPENAI_API_KEY``: this endpoint is often a self-hosted or third-party
+    gateway, and handing it the operator's real OpenAI key would leak a
+    metered secret to a host that never asked for it. Set-but-blank refuses,
+    like every other Talk key; the key rides the ``Authorization`` header only.
+    """
+
+    scoped = _talk_env_get("TALK_CASCADE_OPENAI_API_KEY")
+    if scoped is None:
+        return None
+    if not scoped.strip():
+        raise TalkConfigError(
+            "TALK_CASCADE_OPENAI_API_KEY is set but empty — set a real key or unset it"
+        )
+    return scoped.strip()
+
+
+def discord_auto_join() -> bool:
+    """Experimental: whether ``/talk join`` may join the caller's voice channel.
+
+    Off by default, so ``/talk join`` keeps borrowing only the connection the
+    host already holds (hermes-talk#224). ``TALK_DISCORD_AUTO_JOIN`` wins when
+    set (junk refuses); otherwise the plugin setting ``discord_auto_join``.
+    """
+
+    raw = (_talk_env_get("TALK_DISCORD_AUTO_JOIN") or "").strip().lower()
+    if raw:
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise TalkConfigError(
+            f"TALK_DISCORD_AUTO_JOIN '{raw}' is not a switch: use 1/true/on or 0/false/off"
+        )
+    try:
+        saved = plugin_setting("discord_auto_join")
+    except Exception:  # noqa: BLE001 - an unreadable setting keeps today's behaviour
+        return False
+    return saved is True
 
 
 def agent_timeout_s() -> int:
@@ -848,7 +1262,7 @@ def agent_timeout_s() -> int:
     a wedged agent cannot leave a poll loop running for the whole session.
     """
 
-    raw = (os.environ.get("TALK_AGENT_TIMEOUT_S") or "").strip()
+    raw = (_talk_env_get("TALK_AGENT_TIMEOUT_S") or "").strip()
     if raw:
         try:
             parsed = int(raw)
@@ -862,7 +1276,7 @@ def agent_timeout_s() -> int:
 def _positive_float(name: str, default: float) -> float:
     """A positive float knob. Junk and non-positive values take the default."""
 
-    raw = (os.environ.get(name) or "").strip()
+    raw = (_talk_env_get(name) or "").strip()
     if raw:
         try:
             parsed = float(raw)
@@ -876,7 +1290,7 @@ def _positive_float(name: str, default: float) -> float:
 def api_server_url() -> str:
     """Base URL of the Hermes api_server gateway platform, no trailing slash."""
 
-    raw = (os.environ.get("TALK_API_SERVER_URL") or "").strip()
+    raw = (_talk_env_get("TALK_API_SERVER_URL") or "").strip()
     return (raw or DEFAULT_API_SERVER_URL).rstrip("/")
 
 
@@ -893,10 +1307,10 @@ def api_server_key() -> str | None:
     so "no key" is a real, reachable configuration rather than a broken one.
     """
 
-    scoped = secret("TALK_API_SERVER_KEY")
+    scoped = _talk_env_get("TALK_API_SERVER_KEY")
     if scoped is not None:
         return scoped.strip() or None
-    return (secret("API_SERVER_KEY") or "").strip() or None
+    return (_talk_env_get("API_SERVER_KEY") or "").strip() or None
 
 
 def api_server_probe_timeout_s() -> float:
@@ -937,7 +1351,7 @@ def catalog_startup_wait_s() -> float:
     — section omitted, never a stall.
     """
 
-    raw = (os.environ.get("TALK_CATALOG_STARTUP_WAIT_S") or "").strip()
+    raw = (_talk_env_get("TALK_CATALOG_STARTUP_WAIT_S") or "").strip()
     if raw:
         try:
             parsed = float(raw)
@@ -965,14 +1379,14 @@ def memory_search_timeout_s() -> float:
 def audio_input_device() -> str | None:
     """Optional sounddevice input override (Windows/WASAPI proofing)."""
 
-    raw = (os.environ.get("TALK_INPUT_DEVICE") or "").strip()
+    raw = (_talk_env_get("TALK_INPUT_DEVICE") or "").strip()
     return raw or None
 
 
 def audio_output_device() -> str | None:
     """Optional sounddevice output override."""
 
-    raw = (os.environ.get("TALK_OUTPUT_DEVICE") or "").strip()
+    raw = (_talk_env_get("TALK_OUTPUT_DEVICE") or "").strip()
     return raw or None
 
 
@@ -983,7 +1397,7 @@ def discord_operator_user_ids() -> frozenset[int]:
     A partially valid list never partially authorizes.
     """
 
-    raw = os.environ.get("TALK_DISCORD_OPERATOR_USER_IDS")
+    raw = _talk_env_get("TALK_DISCORD_OPERATOR_USER_IDS")
     if raw is None or not raw.strip():
         return frozenset()
     resolved: set[int] = set()
@@ -1039,11 +1453,12 @@ def trust_declared_read_only() -> bool:
     key run together; anything else, junk included, keeps the fence.
     """
 
-    raw = (os.environ.get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
+    raw = (_talk_env_get("TALK_TRUST_DECLARED_READ_ONLY") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
 __all__ = [
+    "CASCADE_OPENAI_FORMATS",
     "DEFAULT_AGENT_TIMEOUT_S",
     "DEFAULT_API_SERVER_POLL_S",
     "DEFAULT_API_SERVER_PROBE_TIMEOUT_S",
@@ -1052,6 +1467,7 @@ __all__ = [
     "DEFAULT_APPROVAL_PERMIT_TTL_S",
     "DEFAULT_APPROVAL_PROMPT_TIMEOUT_S",
     "DEFAULT_CAPABILITY_CATALOG_TTL_S",
+    "DEFAULT_CASCADE_OPENAI_FORMAT",
     "DEFAULT_CASCADE_TTS",
     "DEFAULT_CATALOG_STARTUP_WAIT_S",
     "DEFAULT_ELEVENLABS_MODEL",
@@ -1061,6 +1477,9 @@ __all__ = [
     "DEFAULT_GEMINI_VOICE",
     "DEFAULT_GROK_MODEL",
     "DEFAULT_GROK_VOICE",
+    "DEFAULT_LOCAL_MODEL",
+    "DEFAULT_LOCAL_URL",
+    "DEFAULT_LOCAL_VOICE",
     "DEFAULT_MEMORY_SEARCH_TIMEOUT_S",
     "DEFAULT_TALK_MODEL",
     "DEFAULT_TALK_PROVIDER",
@@ -1077,6 +1496,7 @@ __all__ = [
     "TALK_CASCADE_TTS_PROVIDERS",
     "TALK_PROVIDERS",
     "TALK_VOICE_MODES",
+    "CascadeVoiceConfig",
     "TalkConfigError",
     "agent_profile",
     "agent_timeout_s",
@@ -1089,10 +1509,13 @@ __all__ = [
     "approval_prompt_timeout_s",
     "audio_input_device",
     "audio_output_device",
+    "cascade_openai_base_url",
+    "cascade_openai_format",
     "cascade_tts",
     "cascade_voice_config",
     "catalog_startup_wait_s",
     "detect_agent_profile",
+    "discord_auto_join",
     "discord_operator_user_ids",
     "elevenlabs_model",
     "elevenlabs_speed",
@@ -1103,8 +1526,11 @@ __all__ = [
     "memory_search_timeout_s",
     "realtime_model_compatibility",
     "realtime_model_valid",
+    "reply_language",
+    "resolve_cascade_openai_key",
     "resolve_elevenlabs_key",
     "resolve_gemini_key",
+    "resolve_local_key",
     "resolve_openai_key",
     "resolve_xai_key",
     "state_dir",
@@ -1112,9 +1538,14 @@ __all__ = [
     "talk_gemini_voice",
     "talk_grok_model",
     "talk_grok_voice",
+    "talk_local_model",
+    "talk_local_url",
+    "talk_local_voice",
     "talk_model",
     "talk_provider",
     "talk_voice",
+    "transcription_languages",
+    "transcription_prompt",
     "trust_declared_read_only",
     "turn_detection",
     "voice_mode",
