@@ -22,6 +22,7 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 MIN_TURNS = 2
 MIN_CHARS = 200
+REVIEW_CHILD_ENV = "TALK_TRANSCRIPT_REVIEW_CHILD"
 _ACTIVE_TRANSCRIPTS: set[Path] = set()
 _ACTIVE_LOCK = threading.RLock()
 _HANDOFF_STATUS: dict[str, str] = {"state": "unknown"}
@@ -497,6 +498,11 @@ def sweep_transcripts(
     run_agent: Callable[[str], object] | None = None,
 ) -> None:
     """Fail-open public sweep; root discovery can never delay or fail a call."""
+
+    # A detached review may outlive the process that held its claim's lease.
+    # Its own teardown must not reclaim that transcript and launch another review.
+    if os.environ.get(REVIEW_CHILD_ENV) == "1":
+        return
 
     try:
         _sweep_transcripts(hermes_home, run_agent)
