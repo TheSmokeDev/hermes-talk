@@ -1,5 +1,5 @@
 name: hermes-talk
-version: 0.24.0
+version: 0.24.1
 requires_hermes: ">=0.23.0"
 manifest_version: 1
 kind: standalone
