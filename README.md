@@ -87,7 +87,7 @@ Every version and what it shipped: [CHANGELOG.md](CHANGELOG.md).
 ## Install
 
 ```bash
-hermes plugins install --ref 012c1069d725decce26aae480217093f647776bf TheSmokeDev/hermes-talk --enable
+hermes plugins install --ref 0668fb23648f3fbe0f926c874e003aaa4a80c250 TheSmokeDev/hermes-talk --enable
 pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 ```
 
@@ -95,13 +95,13 @@ You need Python 3.11 or newer and a Hermes host at v0.23.0 or newer. GPT-Live,
 shared task attachment and Codex workers need extra host capabilities, listed
 in [Prerequisites](docs/OPERATING.md#prerequisites).
 
-That commit is the published **v0.24.0** source. Hermes v0.22.5 wants a full
+That commit is the published **v0.24.1** source. Hermes v0.22.5 wants a full
 40-character commit SHA for `--ref` and won't take a tag, and pinning the SHA
 also avoids an older community-catalog pin. To move an existing pinned install,
 keep any local plugin edits safe, then run:
 
 ```bash
-hermes plugins install --force --ref 012c1069d725decce26aae480217093f647776bf --enable TheSmokeDev/hermes-talk
+hermes plugins install --force --ref 0668fb23648f3fbe0f926c874e003aaa4a80c250 --enable TheSmokeDev/hermes-talk
 ```
 
 Restart the gateway, the dashboard and Desktop afterwards. A running process
