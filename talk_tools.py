@@ -596,8 +596,18 @@ def _describe_age(run: dict) -> str:
     return f" {seconds // 3600}h"
 
 
+#: A failed run that was proven stopped or interrupted is reported as such.
+_FAILED_RUN_WORDS = {
+    talk_runs.OUTCOME_STOPPED: "was stopped",
+    talk_runs.OUTCOME_INTERRUPTED: "was interrupted",
+}
+
+
 def _describe_run(run: dict) -> str:
-    line = f"run {run.get('runId')} ({run.get('kind')}) {run.get('status')}"
+    status = run.get("status")
+    if status == "failed":
+        status = _FAILED_RUN_WORDS.get(talk_runs.terminal_outcome(run), status)
+    line = f"run {run.get('runId')} ({run.get('kind')}) {status}"
     if run.get("status") == "running":
         line += _describe_age(run)
         # What a live run holds (hermes-talk#101), so "why was that refused?"

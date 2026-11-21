@@ -675,6 +675,32 @@ none itself afterwards. Model-facing contract:
 
 ### api-server lane
 
+Only a remote `completed` status produces a successful Talk result. Remote
+`failed`, `cancelled`, and `interrupted` statuses map to Talk's local `failed`
+state with the remote status and reason in the report. Memory handoffs also
+require `completed`; a failed handoff keeps its transcript for a later retry.
+Completion announcements use the recorded local outcome and claim delivery
+once. The words follow the proven outcome: "Background run #N finished",
+"failed", "was stopped" (remote `cancelled`, which is how a `stop_work` stop
+ends; a detached run that `stop_work` signalled), or "was interrupted" (remote
+`interrupted`: the gateway shut down or restarted). `check_work` reports a
+stopped or interrupted run the same way. If a local terminal transition races a remote result, the first recorded
+transition wins.
+
+The confirmed remote failure status is stored as terminal metadata in that
+same transition and retained in history. Spoken reports keep that status even
+when a long reason is shortened to the 1,500-character announcement budget;
+successful answer text is never interpreted as a remote failure status.
+
+A connection loss or polling deadline ends local tracking as `failed`, with
+an explicit unknown remote outcome; it does not prove the remote work stopped.
+The API run id remains in the run metadata for addressing that same run.
+Automatic reconnection is not added. A terminal parent does not prove its
+delegated children finished or stopped. Existing result truncation still
+applies (4,000 characters from the API lane, 2,000 in Talk's run history).
+These rules use the existing run endpoints without a new capability or
+submission field; they do not require an inline-delegation host contract.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_API_SERVER_URL` | `http://127.0.0.1:8642` | Gateway base URL; trailing slash stripped. |
@@ -826,6 +852,18 @@ TALK_DISCORD_OPERATOR_USER_IDS=<your-immutable-discord-user-id>
 Use Discord's numeric user ID, not a username or display name. With the variable
 unset, every participant can converse and use read-only tools, while every
 mutating tool is denied.
+
+Native Discord replies finish on a 20 ms playback frame: when provider output
+ends, Talk pads any final partial frame with silence. The response boundary is
+preserved even when the playback queue is full, and queued announcements can
+resume once the admitted audio drains. Canonical native sessions, and Live
+sessions whose provider reports output turns, use their output-completion events
+too. Barge-in discards pending audio and its boundary. Cascade TTS runs
+asynchronously: the provider's text-completion event does not signal that its
+audio has finished, so a cascade reply ends when its ElevenLabs stream settles
+instead. A partial frame whose reply sends no end marker at all (GPT-Live does
+not report output turns) plays after ten silent 20 ms reads, about 200 ms, so
+it cannot hold announcements back.
 
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we

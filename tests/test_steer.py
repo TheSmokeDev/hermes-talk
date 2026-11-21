@@ -21,6 +21,7 @@ import pytest
 import wallclock
 
 import talk_apiserver
+import talk_cli
 import talk_host
 import talk_runs
 import talk_steer
@@ -484,6 +485,65 @@ def test_stop_confirm_consults_the_run_record_before_claiming_uncertainty(monkey
     finally:
         hung.set()  # the worker finishes; the run flips terminal
     assert "run finished as done" in _poll_stop_receipt(run_id, "run finished as")
+
+
+def _killable_run() -> tuple[int, threading.Event]:
+    """A detached-shaped run whose worker records a killed child as failed."""
+
+    killed = threading.Event()
+
+    def worker(run_id: int) -> str:
+        killed.wait(5)
+        # The exact terminal record _detached_agent_worker writes for a
+        # non-zero exit: failed, with the exit code in the output.
+        message = "the agent exited -15: terminated"
+        talk_runs.finish_run(run_id, "failed", message)
+        return message
+
+    return talk_runs.start_run("agent", "audit", worker), killed
+
+
+def _terminal(run_id: int, timeout: float = 3.0) -> dict:
+    deadline = time.time() + wallclock.stretch(timeout)
+    while time.time() < deadline:
+        run = talk_runs.get_run(run_id)
+        if run["status"] in talk_runs.TERMINAL_STATUSES:
+            return run
+        threading.Event().wait(0.02)
+    raise AssertionError(f"run {run_id} never finished")
+
+
+def test_a_stopped_detached_run_is_announced_and_reported_as_stopped():
+    run_id, killed = _killable_run()
+
+    class _KilledProc(_DyingProc):
+        def terminate(self):
+            self._code = -15
+            killed.set()  # the worker reaps the child at once
+
+    talk_runs.register_process(run_id, _KilledProc())
+    talk_host.host().stop_work(str(run_id))
+    run = _terminal(run_id)
+    assert run["status"] == "failed" and run["meta"]["stop_requested"] is True
+    text = talk_cli.run_finished_commands(run)[0].text
+    assert text.startswith(f"Background run #{run_id} was stopped.")
+    assert "failed" not in text
+    report = talk_tools.execute_talk_tool("check_work", {"run_id": run_id})
+    assert report.startswith(f"run {run_id} (agent) was stopped")
+
+
+def test_a_detached_run_that_dies_on_its_own_is_still_failed():
+    run_id, killed = _killable_run()
+    # No handle: the stop never reached the child, so it proves nothing.
+    assert "don't hold a handle" in talk_host.host().stop_work(str(run_id)).lower()
+    killed.set()
+    run = _terminal(run_id)
+    assert run["meta"]["stop_requested"] is False
+    assert talk_cli.run_finished_commands(run)[0].text.startswith(
+        f"Background run #{run_id} failed."
+    )
+    report = talk_tools.execute_talk_tool("check_work", {"run_id": run_id})
+    assert report.startswith(f"run {run_id} (agent) failed")
 
 
 def test_check_work_speaks_the_stop_receipt(monkeypatch):

@@ -850,12 +850,34 @@ def run_finished_messages(run: dict) -> list[dict]:
 def run_finished_commands(run: dict) -> list[talk_realtime.RealtimeCommand]:
     """Provider-neutral commands that make the model speak a finished run."""
 
-    tail = str(run.get("output") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
-    verb = "finished" if run.get("status") == "done" else "failed"
-    headline = f"Background run #{run.get('runId')} {verb}" + (
+    output = str(run.get("output") or "").strip()
+    tail = output[-WATCH_OUTPUT_TAIL_CHARS:]
+    meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+    remote_status = meta.get("api_run_status")
+    if (
+        len(output) > WATCH_OUTPUT_TAIL_CHARS
+        and run.get("status") == "failed"
+        and remote_status in ("failed", "cancelled", "interrupted")
+    ):
+        # The output's prefix may be outside the spoken tail. Restore the
+        # structured verdict within that same budget, without parsing output.
+        prefix = f"the agent run {remote_status}: "
+        tail = prefix + tail[-(WATCH_OUTPUT_TAIL_CHARS - len(prefix)) :]
+    outcome = talk_runs.terminal_outcome(run) or talk_runs.OUTCOME_FAILED
+    headline = f"Background run #{run.get('runId')} {RUN_OUTCOME_WORDS[outcome]}" + (
         "." if tail else " with no output."
     )
     return _announcement_commands(headline, tail)
+
+
+#: ``talk_runs.terminal_outcome`` -> the words a finished run is announced
+#: with. A stop or an interruption is not a failure and is not called one.
+RUN_OUTCOME_WORDS = {
+    talk_runs.OUTCOME_FINISHED: "finished",
+    talk_runs.OUTCOME_FAILED: "failed",
+    talk_runs.OUTCOME_STOPPED: "was stopped",
+    talk_runs.OUTCOME_INTERRUPTED: "was interrupted",
+}
 
 
 #: ``child_status`` → the verb the model is prompted with. Values from
@@ -1779,12 +1801,17 @@ async def run_talk_session(
     # worker task running.
     cascade = None
     if cascade_config is not None:
+        # The provider's ResponseFinished arrives before the TTS audio, so a
+        # sink that holds a partial frame (Discord) is told the reply ended
+        # when its TTS stream settles instead.
+        finish_playback = getattr(audio, "finish_playback", None)
         cascade = talk_cascade_voice.CascadeVoice(
             api_key=cascade_config[0],
             voice_id=cascade_config[1],
             model=cascade_config[2],
             on_audio=audio.queue_playback,
             on_error=on_error,
+            on_stream_end=finish_playback if callable(finish_playback) else None,
             voice_settings=talk_config.elevenlabs_voice_settings(),
         )
     session = None
@@ -2062,6 +2089,7 @@ async def run_talk_session(
                 # stops before the sink empties, never after.
                 if cascade is not None:
                     cascade.handle_event(event)
+                response_was_active = relay.response_active
                 outgoing = relay.handle_realtime_event(event)
                 if (
                     authorization_ledger is not None
@@ -2073,6 +2101,16 @@ async def run_talk_session(
                     if response_create is not None:
                         outgoing.append(_neutral_response_command(response_create))
                 if isinstance(event, talk_realtime.ResponseFinished):
+                    # A stale terminal must not flush the next response's PCM.
+                    # Cascade TTS can still be producing audio after this event.
+                    finish_playback = getattr(audio, "finish_playback", None)
+                    if (
+                        cascade is None
+                        and response_was_active
+                        and not relay.response_active
+                        and callable(finish_playback)
+                    ):
+                        finish_playback()
                     continued = bool(tool_coordinator.outputs)
                     await tool_coordinator.response_done()
                     if authorization_ledger is not None:

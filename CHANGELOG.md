@@ -89,6 +89,23 @@ named rather than smoothed.
   caller. One pending read is kept per profile and shared instead of piling up
   workers, and a read that finishes late answers the next probe.
   Contributed by Kiven (@abaichuan1017).
+- Discord playback pads the last partial frame when native provider output ends,
+  preserving response boundaries even with a full queue so queued announcements
+  can resume after playback drains. Canonical native output, and Live sessions
+  that report output turns, also signal completion; interrupted audio is
+  discarded. Cascade replies end when their ElevenLabs stream settles, and a
+  fragment with no end marker at all (GPT-Live) plays after about 200 ms of
+  silence. A finished background result is no longer held back for a safe
+  opening that never came. Contributed by @tancou in #218; thanks to
+  @rmccaincns for reporting #239.
+- API-server runs reported as `failed`, `cancelled`, or `interrupted` are no
+  longer recorded or announced as finished. Memory handoffs use the same typed
+  outcome instead of interpreting answer text; lost tracking reports an
+  unknown remote outcome. Remote terminal statuses survive long reasons and
+  bounded spoken reports. Contributed by @tancou in #219. Announcements and
+  `check_work` name the outcome: a run "failed", "was stopped" (remote
+  `cancelled`, as a `stop_work` stop ends, or a detached run `stop_work`
+  signalled), or "was interrupted" (gateway shutdown or restart).
 
 ## [0.23.1] — 2026-11-17
 

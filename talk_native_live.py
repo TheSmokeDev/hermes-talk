@@ -549,6 +549,10 @@ class NativeLiveTaskController(NativeTaskController):
             self.provider_response_active = False
             self.presentation = None
         elif isinstance(event, rt.OutputTurnCompleted):
+            if self.provider_response_active:
+                finish_playback = getattr(self.audio, "finish_playback", None)
+                if callable(finish_playback):
+                    finish_playback()
             self.provider_response_active = False
         elif isinstance(event, rt.OutputAudio):
             if self.service_paused:
