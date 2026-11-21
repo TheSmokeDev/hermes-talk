@@ -53,6 +53,19 @@ named rather than smoothed.
   message is the route's detail alone, with the HTTP code on `status`; the tab
   only matched a `401`/`403` prefix in the message, so a browser off loopback
   got the refusal and no way to answer it. Contributed by @Philibergus.
+- The end-of-call transcript memory review no longer re-spawns itself. The
+  detached `hermes -z` review loads hermes-talk too, and its own session-end
+  sweep could claim the same transcript again once the Talk process that
+  started it had exited, starting a new review each time. The review child is
+  now marked in its environment and skips the sweep. A transcript left claimed
+  by an exited Talk process is still reviewed once more by the next normal
+  sweep. Thanks to @gocoelho for reporting #229.
+- The Gemini Live lane no longer fails to start with close code 1007
+  (`Unknown name "additionalProperties"`). Tool schemas are now sent in
+  `parametersJsonSchema`, which accepts `additionalProperties`, instead of the
+  OpenAPI-style `parameters` field, so closed and nested object rules are kept
+  rather than stripped. Not yet confirmed with a live Gemini tool call.
+  Thanks to @gocoelho for reporting #227.
 
 ## [0.23.1] — 2026-11-17
 
