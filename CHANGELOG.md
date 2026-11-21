@@ -86,12 +86,16 @@ named rather than smoothed.
 - Discord playback pads the last partial frame when native provider output ends,
   preserving response boundaries even with a full queue so queued announcements
   can resume after playback drains. Canonical native and Live output also signal
-  completion; interrupted audio is discarded. Thanks to @tancou.
+  completion; interrupted audio is discarded. A finished background result is
+  no longer held back for a safe opening that never came. Cascade replies end
+  when their ElevenLabs stream settles. Contributed by @tancou in #218; thanks
+  to @rmccaincns for reporting #239.
 - API-server runs reported as `failed`, `cancelled`, or `interrupted` now
   remain failures in Talk's registry and completion announcements. Memory
   handoffs use the same typed outcome instead of interpreting answer text;
   lost tracking reports an unknown remote outcome. Remote terminal statuses
-  survive long reasons and bounded spoken reports. Contributed by @tancou.
+  survive long reasons and bounded spoken reports. Contributed by @tancou in
+  #219.
 
 ## [0.23.1] — 2026-11-17
 
