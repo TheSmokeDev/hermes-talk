@@ -72,6 +72,7 @@ py-modules = [
   "talk_cascade_voice",
   "talk_check",
   "talk_diagnostics",
+  "talk_delegated",
   "talk_dashboard_gateway",
   "talk_dashboard_store",
   "talk_dashboard_tasks",
