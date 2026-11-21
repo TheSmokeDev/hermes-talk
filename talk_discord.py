@@ -1954,7 +1954,7 @@ def start_core_session(factory: object, guild_id: int | None = None) -> str:
 
 def start_session(
     guild_id: int | None = None, *, host_execution_attachment=None,
-    native_task=None, native_task_api=None,
+    native_task=None, native_task_api=None, delegated_binding=None,
 ) -> str:
     """Start a realtime session on the host's voice connection.
 
@@ -2105,7 +2105,8 @@ def start_session(
             )
         elif host_execution_attachment is None:
             session = talk_cli.run_talk_session(
-                audio=audio, lane="discord", on_refusal=_note_refusal
+                audio=audio, lane="discord", on_refusal=_note_refusal,
+                delegated_binding=delegated_binding,
             )
         else:
             session = talk_cli.run_talk_session(
@@ -2120,6 +2121,7 @@ def start_session(
             {
                 "task": task,
                 "guild_id": bridge["guild_id"],
+                "delegated_binding": delegated_binding,
                 "audio": audio,
                 "mode": (
                     "native-task" if native_task is not None else
@@ -2133,6 +2135,9 @@ def start_session(
     # still has to mint, open a socket, and take the channel, and any of
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
+    if delegated_binding is not None:
+        return ("Starting same-chat delegated voice. Set /voice off in this chat to prevent "
+                "duplicate host speech. Use /talk status or /talk leave.")
     if native_task is not None:
         return "Starting canonical task voice; say `talk status` to check or `talk leave` to stop."
     if host_execution_attachment is not None:
@@ -2213,3 +2218,10 @@ async def native_command(text, *, operator_user_id, guild_id, channel_id):
         if _SESSION.get("generation") != generation or _SESSION.get("task") is not running:
             raise NativeTaskError("Discord control result belongs to an older voice session")
     return result
+
+
+def delegated_session_binding():
+    """Return the active opt-in binding for command ownership checks."""
+    with _SESSION_LOCK:
+        task = _SESSION.get("task")
+        return _SESSION.get("delegated_binding") if task is not None and not task.done() else None

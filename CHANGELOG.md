@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Opt-in `/talk delegate join` submits work to the current Discord conversation
+  through the host's durable plugin submission API, keeps voice available, and
+  brings exact turn results and background delegation updates into the call.
+  Requires a compatible host and `/voice off`; ordinary `/talk join` is unchanged.
+
 ## [0.24.0] — 2026-11-21
 
 A big community release. Talk gets a one-button panel in Hermes Desktop and the
