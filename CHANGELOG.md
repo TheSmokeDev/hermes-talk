@@ -14,6 +14,12 @@ named rather than smoothed.
 ## [Unreleased]
 
 ### Added
+- `python -m talk_twilio_server` answers calls to your own Twilio number with
+  a fresh Gemini Live voice session (no task, no tools), over Twilio Media
+  Streams. It is a separate opt-in server, not the Dograh Phone mode, and
+  normal Talk never loads it. Every webhook is signature-checked, callers
+  must be on an allowlist (`*` for anyone), and refused calls are never
+  answered. See [docs/TWILIO.md](docs/TWILIO.md). Experimental. Contributed by @computator1200.
 - Experimental controls in Hermes Talk plugin settings for a saved Echo,
   the text-only call journal, and voice language. New users start with Echo
   and Journal off and language on Auto.
