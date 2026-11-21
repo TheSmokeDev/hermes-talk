@@ -13,6 +13,11 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.24.1] — 2026-11-21
+
+Three community-requested options, all off by default: Discord auto-join, an
+OpenAI-compatible cascade voice backend, and versioned `TALK.md` voice instructions.
+
 ### Added
 - `/talk join` on Discord can connect to the voice channel you are in when the
   bot is not in one yet, then start Talk. Off by default; turn on
@@ -28,7 +33,7 @@ named rather than smoothed.
   to `OPENAI_API_KEY`. Experimental. Requested by @HearthCore (#151).
 - Git deployments can version optional `TALK.md` voice preferences in their
   plugin branch. New Realtime and GPT-Live sessions load the bounded UTF-8 file
-  alongside the existing host contracts and identity sections.
+  alongside the existing host contracts and identity sections. Contributed by @tancou.
 
 ## [0.24.0] — 2026-11-21
 
