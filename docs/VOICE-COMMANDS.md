@@ -7,6 +7,11 @@ substrate can prove, never more. `WORK_STARTED #7` is a commitment to
 watch run 7 and speak its result; "queued" is a queue write, not a
 delivery; "landed" only ever follows a real delivery artifact.
 
+The experimental `/talk hybrid join` route has its own
+[tool and receipt contract](hybrid-discord.md): short host tools, `delegate_work`,
+native child controls and exact parent submission controls. The legacy tool names
+and spoken approval flow below do not describe that route.
+
 ## The card
 
 | Say something like | Tool fired | You hear | What it commits to |

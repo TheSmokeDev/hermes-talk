@@ -171,7 +171,8 @@ def _register_talk_command(ctx) -> None:
             "hosts with the core voice contract, core join"
         ),
         "args_hint": (
-            "[join [TARGET [PEER PROFILE]]|select TARGET|return|reconnect|"
+            "[join [TARGET [PEER PROFILE]]|delegate join|hybrid join|"
+            "select TARGET|return|reconnect|"
             "say TEXT|pause|resume|leave|status]"
         ),
     }
@@ -187,7 +188,10 @@ def _register_talk_command(ctx) -> None:
     )
 
 
-def _talk_command(raw_args: str = "", invocation=None) -> str:
+def _talk_command(
+    raw_args: str = "", invocation=None, *, source=None, session_id="",
+    session_key="", platform="", _delegated_binding=None,
+) -> str:
     """``/talk`` — start a voice session from inside a Hermes session.
 
     Two rooms, one command. In a terminal session the call owns the terminal:
@@ -200,6 +204,15 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
 
     raw = (raw_args or "").strip()
     sub = raw.lower()
+    if sub in {"delegate join", "hybrid join"} and _delegated_binding is None:
+        try:
+            from .talk_delegated import Binding
+            _delegated_binding = Binding.capture(
+                talk_host.get_ctx(), source, session_key, session_id, platform,
+                hybrid=sub == "hybrid join",
+            )
+        except (ImportError, ValueError) as exc:
+            return str(exc)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -208,15 +221,21 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
         try:
             from gateway.session_context import get_session_env
         except ImportError:
-            platform = ""
+            platform = platform or ""
         else:
-            platform = get_session_env("HERMES_SESSION_PLATFORM")
+            platform = platform or get_session_env("HERMES_SESSION_PLATFORM")
         if platform == "discord":
             # The gateway awaits returned coroutines on its owning event loop.
             # Keep Discord objects and tasks on that loop; never asyncio.run()
             # them in this worker or bypass the existing audience checks.
-            return _talk_command_on_gateway_loop(raw_args, invocation)
-        if sub in {"join", "core join", "pause", "resume", "leave", "status"}:
+            return _talk_command_on_gateway_loop(
+                raw_args, invocation, source=source, session_id=session_id,
+                session_key=session_key, platform=platform, _delegated_binding=_delegated_binding,
+            )
+        if sub in {
+            "join", "delegate join", "hybrid join", "core join",
+            "pause", "resume", "leave", "status",
+        }:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
                 "terminal, plain `/talk` starts the call; the standalone "
@@ -232,6 +251,13 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
             if talk_cli.cli_entry(keyboard_control=False) == 0
             else ("Voice session ended with errors — see stderr.")
         )
+
+    if sub in {"delegate join", "hybrid join"}:
+        binding = _delegated_binding
+        return talk_discord.start_session(guild_id=binding.guild_id, delegated_binding=binding)
+    delegated = talk_discord.delegated_session_binding()
+    if delegated is not None and not delegated.owns(source, session_key):
+        return "Only the user who joined delegated voice, in its original chat, can control it."
 
     canonical = talk_discord.native_session_active()
     requested = raw.split(maxsplit=1)[0].lower() if raw else "join"
@@ -279,9 +305,9 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
 
 
 
-async def _talk_command_on_gateway_loop(raw_args: str = "", invocation=None) -> str:
+async def _talk_command_on_gateway_loop(raw_args: str = "", invocation=None, **context) -> str:
     """Resume an offloaded Discord command on the gateway's owning loop."""
-    result = _talk_command(raw_args, invocation)
+    result = _talk_command(raw_args, invocation, **context)
     if inspect.isawaitable(result):
         return await result
     return result

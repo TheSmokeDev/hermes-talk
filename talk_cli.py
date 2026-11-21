@@ -1554,6 +1554,7 @@ async def run_talk_session(
     native_task_api=None,
     control_input=None,
     on_native_controller=None,
+    delegated_binding=None,
 ) -> int:
     """Run one voice session. Returns a process exit code.
 
@@ -1614,6 +1615,12 @@ async def run_talk_session(
         print(f"talk: {exc}", file=sys.stderr)
         return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
+    if delegated_binding is not None:
+        try:
+            from . import talk_delegated, talk_hybrid
+        except ImportError:
+            import talk_delegated
+            import talk_hybrid
     hermes_home = talk_config.get_hermes_home()
     talk_transcript.sweep_transcripts(hermes_home)
     # Start filling the capability catalog now so the instruction section below
@@ -1654,10 +1661,23 @@ async def run_talk_session(
     else:
         resume_control = None
 
+    host_catalog = []
     try:
+        if delegated_binding is not None and delegated_binding.hybrid:
+            catalog = await asyncio.to_thread(
+                delegated_binding.ctx.conversation_tools,
+                session_key=delegated_binding.session_key,
+                expected_session_id=delegated_binding.session_id,
+            )
+            if not catalog.get("ok"):
+                raise ValueError("The host refused the conversation tool catalog")
+            host_catalog = catalog["tools"]
         tools = (
             host_execution_attachment.tool_definitions()
             if host_execution_attachment is not None
+            else talk_hybrid.tools(host_catalog)
+            if delegated_binding is not None and delegated_binding.hybrid
+            else talk_delegated.TOOLS if delegated_binding is not None
             else talk_tools.default_talk_tools(pausable=resume_control is not None)
         )
     except Exception as exc:  # noqa: BLE001 - host attachment startup boundary
@@ -1683,11 +1703,14 @@ async def run_talk_session(
         host_execution=host_execution_attachment is not None,
         lane=lane,
         host_summary=_host_summary_line() if lane == "cli" else None,
-        capabilities=talk_capabilities.instruction_section(catalog_snapshot),
+        capabilities=(None if delegated_binding is not None
+                      else talk_capabilities.instruction_section(catalog_snapshot)),
         reply_language=talk_config.reply_language(),
         # `/talk core join` exists only on the Discord gateway, and only on a
         # host carrying the core voice contract (hermes-talk#215).
         core_join=lane == "discord" and talk_core_realtime.core_provider_available(),
+        delegated_work=delegated_binding is not None,
+        hybrid_work=delegated_binding is not None and delegated_binding.hybrid,
     )
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
@@ -1704,10 +1727,14 @@ async def run_talk_session(
     discord_authorization = bool(
         getattr(audio, "discord_speaker_authorization", False)
     )
+    if delegated_binding is not None and not discord_authorization:
+        print("talk: delegated voice requires attributable Discord audio", file=sys.stderr)
+        return refuse(STARTUP_REFUSAL_AUTHORIZATION)
     authorization_ledger = (
         talk_operator_auth.DiscordToolAuthorizationLedger(
             # xAI's response.created never echoes the metadata we send.
             echoes_response_metadata=provider != "grok",
+            initiating_user_id=delegated_binding.user_id if delegated_binding is not None else None,
         )
         if discord_authorization
         else None
@@ -1746,6 +1773,7 @@ async def run_talk_session(
         turn_detection=turn_detection,
         text_output=voice_mode == "cascade",
     )
+    input_speaking = False
     pending: list[talk_realtime.RealtimeCommand] = []
     watchers: list[asyncio.Task] = []
     watched: set[int] = set()
@@ -1886,6 +1914,8 @@ async def run_talk_session(
                 watched.add(run_id)
                 watchers.append(asyncio.create_task(watch_run(run_id)))
 
+        delegated_relay = None
+
         async def send_outgoing(outgoing, *, is_announcement: bool = False) -> bool:
             """Serialize every provider write; keep multi-command batches contiguous.
 
@@ -1909,7 +1939,8 @@ async def run_talk_session(
                 # for this lock, and a response can start while it waits there.
                 # Re-check at the point the write actually happens.
                 if is_announcement and (
-                    relay.response_active or continuation_pending or speaker_busy()
+                    relay.response_active or continuation_pending
+                    or speaker_busy() or input_speaking
                 ):
                     return False
                 if any(
@@ -1917,7 +1948,27 @@ async def run_talk_session(
                     for command in commands
                 ):
                     continuation_pending = True
-                await session.send(commands)
+                if delegated_relay is not None and (not commands or any(
+                    isinstance(command, talk_realtime.StartResponse) for command in commands
+                )):
+                    try:
+                        context = await delegated_relay.context_commands()
+                    except Exception:  # noqa: BLE001 - close binding on storage failure
+                        delegated_relay.closed = True
+                        context = [talk_realtime.AddContext(
+                            item_id=f"talkclosed{uuid.uuid4().hex[:20]}",
+                            text=("Hermes context changed or is unavailable. Work submission is "
+                                  "disabled; ask the user to leave and rejoin Talk."),
+                        )]
+                    if context:
+                        await session.send(context)
+                    if is_announcement and (
+                        relay.response_active or speaker_busy() or input_speaking
+                    ):
+                        continuation_pending = False
+                        return False
+                if commands:
+                    await session.send(commands)
             start_watchers(commands)
             return True
 
@@ -2010,6 +2061,14 @@ async def run_talk_session(
                     if commands:
                         await announce_queue.put(QueuedAnnouncement(commands))
 
+        delegated_relay = (
+            (talk_hybrid.HybridRelay
+             if delegated_binding.hybrid else talk_delegated.SubmissionRelay)(
+                delegated_binding, authorization_ledger.authorize_tool,
+                **({"catalog": host_catalog} if delegated_binding.hybrid else {}),
+            )
+            if delegated_binding is not None else None
+        )
         tool_coordinator = ToolResponseCoordinator(
             (
                 HostExecutionRelay(
@@ -2027,7 +2086,7 @@ async def run_talk_session(
                     ),
                 )
                 if host_execution_attachment is not None
-                else relay
+                else delegated_relay if delegated_relay is not None else relay
             ),
             send_outgoing,
             max_pending=TOOL_SESSION_QUEUE_SIZE,
@@ -2035,7 +2094,7 @@ async def run_talk_session(
         )
 
         async def receive_events() -> None:
-            nonlocal continuation_pending, spoken_item
+            nonlocal continuation_pending, spoken_item, input_speaking
             async for event in session:
                 if isinstance(event, talk_realtime.SessionTerminated):
                     if event.state is talk_realtime.SessionState.FAILED:
@@ -2043,6 +2102,10 @@ async def run_talk_session(
                             event.detail or "provider session failed"
                         )
                     break
+                if isinstance(event, talk_realtime.SpeechStarted):
+                    input_speaking = True
+                elif isinstance(event, talk_realtime.SpeechStopped):
+                    input_speaking = False
                 if authorization_ledger is not None:
                     if isinstance(event, talk_realtime.SpeechStarted):
                         authorization_ledger.note_speech_started(
@@ -2220,7 +2283,7 @@ async def run_talk_session(
         loop = asyncio.get_running_loop()
         # Snapshot ownership once for this session. Older Hermes builds do not
         # expose the property; None suppresses announcements instead of guessing.
-        owner_session_id = _active_parent_session_id()
+        owner_session_id = None if delegated_binding is not None else _active_parent_session_id()
         talk_lifecycle.attach_session(loop, on_subagent_event, owner_session_id)
         # Progress milestones (hermes-talk#33) share the target and the owner
         # gate: the hook registrations are process-scoped, so attach is what
@@ -2228,7 +2291,8 @@ async def run_talk_session(
         talk_progress.attach_session(loop, on_subagent_event, owner_session_id)
         # The approval bridge shares the loop; its prompts are gated by the
         # bridge itself (nothing announces while detached).
-        talk_approvals.attach_session(loop, on_approval_event)
+        if delegated_binding is None:
+            talk_approvals.attach_session(loop, on_approval_event)
         # This connection's own identity (hermes-talk#35), minted BEFORE any
         # tool can dispatch work. Independent of whether a Hermes ctx happens
         # to be bound, so tier-2/3 work has an exact destination off tier 1
@@ -2262,12 +2326,13 @@ async def run_talk_session(
         # as undelivered — its claimant died with its process — and the
         # duplication window is bounded to a crash between the wire hand-off
         # and the flip (see QueuedAnnouncement).
-        for orphaned in talk_runs.list_undelivered_for_session(
+        for orphaned in ([] if delegated_binding is not None
+                         else talk_runs.list_undelivered_for_session(
             owner_session_id,
             operator=auth.source,
             profile=talk_profile,
             claimant=talk_session_id,
-        ):
+        )):
             try:
                 orphan_id = int(orphaned["runId"])
             except (KeyError, TypeError, ValueError):
@@ -2289,6 +2354,10 @@ async def run_talk_session(
             lambda sid: loop.call_soon_threadsafe(on_note_landed, sid)
         )
 
+        if delegated_relay is not None:
+            watchers.append(asyncio.create_task(delegated_relay.watch(
+                announce_queue, _announcement_commands, send_outgoing,
+            )))
         sender = asyncio.create_task(send_microphone())
         pump = asyncio.create_task(
             pump_announcements(
@@ -2301,6 +2370,7 @@ async def run_talk_session(
                     or continuation_pending
                     or bool(tool_coordinator.outputs)
                     or speaker_busy()
+                    or input_speaking
                 ),
                 lambda waited: on_error(
                     f"an update has been waiting {waited:.0f}s for a safe opening"
@@ -2337,6 +2407,8 @@ async def run_talk_session(
                 raise TimeoutError("tool cleanup exceeded its bound")
             await drain
         finally:
+            if delegated_relay is not None:
+                delegated_relay.closed = True
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
             talk_progress.detach_session()

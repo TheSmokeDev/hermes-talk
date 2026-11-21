@@ -105,6 +105,11 @@ Talk answers in the room everyone can hear; `/talk leave` ends it. Mutating
 tools stay denied until you set `TALK_DISCORD_OPERATOR_USER_IDS`.
 → [Discord voice](docs/OPERATING.md#discord-voice--talking-in-the-channel-hermes-is-already-in)
 
+Opt-in on hosts with plugin message submission: [same-chat delegated voice](docs/delegated-discord.md)
+(`/talk delegate join`) keeps the voice call responsive while Hermes works in that text chat.
+The experimental [hybrid mode](docs/hybrid-discord.md) (`/talk hybrid join`) adds
+direct host tools, native background children, and controls for observed work.
+
 **Dashboard** — browser audio, no local mic drivers:
 
 ```bash

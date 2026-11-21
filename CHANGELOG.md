@@ -13,6 +13,17 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Added
+- Experimental `/talk hybrid join` combines short host tool operations with native
+  background delegation in the current Discord conversation. Exact submitted turns
+  and native children have separate controls; background launch refuses inline
+  fallback. Requires the complementary host APIs; see `docs/hybrid-discord.md`.
+  Contributed by @tancou.
+- Opt-in `/talk delegate join` submits work to the current Discord conversation
+  through the host's durable plugin submission API, keeps voice available, and
+  brings exact turn results and background delegation updates into the call.
+  Requires a compatible host and `/voice off`; ordinary `/talk join` is unchanged.
+
 ## [0.24.0] — 2026-11-21
 
 A big community release. Talk gets a one-button panel in Hermes Desktop and the
