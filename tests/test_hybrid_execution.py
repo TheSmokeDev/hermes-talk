@@ -2,8 +2,11 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import talk_delegated
 import talk_hybrid
@@ -129,3 +132,33 @@ def test_raw_or_unsupported_delegation_cannot_fall_back_inline():
     ]
     assert "delegate_task" not in names
     assert {"delegate_work", "delegation_control", "terminal"} <= set(names)
+
+
+@pytest.mark.parametrize("operation", ["terminal", "control_task"])
+def test_hybrid_host_waiters_do_not_occupy_the_gateway_storage_worker(operation):
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+
+        async def storage():
+            return await asyncio.to_thread(lambda: {"ok": True, "status": "terminal"})
+
+        def host(*_args, **_kwargs):
+            return asyncio.run_coroutine_threadsafe(storage(), loop).result(timeout=3)
+
+        voice = make_relay(host)
+        voice.binding.ctx.control_submission = host
+        voice.requests["known"] = "Existing parent turn"
+        voice.observed["known"] = {
+            "controls": ["interrupt"], "authority_epoch": 1, "execution_generation": 2,
+        }
+        arguments = (
+            {"command": "pwd"} if operation == "terminal"
+            else {"request_id": "known", "action": "interrupt"}
+        )
+        try:
+            assert result(await voice.handle_tool_call_async(call(operation, arguments)))["ok"]
+        finally:
+            voice.close()
+
+    asyncio.run(run())

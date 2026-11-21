@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,16 +58,20 @@ def test_hybrid_session_loads_catalog_and_dispatches_only_joining_speaker(
     fake, audio = ProviderUntilToolsFinish(), Audio()
     audio.discord_speaker_authorization = True
     catalog_reads, executions = [], []
+    owner_loop = None
 
-    def catalog(**identity):
-        catalog_reads.append(identity)
-        return {
+    async def stored_catalog():
+        return await asyncio.to_thread(lambda: {
             "ok": True,
             "tools": [
                 {"name": name, "description": "A host tool.", "parameters": {"type": "object"}}
                 for name in ("terminal", "delegate_task")
             ],
-        }
+        })
+
+    def catalog(**identity):
+        catalog_reads.append(identity)
+        return asyncio.run_coroutine_threadsafe(stored_catalog(), owner_loop).result(timeout=3)
 
     def execute(**request):
         executions.append(request)
@@ -108,14 +113,18 @@ def test_hybrid_session_loads_catalog_and_dispatches_only_joining_speaker(
     monkeypatch.setattr(talk_operator_auth, "DiscordToolAuthorizationLedger", ledger_for_session)
     monkeypatch.setattr(talk_delegated.ConversationTail, "read", lambda _tail: [])
     ctx = SimpleNamespace(conversation_tools=catalog, execute_tools=execute)
-    result = asyncio.run(
-        talk_cli.run_talk_session(
+    async def run():
+        nonlocal owner_loop
+        owner_loop = asyncio.get_running_loop()
+        owner_loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        return await talk_cli.run_talk_session(
             audio=audio,
             session_factory=lambda _auth: fake,
             delegated_binding=binding(ctx),
             lane="discord",
         )
-    )
+
+    result = asyncio.run(run())
     assert result == 0 and fake.closed and audio.stopped
     assert catalog_reads == [{"session_key": "discord:room", "expected_session_id": "conversation"}]
     assert {tool.name for tool in fake.setup.tools} >= {

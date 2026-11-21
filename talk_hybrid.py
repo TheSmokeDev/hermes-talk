@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 
@@ -100,7 +99,7 @@ class HybridRelay(talk_delegated.SubmissionRelay):
 
     async def status(self, request_id):
         if request_id in self.direct_requests:
-            receipt = await asyncio.to_thread(
+            receipt = await self.host_call(
                 self.binding.ctx.execute_tools,
                 **self.direct_requests[request_id],
             )
@@ -164,7 +163,7 @@ class HybridRelay(talk_delegated.SubmissionRelay):
                     "status": "unknown",
                     "error": "control_outcome_unknown",
                 }
-                result = await asyncio.to_thread(
+                result = await self.host_call(
                     self.binding.ctx.control_submission,
                     action,
                     **self.identity(request_id),
