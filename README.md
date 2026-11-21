@@ -196,6 +196,15 @@ What you would want to know before installing (catalog rule 13):
 - **Network:** your voice and the conversation context go to the provider you
   select — OpenAI (`api.openai.com`, and `chatgpt.com` for subscription calls),
   xAI, Google, and optionally ElevenLabs for cascade speech.
+- **Optional network surfaces, all off by default:** Phone mode calls your own
+  Dograh account and its carrier; `TALK_PROVIDER=local` connects to a
+  self-hosted Realtime server you name (plain `ws://` only on loopback);
+  `TALK_CASCADE_TTS=openai` sends reply text to the OpenAI-compatible speech
+  server you name (plain `http://` only on loopback); `hermes talk echo HOST`
+  streams audio to and from an Echo running hassmic on your LAN, only while the
+  command runs; `python -m talk_twilio_server` is a separate process you start
+  yourself, which answers your Twilio number with Gemini Live behind signature
+  checks and a caller allowlist. Discord auto-join uses the profile's own bot.
 - **Credentials:** API keys are read through Hermes's profile-scoped secret
   route. The ChatGPT subscription is used only through Hermes-signed requests
   (`requires_auth: [openai-codex]`) or the Codex CLI's own login; Talk never
@@ -210,7 +219,9 @@ What you would want to know before installing (catalog rule 13):
   replies only `skip`, and cannot run tools.
 - **Work on your behalf:** spoken requests are handed to your Hermes agent,
   whose tools can run shell commands under Hermes's own approvals.
-- **Local data:** run history and voice-session state under Hermes's home. No
+- **Local data:** run history and voice-session state under Hermes's home. The
+  optional call journal (`TALK_CALL_JOURNAL=1`, off by default) keeps text-only
+  call records there, kept 30 days unless you set `TALK_CALL_JOURNAL_DAYS`. No
   telemetry.
 
 ## Surfaces
