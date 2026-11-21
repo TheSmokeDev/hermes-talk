@@ -883,3 +883,28 @@ def test_terminal_routing_without_gateway_module(plugin, monkeypatch):
     monkeypatch.setattr(plugin.talk_cli, "cli_entry", lambda **kw: 0)
     assert plugin._talk_command("") == "Voice session ended."
     assert "terminal" in plugin._talk_command("join")
+
+
+def test_hybrid_join_captures_authority_before_gateway_handoff(plugin, monkeypatch, tmp_path):
+    source = types.SimpleNamespace(user_id="33", chat_id="22", scope_id="11")
+    ctx = types.SimpleNamespace(**{name: lambda **kw: None for name in (
+        "submit_message", "submission_status", "control_submission",
+        "conversation_tools", "execute_tools",
+    )})
+    monkeypatch.setattr(plugin.talk_host, "get_ctx", lambda: ctx)
+    monkeypatch.setitem(sys.modules, "persistence_assembly", types.SimpleNamespace(
+        profile_scope=lambda: types.SimpleNamespace(profile_dir=tmp_path),
+    ))
+    captured = []
+    monkeypatch.setattr(plugin.talk_discord, "start_session", lambda **kw: (
+        captured.append(kw) or "starting"
+    ))
+    pending = plugin._talk_command(
+        "hybrid join", source=source, session_id="session", session_key="route", platform="discord",
+    )
+    source.user_id = "99"
+    assert asyncio.run(pending) == "starting"
+    binding = captured[0]["delegated_binding"]
+    assert binding.hybrid and binding.ctx is ctx and binding.profile_dir == tmp_path
+    assert binding.user_id == "33" and captured[0]["guild_id"] == 11
+    assert (binding.session_key, binding.session_id) == ("route", "session")

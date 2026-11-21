@@ -171,7 +171,8 @@ def _register_talk_command(ctx) -> None:
             "hosts with the core voice contract, core join"
         ),
         "args_hint": (
-            "[join [TARGET [PEER PROFILE]]|delegate join|select TARGET|return|reconnect|"
+            "[join [TARGET [PEER PROFILE]]|delegate join|hybrid join|"
+            "select TARGET|return|reconnect|"
             "say TEXT|pause|resume|leave|status]"
         ),
     }
@@ -203,11 +204,12 @@ def _talk_command(
 
     raw = (raw_args or "").strip()
     sub = raw.lower()
-    if sub == "delegate join" and _delegated_binding is None:
+    if sub in {"delegate join", "hybrid join"} and _delegated_binding is None:
         try:
             from .talk_delegated import Binding
             _delegated_binding = Binding.capture(
                 talk_host.get_ctx(), source, session_key, session_id, platform,
+                hybrid=sub == "hybrid join",
             )
         except (ImportError, ValueError) as exc:
             return str(exc)
@@ -230,7 +232,10 @@ def _talk_command(
                 raw_args, invocation, source=source, session_id=session_id,
                 session_key=session_key, platform=platform, _delegated_binding=_delegated_binding,
             )
-        if sub in {"join", "delegate join", "core join", "pause", "resume", "leave", "status"}:
+        if sub in {
+            "join", "delegate join", "hybrid join", "core join",
+            "pause", "resume", "leave", "status",
+        }:
             return (
                 "Those are for the gateway's Discord voice channel. Here in a "
                 "terminal, plain `/talk` starts the call; the standalone "
@@ -247,7 +252,7 @@ def _talk_command(
             else ("Voice session ended with errors — see stderr.")
         )
 
-    if sub == "delegate join":
+    if sub in {"delegate join", "hybrid join"}:
         binding = _delegated_binding
         return talk_discord.start_session(guild_id=binding.guild_id, delegated_binding=binding)
     delegated = talk_discord.delegated_session_binding()
