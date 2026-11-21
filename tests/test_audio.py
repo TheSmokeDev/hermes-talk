@@ -43,6 +43,16 @@ def test_headless_portaudio_failure_is_a_talk_audio_error(headless_sounddevice):
     assert talk_audio.audio_available() is False
 
 
+def test_other_sounddevice_load_failures_are_not_called_headless(tmp_path, monkeypatch):
+    (tmp_path / "sounddevice.py").write_text("raise ValueError('numpy ABI mismatch')\n")
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(talk_audio.TalkAudioError, match="ValueError") as caught:
+        talk_audio.import_sounddevice()
+    assert not isinstance(caught.value, talk_audio.TalkAudioDeviceError)
+
+
 def test_audio_availability_only_requires_sounddevice(monkeypatch):
     monkeypatch.setattr(talk_audio, "import_sounddevice", lambda: object())
 
@@ -392,7 +402,13 @@ def test_echo_gate_hold_reads_env_first_then_the_saved_setting(monkeypatch):
         monkeypatch.setenv("TALK_ECHO_GATE_HOLD_MS", junk)
         assert talk_audio.DuplexAudio()._echo_gate_hold_s == 0
 
+    monkeypatch.setenv("TALK_ECHO_GATE_HOLD_MS", "70000")  # a typo is bounded
+    assert talk_audio.DuplexAudio()._echo_gate_hold_s == pytest.approx(5.0)
+
     monkeypatch.delenv("TALK_ECHO_GATE_HOLD_MS")
+    huge = {"echo_gate_hold_ms": 10**400}
+    monkeypatch.setattr(talk_audio.talk_config, "plugin_setting", huge.get)
+    assert talk_audio.DuplexAudio()._echo_gate_hold_s == 0
     monkeypatch.setattr(talk_audio.talk_config, "plugin_setting", {"echo_gate_hold_ms": True}.get)
     assert talk_audio.DuplexAudio()._echo_gate_hold_s == 0
 

@@ -67,6 +67,8 @@ OUTPUT_ECHO_RATIO = 0.65
 #: little longer there or the tail of its own speech reaches the provider as
 #: the operator talking (hermes-talk#228).
 ECHO_GATE_HOLD_MS = 0.0
+#: Upper bound: a typo (70000 for 700) must not hold the gate for a minute.
+MAX_ECHO_GATE_HOLD_MS = 5_000.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -102,14 +104,15 @@ def _echo_gate_hold_s() -> float:
     """
 
     if (talk_config._talk_env_get("TALK_ECHO_GATE_HOLD_MS") or "").strip():
-        return _env_float("TALK_ECHO_GATE_HOLD_MS", ECHO_GATE_HOLD_MS) / 1000.0
-    try:
-        saved = talk_config.plugin_setting("echo_gate_hold_ms")
-    except Exception:  # noqa: BLE001 - an unreadable config must not cost the call its audio
-        saved = None
-    if isinstance(saved, (int, float)) and not isinstance(saved, bool) and saved > 0:
-        return float(saved) / 1000.0
-    return ECHO_GATE_HOLD_MS / 1000.0
+        hold_ms = _env_float("TALK_ECHO_GATE_HOLD_MS", ECHO_GATE_HOLD_MS)
+    else:
+        try:
+            saved = talk_config.plugin_setting("echo_gate_hold_ms")
+            valid = isinstance(saved, (int, float)) and not isinstance(saved, bool)
+            hold_ms = float(saved) if valid and saved > 0 else ECHO_GATE_HOLD_MS
+        except Exception:  # noqa: BLE001 - an unreadable setting must not cost the call its audio
+            hold_ms = ECHO_GATE_HOLD_MS
+    return min(hold_ms, MAX_ECHO_GATE_HOLD_MS) / 1000.0
 
 
 _INSTALL_HINT = (
@@ -144,7 +147,9 @@ def import_sounddevice():
         # (a headless host) it raises PortAudioError, which is neither of the
         # two above and would otherwise escape doctor/check as a traceback.
         # It cannot be named here: the class only exists once this import works.
-        raise TalkAudioDeviceError(f"{_NO_DEVICE_HINT} ({exc})") from exc
+        if type(exc).__name__ == "PortAudioError":
+            raise TalkAudioDeviceError(f"{_NO_DEVICE_HINT} ({exc})") from exc
+        raise TalkAudioError(f"sounddevice failed to load ({type(exc).__name__}: {exc})") from exc
     return sd
 
 

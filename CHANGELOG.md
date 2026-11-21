@@ -129,7 +129,8 @@ named rather than smoothed.
   terminal and Discord Realtime lanes stopped speaking the once-a-minute
   "still working" heartbeat, the "accepted" milestone that repeated the start
   receipt, and an `executing` milestone with no real step label; approval
-  waits, labelled steps, results and errors are still spoken, and `check_work`
+  waits, a step whose label is known when it starts, results and errors are
+  still spoken, and `check_work`
   still answers "how's it going?". On GPT-Live, a delegation the model makes
   without new operator speech is now answered as reference context instead of
   a line to speak, so retries while work is pending stop turning into "still
