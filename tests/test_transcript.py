@@ -678,6 +678,52 @@ def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, 
     assert talk_transcript.handoff_status()["state"] == "handoff pending"
 
 
+def test_detached_review_child_cannot_reclaim_an_abandoned_transcript(
+    tmp_path, monkeypatch, flush_lanes,
+):
+    import talk_host
+
+    _finished_capture(tmp_path, "prior owner exited")
+    root = tmp_path / "state" / "talk-transcripts"
+    original = next(root.glob("*.jsonl"))
+    claim = original.with_name(f"{original.name}.claimed-1000-dead")
+    original.rename(claim)
+
+    marker = "TALK_TRANSCRIPT_REVIEW_CHILD"
+    monkeypatch.delenv(marker, raising=False)
+    monkeypatch.setenv("TALK_TEST_PARENT_ENV", "preserved")
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: "fixture-hermes")
+    reentered = []
+    inherited = []
+
+    class Review:
+        returncode = 0
+
+        def communicate(self, *, timeout):
+            return "reviewed", ""
+
+    def launch_review(_argv, **kwargs):
+        child_env = kwargs.get("env", os.environ)
+        inherited.append(child_env["TALK_TEST_PARENT_ENV"])
+        with monkeypatch.context() as child:
+            if marker in child_env:
+                child.setenv(marker, child_env[marker])
+            talk_transcript.sweep_transcripts(tmp_path, run_agent=reentered.append)
+        return Review()
+
+    monkeypatch.setattr(talk_host.subprocess, "Popen", launch_review)
+
+    assert talk_host.host().flush_agent("review existing memory").startswith("FLUSH_DONE")
+    assert inherited == ["preserved"]
+    assert not reentered
+    assert claim.is_file()
+    assert marker not in os.environ
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=reentered.append)
+    assert len(reentered) == 1
+    assert not claim.exists()
+
+
 def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
     tmp_path, monkeypatch, flush_lanes
 ):

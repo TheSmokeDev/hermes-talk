@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -1241,6 +1242,7 @@ class HostAdapter:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env={**os.environ, talk_transcript.REVIEW_CHILD_ENV: "1"},
                 )
             except Exception as exc:  # noqa: BLE001 — a spawn failure is a failure
                 return f"I couldn't finish that work — {type(exc).__name__}: {exc}"
