@@ -85,11 +85,13 @@ named rather than smoothed.
   Contributed by Kiven (@abaichuan1017).
 - Discord playback pads the last partial frame when native provider output ends,
   preserving response boundaries even with a full queue so queued announcements
-  can resume after playback drains. Canonical native and Live output also signal
-  completion; interrupted audio is discarded. A finished background result is
-  no longer held back for a safe opening that never came. Cascade replies end
-  when their ElevenLabs stream settles. Contributed by @tancou in #218; thanks
-  to @rmccaincns for reporting #239.
+  can resume after playback drains. Canonical native output, and Live sessions
+  that report output turns, also signal completion; interrupted audio is
+  discarded. Cascade replies end when their ElevenLabs stream settles, and a
+  fragment with no end marker at all (GPT-Live) plays after about 200 ms of
+  silence. A finished background result is no longer held back for a safe
+  opening that never came. Contributed by @tancou in #218; thanks to
+  @rmccaincns for reporting #239.
 - API-server runs reported as `failed`, `cancelled`, or `interrupted` now
   remain failures in Talk's registry and completion announcements. Memory
   handoffs use the same typed outcome instead of interpreting answer text;

@@ -85,6 +85,34 @@ def test_live_discord_output_completion_flushes_partial_audio_after_interruption
     asyncio.run(scenario())
 
 
+def test_gpt_live_discord_tail_plays_and_opens_the_quiet_gate_without_a_turn_event():
+    """GPT-Live's decoder emits audio but no output-turn event (#239 on Live)."""
+
+    async def scenario():
+        h = await connected()
+        audio = talk_discord.DiscordAudio()
+        audio._source = talk_discord._RealtimeSource(audio._outbound)
+        h.controller.audio = audio
+        try:
+            assert not getattr(h.session, "emits_output_lifecycle", False)
+            pcm = b"\x01\x00" * 5
+            await h.controller.handle(rt.OutputAudio(pcm))
+            for _ in range(talk_discord.HELD_FRAGMENT_UNDERRUNS):
+                assert audio._source.read() == talk_discord.SILENCE_FRAME
+            await h.controller.tick()
+            assert h.controller.provider_response_active  # its tail is unplayed
+            assert not h.controller._quiet()
+            expected, _ = talk_discord.session_to_discord(pcm)
+            assert audio._source.read() == expected + bytes(3840 - len(expected))
+            await h.controller.tick()
+            assert not h.controller.provider_response_active
+            assert h.controller._quiet()
+        finally:
+            await close(h)
+
+    asyncio.run(scenario())
+
+
 def test_partial_live_transcripts_keep_wire_finality_and_original_source_text():
     async def scenario():
         h = await connected()

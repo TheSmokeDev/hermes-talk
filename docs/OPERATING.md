@@ -852,11 +852,14 @@ mutating tool is denied.
 Native Discord replies finish on a 20 ms playback frame: when provider output
 ends, Talk pads any final partial frame with silence. The response boundary is
 preserved even when the playback queue is full, and queued announcements can
-resume once the admitted audio drains. Canonical native and Live sessions use
-their output-completion events too. Barge-in discards pending audio and its
-boundary. Cascade TTS runs asynchronously: the provider's text-completion event
-does not signal that its audio has finished, so a cascade reply ends when its
-ElevenLabs stream settles instead.
+resume once the admitted audio drains. Canonical native sessions, and Live
+sessions whose provider reports output turns, use their output-completion events
+too. Barge-in discards pending audio and its boundary. Cascade TTS runs
+asynchronously: the provider's text-completion event does not signal that its
+audio has finished, so a cascade reply ends when its ElevenLabs stream settles
+instead. A partial frame whose reply sends no end marker at all (GPT-Live does
+not report output turns) plays after ten silent 20 ms reads, about 200 ms, so
+it cannot hold announcements back.
 
 We do **not** open a second Discord connection. Hermes already has one,
 already decrypts DAVE, and already decodes Opus in this process — we

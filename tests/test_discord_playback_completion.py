@@ -5,6 +5,7 @@ import types
 
 import fake_realtime as fr
 import pytest
+import wallclock
 from test_discord import _wired_host
 from test_fake_provider_session import (
     AnnouncementAnsweringProvider,
@@ -22,10 +23,8 @@ FRAME = talk_discord.DISCORD_FRAME_BYTES
 
 
 def _finish(audio):
-    # Also runnable on main to expose the retained PCM, before the new hook exists.
-    finish = getattr(audio, "finish_playback", None)
-    if finish is not None:
-        finish()
+    # Called directly so a renamed or removed hook fails here, not vacuously.
+    audio.finish_playback()
 
 
 def _audio(capacity=2):
@@ -120,6 +119,46 @@ def test_unfinished_response_retains_partial_frame_until_its_own_boundary():
     assert not audio.playback_pending
 
 
+HELD = talk_discord.HELD_FRAGMENT_UNDERRUNS
+
+
+def test_fragment_without_an_end_marker_plays_after_a_bounded_stall():
+    # GPT-Live sends no output-turn event, so no end marker ever arrives.
+    audio = _audio()
+    audio._outbound.put_nowait(b"a" * 20)
+    for _ in range(HELD):  # the read that takes it, then HELD - 1 underruns
+        assert audio._source.read() == talk_discord.SILENCE_FRAME
+        assert audio.playback_pending
+    assert audio._source.read() == b"a" * 20 + bytes(FRAME - 20)
+    assert not audio.playback_pending
+    assert audio._source.read() == talk_discord.SILENCE_FRAME
+
+
+def test_arriving_audio_restarts_the_stall_bound():
+    audio = _audio()
+    audio._outbound.put_nowait(b"a" * 20)
+    for _ in range(HELD):
+        assert audio._source.read() == talk_discord.SILENCE_FRAME
+    audio._outbound.put_nowait(b"b" * 20)  # the reply is still arriving
+    for _ in range(HELD):
+        assert audio._source.read() == talk_discord.SILENCE_FRAME
+        assert audio.playback_pending
+    assert audio._source.read() == b"a" * 20 + b"b" * 20 + bytes(FRAME - 40)
+    assert not audio.playback_pending
+
+
+def test_barge_in_resets_the_stall_bound():
+    audio = _audio()
+    audio._outbound.put_nowait(b"a" * 20)
+    for _ in range(HELD):
+        assert audio._source.read() == talk_discord.SILENCE_FRAME
+    audio.drain_playback()
+    audio._outbound.put_nowait(b"b" * 20)
+    for _ in range(HELD):
+        assert audio._source.read() == talk_discord.SILENCE_FRAME
+    assert audio._source.read() == b"b" * 20 + bytes(FRAME - 20)
+
+
 def test_cleanup_clears_a_boundary_held_with_multi_frame_audio():
     audio = _audio()
     audio._outbound.put_nowait(b"a" * (FRAME + 20))
@@ -169,7 +208,7 @@ def test_final_fragment_releases_a_deferred_announcement(monkeypatch):
             await asyncio.sleep(0)
             assert not sent.is_set()
             assert audio._source.read() == b"a" * 20 + bytes(FRAME - 20)
-            await asyncio.wait_for(sent.wait(), 1)
+            await asyncio.wait_for(sent.wait(), wallclock.stretch(1))
         finally:
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
@@ -273,7 +312,7 @@ def test_owed_result_is_announced_once_after_the_final_partial_frame_plays(
             )
         )
         try:
-            await asyncio.wait_for(fake.reply_handled.wait(), 3)
+            await asyncio.wait_for(fake.reply_handled.wait(), wallclock.stretch(3))
             source = vc.playing
             for _ in range(20):
                 await asyncio.sleep(0)
@@ -284,7 +323,7 @@ def test_owed_result_is_announced_once_after_the_final_partial_frame_plays(
             converted, _ = talk_discord.session_to_discord(pcm)
             assert source.read() == converted + bytes(FRAME - len(converted))
             assert not audio.playback_pending
-            assert await asyncio.wait_for(session, 6) == 0
+            assert await asyncio.wait_for(session, wallclock.stretch(6)) == 0
         finally:
             if not session.done():
                 session.cancel()

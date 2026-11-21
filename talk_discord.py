@@ -64,6 +64,13 @@ DISCORD_FRAME_BYTES = 3_840
 #: for good with no error anywhere.
 SILENCE_FRAME = b"\x00" * DISCORD_FRAME_BYTES
 
+#: Underrun reads (20 ms each) a partial frame may wait for its reply's end
+#: marker before it is padded and played anyway. Some lanes never send that
+#: marker (GPT-Live has no output-turn event), and a held fragment keeps
+#: ``playback_pending`` true, which starves announcements (#239). A stall
+#: this long is already an audible gap, so playing the fragment costs nothing.
+HELD_FRAGMENT_UNDERRUNS = 10
+
 #: One 20 ms frame of the session's own format (24 kHz mono s16le), and the
 #: silence we synthesize when Discord goes quiet.
 SESSION_FRAME_MS = 20
@@ -388,6 +395,7 @@ class _RealtimeSource:
         self._frames = frames
         self._carry = bytearray()
         self._response_finished = False
+        self._held_underruns = 0
         # read() runs on the host's player thread; cleanup() runs on the
         # event loop during barge-in — which is exactly when both fire at
         # once. An unguarded bytearray tears there, and an exception inside
@@ -415,16 +423,26 @@ class _RealtimeSource:
             self.discard_pending()
             return SILENCE_FRAME
         with self._carry_lock:
+            took_audio = False
             while len(self._carry) < DISCORD_FRAME_BYTES and not self._response_finished:
                 try:
                     chunk = self._frames.get_nowait()
                 except queue.Empty:
                     break
+                took_audio = took_audio or bool(chunk)
                 self._carry += chunk
                 self._response_finished = isinstance(chunk, _FinalAudio) or not chunk
-            if self._response_finished and 0 < len(self._carry) < DISCORD_FRAME_BYTES:
+            partial = 0 < len(self._carry) < DISCORD_FRAME_BYTES
+            if partial and not self._response_finished:
+                # No end marker yet. Count reads that brought nothing new; past
+                # the bound, play the fragment rather than hold it forever.
+                self._held_underruns = 0 if took_audio else self._held_underruns + 1
+            if partial and (
+                self._response_finished or self._held_underruns >= HELD_FRAGMENT_UNDERRUNS
+            ):
                 self._carry.extend(bytes(DISCORD_FRAME_BYTES - len(self._carry)))
             if len(self._carry) >= DISCORD_FRAME_BYTES:
+                self._held_underruns = 0
                 frame = bytes(self._carry[:DISCORD_FRAME_BYTES])
                 del self._carry[:DISCORD_FRAME_BYTES]
                 if not self._carry:
@@ -445,12 +463,14 @@ class _RealtimeSource:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
             self._response_finished = False
+            self._held_underruns = 0
 
     def discard_pending(self) -> None:
         with self._carry_lock:
             self._discarded_bytes += len(self._carry)
             self._carry.clear()
             self._response_finished = False
+            self._held_underruns = 0
             while True:
                 try:
                     self._discarded_bytes += len(self._frames.get_nowait())
