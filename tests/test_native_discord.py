@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import queue
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -93,6 +95,36 @@ def test_only_immutable_operator_pcm_and_transport_silence_are_admitted(room):
     assert (
         room.audio.admit_native_packet(talk_discord.InputAudioPacket(pcm=pcm, speaker=None)) is None
     )
+
+
+def test_guard_reads_the_binding_profile_on_host_threads(room, monkeypatch):
+    """On a multiplexed gateway the guard also runs on the host's player and
+    receiver threads, which carry no profile scope. It must still read the
+    operator list of the profile that bound the room, not revoke the audio."""
+
+    secrets = contextvars.ContextVar("test_profile_secrets", default=None)
+
+    def get_secret(name, default=None):
+        bound = secrets.get()
+        if bound is None:
+            raise RuntimeError(f"no profile scope for {name}")
+        return bound.get(name, default)
+
+    monkeypatch.setattr(talk_discord.talk_config, "_hermes_get_secret", get_secret)
+
+    def bind():
+        secrets.set({"TALK_DISCORD_OPERATOR_USER_IDS": "101"})
+        return room.audio.bind_native_surface(room.proof)
+
+    guard = contextvars.copy_context().run(bind)
+    seen = []
+    host_threads = [threading.Thread(target=lambda: seen.append(guard())) for _ in range(2)]
+    for thread in host_threads:
+        thread.start()
+    for thread in host_threads:
+        thread.join(5)
+    assert seen == [True, True]
+    assert room.audio._source.authorize_playback is guard
 
 
 @pytest.mark.parametrize("mutation", ["member", "channel", "operator", "bridge", "disconnected"])

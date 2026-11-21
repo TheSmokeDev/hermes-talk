@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import shlex
 
 try:
@@ -238,7 +237,7 @@ def _talk_command(raw_args: str = "", invocation=None) -> str:
     requested = raw.split(maxsplit=1)[0].lower() if raw else "join"
     explicit_target = requested == "join" and len(raw.split(maxsplit=1)) > 1
     native_join = requested == "join" and (
-        explicit_target or os.environ.get("TALK_TASK_TARGET")
+        explicit_target or talk_config._talk_env_get("TALK_TASK_TARGET")
         or talk_config.voice_mode() == "live"
     )
     if canonical or native_join or requested in {
@@ -314,7 +313,8 @@ def _canonical_discord_command(raw, invocation):
         profile = arguments[2] if len(arguments) == 3 else context.get("profile", "default")
         task = {
             "target_id": (arguments[0] if arguments else
-                          os.environ.get("TALK_TASK_TARGET") or context["anchor_session_id"]),
+                          talk_config._talk_env_get("TALK_TASK_TARGET")
+                          or context["anchor_session_id"]),
             "peer_id": peer, "profile": profile,
             "tab_id": "discord-" + "-".join(str(value) for value in identifiers.values()),
             "surface_context": {

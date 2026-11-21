@@ -48,6 +48,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import copy_context
 from typing import Any
 
 try:
@@ -733,9 +734,10 @@ def start_run(
         # Evict AFTER inserting so the cap holds for the registry as it now
         # stands; the entry just added is running, so it is never a candidate.
         _evict_locked()
+    context = copy_context()
     thread = threading.Thread(
-        target=_run_worker,
-        args=(run_id, worker),
+        target=context.run,
+        args=(_run_worker, run_id, worker),
         name=f"talk-run-{kind}-{run_id}",
         daemon=True,
     )

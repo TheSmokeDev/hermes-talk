@@ -694,6 +694,17 @@ endpoint's named key takes precedence over `data`, even when empty; otherwise
 a `data` list is used. Entries that are not objects are ignored. Unrecognized
 response shapes remain errors, rather than reporting an empty catalog.
 
+In-process registry discovery waits at most `TALK_API_SERVER_PROBE_TIMEOUT_S`
+before falling through to the API-server catalog. This also bounds the
+background-refresh path. A timed-out registry read continues on one daemon
+worker; repeated probes share that pending read rather than spawning more
+workers while it is stuck. When it finishes, the next probe takes its result
+(if younger than `TALK_CAPABILITY_CATALOG_TTL_S`) and starts the following
+read, so a host that is always slower than the budget still answers from the
+in-process tier. Reads are kept per profile (per resolved Hermes home): on a
+multiplexed gateway one profile's stuck read never blocks or answers another,
+and each read runs in its caller's profile context.
+
 | Variable | Default | Effect / failure mode |
 |---|---|---|
 | `TALK_CAPABILITY_CATALOG_TTL_S` | `30.0` | How long a resolved `talk_capabilities` snapshot (skills, toolsets, capabilities, health) is trusted before a background refresh, whichever source answered it. Junk or ≤0 silently takes the default. |

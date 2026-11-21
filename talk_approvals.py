@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -137,7 +138,8 @@ def _spawn_daemon(fn, *args, name: str = "talk-approval") -> None:
     """Fire-and-forget worker. Daemon by design: a deny POST still in flight
     at hangup must never stall process exit."""
 
-    threading.Thread(target=fn, args=args, daemon=True, name=name).start()
+    context = copy_context()
+    threading.Thread(target=context.run, args=(fn, *args), daemon=True, name=name).start()
 
 
 def attach_session(loop: Any, callback: Any) -> None:
@@ -342,8 +344,9 @@ def note_prompt_sent(run_id: int) -> None:
             # can land after the operator already spoke). Record the send;
             # arm nothing — _reopen restores the floor if the answer fails.
             return
+        context = copy_context()
         timer = threading.Timer(
-            talk_config.approval_prompt_timeout_s(), _expire, args=(run_id,)
+            talk_config.approval_prompt_timeout_s(), context.run, args=(_expire, run_id)
         )
         timer.daemon = True
         pending.timer = timer
@@ -385,8 +388,9 @@ def _reopen(run_id: int, pending: _PendingApproval) -> None:
             return
         current.resolving = False
         if current.opened and current.timer is None:
+            context = copy_context()
             timer = threading.Timer(
-                talk_config.approval_prompt_timeout_s(), _expire, args=(run_id,)
+                talk_config.approval_prompt_timeout_s(), context.run, args=(_expire, run_id)
             )
             timer.daemon = True
             current.timer = timer
@@ -639,8 +643,9 @@ def watch_run(run_id: int, api_run_id: str) -> None:
             with _LOCK:
                 _WATCHERS.discard(run_id)
 
+    context = copy_context()
     threading.Thread(
-        target=_reader, daemon=True, name=f"talk-approval-watch-{run_id}"
+        target=context.run, args=(_reader,), daemon=True, name=f"talk-approval-watch-{run_id}"
     ).start()
 
 
