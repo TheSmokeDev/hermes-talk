@@ -13,15 +13,19 @@ named rather than smoothed.
 
 ## [Unreleased]
 
-## [0.24.0] — 2026-11-17
+## [0.24.0] — 2026-11-21
 
-On a compatible Hermes host, say “Switch to my Codex chat and read its last
-reply,” then “Ask it to check mobile too.” The same flow works with Claude Code.
-The execution host must expose an authenticated recipient bridge. Reading
-requires chat history access, and sending requires a writable chat. See the
-[voice commands and host requirements](docs/recipient-routing.md). This release
-also carries the experimental settings, call journal, Echo surface and
-spoken-language knobs below.
+A big community release. Talk gets a one-button panel in Hermes Desktop and the
+dashboard, and a new **Experimental** section in its plugin settings, where
+community features ship off by default: Amazon Echo as a speaker and mic, a
+text-only call journal, voice language, a speaker echo hold, and a standalone
+Twilio phone server. Pressing Talk works exactly as before. On a compatible
+Hermes host, you can also say “Switch to my Codex chat and read its last
+reply,” then “Ask it to check mobile too.” This works with Claude Code too (see
+the [voice commands and host requirements](docs/recipient-routing.md)). The
+release also carries fixes for profile isolation on multiplexed gateways,
+Discord playback, honest run outcomes, the transcript review loop and Gemini
+tool calls. Thanks to everyone who contributed and reported issues.
 
 ### Added
 - `python -m talk_twilio_server` answers calls to your own Twilio number with
