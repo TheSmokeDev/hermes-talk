@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Same-chat delegated voice uses a dedicated worker pool for blocking host receipt
+  calls, leaving the gateway's workers available for admission storage. Session
+  cleanup does not wait for already-started calls or claim to cancel their work.
+  Contributed by @tancou.
+
 ### Added
 - Opt-in `/talk delegate join` submits work to the current Discord conversation
   through the host's durable plugin submission API, keeps voice available, and

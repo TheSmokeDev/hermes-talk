@@ -33,6 +33,11 @@ a new assistant message alone is not proof that a particular task finished.
 Announcements wait for speech and playback to become idle. Barge-in remains enabled.
 There is no new scheduler, resource locking, task cancellation or steering API.
 
+Blocking host receipt calls use a dedicated, bounded worker pool for each call.
+They do not occupy the gateway's default workers, which admission storage needs.
+Leaving Talk closes the pool without waiting on the gateway loop; an already-started
+host call may still commit, so leaving is not cancellation of submitted work.
+
 Limits: reset, compaction or rewritten delivered history requires leaving and
 rejoining. Receipts are bounded to 64 per voice call and are not adopted after a
 process restart; results remain in Discord. Interrupting an announcement can cut
