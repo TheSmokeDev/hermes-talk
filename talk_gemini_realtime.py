@@ -204,24 +204,13 @@ def _wire_model(model: str) -> str:
     return model if model.startswith("models/") else f"models/{model}"
 
 
-def _schema_wire(value: Any) -> Any:
-    """Uppercase JSON-Schema ``type`` names into the Live API's enum vocabulary."""
-
-    if isinstance(value, dict):
-        return {
-            key: item.upper() if key == "type" and isinstance(item, str) else _schema_wire(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_schema_wire(item) for item in value]
-    return value
-
-
 def _tool_wire(tool: rt.ToolDefinition) -> dict[str, Any]:
+    # Live's OpenAPI parameters cannot carry JSON Schema keywords such as
+    # additionalProperties. The JSON Schema field preserves those constraints.
     return {
         "name": tool.name,
         "description": tool.description,
-        "parameters": _schema_wire(dict(tool.parameters)),
+        "parametersJsonSchema": dict(tool.parameters),
     }
 
 

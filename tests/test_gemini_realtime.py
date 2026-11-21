@@ -167,6 +167,39 @@ def _b64(pcm: bytes) -> str:
 # -- setup message and connect ---------------------------------------------------
 
 
+def test_live_tools_keep_closed_and_nested_json_schemas():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "additionalProperties": {"type": "boolean"},
+            "records": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+        },
+        "required": ["records"],
+    }
+    setup = rt.SessionSetup(
+        model="gemini-live-test",
+        voice="Puck",
+        instructions="Use the requested tool.",
+        tools=(rt.ToolDefinition("read_records", "Read records", schema),),
+    )
+
+    tools = gemini_rt.build_setup_message(setup)["setup"]["tools"]
+    declaration = tools[0]["functionDeclarations"][0]
+
+    assert declaration == {
+        "name": "read_records",
+        "description": "Read records",
+        "parametersJsonSchema": schema,
+    }
+
+
 def test_connect_sends_setup_with_key_in_url_and_models_prefix():
     async def scenario():
         socket = _Socket()
@@ -197,17 +230,17 @@ def test_connect_sends_setup_with_key_in_url_and_models_prefix():
     # hard-cap near 15 minutes.
     assert setup["sessionResumption"] == {}
     assert setup["contextWindowCompression"] == {"slidingWindow": {}}
-    # Function-declaration schema types are UPPERCASE, recursively.
+    # Function declarations keep the neutral JSON schema unchanged.
     declarations = setup["tools"][0]["functionDeclarations"]
     assert declarations == [
         {
             "name": "search_memory",
             "description": "Search memory",
-            "parameters": {
-                "type": "OBJECT",
+            "parametersJsonSchema": {
+                "type": "object",
                 "properties": {
-                    "query": {"type": "STRING"},
-                    "tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "query": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
                 },
             },
         }
