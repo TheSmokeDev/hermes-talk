@@ -30,6 +30,8 @@ parent turn; they can run while native background children work. A slow direct
 tool can occupy the parent too: the prompt asks the model to delegate code changes,
 investigations and test suites, but it cannot predict every tool's duration.
 The voice call remains duplex while host requests are pending.
+Catalog, execution and control waits use dedicated workers so they cannot occupy
+the gateway's default pool while waiting for that same pool to read or admit work.
 
 Submission status reports available controls and observed tool progress, not a
 percentage or an invented completion estimate. Queued work can be cancelled;

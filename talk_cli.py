@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -1664,11 +1666,18 @@ async def run_talk_session(
     host_catalog = []
     try:
         if delegated_binding is not None and delegated_binding.hybrid:
-            catalog = await asyncio.to_thread(
-                delegated_binding.ctx.conversation_tools,
-                session_key=delegated_binding.session_key,
-                expected_session_id=delegated_binding.session_id,
-            )
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="talk-host-catalog")
+            context = contextvars.copy_context()
+            try:
+                catalog = await asyncio.get_running_loop().run_in_executor(
+                    executor, lambda: context.run(
+                        delegated_binding.ctx.conversation_tools,
+                        session_key=delegated_binding.session_key,
+                        expected_session_id=delegated_binding.session_id,
+                    ),
+                )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
             if not catalog.get("ok"):
                 raise ValueError("The host refused the conversation tool catalog")
             host_catalog = catalog["tools"]
