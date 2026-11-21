@@ -102,11 +102,13 @@ def test_failed_host_catalog_read_returns_none_and_can_be_retried(monkeypatch):
 
 def test_a_host_slower_than_the_budget_still_reaches_the_in_process_tier(monkeypatch):
     gates = [threading.Event() for _ in range(3)]
+    started = [threading.Event() for _ in range(3)]
     calls: list[int] = []
 
     def read():
         number = len(calls)
         calls.append(number)
+        started[number].set()
         assert gates[number].wait(10)
         return {"skills": [{"name": f"read-{number}"}]}
 
@@ -122,6 +124,7 @@ def test_a_host_slower_than_the_budget_still_reaches_the_in_process_tier(monkeyp
         gates[1].set()
         _join_readers()
         assert json.loads(_probe())["skills"] == [{"name": "read-1"}]
+        assert started[2].wait(3), "taking a late result starts the following read"
         assert calls == [0, 1, 2]
     finally:
         for gate in gates:
@@ -150,6 +153,44 @@ def test_a_stale_late_result_is_not_reused(monkeypatch):
     )
     monkeypatch.setattr(talk_config, "api_server_probe_timeout_s", lambda: 5.0)
     assert json.loads(_probe())["skills"] == [{"name": "fresh"}]
+
+
+def test_an_aborted_read_does_not_wedge_the_profile(monkeypatch):
+    """A reader killed by a BaseException still resolves its read, as an
+    ordinary failure, so the next probe can start another."""
+
+    class Aborted(BaseException):
+        pass
+
+    def abort():
+        raise Aborted
+
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)
+    monkeypatch.setattr(talk_host, "_catalog_from_host_modules", abort)
+    monkeypatch.setattr(talk_config, "api_server_probe_timeout_s", lambda: 5.0)
+    assert _probe() is None
+    monkeypatch.setattr(talk_host, "_catalog_from_host_modules", lambda: {"skills": []})
+    assert json.loads(_probe()) == {"skills": []}
+
+
+def test_a_worker_that_cannot_start_leaves_no_pending_read(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(talk_host, "_spawn_daemon", refuse)
+    monkeypatch.setattr(talk_host, "_catalog_from_host_modules", lambda: {"skills": []})
+    assert _probe() is None
+    assert talk_host._CATALOG_READS == {}
+
+
+def test_an_unreadable_budget_falls_through_without_raising(monkeypatch):
+    def unscoped():
+        raise RuntimeError("no profile scope bound")
+
+    monkeypatch.setattr(talk_config, "api_server_probe_timeout_s", unscoped)
+    monkeypatch.setattr(talk_host, "_catalog_from_host_modules", lambda: {"skills": []})
+    assert _probe() is None
+    assert talk_host._CATALOG_READS == {}
 
 
 def test_profiles_keep_separate_pending_reads(profiles, monkeypatch):

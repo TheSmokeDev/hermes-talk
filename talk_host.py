@@ -142,19 +142,28 @@ def _start_catalog_read(key: str) -> _CatalogRead:
     """
 
     entry = _CatalogRead()
-    _CATALOG_READS[key] = entry
 
     def read() -> None:
         try:
             result = _catalog_from_host_modules()
-        except Exception as exc:  # noqa: BLE001 — propagate through the bounded result
+        except BaseException as exc:  # never leave the read unresolved
             entry.finished_at = time.monotonic()
-            entry.future.set_exception(exc)
+            if isinstance(exc, Exception):
+                entry.future.set_exception(exc)
+            else:
+                # A waiting caller must see an ordinary failure, not SystemExit.
+                entry.future.set_exception(
+                    RuntimeError(f"catalog read aborted: {type(exc).__name__}")
+                )
+                raise
         else:
             entry.finished_at = time.monotonic()
             entry.future.set_result(result)
 
+    # Registered only once the worker exists: an entry with no worker would
+    # never finish and would pin this profile's probes to the full budget.
     _spawn_daemon(read, name="talk-catalog-probe")
+    _CATALOG_READS[key] = entry
     return entry
 
 
@@ -167,8 +176,12 @@ def _late_catalog(entry: _CatalogRead) -> dict | None:
 
     if entry.future.exception() is not None:
         return None
+    try:
+        max_age = talk_config.capability_catalog_ttl_s()
+    except Exception:  # noqa: BLE001 — an unreadable TTL makes the late result stale
+        return None
     finished = entry.finished_at
-    if finished is None or time.monotonic() - finished > talk_config.capability_catalog_ttl_s():
+    if finished is None or time.monotonic() - finished > max_age:
         return None
     return entry.future.result()
 
@@ -183,20 +196,33 @@ def _catalog_probe_bounded() -> dict | None:
     always slower than the budget still answers from the in-process tier.
     """
 
+    try:
+        budget = talk_config.api_server_probe_timeout_s()
+    except Exception as exc:  # noqa: BLE001 — the probe NEVER raises; REST answers instead
+        _log.debug("host catalog probe budget unreadable: %s", type(exc).__name__)
+        return None
     key = _catalog_profile_key()
     with _CATALOG_PROBE_LOCK:
         entry = _CATALOG_READS.get(key)
         if entry is not None and entry.future.done():
             late = None if entry.delivered else _late_catalog(entry)
             entry.delivered = True
-            entry = _start_catalog_read(key)
+            try:
+                entry = _start_catalog_read(key)
+            except Exception as exc:  # noqa: BLE001 — no worker: answer late or fall through
+                _log.debug("host catalog read not started: %s", type(exc).__name__)
+                return late
             if late is not None:
                 return late
         elif entry is None:
-            entry = _start_catalog_read(key)
+            try:
+                entry = _start_catalog_read(key)
+            except Exception as exc:  # noqa: BLE001 — no worker: REST answers instead
+                _log.debug("host catalog read not started: %s", type(exc).__name__)
+                return None
 
     try:
-        payload = entry.future.result(timeout=talk_config.api_server_probe_timeout_s())
+        payload = entry.future.result(timeout=budget)
     except TimeoutError:
         return None
     except Exception as exc:  # noqa: BLE001 — an unreadable catalog falls through to REST
