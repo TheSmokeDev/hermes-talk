@@ -1762,6 +1762,12 @@ class HostAdapter:
             # reaps the child, and a confirm that re-looks-up by run id would
             # then read a successful death as "never confirmed".
             proc = talk_runs.get_process(run_id)
+            # Recorded BEFORE the signal: the worker can reap the child and
+            # write the terminal record before terminate() even returns, and
+            # that record is what the announcement reads. A detached run has
+            # no remote status, so this is how it is announced as stopped
+            # rather than failed (talk_runs.terminal_outcome).
+            talk_runs.annotate_run(run_id, tee=True, stop_requested=True)
             if talk_runs.terminate_process(run_id):
                 # terminate() is a signal, not a wait — confirm within the
                 # bounded budget, and keep confirming off-thread past it
@@ -1800,6 +1806,7 @@ class HostAdapter:
                     f"Sent the stop for run {run.get('runId')} — it's winding "
                     "down; I'll have the death receipt next time you ask."
                 )
+            talk_runs.annotate_run(run_id, tee=True, stop_requested=False)
             return (
                 "I couldn't stop that one — I don't hold a handle to its "
                 "process anymore."

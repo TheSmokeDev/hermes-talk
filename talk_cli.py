@@ -863,11 +863,21 @@ def run_finished_commands(run: dict) -> list[talk_realtime.RealtimeCommand]:
         # structured verdict within that same budget, without parsing output.
         prefix = f"the agent run {remote_status}: "
         tail = prefix + tail[-(WATCH_OUTPUT_TAIL_CHARS - len(prefix)) :]
-    verb = "finished" if run.get("status") == "done" else "failed"
-    headline = f"Background run #{run.get('runId')} {verb}" + (
+    outcome = talk_runs.terminal_outcome(run) or talk_runs.OUTCOME_FAILED
+    headline = f"Background run #{run.get('runId')} {RUN_OUTCOME_WORDS[outcome]}" + (
         "." if tail else " with no output."
     )
     return _announcement_commands(headline, tail)
+
+
+#: ``talk_runs.terminal_outcome`` -> the words a finished run is announced
+#: with. A stop or an interruption is not a failure and is not called one.
+RUN_OUTCOME_WORDS = {
+    talk_runs.OUTCOME_FINISHED: "finished",
+    talk_runs.OUTCOME_FAILED: "failed",
+    talk_runs.OUTCOME_STOPPED: "was stopped",
+    talk_runs.OUTCOME_INTERRUPTED: "was interrupted",
+}
 
 
 #: ``child_status`` → the verb the model is prompted with. Values from

@@ -61,6 +61,41 @@ _log = logging.getLogger(__name__)
 RUN_KINDS = ("agent", "skill")
 TERMINAL_STATUSES = ("done", "failed")
 
+#: How a terminal run ended, for the words Talk speaks and reports. A
+#: ``failed`` run gets a more specific word only when a recorded fact proves it.
+OUTCOME_FINISHED = "finished"
+OUTCOME_FAILED = "failed"
+OUTCOME_STOPPED = "stopped"
+OUTCOME_INTERRUPTED = "interrupted"
+
+
+def terminal_outcome(run: dict) -> str | None:
+    """Finished, failed, stopped or interrupted; None while not terminal.
+
+    ``done`` is finished. A failed api-server run is classified by the remote
+    status stored with its terminal transition: ``cancelled`` means it was
+    stopped before it finished (stop_work's ``POST /stop`` ends that way),
+    ``interrupted`` that the gateway shut down or restarted under it. A failed
+    run with no remote side was stopped only if stop_work signalled its
+    process (``meta.stop_requested``). A lost remote outcome stays failed:
+    nothing proves the run stopped.
+    """
+
+    status = run.get("status")
+    if status == "done":
+        return OUTCOME_FINISHED
+    if status != "failed":
+        return None
+    meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+    remote = meta.get("api_run_status")
+    if remote == "cancelled":
+        return OUTCOME_STOPPED
+    if remote == "interrupted":
+        return OUTCOME_INTERRUPTED
+    if remote is None and not meta.get("api_run_id") and meta.get("stop_requested") is True:
+        return OUTCOME_STOPPED
+    return OUTCOME_FAILED
+
 # Eviction policy — terminal runs only; a running entry is never evicted.
 _RUN_TTL_S = 24 * 60 * 60
 _MAX_RUNS = 200
@@ -1404,6 +1439,10 @@ __all__ = [
     "HISTORY_OUTPUT_CAP",
     "MAX_RESOURCE_KEYS",
     "MAX_RESOURCE_KEY_CHARS",
+    "OUTCOME_FAILED",
+    "OUTCOME_FINISHED",
+    "OUTCOME_INTERRUPTED",
+    "OUTCOME_STOPPED",
     "RUN_KINDS",
     "TERMINAL_STATUSES",
     "AdmissionRefused",
@@ -1428,6 +1467,7 @@ __all__ = [
     "resolve_run_record",
     "start_run",
     "started_sentinel",
+    "terminal_outcome",
     "terminate_process",
     "wait_process",
 ]

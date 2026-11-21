@@ -92,12 +92,14 @@ named rather than smoothed.
   silence. A finished background result is no longer held back for a safe
   opening that never came. Contributed by @tancou in #218; thanks to
   @rmccaincns for reporting #239.
-- API-server runs reported as `failed`, `cancelled`, or `interrupted` now
-  remain failures in Talk's registry and completion announcements. Memory
-  handoffs use the same typed outcome instead of interpreting answer text;
-  lost tracking reports an unknown remote outcome. Remote terminal statuses
-  survive long reasons and bounded spoken reports. Contributed by @tancou in
-  #219.
+- API-server runs reported as `failed`, `cancelled`, or `interrupted` are no
+  longer recorded or announced as finished. Memory handoffs use the same typed
+  outcome instead of interpreting answer text; lost tracking reports an
+  unknown remote outcome. Remote terminal statuses survive long reasons and
+  bounded spoken reports. Contributed by @tancou in #219. Announcements and
+  `check_work` name the outcome: a run "failed", "was stopped" (remote
+  `cancelled`, as a `stop_work` stop ends, or a detached run `stop_work`
+  signalled), or "was interrupted" (gateway shutdown or restart).
 
 ## [0.23.1] — 2026-11-17
 

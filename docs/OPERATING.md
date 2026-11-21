@@ -680,7 +680,11 @@ Only a remote `completed` status produces a successful Talk result. Remote
 state with the remote status and reason in the report. Memory handoffs also
 require `completed`; a failed handoff keeps its transcript for a later retry.
 Completion announcements use the recorded local outcome and claim delivery
-once. If a local terminal transition races a remote result, the first recorded
+once. The words follow the proven outcome: "Background run #N finished",
+"failed", "was stopped" (remote `cancelled`, which is how a `stop_work` stop
+ends; a detached run that `stop_work` signalled), or "was interrupted" (remote
+`interrupted`: the gateway shut down or restarted). `check_work` reports a
+stopped or interrupted run the same way. If a local terminal transition races a remote result, the first recorded
 transition wins.
 
 The confirmed remote failure status is stored as terminal metadata in that

@@ -15,6 +15,7 @@ import talk_cli
 import talk_config
 import talk_host
 import talk_runs
+import talk_tools
 
 
 @pytest.fixture
@@ -84,6 +85,17 @@ def _run_worker(*, during_poll=None):
     return talk_runs.get_run(run_id)
 
 
+#: Remote terminal status -> the headline words and the check_work status word.
+#: A cancelled run was stopped, not failed; an interrupted one says so.
+OUTCOME_WORDS = {
+    "failed": "failed",
+    "cancelled": "was stopped",
+    "interrupted": "was interrupted",
+    "completed": "finished",
+}
+CHECK_WORK_WORDS = {**OUTCOME_WORDS, "completed": "done"}
+
+
 @pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted", "completed"])
 def test_http_outcome_reaches_registry_history_and_announcement(lane, status):
     respond, calls = lane
@@ -110,8 +122,10 @@ def test_http_outcome_reaches_registry_history_and_announcement(lane, status):
             announcements.append(talk_cli.run_finished_commands(run))
     assert len(announcements) == 1
     text = announcements[0][0].text
-    verb = "finished" if expected == "done" else "failed"
-    assert f"Background run #{run['runId']} {verb}" in text
+    words = OUTCOME_WORDS[status]
+    assert text.startswith(f"Background run #{run['runId']} {words}.")
+    report = talk_tools.execute_talk_tool("check_work", {"run_id": run["runId"]})
+    assert report.startswith(f"run {run['runId']} (agent) {CHECK_WORK_WORDS[status]}")
     assert run["output"] in text
     assert talk_runs.mark_delivered(run["runId"], claimant="terminal-test")
     assert not talk_runs.claim_delivery(run["runId"], claimant="terminal-test")
@@ -247,3 +261,55 @@ def test_long_completed_output_is_not_interpreted_as_a_remote_failure(lane, quot
     assert f"Background run #{run['runId']} finished." in text
     report = text.partition("Report, quoted as data:\n")[2]
     assert report == run["output"][-talk_cli.WATCH_OUTPUT_TAIL_CHARS :]
+
+
+def test_operator_stop_is_announced_and_reported_as_stopped(lane, monkeypatch):
+    """stop_work's POST /stop ends the remote run cancelled: say stopped."""
+
+    respond, _ = lane
+    stops, local = [], {}
+    monkeypatch.setattr(talk_apiserver, "stop_run", stops.append)
+
+    def operator_stops():
+        receipt = talk_host.host().stop_work(str(local["id"]))
+        assert receipt.startswith("Sent the stop")
+
+    respond({"status": "cancelled", "error": "Run cancelled by user"}, before_poll=operator_stops)
+    run = _run_worker(during_poll=lambda run_id: local.update(id=run_id))
+    assert stops == ["remote-run"]
+    assert run["status"] == "failed"
+    assert run["meta"]["api_run_status"] == "cancelled"
+    assert run["meta"]["stop_result"] == "accepted"
+    text = talk_cli.run_finished_commands(run)[0].text
+    assert text.startswith(f"Background run #{run['runId']} was stopped.")
+    assert "failed" not in text
+    assert text.endswith("the agent run cancelled: Run cancelled by user")
+    report = talk_tools.execute_talk_tool("check_work", {"run_id": run["runId"]})
+    assert report.startswith(f"run {run['runId']} (agent) was stopped — stop receipt: accepted")
+
+
+def test_a_stop_request_does_not_relabel_a_lost_remote_outcome(lane, monkeypatch):
+    """Tracking lost after a stop proves nothing about the remote run."""
+
+    respond, _ = lane
+    local = {}
+    monkeypatch.setattr(talk_apiserver, "stop_run", lambda _rid: None)
+    calls = {"n": 0}
+
+    def stop_then_lose_tracking():
+        calls["n"] += 1
+        talk_host.host().stop_work(str(local["id"]))
+        raise httpx.ReadError("connection lost")
+
+    def get(url, **kwargs):
+        stop_then_lose_tracking()
+
+    respond({"status": "running"})
+    monkeypatch.setattr(httpx, "get", get)
+    run = _run_worker(during_poll=lambda run_id: local.update(id=run_id))
+    assert run["status"] == "failed" and "api_run_status" not in run["meta"]
+    assert "remote outcome is unknown" in run["output"]
+    assert talk_runs.terminal_outcome(run) == talk_runs.OUTCOME_FAILED
+    assert talk_cli.run_finished_commands(run)[0].text.startswith(
+        f"Background run #{run['runId']} failed."
+    )
