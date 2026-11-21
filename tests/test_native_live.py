@@ -660,6 +660,9 @@ def test_no_input_tool_proposals_get_one_exact_refusal_and_bounded_loop_shutdown
         assert len(h.session.sent) == 1
         assert h.session.sent[0].delegation_id == "real-first-call"
         assert "No action or approval" in h.session.sent[0].content
+        # hermes-talk#202: reference context, never a line to speak; a model
+        # re-delegating while work is pending used to voice each refusal.
+        assert h.session.sent[0].kind == "context"
         assert not h.requests
         await h.controller.handle(rt.DelegationRequested("real-second-call"))
         await h.controller.handle(rt.DelegationRequested("real-third-call"))

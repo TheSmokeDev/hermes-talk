@@ -43,6 +43,14 @@ named rather than smoothed.
   All three are fail-closed, resolved at call time, and leave the wire and the
   prompt byte-identical when unset. `hermes talk doctor` gains a `language`
   check that reports the prompt's length, never its text. Contributed by @Philibergus.
+- Experimental echo gate hold for loudspeakers with output latency, such as a
+  TV over HDMI: `TALK_ECHO_GATE_HOLD_MS`, or **Experimental · Speaker echo
+  hold (ms)** in the plugin settings, keeps the terminal echo gate closed that
+  long after playback goes quiet, so the tail of the model's own speech is not
+  heard as the operator. Barge-in above the floor still works during the hold.
+  Off (`0`) by default, which is the gate exactly as before. Not yet confirmed
+  on the reporter's hardware with this build. Thanks to @gocoelho for
+  reporting #228.
 
 ### Changed
 - In gated mode (dashboard sign-in engaged), a request the dashboard's own
@@ -106,6 +114,28 @@ named rather than smoothed.
   `check_work` name the outcome: a run "failed", "was stopped" (remote
   `cancelled`, as a `stop_work` stop ends, or a detached run `stop_work`
   signalled), or "was interrupted" (gateway shutdown or restart).
+- `hermes talk doctor` and `hermes talk check` no longer crash on a host with
+  no audio system. `import sounddevice` raises its own `PortAudioError` when
+  PortAudio finds no PulseAudio or ALSA, and that escaped as a traceback; the
+  audio check now reports a warning that no audio device was found and that
+  Discord voice may still be usable. Thanks to @marcablanca for reporting #236.
+- Talk offers `/talk core join` only where it can run: on the Discord gateway,
+  on a host that carries the core voice contract. The terminal session prompt,
+  `talk_status`, and the Discord join, status and refusal lines no longer point
+  at it elsewhere. The README and `docs/OPERATING.md` no longer describe
+  NousResearch/hermes-agent#101808 as landed: it was closed without merging.
+  Thanks to @kvnloo for reporting #215.
+- Delegated work no longer fills the call with empty progress lines. The
+  terminal and Discord Realtime lanes stopped speaking the once-a-minute
+  "still working" heartbeat, the "accepted" milestone that repeated the start
+  receipt, and an `executing` milestone with no real step label; approval
+  waits, a step whose label is known when it starts, results and errors are
+  still spoken, and `check_work`
+  still answers "how's it going?". On GPT-Live, a delegation the model makes
+  without new operator speech is now answered as reference context instead of
+  a line to speak, so retries while work is pending stop turning into "still
+  checking" fillers. Not yet confirmed in a live call. Thanks to @JoshCollis
+  for reporting #202.
 
 ## [0.23.1] — 2026-11-17
 

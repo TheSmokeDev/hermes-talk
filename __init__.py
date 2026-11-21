@@ -166,9 +166,9 @@ def _register_talk_command(ctx) -> None:
     kwargs = {
         "handler": _talk_command,
         "description": (
-            "Start provider-owned voice with canonical Hermes tools (join), or the "
-            "canonical core voice lane (core join); "
-            "gateway also supports pause, resume, leave and status"
+            "Start provider-owned voice with canonical Hermes tools (join); the "
+            "Discord gateway also supports pause, resume, leave, status and, on "
+            "hosts with the core voice contract, core join"
         ),
         "args_hint": (
             "[join [TARGET [PEER PROFILE]]|select TARGET|return|reconnect|"

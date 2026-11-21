@@ -806,7 +806,13 @@ def _handle_talk_status(arguments: dict) -> str:
         "legacy_lane": "legacy-provider-executor",
         "legacy_session": {
             "scope": "limited provider-owned session",
-            "full_parity_command": "/talk core join",
+            # Offered only where it can run (hermes-talk#215): the command is
+            # Discord-gateway-only and needs the host's core voice contract.
+            "full_parity_command": (
+                "/talk core join (Discord voice channel only)"
+                if talk_core_realtime.core_provider_available()
+                else None
+            ),
         },
         "transcript": {
             "current_call": "temporary local capture",

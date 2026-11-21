@@ -210,6 +210,20 @@ def test_each_known_lane_renders_its_exact_sentence():
         assert talk_identity.GENERIC_LANE_LINE not in instructions
 
 
+def test_core_join_is_offered_only_when_the_caller_says_it_can_run():
+    """hermes-talk#215: the legacy contract offered /talk core join on every surface."""
+
+    assert "core join" not in talk_identity.build_instructions(None).lower()
+    assert "core join" not in talk_identity.build_instructions(None, lane="cli").lower()
+    assert "/talk core join" in talk_identity.build_instructions(
+        None, lane="discord", core_join=True
+    )
+    # The task and host-tool lanes carry their own contracts and never point there.
+    for kwargs in ({"canonical_task": True}, {"host_execution": True}):
+        built = talk_identity.build_instructions(None, core_join=True, **kwargs)
+        assert "core join" not in built.lower()
+
+
 def test_an_unknown_or_absent_lane_never_invents_a_hangup_control():
     for lane in (None, "", "gateway"):
         instructions = talk_identity.build_instructions(None, lane=lane)

@@ -34,6 +34,28 @@ def run_workers(monkeypatch):
 
 
 @pytest.fixture
+def headless_sounddevice(tmp_path, monkeypatch):
+    """``import sounddevice`` the way a host with no PulseAudio/ALSA answers it.
+
+    The real module runs ``Pa_Initialize()`` at import and raises its own
+    ``PortAudioError`` (an ``Exception`` subclass, not ImportError/OSError)
+    when no audio system exists (hermes-talk#236).
+    """
+    root = tmp_path / "headless-audio"
+    root.mkdir()
+    (root / "sounddevice.py").write_text(
+        "class PortAudioError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "raise PortAudioError(\"Error initializing PortAudio: [PaErrorCode -9999]: "
+        "'PulseAudio_Initialize: Can't connect to server'\")\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.syspath_prepend(str(root))
+
+
+@pytest.fixture
 def isolated_capability_catalog(monkeypatch):
     """Keep ambient Hermes registries out of tests that own catalog discovery.
 
