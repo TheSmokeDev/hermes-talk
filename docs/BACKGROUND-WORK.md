@@ -79,9 +79,14 @@ change to the caller's context does not retarget that work. Existing stop,
 approval-generation and transcript-lease rules still govern late callbacks.
 
 This preserves an installed Hermes profile scope; it does not install a scope
-where none was bound, or change how configuration and credentials are read.
-Profile-scoped configuration resolution and Discord adapter routing are separate
-requirements for multiplexed hosts.
+where none was bound. Talk settings and keys resolved through `talk_config`
+read that scope (Hermes's `get_secret`), so a worker reads the dispatching
+profile's values; a thread that lost the scope fails closed on a multiplexed
+gateway instead of reading the process environment. Discord voice resolves
+the turn's own profile bot. In-process catalog discovery keeps one pending
+read per profile home. The OpenAI, Grok and GPT-Live auth resolvers
+(`talk_auth`, `talk_grok_auth`, `talk_live_config`) still read the process
+environment directly.
 
 The API verdict and capability snapshot caches, including their in-flight
 refresh guards, remain module globals. Callers sharing one module instance also

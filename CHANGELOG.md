@@ -66,6 +66,23 @@ named rather than smoothed.
   OpenAPI-style `parameters` field, so closed and nested object rules are kept
   rather than stripped. Not yet confirmed with a live Gemini tool call.
   Thanks to @gocoelho for reporting #227.
+- On a multiplexed gateway, Talk settings and API keys resolved by
+  `talk_config` come from the profile serving the turn (Hermes's profile secret
+  scope) instead of the process environment, and a read with no profile bound
+  fails closed. Discord voice uses that profile's own bot; a profile without
+  one is refused rather than speaking through the default bot. The OpenAI,
+  Grok and GPT-Live auth resolvers (`talk_auth`, `talk_grok_auth`,
+  `talk_live_config`) still read the process environment.
+  Contributed by @Akm0d.
+- Background host and run workers, transcript handoffs, approval workers, SSE
+  readers and timeout timers, and API/catalog refreshes keep the caller's
+  profile context, so work that outlives a turn still runs as the profile
+  that started it. Contributed by @tancou.
+- In-process capability-catalog discovery waits at most
+  `TALK_API_SERVER_PROBE_TIMEOUT_S`, so a stuck registry no longer pins the
+  caller. One pending read is kept per profile and shared instead of piling up
+  workers, and a read that finishes late answers the next probe.
+  Contributed by Kiven (@abaichuan1017).
 
 ## [0.23.1] — 2026-11-17
 
