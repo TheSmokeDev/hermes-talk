@@ -31,3 +31,16 @@ def test_invalid_custom_instructions_are_not_silently_truncated():
     path.write_bytes(b"\xff")
     with pytest.raises(UnicodeDecodeError):
         identity.build_instructions({})
+
+
+def test_custom_instructions_accept_exact_limit_and_surface_read_errors(monkeypatch):
+    path = identity.TALK_INSTRUCTIONS_PATH
+    path.write_text("♞" * identity.TALK_INSTRUCTIONS_LIMIT, encoding="utf-8")
+    assert "♞" * identity.TALK_INSTRUCTIONS_LIMIT in identity.build_instructions({})
+
+    def denied(*args, **kwargs):
+        raise PermissionError("unreadable deployment instructions")
+
+    monkeypatch.setattr(type(path), "open", denied)
+    with pytest.raises(PermissionError, match="unreadable deployment instructions"):
+        identity.build_instructions({})
