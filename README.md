@@ -19,11 +19,11 @@ hands longer jobs to background agents, and tells you how they went when they fi
 It runs in the terminal (`hermes talk`), in a Discord voice channel (`/talk join`),
 in the Hermes dashboard **Talk** tab, and in [Hermes Desktop](docs/DESKTOP.md).
 
-You probably don't need a new API key. OpenAI Realtime runs on your ChatGPT
-subscription through `codex login`, and Grok Voice runs on an X Premium or
-SuperGrok login. Gemini Live needs a `GEMINI_API_KEY`, and free-tier AI Studio
-keys work. If you'd rather keep it all at home, the `local` lane talks to your
-own model server.
+**No extra API bill on the main lanes.** OpenAI Realtime runs on the ChatGPT
+subscription you already have (sign in once with `codex login`), and Grok Voice
+runs on your X Premium or SuperGrok login. Gemini Live uses a free AI Studio key
+(`GEMINI_API_KEY`). The `local` lane runs on your own model server with no key at all.
+Prefer API keys? Those work too.
 
 Hermes Talk adds duplex voice to a Hermes install you already run. It is not a
 standalone assistant, and it doesn't replace Hermes's built-in turn-based voice
