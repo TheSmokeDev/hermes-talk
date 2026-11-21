@@ -1891,6 +1891,7 @@ async def run_talk_session(
             host_execution_attachment.close()
         return refuse(STARTUP_REFUSAL_PROVIDER)
 
+    delegated_relay = None
     try:
         send_lock = asyncio.Lock()
         continuation_pending = False
@@ -1904,8 +1905,6 @@ async def run_talk_session(
                     continue
                 watched.add(run_id)
                 watchers.append(asyncio.create_task(watch_run(run_id)))
-
-        delegated_relay = None
 
         async def send_outgoing(outgoing, *, is_announcement: bool = False) -> bool:
             """Serialize every provider write; keep multi-command batches contiguous.
@@ -1945,7 +1944,7 @@ async def run_talk_session(
                     try:
                         context = await delegated_relay.context_commands()
                     except Exception:  # noqa: BLE001 - close binding on storage failure
-                        delegated_relay.closed = True
+                        delegated_relay.close()
                         context = [talk_realtime.AddContext(
                             item_id=f"talkclosed{uuid.uuid4().hex[:20]}",
                             text=("Hermes context changed or is unavailable. Work submission is "
@@ -2396,7 +2395,7 @@ async def run_talk_session(
             await drain
         finally:
             if delegated_relay is not None:
-                delegated_relay.closed = True
+                delegated_relay.close()
             talk_steer.set_landed_notifier(None)
             talk_lifecycle.detach_session()
             talk_progress.detach_session()
@@ -2444,6 +2443,8 @@ async def run_talk_session(
     finally:
         # Idempotent belts for the inner detaches: no exit path may leave the
         # hook bus or ledger holding a callback into a dead session.
+        if delegated_relay is not None:
+            delegated_relay.close()
         talk_steer.set_landed_notifier(None)
         talk_lifecycle.detach_session()
         talk_progress.detach_session()

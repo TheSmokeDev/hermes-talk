@@ -200,3 +200,66 @@ def test_context_budget_keeps_latest_complete_rows():
     assert json.loads(text) == kept
     assert kept[-1] == rows[-1]
     assert kept[0] != rows[0]
+
+
+def test_receipt_waiters_leave_gateway_storage_workers_available_and_preserve_context():
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import ContextVar
+
+    profile = ContextVar("receipt_profile")
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        token = profile.set("profile-alpha")
+
+        async def admission():
+            owner = await asyncio.to_thread(profile.get)
+            return {"ok": True, "status": "queued", "profile": owner}
+
+        def host(*_args, **_kwargs):
+            return asyncio.run_coroutine_threadsafe(admission(), loop).result(timeout=3)
+
+        relay = talk_delegated.SubmissionRelay(
+            binding(SimpleNamespace(submit_message=host, submission_status=host)), lambda *_: None
+        )
+        try:
+            submitted, observed = await asyncio.gather(
+                relay.handle_tool_call_async(event()), relay.status("existing-request")
+            )
+            assert result(submitted) == observed == {
+                "ok": True, "status": "queued", "profile": "profile-alpha",
+            }
+        finally:
+            relay.close()
+            profile.reset(token)
+
+    asyncio.run(run())
+
+
+def test_close_does_not_wait_for_or_cancel_an_already_started_host_call():
+    import threading
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+
+        def host():
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "closing the relay blocked the gateway loop"
+            return {"status": "queued", "admission_id": "committed-after-close"}
+
+        relay = talk_delegated.SubmissionRelay(binding(object()), lambda *_: None)
+        pending = asyncio.create_task(relay.host_call(host))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            relay.close()
+            relay.close()
+            with pytest.raises(ValueError, match="closed"):
+                await relay.host_call(lambda: pytest.fail("call accepted after close"))
+        finally:
+            release.set()
+            relay.close()
+        assert (await pending)["admission_id"] == "committed-after-close"
+
+    asyncio.run(run())

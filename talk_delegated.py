@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -180,6 +182,23 @@ class SubmissionRelay:
         self.context_rows = []
         self.context_lock = asyncio.Lock()
         self.delegation_updates = []
+        self._host_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="talk-host-receipts"
+        )
+
+    async def host_call(self, function, *args, **kwargs):
+        if self.closed:
+            raise ValueError("Voice binding closed; rejoin Talk.")
+        # Receipt waiters must not occupy the gateway workers needed for admission storage.
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            self._host_executor, lambda: context.run(function, *args, **kwargs)
+        )
+
+    def close(self):
+        self.closed = True
+        # An already-running host call may still commit; never wait for it on the gateway loop.
+        self._host_executor.shutdown(wait=False, cancel_futures=True)
 
     def discard_tool_event(self, event):
         self.authorizer(str(event.get("name") or ""), event)
@@ -200,7 +219,7 @@ class SubmissionRelay:
         )
 
     async def status(self, request_id):
-        return await asyncio.to_thread(
+        return await self.host_call(
             self.binding.ctx.submission_status, **self.identity(request_id)
         )
 
@@ -235,7 +254,7 @@ class SubmissionRelay:
                     self.requests[request_id] = args["task"]
                     self.pending.add(request_id)
                     try:
-                        result = await asyncio.to_thread(
+                        result = await self.host_call(
                             self.binding.ctx.submit_message,
                             args["task"],
                             **self.identity(request_id),
@@ -324,7 +343,7 @@ class SubmissionRelay:
                         if status.get("error") == "not_found":
                             # A timed-out admission may still commit; poll the same identity.
                             continue
-                        self.closed = True
+                        self.close()
                         queue.put_nowait(
                             announcement(
                                 "Hermes no longer authorizes this voice binding; "
@@ -337,7 +356,7 @@ class SubmissionRelay:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - host failure cannot escape the voice boundary
-            self.closed = True
+            self.close()
             queue.put_nowait(
                 announcement(
                     "Hermes context synchronization stopped; leave and rejoin Talk.",
