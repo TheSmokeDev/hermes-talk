@@ -391,11 +391,7 @@
   animation: ht-spin 0.9s linear infinite;
 }
 
-@keyframes ht-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+@keyframes ht-spin { to { transform: rotate(360deg); } }
 
 .ht-target-row {
   display: flex;
