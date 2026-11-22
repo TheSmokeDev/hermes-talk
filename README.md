@@ -29,13 +29,13 @@ Hermes Talk adds duplex voice to a Hermes install you already run. It is not a
 standalone assistant, and it doesn't replace Hermes's built-in turn-based voice
 mode, which is a different (and good) design.
 
-<!-- Regenerate this GIF (needs ffmpeg): python docs/render-dashboard-gif.py -->
-![The Talk tab in the Hermes dashboard: a live voice session, a background agent delegated mid-conversation, and its result landing in the runs panel (8x speed)](docs/dashboard.gif)
+<p align="center"><img src="docs/talk-desktop.gif" width="400" alt="Hermes Talk in Hermes Desktop: press Talk, the panel docks on the right, and you talk while Hermes works"></p>
 
-[Watch the 2:27 cut with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4):
-delegate a job, keep talking, hear the result land. It is a real Realtime session
-recorded at v0.3.0 (the GIF runs at 8x), so it predates GPT-Live, the Codex workers
-and the 0.24.0 panel.
+[**Watch the 0.24 film**](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.24.1/hermes-talk-0.24-film.mp4) (1:40, with sound): the one-button
+panel, switching coding chats by voice, Phone mode, Discord, Echo and the community
+behind it. Narration and sample conversations are for demonstration; the features are real.
+
+The original [dashboard demo](docs/dashboard.gif) is a real Realtime session recorded at v0.3.0.
 
 ## New in 0.24.0
 
