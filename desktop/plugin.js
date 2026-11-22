@@ -949,6 +949,7 @@ function createTalkSurface(SDK) {
       this.pendingLocalTools = null;
       this.localToolCalls = new Map();
       this.workflowInput = null;
+      this.workflowSpeechEnd = null;
       this.workflowResponse = null;
       this.usedWorkflowInputs = new Set();
       this.cascade = session && session.voiceMode === "cascade";
@@ -1237,7 +1238,8 @@ function createTalkSurface(SDK) {
         case "input_audio_buffer.committed":
           if (!this.task && this.localTools.has("desktop_slash_workflow") && event.item_id &&
               this.workflowInput?.id !== event.item_id) {
-            const input = {id: event.item_id, time: Date.now(), claimed: false};
+            const input = {id: event.item_id, time: Date.now(), claimed: false,
+              speechEnd: this.workflowSpeechEnd?.id === event.item_id ? this.workflowSpeechEnd.time : null};
             input.ready = new Promise(resolve => { input.resolve = resolve; });
             this.workflowInput = input;
           }
@@ -1319,6 +1321,7 @@ function createTalkSurface(SDK) {
           if (this.task) void this.task.presentation.drain();
           return;
         case "input_audio_buffer.speech_started":
+          this.workflowSpeechEnd = null;
           this.workflowInput = null;
           this.workflowResponse = null;
           if (this.journal && this.responseActive) this.journal.add("interrupted", { status: "barge_in" });
@@ -1335,6 +1338,9 @@ function createTalkSurface(SDK) {
           if (this.responseActive) this.send({ type: "response.cancel" });
           return;
         case "input_audio_buffer.speech_stopped":
+          if (event.item_id && this.localTools.has('desktop_slash_workflow')) {
+            this.workflowSpeechEnd = {id: event.item_id, time: Date.now()};
+          }
           this.cb.onStatus("Processing…");
           return;
         case "response.function_call_arguments.done":
@@ -1726,9 +1732,13 @@ function createTalkSurface(SDK) {
             if (this.localToolCalls.size >= 128) throw new Error("Reconnect before using more Desktop controls.");
             const promise = Promise.resolve().then(() => {
               if (this.closed) throw new Error("Voice call ended before the Desktop action started.");
-              return SDK.executeLocalTool(name, args, { callId,
+              const result = SDK.executeLocalTool(name, args, { callId,
                 takeUtterance: () => this.takeWorkflowUtterance(event, response),
                 signal: this.microphoneLease?.signal || this.startAbort?.signal });
+              if (name !== 'desktop_slash_workflow' || !response?.input?.speechEnd ||
+                  response.id !== event.response_id) return result;
+              return Promise.resolve(result).then(value => ({...value,
+                speech_end_to_tool_result_ms: Date.now() - response.input.speechEnd}));
             });
             saved = { fingerprint, promise };
             this.localToolCalls.set(callId, saved);
@@ -4164,7 +4174,7 @@ function findDesktopWorkflows(catalog, query, offset, kind) {
 }
 
 function matchSpokenWorkflow(catalog, text) {
-  const intent = text.trim().match(/^(?:(?:hey(?:\s+hermes)?|hermes)[,\s]+)?(?:please\s+)?(?:run|start|invoke)\s+(?:the\s+)?(?:slash(?:\s+command)?\s+|\/)(.+)$/iu);
+  const intent = text.trim().match(/^(?:(?:hey(?:\s+hermes)?|hermes)[,\s]+)?(?:please\s+)?(?:(?:run|start|invoke)\s+(?:the\s+)?)?(?:slash(?:\s+command)?\s+|\/)(.+)$/iu);
   if (!intent || /\b(?:actually|scratch that|never\s?mind|cancel that|don't run|do not run|no[,\s]+cancel|hold on|wait a (?:second|minute))\b/i.test(intent[1])) {
     throw new Error('Say “run slash” followed by the command name and its arguments in one fresh request.');
   }
@@ -4194,7 +4204,7 @@ function matchSpokenWorkflow(catalog, text) {
     return { status: 'use_typed_command', command: row.name };
   }
   if (separator) return { row, argument: body.slice(separator.index + separator[0].length) };
-  const tail = body.slice(end);
+  const tail = body.slice(end).replace(/^\s+command(?=[,.:!?\s]|$)/i, '');
   if (tail && !/^(?:\s|[,.:!?](?:\s|$))/.test(tail)) return {status: 'unknown'};
   return { row, argument: tail.replace(/^[,:]\s+/, '').trim().replace(/^[.!?]$/, '') };
 }
@@ -4465,7 +4475,7 @@ function createDesktopVoiceTools(scope, assertOwner) {
       { type: 'object', properties: { session_id: { type: 'string' }, text: { type: 'string', maxLength: 8000 },
         mode: { type: 'string', enum: ['queue', 'steer'] } }, required: ['session_id', 'text'], additionalProperties: false }],
     ['desktop_capabilities', 'Read the actual Desktop Capabilities toolsets and skills for this connection/profile. Reports configured/enabled state, not permission to execute.', empty],
-    ['desktop_slash_workflow', 'When the user says “hey slash”, browse or search the active Hermes session for installed skills, bundles and plugin commands. Use kind=plugin to find installed Hermes plugins or integrations, including those with no slash command. For “run slash NAME [arguments]” call this with run=true. Only the captured spoken request supplies the command and arguments. Never delegate a replacement, invent a name, or retry an unconfirmed command. Read the returned receipt.',
+    ['desktop_slash_workflow', 'Browse the active Hermes session when asked what skills or commands are available, or when the user says “slash” alone. Use kind=plugin for installed plugins and integrations. “Slash NAME”, “run the slash NAME command” and “run slash NAME [arguments]” are direct requests to invoke the named workflow: call this with run=true. No wake phrase is required. Only captured user speech supplies the command and arguments. Never delegate a replacement or retry an unconfirmed command. Report its receipt.',
       { type: 'object', properties: { query: {type: 'string'}, offset: {type: 'integer', minimum: 0},
         kind: {type: 'string', enum: ['skill', 'bundle', 'plugin command', 'quick command', 'plugin']},
         run: {type: 'boolean'} }, additionalProperties: false }],

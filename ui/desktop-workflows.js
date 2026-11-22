@@ -75,7 +75,7 @@ function findDesktopWorkflows(catalog, query, offset, kind) {
 }
 
 function matchSpokenWorkflow(catalog, text) {
-  const intent = text.trim().match(/^(?:(?:hey(?:\s+hermes)?|hermes)[,\s]+)?(?:please\s+)?(?:run|start|invoke)\s+(?:the\s+)?(?:slash(?:\s+command)?\s+|\/)(.+)$/iu);
+  const intent = text.trim().match(/^(?:(?:hey(?:\s+hermes)?|hermes)[,\s]+)?(?:please\s+)?(?:(?:run|start|invoke)\s+(?:the\s+)?)?(?:slash(?:\s+command)?\s+|\/)(.+)$/iu);
   if (!intent || /\b(?:actually|scratch that|never\s?mind|cancel that|don't run|do not run|no[,\s]+cancel|hold on|wait a (?:second|minute))\b/i.test(intent[1])) {
     throw new Error('Say “run slash” followed by the command name and its arguments in one fresh request.');
   }
@@ -105,7 +105,7 @@ function matchSpokenWorkflow(catalog, text) {
     return { status: 'use_typed_command', command: row.name };
   }
   if (separator) return { row, argument: body.slice(separator.index + separator[0].length) };
-  const tail = body.slice(end);
+  const tail = body.slice(end).replace(/^\s+command(?=[,.:!?\s]|$)/i, '');
   if (tail && !/^(?:\s|[,.:!?](?:\s|$))/.test(tail)) return {status: 'unknown'};
   return { row, argument: tail.replace(/^[,:]\s+/, '').trim().replace(/^[.!?]$/, '') };
 }

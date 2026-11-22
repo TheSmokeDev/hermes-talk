@@ -42,7 +42,7 @@ the actionable sentence.
 
 ## Finding a Hermes workflow by voice
 
-Say “hey slash” to browse, “find the release notes skill” to search, or “which Hermes plugins are installed?” to ask about integrations. A plugin can provide tools or hooks without registering any slash commands.
+In Desktop OpenAI Realtime, say “slash” to browse and “slash release notes” or “run the slash release notes command” to invoke a skill named release-notes. You can also ask “which Hermes skills can I run?” or “which Hermes plugins are installed?” A plugin can provide tools or hooks without registering any slash commands.
 
 | Call | What you can ask for |
 |---|---|

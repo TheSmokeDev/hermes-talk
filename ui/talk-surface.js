@@ -948,6 +948,7 @@ function createTalkSurface(SDK) {
       this.pendingLocalTools = null;
       this.localToolCalls = new Map();
       this.workflowInput = null;
+      this.workflowSpeechEnd = null;
       this.workflowResponse = null;
       this.usedWorkflowInputs = new Set();
       this.cascade = session && session.voiceMode === "cascade";
@@ -1236,7 +1237,8 @@ function createTalkSurface(SDK) {
         case "input_audio_buffer.committed":
           if (!this.task && this.localTools.has("desktop_slash_workflow") && event.item_id &&
               this.workflowInput?.id !== event.item_id) {
-            const input = {id: event.item_id, time: Date.now(), claimed: false};
+            const input = {id: event.item_id, time: Date.now(), claimed: false,
+              speechEnd: this.workflowSpeechEnd?.id === event.item_id ? this.workflowSpeechEnd.time : null};
             input.ready = new Promise(resolve => { input.resolve = resolve; });
             this.workflowInput = input;
           }
@@ -1318,6 +1320,7 @@ function createTalkSurface(SDK) {
           if (this.task) void this.task.presentation.drain();
           return;
         case "input_audio_buffer.speech_started":
+          this.workflowSpeechEnd = null;
           this.workflowInput = null;
           this.workflowResponse = null;
           if (this.journal && this.responseActive) this.journal.add("interrupted", { status: "barge_in" });
@@ -1334,6 +1337,9 @@ function createTalkSurface(SDK) {
           if (this.responseActive) this.send({ type: "response.cancel" });
           return;
         case "input_audio_buffer.speech_stopped":
+          if (event.item_id && this.localTools.has('desktop_slash_workflow')) {
+            this.workflowSpeechEnd = {id: event.item_id, time: Date.now()};
+          }
           this.cb.onStatus("Processing…");
           return;
         case "response.function_call_arguments.done":
@@ -1725,9 +1731,13 @@ function createTalkSurface(SDK) {
             if (this.localToolCalls.size >= 128) throw new Error("Reconnect before using more Desktop controls.");
             const promise = Promise.resolve().then(() => {
               if (this.closed) throw new Error("Voice call ended before the Desktop action started.");
-              return SDK.executeLocalTool(name, args, { callId,
+              const result = SDK.executeLocalTool(name, args, { callId,
                 takeUtterance: () => this.takeWorkflowUtterance(event, response),
                 signal: this.microphoneLease?.signal || this.startAbort?.signal });
+              if (name !== 'desktop_slash_workflow' || !response?.input?.speechEnd ||
+                  response.id !== event.response_id) return result;
+              return Promise.resolve(result).then(value => ({...value,
+                speech_end_to_tool_result_ms: Date.now() - response.input.speechEnd}));
             });
             saved = { fingerprint, promise };
             this.localToolCalls.set(callId, saved);

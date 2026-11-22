@@ -149,6 +149,10 @@ assert.equal(result.status,'queued'); assert.equal(sends[0].command,'/release-no
 assert.equal(sends[0].session_id,owner.sessionId);
 assert.equal(rpc.find(row=>row.method==='prompt.submit').params.text,'expanded workflow');
 assert.equal((await call({run:true},'run slash audit')).status,'handler_returned');
+assert.equal((await call({run:true},'Slash audit.')).status,'handler_returned');
+assert.equal((await call({run:true},'Run the slash audit command.')).status,'handler_returned');
+assert.equal((await call({run:true},'/audit')).status,'handler_returned');
+await assert.rejects(call({run:true},'Slash'),/fresh request/);
 gateway.request=async(method,params)=>{
   if(method==='commands.catalog') return catalog;
   if(method==='slash.exec' && params.command!=='/bundles') throw Error('lost reply');
