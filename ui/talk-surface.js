@@ -947,6 +947,9 @@ function createTalkSurface(SDK) {
       this.localTools = new Set();
       this.pendingLocalTools = null;
       this.localToolCalls = new Map();
+      this.workflowInput = null;
+      this.workflowResponse = null;
+      this.usedWorkflowInputs = new Set();
       this.cascade = session && session.voiceMode === "cascade";
       // Every response gets its own relay stream; a tool-call continuation
       // can start streaming while the previous answer's PCM still drains, so
@@ -1186,6 +1189,8 @@ function createTalkSurface(SDK) {
     async sendTyped(text) {
       if (this.closed || !text.trim() || !this.channel || this.channel.readyState !== "open") return false;
       if (this.task) return this.task.typed(text);
+      this.workflowInput = null;
+      this.workflowResponse = null;
       this.send({ type: "conversation.item.create", item: {
         id: clientId("item_"), type: "message", role: "user", content: [{ type: "input_text", text: text.trim() }],
       } });
@@ -1229,6 +1234,12 @@ function createTalkSurface(SDK) {
           break;
         }
         case "input_audio_buffer.committed":
+          if (!this.task && this.localTools.has("desktop_slash_workflow") && event.item_id &&
+              this.workflowInput?.id !== event.item_id) {
+            const input = {id: event.item_id, time: Date.now(), claimed: false};
+            input.ready = new Promise(resolve => { input.resolve = resolve; });
+            this.workflowInput = input;
+          }
           if (this.task && event.item_id) {
             this.task.committed.add(event.item_id);
             const row = this.task.inputs.get(event.item_id);
@@ -1237,6 +1248,9 @@ function createTalkSurface(SDK) {
           return;
         case "conversation.item.input_audio_transcription.completed":
           if (this.task) { this.task.voice(event); return; }
+          if (event.item_id && this.workflowInput?.id === event.item_id && typeof event.transcript === 'string') {
+            this.workflowInput.resolve(event.transcript);
+          }
           if (event.transcript) this.cb.onTranscript("user", event.transcript, true);
           if (event.transcript && this.journal) {
             this.journal.add("user", { text: event.transcript, item_id: event.item_id, source: "voice" });
@@ -1270,6 +1284,11 @@ function createTalkSurface(SDK) {
           return;
         }
         case "response.created":
+          this.workflowResponse = null;
+          if (event.response?.id && this.workflowInput && !this.workflowInput.claimed) {
+            this.workflowInput.claimed = true;
+            this.workflowResponse = { id: event.response.id, input: this.workflowInput };
+          }
           if (this.task) this.task.created(event.response || {});
           this.continuationPending = false;
           this.responseActive = true;
@@ -1278,6 +1297,10 @@ function createTalkSurface(SDK) {
         case "response.done": {
           this.responseActive = false;
           const doneStatus = event.response && event.response.status;
+          if (doneStatus && doneStatus !== 'completed' && event.response?.id === this.workflowResponse?.id) {
+            this.workflowInput = null;
+            this.workflowResponse = null;
+          }
           if (this.journal && doneStatus && doneStatus !== "completed") {
             this.journal.add("response_done", { status: doneStatus });
           }
@@ -1295,6 +1318,8 @@ function createTalkSurface(SDK) {
           if (this.task) void this.task.presentation.drain();
           return;
         case "input_audio_buffer.speech_started":
+          this.workflowInput = null;
+          this.workflowResponse = null;
           if (this.journal && this.responseActive) this.journal.add("interrupted", { status: "barge_in" });
           if (this.task) {
             this.task.presentation.interrupt();
@@ -1321,6 +1346,28 @@ function createTalkSurface(SDK) {
         default:
           return;
       }
+    }
+
+    async takeWorkflowUtterance(event, response) {
+      const input = response?.input;
+      const check = () => {
+        if (this.closed || !input || !response.id || response.id !== event.response_id ||
+            this.workflowInput !== input || Date.now() - input.time > 15000) {
+          throw new Error('The spoken workflow request is no longer current.');
+        }
+      };
+      check();
+      if (this.usedWorkflowInputs.has(input.id)) throw new Error('That spoken request was already handled.');
+      this.usedWorkflowInputs.add(input.id);
+      let timer;
+      try {
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('No final transcript. Repeat the command.')), 1500);
+        });
+        const text = await Promise.race([input.ready, timeout]);
+        check();
+        return { id: input.id, text, check };
+      } finally { clearTimeout(timer); }
     }
 
     handleError(error) {
@@ -1628,9 +1675,10 @@ function createTalkSurface(SDK) {
       if (!this.toolBatch) this.toolBatch = { done: false, results: [] };
       const batch = this.toolBatch;
       const position = batch.results.length;
+      const response = this.workflowResponse;
       batch.results.push(null);
       this.toolTail = this.toolTail.then(async () => {
-        batch.results[position] = await this.handleFunctionCall(event);
+        batch.results[position] = await this.handleFunctionCall(event, null, response);
         this.flushToolResponse(batch);
       });
     }
@@ -1649,7 +1697,7 @@ function createTalkSurface(SDK) {
       this.toolBatch = null;
     }
 
-    async handleFunctionCall(event, binding) {
+    async handleFunctionCall(event, binding, response) {
       const callId = typeof event.call_id === "string" ? event.call_id : "";
       const name = typeof event.name === "string" ? event.name : "";
       if (!callId || !name) return;
@@ -1678,6 +1726,7 @@ function createTalkSurface(SDK) {
             const promise = Promise.resolve().then(() => {
               if (this.closed) throw new Error("Voice call ended before the Desktop action started.");
               return SDK.executeLocalTool(name, args, { callId,
+                takeUtterance: () => this.takeWorkflowUtterance(event, response),
                 signal: this.microphoneLease?.signal || this.startAbort?.signal });
             });
             saved = { fingerprint, promise };

@@ -248,6 +248,151 @@ def test_talk_capabilities_reports_the_snapshot(monkeypatch):
     assert catalog["health"] == {"active_runs": 1}
 
 
+def test_voice_catalog_search_ranks_names_and_explains_availability(monkeypatch):
+    snapshot = _snapshot(
+        skills=({"name": "other", "description": "uses issue tracker", "disabled": True},),
+        commands=({"name": "/issue-tracker", "description": "Look up issues"},),
+        commands_resolved=True,
+        toolsets=({"name": "web", "label": "Issue Tracker", "enabled": False,
+                  "tools": ["issue_tracker_search"]},),
+        tools=("issue_tracker_search",), tools_resolved=True,
+    )
+    monkeypatch.setattr(talk_capabilities, "status", lambda: snapshot)
+    arguments = {"query": "Hey slash /Issue-Tracker"}
+    result = json.loads(talk_tools.execute_talk_tool("talk_capabilities", arguments))
+    assert result["tools_resolved"] and result["commands_resolved"]
+    assert result["total"] == 4 and result["next_offset"] is None
+    command, tool, skill, group = result["matches"]
+    assert command == {"kind": "command", "name": "/issue-tracker", "description": "Look up issues"}
+    assert tool == {"kind": "tool", "name": "issue_tracker_search"}
+    assert skill["disabled"] is True
+    assert group["enabled"] is False and group["has_resolved_tools"] is True
+
+
+def test_voice_catalog_pages_include_skills_beyond_summary_cutoff(monkeypatch):
+    skills = tuple({"name": f"skill-{n:03}", "description": "a" * 200} for n in range(83))
+    monkeypatch.setattr(talk_capabilities, "status", lambda: _snapshot(
+        skills=skills, toolsets=(), source=talk_capabilities.SOURCE_API_SERVER,
+    ))
+    found = []
+    offset = 0
+    while offset is not None:
+        page = json.loads(talk_tools.execute_talk_tool(
+            "talk_capabilities", {"query": "", "offset": offset},
+        ))
+        assert page["tools_resolved"] is False and page["commands_resolved"] is False
+        assert len(page["matches"]) <= 8 and page["total"] == len(skills)
+        found.extend(match["name"] for match in page["matches"])
+        assert page["next_offset"] is None or page["next_offset"] > offset
+        offset = page["next_offset"]
+    assert found == [skill["name"] for skill in skills]
+    exact = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {"query": "skill 082"}))
+    assert exact["matches"][0]["name"] == "skill-082"
+
+
+def test_voice_catalog_reports_unknown_source_and_redacts_metadata(monkeypatch):
+    monkeypatch.setattr(talk_capabilities, "status", lambda: talk_capabilities._empty("warming"))
+    result = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {"query": ""}))
+    assert result == {"source": "unavailable", "available": False, "detail": "warming"}
+    monkeypatch.setattr(talk_capabilities, "status", lambda: _snapshot(
+        skills=({"name": "redact", "description": "key sk-abcdefg12345678", "handler": "hidden"},),
+    ))
+    output = talk_tools.execute_talk_tool("talk_capabilities", {"query": "redact"})
+    assert "<redacted-secret>" in output and "abcdefg" not in output and "hidden" not in output
+
+
+@pytest.mark.parametrize(
+    "args", [{"offset": -1}, {"offset": True}, {"query": 3}, {"query": "x" * 201}],
+)
+def test_invalid_voice_catalog_search_returns_json(monkeypatch, args):
+    monkeypatch.setattr(talk_capabilities, "status", _snapshot)
+    assert json.loads(talk_tools.execute_talk_tool("talk_capabilities", args))["error"]
+
+
+def test_voice_catalog_hides_a_snapshot_from_another_home(monkeypatch):
+    monkeypatch.setattr(talk_host, "_catalog_profile_key", lambda: "A")
+    talk_capabilities._store(_snapshot(), talk_capabilities._read_seq())
+    refreshed = []
+    monkeypatch.setattr(talk_capabilities, "_refresh_in_background", lambda: refreshed.append(True))
+    monkeypatch.setattr(talk_host, "_catalog_profile_key", lambda: "B")
+    assert talk_capabilities.wait_until_warm(0) is None
+    result = json.loads(talk_tools.execute_talk_tool("talk_capabilities", {"query": "web"}))
+    assert result["available"] is False and refreshed
+
+
+def test_voice_catalog_can_recover_a_slow_host_read_before_the_failure_ttl(monkeypatch):
+    missing = talk_capabilities._empty("gateway unavailable")
+    talk_capabilities._store(missing, talk_capabilities._read_seq())
+    refreshed = []
+    monkeypatch.setattr(talk_capabilities, "_refresh_in_background", lambda: refreshed.append(True))
+    monkeypatch.setattr(talk_host, "late_catalog_ready", lambda: True)
+    assert talk_capabilities.status() is missing
+    assert refreshed
+
+
+def test_plugin_lookup_reads_only_existing_registry_metadata(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    plugins = ModuleType("hermes_cli.plugins")
+    def untouched():
+        pytest.fail("discovery/execution must not run during a catalog read")
+
+    def plugin(*, enabled=True, deferred=False, error=None, kind="standalone"):
+        manifest = SimpleNamespace(
+            name="Tickets", kind=kind, path="/private/plugins/desk", requires_env=["private"],
+        )
+        return SimpleNamespace(manifest=manifest, enabled=enabled, error=error, deferred=deferred)
+
+    manager = SimpleNamespace(
+        _discovery_lock=threading.Lock(), _discovered=False,
+        _plugin_commands={"talk": {"description": "Voice", "handler": untouched}},
+        _plugins={
+            "help/tickets": plugin(), "waiting": plugin(deferred=True),
+            "failed": plugin(error="sensitive error details"),
+            "disabled": plugin(enabled=False), "external": plugin(kind="model-provider"),
+            "/private/plugins/desk": plugin(),
+        },
+        list_plugins=untouched, discover_and_load=untouched,
+    )
+    plugins.get_plugin_manager = lambda: manager
+    plugins.get_plugin_commands = untouched
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    assert talk_host._registered_plugin_inventory() == {}
+    manager._discovered = True
+    with manager._discovery_lock:
+        assert talk_host._registered_plugin_inventory() == {}
+    inventory = talk_host._registered_plugin_inventory()
+    commands = inventory["commands"]
+    assert commands == [{"name": "/talk", "description": "Voice"}]
+    monkeypatch.setattr(
+        talk_host.host(), "capability_catalog_probe",
+        lambda: json.dumps({"skills": [], **inventory}),
+    )
+    snapshot = talk_capabilities._from_in_process()
+    assert snapshot.commands_resolved and snapshot.commands == tuple(commands)
+    assert snapshot.plugins_resolved
+    monkeypatch.setattr(talk_capabilities, "status", lambda: snapshot)
+    output = talk_tools.execute_talk_tool("talk_capabilities", {"query": "plugins"})
+    assert "private" not in output and "sensitive" not in output
+    matches = json.loads(output)["matches"]
+    assert all(match["kind"] == "plugin" for match in matches)
+    assert [match["name"] for match in matches] == [
+        "help/tickets", "disabled", "external", "failed", "waiting",
+    ]
+    assert [match["load_state"] for match in matches] == [
+        "loaded", "not_loaded", "managed_separately", "not_loaded", "deferred",
+    ]
+    match = json.loads(talk_tools.execute_talk_tool(
+        "talk_capabilities", {"query": "help tickets"},
+    ))["matches"][0]
+    assert match == {
+        "kind": "plugin", "name": "help/tickets", "label": "Tickets",
+        "enabled": True, "load_state": "loaded",
+    }
+    assert "plugins" not in json.loads(talk_tools.execute_talk_tool("talk_capabilities", {}))
+
+
 def test_talk_capabilities_passes_disabled_toolsets_through(monkeypatch):
     """A disabled toolset is REPORTED, not filtered: the model has to be able
     to say "installed but not usable", and it cannot say what it never saw."""

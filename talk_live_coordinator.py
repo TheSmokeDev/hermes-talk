@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import Mapping
 
@@ -29,6 +30,34 @@ UNCERTAIN_OUTPUT = (
     "Inspect the task before giving a fresh instruction."
 )
 PRESENTATION_SECONDS = 30.0
+_SLASH_LOOKUP = re.compile(
+    r"(?:(?:hey[\s,]+)?slash(?=$|[\s,.:!?])[\s,:]*|/(?!/))(?P<query>[^\r\n]*)", re.IGNORECASE
+)
+
+
+def _slash_decision(text, available):
+    if re.match(
+        r"^\s*(?:(?:hey(?:\s+hermes)?|hermes)[,\s]+)?(?:please\s+)?"
+        r"(?:run|start|invoke)\s+(?:the\s+)?(?:slash\b|/)", text, re.IGNORECASE
+    ):
+        return {"name": "", "arguments": {}, "message": (
+            "This task supports discovery only. Use the Hermes command in its native chat."
+        )}
+    match = _SLASH_LOOKUP.fullmatch(text.strip())
+    if match:
+        query = match["query"].strip(" \t.,?!")
+    elif re.fullmatch(
+        r"(?:what|which|list|show)(?:\s+(?:me|my|the|hermes|installed))*\s+plugins"
+        r"(?:\s+(?:are installed|are enabled|do (?:i|you|we) have))?[.?!]?", text.strip(), re.I
+    ):
+        query = "plugins"
+    else:
+        return None
+    if len(query) > 200:
+        return {"name": "", "arguments": {}, "message": "Use a shorter workflow name."}
+    if any(tool["name"] == "talk_capabilities" for tool in available):
+        return {"name": "talk_capabilities", "arguments": {"query": query}, "message": ""}
+    return {"name": "", "arguments": {}, "message": "Workflow lookup is unavailable on this task."}
 
 
 def operation_presentation(operation):
@@ -833,22 +862,26 @@ class LiveCoordinator:
                 bound.stages.get, bound.token, operation["interaction_id"]
             )
             record = await asyncio.to_thread(self.manager._persist_original, bound, record)
-            context = await asyncio.to_thread(self.manager.state, request, body)
             available = self.tools(bound)
-            context = {
-                "task": context["task"],
-                "history": [
-                    {"role": row.get("role"), "content": str(row.get("content", ""))[:2000]}
-                    for row in context.get("history", {}).get("messages", [])[-12:]
-                ],
-                "jobs": context.get("jobs", [])[-12:],
-                "preferences": context.get("preferences", {}),
-                "recipients": context.get("recipients", {}),
-                "capabilities": context.get("capabilities", {}),
-            }
-            value = await self.decide(
-                source=record["source_window"], context=context, tools=available
-            )
+            value = _slash_decision(record["text"], available)
+            selected = None
+            if value is None:
+                context = await asyncio.to_thread(self.manager.state, request, body)
+                context = {
+                    "task": context["task"],
+                    "history": [
+                        {"role": row.get("role"), "content": str(row.get("content", ""))[:2000]}
+                        for row in context.get("history", {}).get("messages", [])[-12:]
+                    ],
+                    "jobs": context.get("jobs", [])[-12:],
+                    "preferences": context.get("preferences", {}),
+                    "recipients": context.get("recipients", {}),
+                    "capabilities": context.get("capabilities", {}),
+                }
+                selected = context["recipients"].get("selected")
+                value = await self.decide(
+                    source=record["source_window"], context=context, tools=available
+                )
             if (
                 not isinstance(value, dict)
                 or set(value) != {"name", "arguments", "message"}
@@ -859,7 +892,6 @@ class LiveCoordinator:
             ):
                 raise DashboardTaskError("live_decision_invalid", 502)
             if value["name"] == "send_agent_message":
-                selected = context["recipients"].get("selected")
                 arguments = value["arguments"]
                 if not selected or any(
                     key in arguments and arguments[key] != selected[key] for key in IDENTITY_FIELDS

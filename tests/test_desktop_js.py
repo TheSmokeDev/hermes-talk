@@ -88,7 +88,7 @@ def test_desktop_voice_preserves_server_tools_and_uses_scoped_catalog():
 const sdk=createSDK();
 const patch=sdk.realtimeSessionPatch({instructions:'Existing rules',
  tools:[{name:'delegate_task'}]});
-assert.equal(patch.tools.length,9);
+assert.equal(patch.tools.length,10);
 assert(patch.instructions.startsWith('Existing rules'));
 assert.equal(patch.tools[0].name,'delegate_task');
 let seen;
@@ -99,6 +99,97 @@ assert.deepEqual(JSON.parse(JSON.stringify(seen)),{connectionId:'connection-a',p
 assert.equal(output.toolsets[0].name,'terminal');
 assert(!JSON.stringify(output).includes('secret'));
 assert.equal(rpc.length,0);
+})();
+""")
+
+
+def test_spoken_slash_uses_captured_words_and_full_native_catalog():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), previous=gateway.request.bind(gateway);
+const skills=Object.fromEntries(Array.from({length:120}, (_,i)=>['/skill-'+i,{}]));
+skills['/release-notes']={}; skills['/release_notes']={};
+const catalog={skills, pairs:[], categories:[{name:'Plugin commands', pairs:[['/audit','Audit']]}],
+  canon:{'/audit':'/audit','/reset':'/reset'}, commands:{'/reset':{}},
+  plugin_commands:{audit:'Audit',reset:'Hidden collision'}};
+const sends=[];
+gateway.request=async(method,params)=>{
+  if(method==='commands.catalog') return catalog;
+  if(method==='plugins.manage') {
+    assert.equal(params.action,'list'); assert.equal(params.profile,'profile-a');
+    return {plugins:[{name:'no-commands',enabled:true,settings:{secret:'private'}}]};
+  }
+  if(method==='slash.exec' && params.command==='/bundles')
+    return {type:'exec',output:'• /weekly-pack — Weekly (2 skills)'};
+  if(method==='slash.exec') {
+    sends.push(params);
+    return params.command==='/audit' ? {type:'exec',output:'audit reported 0 issues'} :
+        {type:'skill',message:'expanded workflow', notice:'fixture'};
+  }
+  return previous(method,params);
+};
+const call=(args,text,check=()=>{})=>sdk.executeLocalTool('desktop_slash_workflow',args,
+  {takeUtterance:async()=>({id:'item-1',text,check})});
+const modules=await call({kind:'plugin',query:'no commands'});
+assert.equal(modules.matches[0].enabled,true); assert(!JSON.stringify(modules).includes('private'));
+assert.equal((await call({query:'skill 118'})).matches[0].name,'/skill-118');
+assert.equal((await call({query:'weekly',kind:'bundle'})).matches[0].name,'/weekly-pack');
+assert((await call({query:'',offset:8})).next_offset>8);
+assert.equal((await call({run:true},'run slash release notes')).status,'ambiguous');
+assert.equal((await call({run:true},'run slash reset')).status,'use_typed_command');
+assert.equal((await call({run:true},'run slash absent')).status,'unknown');
+await assert.rejects(call({run:true},'what if I say run slash audit'),/fresh request/);
+await assert.rejects(call({run:true},'run slash audit, actually wait'),/fresh request/);
+await assert.rejects(call({run:true},'run slash audit, no, cancel'),/fresh request/);
+await assert.rejects(call({run:true},'run slash audit',()=>{throw Error('changed')}),/changed/);
+assert.equal(sends.length,0);
+const result=await call({run:true,query:'audit'},
+  'Hey Hermes, run slash release dash notes with arguments RC2 /tmp/X');
+assert.equal(result.status,'queued'); assert.equal(sends[0].command,'/release-notes RC2 /tmp/X');
+assert.equal(sends[0].session_id,owner.sessionId);
+assert.equal(rpc.find(row=>row.method==='prompt.submit').params.text,'expanded workflow');
+assert.equal((await call({run:true},'run slash audit')).status,'handler_returned');
+gateway.request=async(method,params)=>{
+  if(method==='commands.catalog') return catalog;
+  if(method==='slash.exec' && params.command!=='/bundles') throw Error('lost reply');
+  return previous(method,params);
+};
+assert.equal((await call({run:true},'run slash audit')).status,'unconfirmed');
+})();
+""")
+
+
+def test_legacy_workflows_use_session_checked_dispatch_and_only_fallback_for_a_skill_referral():
+    run_node(DESKTOP_TOOLS + r"""
+(async()=>{
+const sdk=createSDK(), log=[];
+let lost=false;
+gateway.request=async(method,params)=>{
+  log.push(method);
+  if(method==='session.list') throw Object.assign(
+    Error('invalid params for session.list: scope: extra'),{code:4000});
+  if(method==='commands.catalog') return {skills:{'/demo':{}},pairs:[],canon:{'/audit':'/audit'},
+    categories:[{name:'Plugin commands',pairs:[['/audit','read']]}],plugin_commands:{audit:'read'}};
+  if(method==='complete.slash') return {items:[{text:'/weekly',kind:'skill'}]};
+  if(method==='slash.exec') {
+    if(lost) throw Error('lost');
+    if(params.command==='/demo A') throw Object.assign(
+      Error('skill command: use command.dispatch for /demo'),{code:4018});
+    if(params.command==='/weekly') return {type:'send',message:'bundle body'};
+    assert.equal(params.command,'/audit'); return {output:'audit readback'};
+  }
+  if(method==='command.dispatch') return {type:'skill',message:'skill body'};
+  if(method==='prompt.submit') return {status:'streaming'};
+  throw Error('unexpected '+method);
+};
+const say=text=>sdk.executeLocalTool('desktop_slash_workflow',{run:true},
+  {takeUtterance:async()=>({id:'captured',text,check(){}})});
+assert.equal((await say('run slash weekly')).status,'streaming');
+assert.equal((await say('run slash demo A')).status,'streaming');
+assert.equal((await say('run slash audit')).status,'handler_returned');
+lost=true;
+assert.equal((await say('run slash audit')).status,'unconfirmed');
+assert.equal(log.filter(method=>method==='command.dispatch').length,1);
 })();
 """)
 
