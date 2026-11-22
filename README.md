@@ -52,13 +52,21 @@ Hermes Talk adds duplex voice to a Hermes install you already run. It is not a
 standalone assistant, and it doesn't replace Hermes's built-in turn-based voice
 mode, which is a different (and good) design.
 
-<!-- Regenerate this GIF (needs ffmpeg): python docs/render-dashboard-gif.py -->
-![The Talk tab in the Hermes dashboard: a live voice session, a background agent delegated mid-conversation, and its result landing in the runs panel (8x speed)](docs/dashboard.gif)
+<p align="center"><img src="docs/talk-desktop.gif" width="400" alt="Hermes Talk in Hermes Desktop: press Talk, the panel docks on the right, and you talk while Hermes works"></p>
 
-[Watch the 2:27 cut with sound](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.3.0/hermes-talk-dashboard-cut.mp4):
-delegate a job, keep talking, hear the result land. It is a real Realtime session
-recorded at v0.3.0 (the GIF runs at 8x), so it predates GPT-Live, the Codex workers
-and the 0.24.0 panel.
+[**Watch the 0.24 film**](https://github.com/TheSmokeDev/hermes-talk/releases/download/v0.24.1/hermes-talk-0.24-film.mp4) (1:40, with sound): the one-button
+panel, switching coding chats by voice, Phone mode, Discord, Echo and the community
+behind it. Narration and sample conversations are for demonstration; the features are real.
+
+The original [dashboard demo](docs/dashboard.gif) is a real Realtime session recorded at v0.3.0.
+
+## New in 0.25.0
+
+In an unbound OpenAI Realtime call in Hermes Desktop, say **“slash”** to browse
+the active session's workflows. Say **“run the slash meeting action items command”**
+to invoke that skill if it is installed. You can also ask which Hermes plugins
+are available. The operator tested this flow with a microphone and a Codex
+subscription on the standalone build. [Voice commands and supported surfaces](docs/VOICE-COMMANDS.md#finding-a-hermes-workflow-by-voice)
 
 ## New in 0.24.0
 
@@ -116,7 +124,6 @@ Hermes-signed requests or the Codex CLI's own login. Install it by name:
 
 ```bash
 hermes plugins install hermes-talk --enable
-pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
 ```
 
 Needs Python ≥ 3.11 and Hermes Agent ≥ 0.23.0. GPT-Live on the subscription also
@@ -124,7 +131,9 @@ needs the Codex CLI (`npm install -g @openai/codex`, then `codex login`). The
 standalone build on the `main` branch keeps every subscription lane, including
 the Grok subscription, and installs from GitHub as described in its README.
 
-Every version with its receipts: [CHANGELOG.md](CHANGELOG.md).
+When the updated pin is accepted in the Hermes catalog, upgrade an existing
+catalog installation with `hermes plugins update hermes-talk`. Restart the gateway,
+dashboard and Desktop after updating.
 
 **Using Desktop?** Installed agent packages are opt-in there. In Desktop
 **Capabilities → Plugins**, turn on the Desktop half of **Hermes Talk** if it is
@@ -218,7 +227,11 @@ What you would want to know before installing (catalog rule 13):
   thread runs a small Codex turn for each voice request (subscription quota),
   replies only `skip`, and cannot run tools.
 - **Work on your behalf:** spoken requests are handed to your Hermes agent,
-  whose tools can run shell commands under Hermes's own approvals.
+  whose tools can run shell commands under Hermes's own approvals. In an unbound
+  OpenAI Realtime call, Desktop can list the session's skills, commands, bundles and
+  installed plugins. An explicit spoken slash request can invoke an eligible command
+  or queue a skill prompt in that session. A registered plugin command can run its
+  own handler immediately, subject to the host's permissions.
 - **Local data:** run history and voice-session state under Hermes's home. The
   optional call journal (`TALK_CALL_JOURNAL=1`, off by default) keeps text-only
   call records there, kept 30 days unless you set `TALK_CALL_JOURNAL_DAYS`. No

@@ -19,6 +19,7 @@ import copy
 import functools
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -378,13 +379,21 @@ _TOOL_TALK_CAPABILITIES: dict = {
         "configured, the gateway's feature flags, and how much work is in "
         "flight. Use when asked what you can do, which tools or skills are "
         "available, or why something seems missing. A toolset listed here "
-        "with enabled or configured false is NOT usable — say so rather than "
-        "offering it. If the source is 'unavailable', say you could not read "
+        "as disabled or unconfigured may be unavailable; report its actual flags. "
+        "If the source is 'unavailable', say you could not read "
         "the catalog; never answer from memory instead."
+        " When the caller says 'hey slash' or asks for a skill, integration or slash "
+        "command, pass its name as query (empty to browse). Use query 'plugins' to list "
+        "plugins, including integrations without commands. Report load_state as returned; "
+        "loaded does not verify a connected service. A match is discovery only. "
+        "plugins_resolved, commands_resolved and tools_resolved report registry coverage."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "query": {"type": "string", "description": "Name or search terms. Empty to browse."},
+            "offset": {"type": "integer", "description": "Next offset for the same search."},
+        },
         "additionalProperties": False,
     },
 }
@@ -868,6 +877,8 @@ def _render_catalog(payload: dict) -> str:
 
 def _handle_talk_capabilities(arguments: dict) -> str:
     snapshot = talk_capabilities.status()
+    if "query" in arguments or "offset" in arguments:
+        return _search_capabilities(snapshot, arguments)
     payload = {
         "source": snapshot.source,
         "detail": snapshot.detail,
@@ -920,6 +931,94 @@ def _handle_talk_capabilities(arguments: dict) -> str:
             }
         )
     return rendered
+
+
+def _catalog_words(value: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", value.casefold()))
+
+
+def _search_capabilities(snapshot: talk_capabilities.CatalogSnapshot, arguments: dict) -> str:
+    """Search a specific host snapshot, keeping its registries and availability distinct."""
+    query = arguments.get("query", "")
+    offset = arguments.get("offset", 0)
+    if not isinstance(query, str) or len(query) > 200 or type(offset) is not int or offset < 0:
+        return _render_catalog({"error": "invalid catalog search"})
+    if snapshot.source == talk_capabilities.SOURCE_NONE:
+        return _render_catalog({
+            "source": snapshot.source, "available": False,
+            "detail": talk_doctor.redact_text(snapshot.detail)[:240],
+        })
+
+    needle = _catalog_words(query)
+    if needle == "hey slash" or needle.startswith("hey slash "):
+        needle = needle[len("hey slash"):].strip()
+    plugins_only = needle == "plugins"
+    if plugins_only:
+        needle = ""
+    terms = needle.split()
+    live_tools = set(snapshot.tools)
+    matches = []
+    for kind, entries in (
+        ("skill", snapshot.skills),
+        ("toolset", snapshot.toolsets),
+        ("tool", ({"name": name} for name in snapshot.tools)),
+        ("command", snapshot.commands),
+        ("plugin", snapshot.plugins),
+    ):
+        if plugins_only and kind != "plugin":
+            continue
+        for entry in entries:
+            normalized = _catalog_words(_catalog_name(entry))
+            metadata = " ".join(
+                entry[key] for key in ("label", "category", "description")
+                if isinstance(entry.get(key), str)
+            )
+            members = entry.get("tools")
+            member_names = [n for n in members if isinstance(n, str)] if (
+                kind == "toolset" and isinstance(members, list)
+            ) else []
+            searchable = normalized + " " + _catalog_words(
+                talk_doctor.redact_text(" ".join([metadata, *member_names]))
+            )
+            if not all(term in searchable for term in terms):
+                continue
+            match = {"kind": kind, **_compact_entry(entry)}
+            if kind == "plugin" and entry.get("load_state") in (
+                "loaded", "deferred", "not_loaded", "managed_separately", "unknown",
+            ):
+                match["load_state"] = entry["load_state"]
+                if isinstance(entry.get("label"), str):
+                    match["label"] = entry["label"]
+            description = entry.get("description")
+            if isinstance(description, str) and description.strip():
+                match["description"] = " ".join(talk_doctor.redact_text(description).split())[:120]
+            if kind == "toolset" and snapshot.tools_resolved and isinstance(members, list):
+                match["has_resolved_tools"] = bool(live_tools.intersection(member_names))
+            # Prefer the exact spoken identifier, then a name prefix, then other name
+            # matches, with description-only matches after all of them.
+            rank = (
+                normalized != needle, not normalized.startswith(needle), needle not in normalized,
+                plugins_only and match.get("load_state") != "loaded",
+            )
+            matches.append((rank, normalized, match))
+    matches.sort(key=lambda row: (row[0], row[1], row[2]["kind"]))
+    page = [row[2] for row in matches[offset:offset + 8]]
+    result = {
+        "source": snapshot.source, "total": len(matches), "matches": page,
+        "tools_resolved": snapshot.tools_resolved, "commands_resolved": snapshot.commands_resolved,
+        "plugins_resolved": snapshot.plugins_resolved,
+    }
+    while True:
+        after = offset + len(page)
+        result["next_offset"] = after if after < len(matches) else None
+        rendered = _render_catalog(result)
+        if len(rendered) <= MAX_OUTPUT_CHARS:
+            return rendered
+        if len(page) == 1:
+            return _render_catalog({
+                "error": "catalog entry exceeds output limit", "next_offset": result["next_offset"],
+            })
+        page.pop()
 
 
 _HANDLERS = {

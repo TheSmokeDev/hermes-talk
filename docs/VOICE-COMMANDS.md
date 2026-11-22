@@ -40,6 +40,19 @@ approval — once, this session, or no?" While that question is open the
 generic "waiting on an approval" milestone stays silent — the question is
 the actionable sentence.
 
+## Finding a Hermes workflow by voice
+
+In Desktop OpenAI Realtime, say “slash” to browse and “slash release notes” or “run the slash release notes command” to invoke a skill named release-notes. You can also ask “which Hermes skills can I run?” or “which Hermes plugins are installed?” A plugin can provide tools or hooks without registering any slash commands.
+
+| Call | What you can ask for |
+|---|---|
+| Desktop, unbound OpenAI Realtime | Browse the active Hermes session's skills, bundles and plugin commands. Say “run slash release notes for version 0.24” to invoke a matching workflow through Hermes. Say “release dash notes” or use “with arguments” to clarify a name. A queued result means Hermes admitted the turn. A plugin command can return its own report immediately. Quick commands use the native chat. Bundle execution depends on the host's dispatcher. |
+| Terminal or dashboard, provider-owned session with Talk tools | Search the Hermes profile's available catalog through the existing voice model. Ask for more results to continue. The reply identifies unavailable registries and can report a cold catalog as still loading. |
+| Task-bound GPT-Live | “Hey slash release notes” searches the advertised catalog of the selected peer and profile on delegation. Some hosts expose only skill or toolset metadata. Use the native chat to invoke the command. |
+| Shared Discord voice on stock Hermes | Use the linked text channel's slash picker. The installed host enforces command permissions there. It does not supply Talk with an authenticated spoken command invocation and admission receipt. |
+
+Lookup uses the voice connection you already selected and the Hermes host. It adds no model account, classifier request, or change of billing route. A workflow that starts an agent turn uses the agent configured in Hermes.
+
 ## Desktop session control (0.22.0)
 
 These tools are available in an unbound OpenAI Realtime call in Desktop when

@@ -122,6 +122,10 @@ class CatalogSnapshot:
     detail: str
     tools: tuple[str, ...] = ()
     tools_resolved: bool = False
+    commands: tuple[dict, ...] = ()
+    commands_resolved: bool = False
+    plugins: tuple[dict, ...] = ()
+    plugins_resolved: bool = False
 
 
 #: Cached snapshot + when it was taken. Guarded for the same reason
@@ -133,6 +137,7 @@ class CatalogSnapshot:
 #: healthy snapshot.
 _LOCK = threading.Lock()
 _SNAPSHOT: CatalogSnapshot | None = None
+_SNAPSHOT_PROFILE: str | None = None
 _SNAPSHOT_AT: float = 0.0
 _STORE_SEQ = 0
 _REFRESHING = False
@@ -262,6 +267,10 @@ def _from_in_process() -> CatalogSnapshot | None:
             else ()
         ),
         tools_resolved=bool(payload.get("tools_resolved")) and isinstance(tools, list),
+        commands=_entries(payload.get("commands")),
+        commands_resolved=isinstance(payload.get("commands"), list),
+        plugins=_entries(payload.get("plugins")),
+        plugins_resolved=isinstance(payload.get("plugins"), list),
     )
 
 
@@ -328,12 +337,14 @@ def _store(snapshot: CatalogSnapshot, started_seq: int) -> None:
     a newer arrival time — dropped, not stored.
     """
 
-    global _SNAPSHOT, _SNAPSHOT_AT, _STORE_SEQ
+    global _SNAPSHOT, _SNAPSHOT_PROFILE, _SNAPSHOT_AT, _STORE_SEQ
+    profile = talk_host._catalog_profile_key()
     with _LOCK:
         if started_seq != _STORE_SEQ:
             return
         _STORE_SEQ += 1
         _SNAPSHOT = snapshot
+        _SNAPSHOT_PROFILE = profile
         _SNAPSHOT_AT = time.monotonic()
     _FILLED.set()
 
@@ -342,10 +353,13 @@ def _refresh_in_background() -> None:
     """Re-read off the hot path so a warm caller never waits on the network."""
 
     global _REFRESHING
+    profile = talk_host._catalog_profile_key()
     with _LOCK:
         if _REFRESHING:
             return
         _REFRESHING = True
+        if profile != _SNAPSHOT_PROFILE:
+            _FILLED.clear()
         started_seq = _STORE_SEQ
 
     def worker() -> None:
@@ -388,12 +402,16 @@ def status() -> CatalogSnapshot:
     catalog we cannot vouch for must not be spoken as a complete one.
     """
 
+    profile = talk_host._catalog_profile_key()
     with _LOCK:
-        cached, taken_at = _SNAPSHOT, _SNAPSHOT_AT
+        cached = _SNAPSHOT if profile == _SNAPSHOT_PROFILE else None
+        taken_at = _SNAPSHOT_AT
     if cached is None:
         _refresh_in_background()
         return _empty(CHECKING_DETAIL)
-    if time.monotonic() - taken_at >= talk_config.capability_catalog_ttl_s():
+    if time.monotonic() - taken_at >= talk_config.capability_catalog_ttl_s() or (
+        cached.source == SOURCE_NONE and talk_host.late_catalog_ready()
+    ):
         _refresh_in_background()
     return cached
 
@@ -423,14 +441,15 @@ def wait_until_warm(timeout_s: float) -> CatalogSnapshot | None:
     visible instead of silent.
     """
 
+    profile = talk_host._catalog_profile_key()
     with _LOCK:
-        cached = _SNAPSHOT
+        cached = _SNAPSHOT if profile == _SNAPSHOT_PROFILE else None
     if cached is not None:
         return cached
     _refresh_in_background()
     if timeout_s > 0 and _FILLED.wait(timeout_s):
         with _LOCK:
-            return _SNAPSHOT
+            return _SNAPSHOT if profile == _SNAPSHOT_PROFILE else None
     if timeout_s > 0:
         _log.info(
             "capability catalog still warming after %.1fs — this session "
@@ -631,9 +650,10 @@ def reset_for_tests() -> None:
     can no longer store into the cleaned cache.
     """
 
-    global _SNAPSHOT, _SNAPSHOT_AT, _STORE_SEQ, _REFRESHING
+    global _SNAPSHOT, _SNAPSHOT_PROFILE, _SNAPSHOT_AT, _STORE_SEQ, _REFRESHING
     with _LOCK:
         _SNAPSHOT = None
+        _SNAPSHOT_PROFILE = None
         _SNAPSHOT_AT = 0.0
         _STORE_SEQ += 1
         _REFRESHING = False

@@ -53,6 +53,9 @@ def test_build_is_deterministic_and_check_never_writes(tmp_path, desktop):
     css = '/* ${literal} \"quoted\" 雪 */\n.ht-page { color: red; }\n'
     (tmp_path / "dashboard/dist/style.css").write_text(css, encoding="utf-8", newline="\n")
     if desktop:
+        (tmp_path / "ui/desktop-workflows.js").write_bytes(
+            (ROOT / "ui/desktop-workflows.js").read_bytes()
+        )
         (tmp_path / "ui/desktop-entry.js").write_text(
             "const TALK_CSS = __HERMES_TALK_CSS__;\nexport { createTalkSurface, TALK_CSS };\n",
             encoding="utf-8",
