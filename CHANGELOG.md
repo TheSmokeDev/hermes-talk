@@ -13,6 +13,23 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-11-21
+
+Run a Hermes skill by name during an unbound OpenAI Realtime call in Desktop.
+Say “slash” to browse, or “run the slash” followed by the skill name and your
+instructions. The Desktop operator confirmed that a real microphone test worked
+on a Codex subscription.
+
+- Desktop resolves names against the active Hermes session. It can invoke
+  skills, supported bundles, and eligible plugin commands. Ambiguous names
+  return choices. A workflow response reports what its host acknowledged.
+- Ask which plugins or integrations are installed, including plugins that
+  expose no slash commands. Lookup searches the selected Hermes catalog on
+  demand and adds no model call, account, or billing route.
+- Bound GPT-Live supports discovery. Gemini and Grok calls can use discovery
+  where the transport exposes Talk tools. Shared Discord rooms use the linked
+  text channel's command picker for permission-checked execution.
+
 ## [0.24.1] — 2026-11-21
 
 Three community-requested options, all off by default: Discord auto-join, an
