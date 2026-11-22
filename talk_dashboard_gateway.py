@@ -176,6 +176,35 @@ class TaskGateway:
     def capabilities(self):
         return self._request("GET", "/v1/capabilities", max_bytes=256 * 1024)
 
+    def workflow_inventory(self, capabilities):
+        """Read only advertised catalog routes on this binding's authenticated profile."""
+        endpoints = capabilities.get("endpoints")
+        listings, unavailable = {}, []
+        for name, path in (("skills", "/v1/skills"), ("toolsets", "/v1/toolsets")):
+            advertised = endpoints.get(name) if isinstance(endpoints, dict) else None
+            if not isinstance(advertised, dict) or (
+                advertised.get("method"), advertised.get("path")
+            ) != ("GET", path):
+                unavailable.append(name)
+                continue
+            try:
+                payload = self._request("GET", path)
+                rows = payload.get("data")
+                if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                encoded_key = json.dumps(self.transport.credential, ensure_ascii=False)[1:-1]
+                if encoded_key and encoded_key in json.dumps(rows, ensure_ascii=False):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+            except DashboardTaskError as exc:
+                if exc.code not in {
+                    "gateway_refused", "gateway_unavailable", "gateway_response_invalid"
+                }:
+                    raise
+                unavailable.append(name)
+                continue
+            listings[name] = tuple(rows)
+        return listings, unavailable
+
     def require_local(self):
         if urlsplit(self.transport.base_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise DashboardTaskError("unverified_remote_host", 503)

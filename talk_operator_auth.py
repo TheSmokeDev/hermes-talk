@@ -856,6 +856,16 @@ class DiscordToolAuthorizationLedger:
             # configuration.
             if isinstance(permit, _CallPermit):
                 permit.consumed = True
+        if name == "talk_capabilities":
+            arguments = _arguments_dict(event.get("arguments")) or {}
+            if "query" in arguments or "offset" in arguments:
+                # A speaker permit doesn't authorize announcing private command names
+                # to the audience. Discord's picker applies the host's channel policy.
+                return (
+                    "Detailed catalog search is unavailable in this voice room. "
+                    "Open the slash-command picker in the linked Discord text channel. "
+                    "If /skill is listed, select it and choose a skill by name."
+                )
         if name in READ_ONLY_TALK_TOOLS:
             return None
         if name in MUTATING_TALK_TOOLS:
