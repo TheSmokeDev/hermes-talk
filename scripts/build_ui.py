@@ -31,7 +31,10 @@ def render_bundles(root: Path) -> dict[Path, str]:
         desktop = desktop.replace(CSS_TOKEN, json.dumps(css, ensure_ascii=True))
         view = root / "ui/desktop-view.js"
         desktop_view = read_source(root, "ui/desktop-view.js") if view.is_file() else ""
-        bundles[root / "desktop/plugin.js"] = banner + shared + "\n" + desktop_view + "\n" + desktop
+        workflows = read_source(root, "ui/desktop-workflows.js")
+        bundles[root / "desktop/plugin.js"] = banner + "\n".join(
+            (shared, desktop_view, workflows, desktop)
+        )
     return bundles
 
 

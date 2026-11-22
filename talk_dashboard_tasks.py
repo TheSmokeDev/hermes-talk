@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 try:
-    from . import talk_input_attachments
+    from . import talk_capabilities, talk_input_attachments, talk_tools
     from .talk_attachment import HistoryDelivery, TalkAttachment
     from .talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from .talk_dashboard_store import DashboardStages, bounded_text
@@ -46,7 +46,9 @@ try:
     from .talk_task_sources import TaskEventError
     from .talk_worker_recipients import TalkWorkerRecipients, WorkerRecipientBackend
 except ImportError:  # pragma: no cover - flat plugin load
+    import talk_capabilities
     import talk_input_attachments
+    import talk_tools
     from talk_attachment import HistoryDelivery, TalkAttachment
     from talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from talk_dashboard_store import DashboardStages, bounded_text
@@ -529,6 +531,10 @@ class DashboardTasks:
         features = self.capabilities(bound).get("features", {})
         return json.dumps({
             "delegation": "Hermes owns actions and their canonical receipts",
+            "workflow_lookup": (
+                "When the operator says 'hey slash' or names a slash lookup, delegate it to "
+                "Hermes. The selected profile's catalog supplies discovery results."
+            ),
             "workers": ["hermes", "codex"] if codex_worker_available(bound.capabilities)
             else ["hermes"],
             "existing_app_recipients": features.get("recipient_bridge", {"state": "unknown"}),
@@ -863,6 +869,13 @@ class DashboardTasks:
                 bound.token, action["run_id"], bound.events
             )
             output = action["output"]
+        elif name == "talk_capabilities" and ("query" in arguments or "offset" in arguments):
+            output = action.get("output")
+            if action["state"] != "returned" or output is None:
+                output = self._workflow_lookup(bound, arguments)
+                action = bound.stages.update_action(
+                    bound.token, action["run_id"], state="returned", output=output
+                )
         else:
             output = self._read_or_control(bound, name, arguments, request=request, body=body)
             action = bound.stages.update_action(bound.token, action["run_id"], state="returned")
@@ -978,6 +991,21 @@ class DashboardTasks:
             if not exc.retryable:
                 raise
             return saved
+
+    def _workflow_lookup(self, bound, arguments):
+        inventory, missing = bound.gateway.workflow_inventory(self.capabilities(bound))
+        detail = "Selected profile's workflow inventory"
+        if missing:
+            detail += " (" + ", ".join(missing) + " unavailable)"
+        snapshot = talk_capabilities.CatalogSnapshot(
+            source=detail if inventory else talk_capabilities.SOURCE_NONE,
+            detail=detail,
+            skills=inventory.get("skills", ()),
+            toolsets=inventory.get("toolsets", ()),
+            capabilities={},
+            health={},
+        )
+        return talk_tools._search_capabilities(snapshot, arguments)
 
     def _read_or_control(self, bound, name, arguments, *, request=None, body=None):
         if name == "talk_capabilities":

@@ -961,6 +961,36 @@ assert.equal(sent.length,count,'bound task must not gain unjournaled local tools
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_spoken_command_is_bound_to_first_response_and_one_final_microphone_item():
+    script = TASK_HARNESS + r"""
+(async()=>{
+const t=new Transport({},callbacks);
+t.channel={readyState:'open',send(){}};
+t.localTools.add('desktop_slash_workflow');
+const commit=id=>emit(t,{type:'input_audio_buffer.committed',item_id:id});
+const response=id=>emit(t,{type:'response.created',response:{id}});
+const transcript=(id,text)=>emit(t,{type:'conversation.item.input_audio_transcription.completed',
+  item_id:id,transcript:text});
+commit('u1');response('r1');
+const bound=t.workflowResponse;
+const pending=t.takeWorkflowUtterance({response_id:'r1'},bound);
+transcript('wrong','run slash wrong');transcript('u1','run slash correct');
+assert.equal((await pending).text,'run slash correct');
+await assert.rejects(t.takeWorkflowUtterance({response_id:'r1'},bound),/already handled/);
+commit('u2');response('r2');transcript('u2','run slash second');
+response('background');assert.equal(t.workflowResponse,null);
+await assert.rejects(t.takeWorkflowUtterance({response_id:'background'},t.workflowResponse),
+  /no longer current/);
+commit('u3');response('r3');const stale=t.workflowResponse;
+await t.sendTyped('cancel');
+await assert.rejects(t.takeWorkflowUtterance({response_id:'r3'},stale),/no longer current/);
+})();
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_dashboard_serializes_tool_calls_and_continues_once_after_response_done():
     script = r"""
 const fs = require("fs");

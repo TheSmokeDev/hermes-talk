@@ -37,6 +37,14 @@ behind it. Narration and sample conversations are for demonstration; the feature
 
 The original [dashboard demo](docs/dashboard.gif) is a real Realtime session recorded at v0.3.0.
 
+## New in 0.25.0
+
+In an unbound OpenAI Realtime call in Hermes Desktop, say **“slash”** to browse
+the active session's workflows. Say **“run the slash meeting action items command”**
+to invoke that skill if it is installed. You can also ask which Hermes plugins
+are available. A real microphone test on a Codex subscription was confirmed by
+the operator. [Voice commands and supported surfaces](docs/VOICE-COMMANDS.md#finding-a-hermes-workflow-by-voice)
+
 ## New in 0.24.0
 
 A big community release. The community features in the new Experimental
@@ -86,23 +94,13 @@ Every version and what it shipped: [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
-```bash
-hermes plugins install --ref 0668fb23648f3fbe0f926c874e003aaa4a80c250 TheSmokeDev/hermes-talk --enable
-pip install "hermes-talk[audio]"   # mic + speaker support (sounddevice); skip if dashboard-only
-```
+Use the pinned plugin install or upgrade command in the
+[0.25.0 release notes](https://github.com/TheSmokeDev/hermes-talk/releases/tag/v0.25.0).
+For Python microphone and speaker support, run `pip install "hermes-talk[audio]==0.25.0"`.
 
 You need Python 3.11 or newer and a Hermes host at v0.23.0 or newer. GPT-Live,
 shared task attachment and Codex workers need extra host capabilities, listed
 in [Prerequisites](docs/OPERATING.md#prerequisites).
-
-That commit is the published **v0.24.1** source. Hermes v0.22.5 wants a full
-40-character commit SHA for `--ref` and won't take a tag, and pinning the SHA
-also avoids an older community-catalog pin. To move an existing pinned install,
-keep any local plugin edits safe, then run:
-
-```bash
-hermes plugins install --force --ref 0668fb23648f3fbe0f926c874e003aaa4a80c250 --enable TheSmokeDev/hermes-talk
-```
 
 Restart the gateway, the dashboard and Desktop afterwards. A running process
 keeps the old code until you do. An unpinned Git install can use
