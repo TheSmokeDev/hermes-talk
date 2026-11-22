@@ -547,6 +547,11 @@ class NativeTaskController:
         elif isinstance(event, rt.FunctionCall):
             await self._call(event)
         elif isinstance(event, rt.ResponseFinished):
+            if event.response_id is not None and event.response_id == self.spoken_response:
+                finish_playback = getattr(self.audio, "finish_playback", None)
+                if callable(finish_playback):
+                    finish_playback()
+                self.spoken_response = None
             await self._done(event)
         elif isinstance(event, rt.OutputAudio):
             if self.service_paused:

@@ -28,7 +28,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import re
 import sys
 import threading
@@ -44,10 +43,12 @@ try:
         talk_approvals,
         talk_audio,
         talk_auth,
+        talk_call_journal,
         talk_capabilities,
         talk_cascade_voice,
         talk_check,
         talk_config,
+        talk_core_realtime,
         talk_diagnostics,
         talk_doctor,
         talk_gemini_realtime,
@@ -56,6 +57,7 @@ try:
         talk_host,
         talk_identity,
         talk_lifecycle,
+        talk_local_realtime,
         talk_openai_realtime,
         talk_operator_auth,
         talk_pause,
@@ -74,10 +76,12 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_approvals
     import talk_audio
     import talk_auth
+    import talk_call_journal
     import talk_capabilities
     import talk_cascade_voice
     import talk_check
     import talk_config
+    import talk_core_realtime
     import talk_diagnostics
     import talk_doctor
     import talk_gemini_realtime
@@ -86,6 +90,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_host
     import talk_identity
     import talk_lifecycle
+    import talk_local_realtime
     import talk_openai_realtime
     import talk_operator_auth
     import talk_pause
@@ -847,12 +852,34 @@ def run_finished_messages(run: dict) -> list[dict]:
 def run_finished_commands(run: dict) -> list[talk_realtime.RealtimeCommand]:
     """Provider-neutral commands that make the model speak a finished run."""
 
-    tail = str(run.get("output") or "").strip()[-WATCH_OUTPUT_TAIL_CHARS:]
-    verb = "finished" if run.get("status") == "done" else "failed"
-    headline = f"Background run #{run.get('runId')} {verb}" + (
+    output = str(run.get("output") or "").strip()
+    tail = output[-WATCH_OUTPUT_TAIL_CHARS:]
+    meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
+    remote_status = meta.get("api_run_status")
+    if (
+        len(output) > WATCH_OUTPUT_TAIL_CHARS
+        and run.get("status") == "failed"
+        and remote_status in ("failed", "cancelled", "interrupted")
+    ):
+        # The output's prefix may be outside the spoken tail. Restore the
+        # structured verdict within that same budget, without parsing output.
+        prefix = f"the agent run {remote_status}: "
+        tail = prefix + tail[-(WATCH_OUTPUT_TAIL_CHARS - len(prefix)) :]
+    outcome = talk_runs.terminal_outcome(run) or talk_runs.OUTCOME_FAILED
+    headline = f"Background run #{run.get('runId')} {RUN_OUTCOME_WORDS[outcome]}" + (
         "." if tail else " with no output."
     )
     return _announcement_commands(headline, tail)
+
+
+#: ``talk_runs.terminal_outcome`` -> the words a finished run is announced
+#: with. A stop or an interruption is not a failure and is not called one.
+RUN_OUTCOME_WORDS = {
+    talk_runs.OUTCOME_FINISHED: "finished",
+    talk_runs.OUTCOME_FAILED: "failed",
+    talk_runs.OUTCOME_STOPPED: "was stopped",
+    talk_runs.OUTCOME_INTERRUPTED: "was interrupted",
+}
 
 
 #: ``child_status`` → the verb the model is prompted with. Values from
@@ -907,7 +934,22 @@ def subagent_stop_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
 #: talk_progress's mapping table. There is no field for args, paths, URLs,
 #: output text, or approval commands to ride in on — redaction here is
 #: positional, not textual.
+#:
+#: Every milestone forces a spoken response, so only a phase change that
+#: tells the operator something new earns one (hermes-talk#202): an approval
+#: they must answer, or a labelled step ("executing — Running tests").
+#: ``accepted`` repeats the WORK_STARTED receipt the model just spoke, and an
+#: ``executing`` with no label (or only the generic "Working") says only
+#: "still going" — both stay silent. The phase is still recorded in run meta
+#: for check_work and the dashboard.
 _PROGRESS_LABEL_CHARS = 60
+
+
+def _progress_news_label(raw: object) -> str:
+    """A milestone's safe tool label, or "" when it names no actual step."""
+
+    label = str(raw or "").strip()[:_PROGRESS_LABEL_CHARS]
+    return "" if label == talk_progress.TOOL_LABEL_FALLBACK else label
 
 
 def run_phase_messages(run: dict, kind: str) -> list[dict]:
@@ -920,14 +962,15 @@ def run_phase_messages(run: dict, kind: str) -> list[dict]:
 
 
 def run_phase_commands(run: dict, kind: str) -> list[talk_realtime.RealtimeCommand]:
-    """Contained milestone speech for one run's phase change or heartbeat.
+    """Contained milestone speech for one run's phase change, or nothing.
 
-    ``kind`` is a non-terminal phase name or ``"heartbeat"``. Terminal phases
-    build nothing: the watcher's terminal branch speaks the outcome off the
-    registry's authoritative status, and a phase-path copy would be a
-    completion claim built from telemetry. Announcements NEVER claim
-    delivery — a milestone is ephemeral speech, re-sayable on every attach,
-    unlike the result, which is exactly-once.
+    ``kind`` is a non-terminal phase name. Terminal phases build nothing: the
+    watcher's terminal branch speaks the outcome off the registry's
+    authoritative status, and a phase-path copy would be a completion claim
+    built from telemetry. ``accepted`` and an unlabelled ``executing`` build
+    nothing either — they carry no news (see above). Announcements NEVER
+    claim delivery — a milestone is ephemeral speech, re-sayable on every
+    attach, unlike the result, which is exactly-once.
     """
 
     run_id = run.get("runId")
@@ -935,15 +978,12 @@ def run_phase_commands(run: dict, kind: str) -> list[talk_realtime.RealtimeComma
         return []
     label = str(run.get("label") or "").strip()[:_PROGRESS_LABEL_CHARS]
     label_part = f" ({label})" if label else ""
-    if kind == "heartbeat":
-        headline = f"Background run #{run_id}{label_part} is still working."
-    elif kind == talk_progress.PHASE_ACCEPTED:
-        headline = f"Background run #{run_id}{label_part} was accepted."
-    elif kind == talk_progress.PHASE_EXECUTING:
+    if kind == talk_progress.PHASE_EXECUTING:
         meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
-        detail = str(meta.get("phase_detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
-        headline = f"Background run #{run_id}{label_part} is executing"
-        headline += f" — {detail}." if detail else "."
+        detail = _progress_news_label(meta.get("phase_detail"))
+        if not detail:
+            return []
+        headline = f"Background run #{run_id}{label_part} is executing — {detail}."
     elif kind == talk_progress.PHASE_BLOCKED:
         headline = f"Background run #{run_id}{label_part} is waiting on an approval."
     else:
@@ -964,7 +1004,9 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     """Contained milestone speech for an attached child's phase change.
 
     Same containment as :func:`subagent_stop_commands` minus the quoted
-    summary — a milestone carries no child-authored text at all.
+    summary — a milestone carries no child-authored text at all. Same news
+    rule as :func:`run_phase_commands`: ``accepted`` and an unlabelled
+    ``executing`` stay silent (hermes-talk#202).
     """
 
     subagent_id = str(event.get("subagent_id") or "")
@@ -973,12 +1015,11 @@ def subagent_phase_commands(event: dict) -> list[talk_realtime.RealtimeCommand]:
     phase = str(event.get("phase") or "")
     role = str(event.get("role") or "").strip()
     role_part = f" ({role})" if role else ""
-    if phase == talk_progress.PHASE_ACCEPTED:
-        headline = f"Background agent {subagent_id}{role_part} was accepted."
-    elif phase == talk_progress.PHASE_EXECUTING:
-        detail = str(event.get("detail") or "").strip()[:_PROGRESS_LABEL_CHARS]
-        headline = f"Background agent {subagent_id}{role_part} is executing"
-        headline += f" — {detail}." if detail else "."
+    if phase == talk_progress.PHASE_EXECUTING:
+        detail = _progress_news_label(event.get("detail"))
+        if not detail:
+            return []
+        headline = f"Background agent {subagent_id}{role_part} is executing — {detail}."
     elif phase == talk_progress.PHASE_BLOCKED:
         headline = (
             f"Background agent {subagent_id}{role_part} is waiting on an approval."
@@ -1287,6 +1328,21 @@ def _grok_auth() -> talk_auth.TalkAuth:
     return talk_grok_auth.resolve_grok_auth()
 
 
+def _local_auth() -> talk_auth.TalkAuth:
+    """The optional bearer for a self-hosted Realtime server.
+
+    Most local servers run without auth, so an unset ``TALK_LOCAL_API_KEY``
+    is a valid empty token and the socket carries no Authorization header.
+    """
+
+    token = talk_config.resolve_local_key()
+    return talk_auth.TalkAuth(
+        token=token,
+        source=talk_auth.SOURCE_CONFIGURED if token else talk_auth.SOURCE_ENV,
+        detail="TALK_LOCAL_API_KEY (local server key)" if token else "no key (local server)",
+    )
+
+
 def _gemini_auth() -> talk_auth.TalkAuth:
     """The Gemini credential for the Gemini Live lane, in the factory's shape.
 
@@ -1295,7 +1351,7 @@ def _gemini_auth() -> talk_auth.TalkAuth:
     receipts name lanes, never keys.
     """
 
-    scoped = (talk_config.secret("TALK_GEMINI_API_KEY") or "").strip()
+    scoped = (talk_config._talk_env_get("TALK_GEMINI_API_KEY") or "").strip()
     token = talk_config.resolve_gemini_key()
     if scoped:
         return talk_auth.TalkAuth(
@@ -1352,6 +1408,14 @@ def resolve_provider_lane() -> ProviderLane:
             model=talk_config.talk_grok_model(),
             voice=talk_config.talk_grok_voice(),
         )
+    if provider == "local":
+        talk_config.talk_local_url()
+        return ProviderLane(
+            provider=provider,
+            auth=_local_auth(),
+            model=talk_config.talk_local_model(),
+            voice=talk_config.talk_local_voice(),
+        )
     if provider == "gemini":
         return ProviderLane(
             provider=provider,
@@ -1391,6 +1455,13 @@ def _realtime_session(
         return talk_grok_realtime.GrokRealtimeSession(
             auth_token=auth.token,
             auth_source=auth.source,
+            aiohttp_module=_import_aiohttp(),
+        )
+    if provider == "local":
+        return talk_local_realtime.LocalRealtimeSession(
+            auth_token=auth.token,
+            auth_source=auth.source,
+            ws_url=talk_config.talk_local_url(),
             aiohttp_module=_import_aiohttp(),
         )
     if provider == "gemini":
@@ -1563,7 +1634,7 @@ async def run_talk_session(
         # or socket is spent. The rules live in talk_config.cascade_voice_config
         # so every lane (terminal, Discord, dashboard) refuses identically.
         voice_mode = talk_config.voice_mode()
-        cascade_config: tuple[str, str, str] | None = None
+        cascade_config: talk_config.CascadeVoiceConfig | None = None
         if voice_mode == "cascade":
             cascade_config = talk_config.cascade_voice_config(provider)
     except (talk_config.TalkConfigError, talk_auth.TalkAuthError) as exc:
@@ -1607,14 +1678,25 @@ async def run_talk_session(
     catalog_snapshot = talk_capabilities.wait_until_warm(
         talk_config.catalog_startup_wait_s()
     )
-    instructions = talk_identity.build_instructions(
-        talk_host.host().identity_sections(),
-        tools=tools,
-        host_execution=host_execution_attachment is not None,
-        lane=lane,
-        host_summary=_host_summary_line() if lane == "cli" else None,
-        capabilities=talk_capabilities.instruction_section(catalog_snapshot),
-    )
+    try:
+        instructions = talk_identity.build_instructions(
+            talk_host.host().identity_sections(),
+            tools=tools,
+            host_execution=host_execution_attachment is not None,
+            lane=lane,
+            host_summary=_host_summary_line() if lane == "cli" else None,
+            capabilities=talk_capabilities.instruction_section(catalog_snapshot),
+            reply_language=talk_config.reply_language(),
+            # `/talk core join` exists only on the Discord gateway, and only on a
+            # host carrying the core voice contract (hermes-talk#215).
+            core_join=lane == "discord" and talk_core_realtime.core_provider_available(),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"talk: voice instructions could not be loaded ({type(exc).__name__})",
+              file=sys.stderr)
+        if host_execution_attachment is not None:
+            host_execution_attachment.close()
+        return refuse(STARTUP_REFUSAL_CONFIGURATION)
 
     # Find out NOW whether the api_server lane is up. The verdict is needed by
     # the first tool call; warming it before then avoids spending that tool's
@@ -1746,12 +1828,15 @@ async def run_talk_session(
     # worker task running.
     cascade = None
     if cascade_config is not None:
-        cascade = talk_cascade_voice.CascadeVoice(
-            api_key=cascade_config[0],
-            voice_id=cascade_config[1],
-            model=cascade_config[2],
+        # The provider's ResponseFinished arrives before the TTS audio, so a
+        # sink that holds a partial frame (Discord) is told the reply ended
+        # when its TTS stream settles instead.
+        finish_playback = getattr(audio, "finish_playback", None)
+        cascade = talk_cascade_voice.build_cascade_voice(
+            cascade_config,
             on_audio=audio.queue_playback,
             on_error=on_error,
+            on_stream_end=finish_playback if callable(finish_playback) else None,
             voice_settings=talk_config.elevenlabs_voice_settings(),
         )
     session = None
@@ -1858,7 +1943,8 @@ async def run_talk_session(
             f"{controls}\n"
             if cascade_config is None
             else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
-            f"via elevenlabs, auth {auth.source}). {controls}\n"
+            f"via {getattr(cascade_config, 'backend', 'elevenlabs')}, "
+            f"auth {auth.source}). {controls}\n"
         )
 
         async def send_microphone() -> None:
@@ -2029,6 +2115,7 @@ async def run_talk_session(
                 # stops before the sink empties, never after.
                 if cascade is not None:
                     cascade.handle_event(event)
+                response_was_active = relay.response_active
                 outgoing = relay.handle_realtime_event(event)
                 if (
                     authorization_ledger is not None
@@ -2040,6 +2127,16 @@ async def run_talk_session(
                     if response_create is not None:
                         outgoing.append(_neutral_response_command(response_create))
                 if isinstance(event, talk_realtime.ResponseFinished):
+                    # A stale terminal must not flush the next response's PCM.
+                    # Cascade TTS can still be producing audio after this event.
+                    finish_playback = getattr(audio, "finish_playback", None)
+                    if (
+                        cascade is None
+                        and response_was_active
+                        and not relay.response_active
+                        and callable(finish_playback)
+                    ):
+                        finish_playback()
                     continued = bool(tool_coordinator.outputs)
                     await tool_coordinator.response_done()
                     if authorization_ledger is not None:
@@ -2399,6 +2496,23 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         default=None,
         help="check this live provider instead of TALK_PROVIDER (this process only)",
     )
+    journal = commands.add_parser(
+        "journal",
+        help="Read opt-in call journals (TALK_CALL_JOURNAL): list calls or print one as Markdown",
+    )
+    journal.add_argument(
+        "journal_call_id",
+        nargs="?",
+        default=None,
+        metavar="CALL_ID",
+        help="print this call as Markdown; omit to list recent calls",
+    )
+    journal.add_argument(
+        "--json",
+        action="store_true",
+        dest="journal_json",
+        help="emit the call list, or the call's raw events, as JSON",
+    )
     diagnostics = commands.add_parser(
         "diagnostics",
         help=(
@@ -2424,7 +2538,61 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
             "Talk state directory) and print where it went"
         ),
     )
+    echo = commands.add_parser(
+        "echo",
+        help="Serve an Echo running hassmic (Wyoming): each wake word is a Talk session",
+    )
+    echo.add_argument(
+        "echo_host", nargs="?", metavar="HOST", help="the Echo address or the saved speaker"
+    )
+    echo.add_argument("--port", dest="echo_port", type=int, default=16700,
+                      help="hassmic's Wyoming port (default 16700)")
+    echo.add_argument("--idle", dest="echo_idle", type=float, default=20.0, metavar="SECONDS",
+                      help="end a session after this long with nobody speaking (default 20)")
+    echo.add_argument("--barge-in-level", dest="echo_barge_in", type=float, default=0.02,
+                      metavar="RMS", help="mic level that may talk over the Echo (default 0.02)")
     subparser.set_defaults(talk_command="session")
+
+
+def _journal_entry(call_id: str | None, json_output: bool) -> int:
+    """``hermes talk journal [CALL_ID] [--json]`` (read-only)."""
+
+    try:
+        if call_id is None:
+            calls = talk_call_journal.list_calls()
+            if json_output:
+                print(json.dumps({"calls": calls}, ensure_ascii=False, indent=2))
+            elif not calls:
+                state = "on" if _journal_switch() else (
+                    'off (turn on "Experimental · Call journal" in Hermes Talk '
+                    "plugin settings, or set TALK_CALL_JOURNAL=1)"
+                )
+                print(f"No call journal yet. TALK_CALL_JOURNAL is {state}.")
+            else:
+                for row in calls:
+                    sessions = ", ".join(row["sessions"]) or "-"
+                    end = "" if row["ended"] else "  (no call_end)"
+                    print(
+                        f"{row['call_id']}  {row['started']}  "
+                        f"{row['engine'].get('model') or '?'}  events={row['events']}  "
+                        f"sessions={sessions}{end}"
+                    )
+            return 0
+        if json_output:
+            print(json.dumps(talk_call_journal.read(call_id), ensure_ascii=False, indent=2))
+        else:
+            print(talk_call_journal.render_markdown(call_id), end="")
+        return 0
+    except talk_call_journal.JournalError as exc:
+        print(f"hermes talk journal: {exc}", file=sys.stderr)
+        return 1
+
+
+def _journal_switch() -> bool:
+    try:
+        return talk_call_journal.enabled()
+    except talk_config.TalkConfigError:
+        return False
 
 
 def cli_entry(
@@ -2481,6 +2649,31 @@ def cli_entry(
         if code:
             raise SystemExit(code)
         return 0
+    if command == "journal":
+        code = _journal_entry(
+            getattr(args, "journal_call_id", None), bool(getattr(args, "journal_json", False))
+        )
+        if code:
+            raise SystemExit(code)
+        return 0
+    if command == "echo":
+        address = args.echo_host
+        if address is None:
+            saved = talk_config.plugin_setting("echo_address")
+            if talk_config.plugin_setting("echo_enabled") is True and isinstance(saved, str):
+                address = saved.strip()
+            if not address:
+                raise SystemExit(
+                    "Specify an Echo address or enable Use saved Echo and set its address "
+                    "in Hermes Talk plugin settings."
+                )
+        try:
+            from . import talk_echo
+        except ImportError:  # pragma: no cover - flat-module fallback
+            import talk_echo
+        return talk_echo.cli_entry(
+            address, args.echo_port, args.echo_idle, args.echo_barge_in
+        )
     if command == "diagnostics":
         bundle = getattr(args, "diagnostics_bundle", None)
         code = talk_diagnostics.cli_entry(
@@ -2494,7 +2687,7 @@ def cli_entry(
 
     if keyboard_control is None:
         keyboard_control = args is not None
-    target = getattr(args, "task_target", None) or os.environ.get("TALK_TASK_TARGET")
+    target = getattr(args, "task_target", None) or talk_config._talk_env_get("TALK_TASK_TARGET")
     native = None
     if target or getattr(args, "targets", False) or getattr(args, "task_api", None):
         native = {
@@ -2780,8 +2973,10 @@ async def run_native_talk_session(
         if talk_config.voice_mode() not in {"native", "live"}:
             raise NativeTaskError("Canonical native surfaces require provider voice output")
         if pick.provider == "live":
-            if (os.environ.get("TALK_TURN_DETECTION", "provider_native").strip().lower()
-                    != "provider_native" or os.environ.get("TALK_SEMANTIC_EAGERNESS") is not None):
+            if (talk_config._talk_env_get("TALK_TURN_DETECTION", "provider_native").strip().lower()
+                    != "provider_native"
+                    or talk_config._talk_env_get("TALK_SEMANTIC_EAGERNESS") is not None
+                ):
                 raise NativeTaskError("Live requires provider_native turn detection")
             turn_detection = talk_realtime.RealtimeTurnDetection()
         else:

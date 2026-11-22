@@ -183,6 +183,7 @@ def test_empty_output_still_says_something(monkeypatch):
 def test_talk_status_reports_state(monkeypatch):
     monkeypatch.delenv("TALK_VOICE", raising=False)
     monkeypatch.setenv("TALK_MODEL", "gpt-realtime-2.1")
+    monkeypatch.setattr(talk_tools.talk_core_realtime, "core_provider_available", lambda: False)
     talk_tools.REGISTRATION_FAILURES.clear()
 
     status = json.loads(talk_tools.execute_talk_tool("talk_status", {}))
@@ -192,9 +193,10 @@ def test_talk_status_reports_state(monkeypatch):
     assert status["attached_to_hermes"] is False
     assert isinstance(status["audio_available"], bool)
     assert status["legacy_lane"] == "legacy-provider-executor"
+    # hermes-talk#215: no core contract on this host, so the command is not offered.
     assert status["legacy_session"] == {
         "scope": "limited provider-owned session",
-        "full_parity_command": "/talk core join",
+        "full_parity_command": None,
     }
     assert status["transcript"] == {
         "current_call": "temporary local capture",
@@ -207,6 +209,17 @@ def test_talk_status_reports_state(monkeypatch):
     assert isinstance(status["core_realtime"]["provider_available"], bool)
     assert status["core_realtime"]["registration"] == "unsupported-optional"
     assert "registration_failures" not in status
+
+
+def test_talk_status_offers_core_join_only_with_the_core_contract(monkeypatch):
+    monkeypatch.setattr(talk_tools.talk_core_realtime, "core_provider_available", lambda: True)
+
+    status = json.loads(talk_tools.execute_talk_tool("talk_status", {}))
+
+    # The status cannot see the surface, so it names the only one that has it.
+    assert status["legacy_session"]["full_parity_command"] == (
+        "/talk core join (Discord voice channel only)"
+    )
 
 
 def _snapshot(**overrides) -> talk_capabilities.CatalogSnapshot:

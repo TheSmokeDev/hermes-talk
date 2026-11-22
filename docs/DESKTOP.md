@@ -1,7 +1,7 @@
 # Hermes Talk in Desktop
 
 The Desktop integration adds **Talk** in the top bar and beside the chat composer.
-Open a conversation, choose **Talk**, then **Connect**. The small popover closes
+Open a conversation, choose **Talk**, then press the microphone button. The small popover closes
 automatically once connected so the conversation and dashboard remain usable.
 Talk attaches the current conversation; its status and **Stop** remain beside the
 composer. Reopen Talk whenever you want captions, results or settings.
@@ -19,7 +19,7 @@ Talk runs in the composer popover. It reads the focused conversation from the
 host state atoms, confirms the stored conversation with a read-only
 `session.title` request, and attaches. Its boundaries:
 
-- **Connect once the conversation has one message.** Desktop writes a
+- **Start Talk once the conversation has one message.** Desktop writes a
   conversation row on the first message, so an empty conversation has nothing to
   attach to. Talk says so rather than saving a placeholder for you.
 - **Talk follows the active profile.** Plugin REST on this lane routes through
@@ -27,7 +27,7 @@ host state atoms, confirms the stored conversation with a read-only
   away from the conversation Talk attached to, Talk refuses the request instead
   of addressing another gateway.
 - **No microphone coordination.** There is no lease to share with Desktop
-  dictation or a wake word. Stop those before you Connect.
+  dictation or a wake word. Stop those before you start Talk.
 - **`TALK_DASHBOARD_TOKEN` is unsupported.** This lane cannot present the token,
   so a backend that sets it answers 401. Unset it for local Desktop use, or use
   the dashboard Talk tab.
@@ -48,7 +48,7 @@ That contract builds on the composer ownership controller proposed in
 the proposal by itself does not supply all of it. A host that reports only part
 of the contract gets the stock lane in the composer instead of a half driven
 controller; the four additions above arrive together or not at all, and the panel
-says which build the floating window needs.
+says under **Settings** which build the floating window needs.
 
 ### Hosts without task context
 
@@ -63,8 +63,8 @@ dashboard's legacy Talk does, on either Desktop lane:
   session rather than inside this conversation's history.
 - **GPT-Live does not.** It always runs on an attached task, so the panel refuses
   it before connecting and names the missing host support.
-- **The canonical task-recipient picker is unavailable.** The panel says so
-  instead of reporting a failed request, and the task list under Advanced stays
+- **The canonical task-recipient picker is unavailable.** The panel hides it
+  instead of reporting a failed request, and the task list under Settings stays
   empty. The Desktop session controls below use the host SDK separately and can
   still create, inspect, message and steer Desktop conversations by voice.
 
@@ -129,7 +129,7 @@ reuse their original result rather than creating duplicate sessions.
    contribution is disabled. Installed agent packages are opt-in on Desktop.
 4. Open a connected Hermes conversation, then click **Talk** in the top bar or
    beside its composer. The top-bar button follows the focused conversation.
-5. Click **Connect**. Existing conversations are resumed by their exact identity.
+5. Press the microphone button (**Start talking**). Existing conversations are resumed by their exact identity.
    On the Talk-enabled build a new conversation is saved automatically, without a
    synthetic message; on stock Desktop, send one message first.
 6. Allow the requested microphone access. The popover disappears once connected.
@@ -139,7 +139,9 @@ reuse their original result rather than creating duplicate sessions.
 
 Local Desktop authentication is automatic. There is no Talk token field or task
 picker to complete before starting. Voice selection, conversation switching and
-spoken-update preferences are available under **Advanced**.
+spoken-update preferences are available under **Settings**. Typing a message, sending
+to another app or task, and attachments are under **Type a message**; Mute and Sleep
+appear beside the microphone button while Talk is connected.
 
 The plugin installer installs the repository, including `desktop/plugin.js`.
 Installing the Python wheel alone does not register a Desktop contribution.

@@ -841,7 +841,18 @@ function createTalkSurface(SDK) {
   }
 
   /** fetchJSON throws Error("<status>: <body>") — the gate's refusals look like this. */
+  /**
+   * True for a refusal that a pasted TALK_DASHBOARD_TOKEN can fix.
+   *
+   * The dashboard's `fetchJSON` throws an `ApiError` whose message is the
+   * route's `detail` text alone, with the HTTP code on `err.status`; only
+   * older hosts (and the Desktop IPC bridge) prefix the code to the message.
+   * Reading the message alone hid the token field on current dashboards, so a
+   * browser off loopback showed the refusal and no way to answer it.
+   */
   function isAuthError(err) {
+    const status = err && err.status;
+    if (status === 401 || status === 403) return true;
     return /^(401|403)\b/.test(String((err && err.message) || ""));
   }
 
@@ -874,6 +885,53 @@ function createTalkSurface(SDK) {
    * PCM24k that comes back plays through an AudioContext. The ElevenLabs key
    * never touches this page — the server owns it.
    */
+  /**
+   * Opt-in call journal (TALK_CALL_JOURNAL). The mint created the journal and
+   * handed back its id; this page only reports FINAL text and event metadata,
+   * batched, in order. Delivery is best-effort: a failed post never touches
+   * the audio, and the server keeps every line it already accepted.
+   */
+  class CallJournal {
+    constructor(callId) {
+      this.callId = callId;
+      this.seq = 0;
+      this.queue = [];
+      this.timer = null;
+      this.tail = Promise.resolve();
+      this.failures = 0;
+      this.closed = false;
+    }
+
+    add(kind, fields) {
+      if (this.closed || !this.callId) return;
+      const event = Object.assign({ kind: kind, seq: ++this.seq, client_ts: Date.now() }, fields || {});
+      if (typeof event.text === "string" && event.text.length > 8000) event.text = event.text.slice(0, 8000);
+      this.queue.push(event);
+      if (this.queue.length >= 32) this.flush();
+      else if (!this.timer) this.timer = window.setTimeout(() => this.flush(), 400);
+    }
+
+    flush() {
+      if (this.timer) { window.clearTimeout(this.timer); this.timer = null; }
+      if (!this.queue.length) return this.tail;
+      const events = this.queue.splice(0, 64);
+      this.tail = this.tail.then(() => apiPost("/journal", { call_id: this.callId, events: events }, 8000))
+        .catch((err) => {
+          this.failures += 1;
+          if (this.failures === 1) globalThis.console?.warn?.("[hermes-talk] call journal write failed", errorText(err));
+        });
+      if (this.queue.length) return this.flush();
+      return this.tail;
+    }
+
+    end(reason) {
+      if (this.closed) return;
+      this.add("call_end", reason ? { status: reason } : {});
+      this.closed = true;
+      void this.flush();
+    }
+  }
+
   class TalkTransport {
     constructor(session, callbacks) {
       this.session = session;
@@ -916,6 +974,8 @@ function createTalkSurface(SDK) {
       // One receipt per session for a relay that failed for a real reason.
       this.cascadeFailureLogged = false;
       this.task = session && session.task ? new TaskContinuity(this, session.task) : null;
+      const journalId = session && session.journal && session.journal.callId;
+      this.journal = !this.task && typeof journalId === "string" ? new CallJournal(journalId) : null;
     }
 
     async start() {
@@ -1024,6 +1084,7 @@ function createTalkSurface(SDK) {
     }
 
     stop(beforeTaskClose) {
+      if (this.journal && !this.closed) this.journal.end();
       this.closed = true;
       if (this.startAbort) this.startAbort.abort();
       this.startAbort = null;
@@ -1134,6 +1195,7 @@ function createTalkSurface(SDK) {
         id: clientId("item_"), type: "message", role: "user", content: [{ type: "input_text", text: text.trim() }],
       } });
       this.cb.onTranscript("user", text.trim(), true);
+      if (this.journal) this.journal.add("user", { text: text.trim(), source: "typed" });
       this.send({ type: "response.create" });
       return true;
     }
@@ -1181,6 +1243,9 @@ function createTalkSurface(SDK) {
         case "conversation.item.input_audio_transcription.completed":
           if (this.task) { this.task.voice(event); return; }
           if (event.transcript) this.cb.onTranscript("user", event.transcript, true);
+          if (event.transcript && this.journal) {
+            this.journal.add("user", { text: event.transcript, item_id: event.item_id, source: "voice" });
+          }
           return;
         case "response.output_audio_transcript.delta":
           if (event.delta) this.cb.onTranscript("assistant", event.delta, false);
@@ -1188,6 +1253,9 @@ function createTalkSurface(SDK) {
         case "response.output_audio_transcript.done":
           if (this.task && event.transcript) this.task.final(event, event.transcript);
           if (event.transcript) this.cb.onTranscript("assistant", event.transcript, true);
+          if (event.transcript && this.journal) {
+            this.journal.add("assistant", { text: event.transcript, item_id: event.item_id });
+          }
           return;
         case "response.output_text.delta":
           // Cascade sessions: the model's answer arrives as TEXT, not audio.
@@ -1199,6 +1267,7 @@ function createTalkSurface(SDK) {
           const text = typeof event.text === "string" ? event.text : "";
           if (this.task && text) this.task.final(event, text);
           if (text) this.cb.onTranscript("assistant", text, true);
+          if (text && this.journal) this.journal.add("assistant", { text: text, item_id: event.item_id });
           if (this.cascade) {
             this.cascadeSend({ done: text });
             this.finishCascadeStream();
@@ -1211,8 +1280,12 @@ function createTalkSurface(SDK) {
           this.responseActive = true;
           this.cb.onStatus("Thinking…");
           return;
-        case "response.done":
+        case "response.done": {
           this.responseActive = false;
+          const doneStatus = event.response && event.response.status;
+          if (this.journal && doneStatus && doneStatus !== "completed") {
+            this.journal.add("response_done", { status: doneStatus });
+          }
           // A response that ends with its text stream still open was
           // interrupted upstream; its half-spoken answer dies with it.
           if (this.cascade && this.cascadeReq && this.cascadeReq.sink) this.abortCascade();
@@ -1220,12 +1293,14 @@ function createTalkSurface(SDK) {
           else this.finishToolResponse();
           this.cb.onStatus("Listening…");
           return;
+        }
         case "output_audio_buffer.started":
         case "output_audio_buffer.stopped":
         case "output_audio_buffer.cleared":
           if (this.task) void this.task.presentation.drain();
           return;
         case "input_audio_buffer.speech_started":
+          if (this.journal && this.responseActive) this.journal.add("interrupted", { status: "barge_in" });
           if (this.task) {
             this.task.presentation.interrupt();
             if (this.responseActive || this.task.timing.nativePlaying) this.clearPlayback();
@@ -1271,6 +1346,7 @@ function createTalkSurface(SDK) {
         code: diagnostic(error?.code), param: diagnostic(error?.param),
       });
       const code = diagnostic(error?.code), param = diagnostic(error?.param);
+      if (this.journal) this.journal.add("error", { status: code, text: detail || "Realtime error." });
       this.cb.onError(detail ? "Realtime error [" + code + ";" + param + "]: " + detail : "Realtime error.");
     }
 
@@ -1590,6 +1666,8 @@ function createTalkSurface(SDK) {
         /* a malformed arguments blob executes with {} */
       }
       this.cb.onStatus("Using " + name + "…");
+      const journal = binding ? null : this.journal;
+      if (journal) journal.add("tool_call", { tool: name, tool_call_id: callId, text: JSON.stringify(args) });
       let output, selection;
       try {
         let res;
@@ -1622,6 +1700,15 @@ function createTalkSurface(SDK) {
       } catch (err) {
         if (binding) { this.task.report(errorText(err)); return null; }
         output = name + " failed: " + errorText(err);
+      }
+      if (journal) {
+        let sessionId;
+        try {
+          const parsed = JSON.parse(output);
+          if (parsed && typeof parsed.session_id === "string") sessionId = parsed.session_id;
+        } catch (e) { /* plain-text tool output */ }
+        if (!sessionId && typeof args.session_id === "string") sessionId = args.session_id;
+        journal.add("tool_result", { tool: name, tool_call_id: callId, session_id: sessionId, text: output });
       }
       return {
         output: output,
@@ -2431,6 +2518,10 @@ function createTalkSurface(SDK) {
           if (epoch !== connectionEpoch.current || controller.signal.aborted) return;
         }
         const body = voice ? { voice: voice } : {};
+        body.surface = SDK.desktopOwner ? "desktop" : "dashboard";
+        if (SDK.desktopOwner && SDK.desktopOwner.storedSessionId) {
+          body.host_session_id = String(SDK.desktopOwner.storedSessionId);
+        }
         if (targetId) body.task = { target_id: targetId, tab_id: tabId.current,
           page_reference: pageReference() };
         const session = await apiCall("/session", {
@@ -3019,75 +3110,52 @@ function createTalkSurface(SDK) {
       refreshCatalog: () => { setCatalogReload((value) => value + 1); void refresh(); },
     });
 
-    return h("div", { className: "ht-page" },
-      h("div", { className: "ht-head" },
-        h("div", null,
-          h("h1", { className: "ht-title" }, "Talk"),
-          h("div", { className: "ht-sub" },
-            loading ? "Checking readiness…"
-              : ready ? "Ready via " + describeSource(status.source)
-              : (status && status.detail) || "Not configured"
-          )
-        ),
-        h("div", { className: "ht-actions" },
-          active || starting
-            ? h(C.Button, { onClick: stopTalk }, starting ? "Cancel connection" : "Stop")
-            : h(C.Button, { onClick: () => void startTalk(), disabled: !ready || loading ||
-                (status.voiceMode === "live" && !selectedTask) },
-                selectedTask ? "Join / resume task" : status && status.voiceMode === "live"
-                  ? "Start GPT-Live" : "Start legacy Talk")
-        )
-      ),
+    const startLabel = selectedTask ? "Join / resume task"
+      : status && status.voiceMode === "live" ? "Start GPT-Live" : "Start legacy Talk";
+    const orbLabel = active ? "Stop" : starting ? "Cancel connection" : startLabel;
+    const statusLine = loading ? "Checking readiness…" : starting ? "Connecting…"
+      : live ? live : active ? "Connected"
+      : ready ? startLabel : (status && status.detail) || "Not configured";
+    const disclosure = (title, body, hint) => h("details", { className: "ht-disclosure" },
+      h("summary", null, title, hint && h("span", { className: "ht-summary-hint" }, hint)),
+      h("div", { className: "ht-disclosure-body" }, body));
 
-      h("div", { className: "ht-note" },
-        h("label", { className: "ht-field" }, "Target source",
-          h("select", { className: "ht-select", value: peerId, disabled: starting || switching, "aria-label": "Target source",
-            onChange: (e) => { setPeerId(e.target.value); setProfile(e.target.value === "local" ? "" : "default"); setSelectedTask(""); } },
-            h("option", { value: "local" }, "Local host"),
-            peers.filter((peer) => peer.peer_id !== "local").map((peer) =>
-              h("option", { key: peer.peer_id, value: peer.peer_id }, peer.label + " · " + peer.peer_id)))),
-        h("label", { className: "ht-field" }, peerId === "local" ? "Local profile" : "Remote profile (explicit name)",
-          peerId === "local" ? h("select", { className: "ht-select", value: profile, disabled: starting || switching, "aria-label": "Local profile",
-            onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } },
-            h("option", { value: "" }, "All authorized local profiles"),
-            localProfiles.map((name) => h("option", { key: name, value: name }, name)))
-            : h(C.Input, { value: profile, disabled: starting || switching, placeholder: "default", "aria-label": "Remote profile",
-              onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } })),
-        h("label", { className: "ht-field" }, "Task or Bot target",
-          h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
-            onChange: (e) => setSelectedTask(e.target.value) },
-            h("option", { value: "", disabled: active }, status && status.voiceMode === "live"
-              ? "Choose a task for GPT-Live" : "Legacy unbound Talk (no task history)"),
-            tasks.map((task) => {
-              const id = task.target_id;
-              return id && h("option", { key: id, value: id,
-                disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
-                targetLabel(task));
-            }))),
-        h("div", { className: "ht-token-row" },
-          bound && h(C.Button, { disabled: !selectedTask || starting || switching,
-            onClick: () => void switchTarget({ target_id: selectedTask }) }, "Switch target"),
-          bound && h(C.Button, { disabled: returnDepth < 1 || starting || switching,
-            onClick: () => void switchTarget({ back: true }) }, "Return to previous (" + returnDepth + ")"),
-          h(C.Button, { disabled: starting || switching,
-            onClick: () => setCatalogReload((value) => value + 1) }, "Refresh targets / selection"),
-          switching && h(C.Button, { onClick: () => cancelSwitch() }, "Cancel switch")),
-        bound && h("form", { className: "ht-token-row", onSubmit: (event) => {
-          event.preventDefault(); void switchTarget({ reference: reference, peer_id: peerId, profile: profile });
-        } }, h(C.Input, { value: reference, disabled: starting || switching, placeholder: "Exact target name",
-          "aria-label": "Target reference", onChange: (e) => setReference(e.target.value) }),
-          h(C.Button, { type: "submit", disabled: !reference.trim() || starting || switching }, "Find and switch")),
-        choices.length > 0 && h("div", { className: "ht-out" }, "Choose a target:",
-          choices.map((choice) => h(C.Button, { key: choice.target_id, disabled: starting || switching,
-            onClick: () => void switchTarget({ target_id: choice.target_id }) }, targetLabel(choice)))),
-        selection && selection.current && !taskState && h("div", { className: "ht-out" },
-          "Saved selection: " + targetLabel(selection.current)),
-        selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
-        status && status.taskContinuity && !status.taskContinuity.supported &&
-          h("div", null, "Task continuity unavailable: " + status.taskContinuity.reason),
-        unavailable.map((item, index) => h("div", { key: index, className: "ht-out" },
-          item.peer_id + " / " + item.profile + ": " + item.reason)),
-        catalogError && h("div", { className: "ht-error" }, "Target list unavailable: " + catalogError)),
+    return h("div", { className: "ht-page" },
+      h("section", { className: "ht-hero",
+        "data-state": active ? "live" : starting ? "connecting" : ready ? "idle" : "off" },
+        h("div", { className: "ht-orb-wrap" },
+          h("span", { className: "ht-orb-halo", "aria-hidden": true }),
+          h("button", { type: "button", className: "ht-orb", title: orbLabel,
+            onClick: active || starting ? stopTalk : () => void startTalk(),
+            disabled: !(active || starting) && Boolean(!ready || loading ||
+              (status.voiceMode === "live" && !selectedTask)) },
+          h("span", { className: "ht-sr" }, orbLabel))),
+        h("div", { className: "ht-hero-text" },
+          h("div", { className: "ht-head" },
+            h("h1", { className: "ht-title" }, "Talk"),
+            status && status.source && h("span", { className: "ht-badge", "data-live": String(active),
+              title: "Voice provider" }, describeSource(status.source))),
+          h("div", { className: "ht-sub", role: "status" }, statusLine),
+          h("div", { className: "ht-target-row" },
+            h("label", { className: "ht-field" }, "Task or Bot target",
+              h("select", { className: "ht-select", value: selectedTask, disabled: starting || switching, "aria-label": "Task or Bot target",
+                onChange: (e) => setSelectedTask(e.target.value) },
+                h("option", { value: "", disabled: active }, status && status.voiceMode === "live"
+                  ? "Choose a task for GPT-Live" : "Legacy unbound Talk (no task history)"),
+                tasks.map((task) => {
+                  const id = task.target_id;
+                  return id && h("option", { key: id, value: id,
+                    disabled: !(status && status.taskContinuity && status.taskContinuity.supported) },
+                    targetLabel(task));
+                }))),
+            bound && h(C.Button, { disabled: !selectedTask || starting || switching,
+              onClick: () => void switchTarget({ target_id: selectedTask }) }, "Switch target"),
+            bound && h(C.Button, { disabled: returnDepth < 1 || starting || switching,
+              onClick: () => void switchTarget({ back: true }) }, "Return to previous (" + returnDepth + ")"),
+            switching && h(C.Button, { onClick: () => cancelSwitch() }, "Cancel switch")))),
+
+      catalogError && h("div", { className: "ht-error" }, "Target list unavailable: " + catalogError),
+      error && h("div", { className: "ht-error", role: "alert" }, error),
 
       needsToken && h("div", { className: "ht-note ht-note-warn" },
         h("div", { className: "ht-note-title" }, "This dashboard needs the hermes-talk token"),
@@ -3105,28 +3173,112 @@ function createTalkSurface(SDK) {
         )
       ),
 
-      h("div", { className: "ht-metrics" },
-        h(Metric, { label: "Auth", value: status ? describeSource(status.source) : "…" }),
-        h(Metric, { label: "Model", value: (status && status.model) || "…" }),
-        h(Metric, {
-          label: "Session",
-          value: active ? "live" : starting ? "connecting" : "idle",
-        }),
-        h(Metric, {
-          // Tri-state string from the backend: "attached" | "api-server" |
-          // "out of process". Rendered verbatim — it was a bool before, so a
-          // truthiness test here would read "out of process" as attached.
-          label: "Agent loop",
-          value: (status && status.agentLoop) || "…",
-        })
+      h("form", { className: "ht-token-row ht-compose", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
+        h(C.Input, { value: typed, disabled: sending || switching, placeholder: "Type to this Talk connection",
+          "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
+        h(C.Button, { type: "submit", disabled: !canSendTyped || !typed.trim() }, sending ? "Staging…" : "Send")),
+      inputError && h("div", { role: "alert", className: "ht-error" }, inputError),
+
+      h("div", { className: "ht-grid" },
+        h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, taskState ? "Live captions (not canonical history)" : "Transcript"),
+          transcript.length === 0
+            ? h("div", { className: "ht-empty" }, "No transcript yet. Start a session and speak.")
+            : transcript.map((row) =>
+                h("div", { key: row.id, className: "ht-row" },
+                  h("div", { className: "ht-role" },
+                    (row.role === "user" ? "You" : "Hermes") + (row.final ? "" : " …")),
+                  h("div", { className: "ht-text" }, row.text)))
+        ),
+        taskState ? h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, "Task jobs"),
+          !(taskState.jobs || []).length && h("div", { className: "ht-empty" }, "Nothing running."),
+          (taskState.jobs || []).map((job) => h("div", { key: job.run_id, className: "ht-row",
+            id: "ht-job-" + encodeURIComponent(job.run_id) },
+            h("div", { className: "ht-role" },
+              h("span", { className: "ht-status ht-status-" + job.status }, job.status),
+              " run " + job.run_id + " · action " + job.action_id),
+            h("div", { className: "ht-text" }, job.goal),
+            h("div", { className: "ht-out" }, steeringLabel(job.steering)),
+            h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
+            job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
+            results[job.run_id] && h("div", null,
+              h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
+              results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
+              h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
+              (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
+                h("div", { key: index },
+                  h("div", { className: "ht-role" }, "Artifact changes"),
+                  h("pre", { className: "ht-out" }, JSON.stringify(artifact, null, 2))))),
+            results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport."))))
+        : h("section", { className: "ht-card" },
+          h("div", { className: "ht-card-head" }, "Background runs"),
+          runs.length === 0
+            ? h("div", { className: "ht-empty" }, "Nothing running.")
+            : runs.map((run) =>
+                h("div", { key: run.runId, className: "ht-row" },
+                  h("div", { className: "ht-role" },
+                    h("span", { className: "ht-status ht-status-" + run.status }, run.status),
+                    " run " + run.runId + " · " + (run.kind || "?")),
+                  h("div", { className: "ht-text" }, run.label || ""),
+                  run.output && h("div", { className: "ht-out" }, run.output)))
+        )
       ),
 
-      (status && status.voiceMode) === "cascade"
-        ? h("div", { className: "ht-field" },
-            h("div", { className: "ht-note" },
-              "Custom voice: the cascade speaks through ElevenLabs " +
-              "(TALK_ELEVENLABS_VOICE_ID on the server); the provider voice " +
-              "select sits out cascade sessions."))
+      disclosure("Target and connection", h(React.Fragment, null,
+        h("div", { className: "ht-token-row" },
+          h("label", { className: "ht-field" }, "Target source",
+            h("select", { className: "ht-select", value: peerId, disabled: starting || switching, "aria-label": "Target source",
+              onChange: (e) => { setPeerId(e.target.value); setProfile(e.target.value === "local" ? "" : "default"); setSelectedTask(""); } },
+              h("option", { value: "local" }, "Local host"),
+              peers.filter((peer) => peer.peer_id !== "local").map((peer) =>
+                h("option", { key: peer.peer_id, value: peer.peer_id }, peer.label + " · " + peer.peer_id)))),
+          h("label", { className: "ht-field" }, peerId === "local" ? "Local profile" : "Remote profile (explicit name)",
+            peerId === "local" ? h("select", { className: "ht-select", value: profile, disabled: starting || switching, "aria-label": "Local profile",
+              onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } },
+              h("option", { value: "" }, "All authorized local profiles"),
+              localProfiles.map((name) => h("option", { key: name, value: name }, name)))
+              : h(C.Input, { value: profile, disabled: starting || switching, placeholder: "default", "aria-label": "Remote profile",
+                onChange: (e) => { setProfile(e.target.value); setSelectedTask(""); } }))),
+        h("div", { className: "ht-token-row" },
+          h(C.Button, { disabled: starting || switching,
+            onClick: () => setCatalogReload((value) => value + 1) }, "Refresh targets / selection")),
+        bound && h("form", { className: "ht-token-row", onSubmit: (event) => {
+          event.preventDefault(); void switchTarget({ reference: reference, peer_id: peerId, profile: profile });
+        } }, h(C.Input, { value: reference, disabled: starting || switching, placeholder: "Exact target name",
+          "aria-label": "Target reference", onChange: (e) => setReference(e.target.value) }),
+          h(C.Button, { type: "submit", disabled: !reference.trim() || starting || switching }, "Find and switch")),
+        choices.length > 0 && h("div", { className: "ht-out" }, "Choose a target:",
+          choices.map((choice) => h(C.Button, { key: choice.target_id, disabled: starting || switching,
+            onClick: () => void switchTarget({ target_id: choice.target_id }) }, targetLabel(choice)))),
+        selection && selection.current && !taskState && h("div", { className: "ht-out" },
+          "Saved selection: " + targetLabel(selection.current)),
+        selectedTask && h("div", { className: "ht-out" }, "Page reference: " + document.title + " · " + window.location.href),
+        status && status.taskContinuity && !status.taskContinuity.supported &&
+          h("div", { className: "ht-out" }, "Task continuity unavailable: " + status.taskContinuity.reason),
+        unavailable.map((item, index) => h("div", { key: index, className: "ht-out" },
+          item.peer_id + " / " + item.profile + ": " + item.reason)),
+        h("div", { className: "ht-metrics" },
+          h(Metric, { label: "Auth", value: status ? describeSource(status.source) : "…" }),
+          h(Metric, { label: "Model", value: (status && status.model) || "…" }),
+          h(Metric, {
+            label: "Session",
+            value: active ? "live" : starting ? "connecting" : "idle",
+          }),
+          h(Metric, {
+            // Tri-state string from the backend: "attached" | "api-server" |
+            // "out of process". Rendered verbatim — it was a bool before, so a
+            // truthiness test here would read "out of process" as attached.
+            label: "Agent loop",
+            value: (status && status.agentLoop) || "…",
+          })
+        )), peerId === "local" ? "Local host" : peerId),
+
+      disclosure("Voice", (status && status.voiceMode) === "cascade"
+        ? h("div", { className: "ht-note" },
+            "Custom voice: the cascade speaks through ElevenLabs " +
+            "(TALK_ELEVENLABS_VOICE_ID on the server); the provider voice " +
+            "select sits out cascade sessions.")
         : h("label", { className: "ht-field" }, "Voice",
             h("select", {
               className: "ht-select",
@@ -3135,19 +3287,17 @@ function createTalkSurface(SDK) {
               onChange: (e) => setVoice(e.target.value),
             }, ((status && status.voices) || []).map((name) =>
               h("option", { key: name, value: name }, name)))
-          ),
+          ), (status && status.voiceMode) === "cascade" ? "ElevenLabs" : voice),
 
-      live && h("div", { className: "ht-live" }, live),
-      error && h("div", { className: "ht-error" }, error),
-
-      taskState && h("section", { className: "ht-card" },
-        h("label", { className: "ht-row" }, "Spoken updates for this task ",
-          h("select", { value: (taskState.preferences || {}).update_mode || "important",
+      taskState && disclosure("Task details", h(React.Fragment, null,
+        h("label", { className: "ht-field" }, "Spoken updates for this task",
+          h("select", { className: "ht-select", value: (taskState.preferences || {}).update_mode || "important",
             disabled: !active, "aria-label": "Task update frequency",
             onChange: (event) => void saveUpdatePreference(event.target.value) },
           h("option", { value: "important" }, "Completion and important updates"),
           h("option", { value: "completion" }, "Completion only"),
           h("option", { value: "frequent" }, "Include meaningful milestones"))),
+        h("section", { className: "ht-card" },
         h("div", { className: "ht-card-head" }, "Bound task and server context"),
         h("div", { className: "ht-row ht-text" },
           targetLabel(taskState.task || {}) + " · session: " + ((taskState.task || {}).session_id || "unavailable") + "\n" +
@@ -3199,55 +3349,7 @@ function createTalkSurface(SDK) {
               h("div", { className: "ht-out" }, "Origin: ",
                 h(originLink ? "a" : "span", originLink ? { href: originLink } : null, value(event.origin_turn_id)),
                 " · action: ", h(actionLink ? "a" : "span", actionLink ? { href: actionLink } : null, value(event.action_id))));
-          }),
-        h("div", { className: "ht-card-head" }, "Task jobs"),
-        (taskState.jobs || []).map((job) => h("div", { key: job.run_id, className: "ht-row",
-          id: "ht-job-" + encodeURIComponent(job.run_id) },
-          h("div", { className: "ht-role" }, job.status + " · run " + job.run_id + " · action " + job.action_id),
-          h("div", { className: "ht-text" }, job.goal),
-          h("div", { className: "ht-out" }, steeringLabel(job.steering)),
-          h("div", { className: "ht-out" }, "Approval: " + ((job.approval || {}).state || "unavailable")),
-          job.result_available && h(C.Button, { onClick: () => void showResult(job.run_id), disabled: !active }, "View available result"),
-          results[job.run_id] && h("div", null,
-            h("div", { className: "ht-role" }, "Full available result · " + results[job.run_id].status),
-            results[job.run_id].error && h("div", { className: "ht-out" }, String(results[job.run_id].error)),
-            h("div", { className: "ht-text" }, results[job.run_id].output || "No result detail was supplied."),
-            (Array.isArray(results[job.run_id].artifacts) ? results[job.run_id].artifacts : []).map((artifact, index) =>
-              h("div", { key: index },
-                h("div", { className: "ht-role" }, "Artifact changes"),
-                h("pre", { className: "ht-out" }, JSON.stringify(artifact, null, 2))))),
-          results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport.")))),
-
-      h("form", { className: "ht-token-row", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
-        h(C.Input, { value: typed, disabled: sending || switching, placeholder: "Type to this Talk connection",
-          "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
-        h(C.Button, { type: "submit", disabled: !canSendTyped || !typed.trim() }, sending ? "Staging…" : "Send")),
-      inputError && h("div", { role: "alert", className: "ht-error" }, inputError),
-
-      h("div", { className: "ht-grid" },
-        h("section", { className: "ht-card" },
-          h("div", { className: "ht-card-head" }, taskState ? "Live captions (not canonical history)" : "Transcript"),
-          transcript.length === 0
-            ? h("div", { className: "ht-empty" }, "No transcript yet. Start a session and speak.")
-            : transcript.map((row) =>
-                h("div", { key: row.id, className: "ht-row" },
-                  h("div", { className: "ht-role" },
-                    (row.role === "user" ? "You" : "Hermes") + (row.final ? "" : " …")),
-                  h("div", { className: "ht-text" }, row.text)))
-        ),
-        !taskState && h("section", { className: "ht-card" },
-          h("div", { className: "ht-card-head" }, "Background runs"),
-          runs.length === 0
-            ? h("div", { className: "ht-empty" }, "Nothing running.")
-            : runs.map((run) =>
-                h("div", { key: run.runId, className: "ht-row" },
-                  h("div", { className: "ht-role" },
-                    h("span", { className: "ht-status ht-status-" + run.status }, run.status),
-                    " run " + run.runId + " · " + (run.kind || "?")),
-                  h("div", { className: "ht-text" }, run.label || ""),
-                  run.output && h("div", { className: "ht-out" }, run.output)))
-        )
-      )
+          }))), targetLabel(taskState.task || {}))
     );
   }
 

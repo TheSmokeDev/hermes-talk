@@ -13,6 +13,180 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+## [0.24.1] — 2026-11-21 (catalog build)
+
+This is the Hermes plugin catalog build of 0.24.0 and 0.24.1, published from
+the `catalog` branch. It keeps the catalog authentication rules from 0.22.1:
+Hermes signs subscription Realtime mints, GPT-Live on the subscription runs
+through `codex app-server`, keys are read through `get_secret`, and Grok uses
+xAI keys only. It also brings in two items from the standalone 0.23.0 that the
+catalog 0.23.x did not carry: the self-hosted `TALK_PROVIDER=local` terminal
+lane and OpenAI-style `data` list envelopes in REST skill and toolset discovery.
+Every new surface below is off by default.
+
+Three community-requested options, all off by default: Discord auto-join, an
+OpenAI-compatible cascade voice backend, and versioned `TALK.md` voice instructions.
+
+### Added
+- `/talk join` on Discord can connect to the voice channel you are in when the
+  bot is not in one yet, then start Talk. Off by default; turn on
+  *Experimental · Discord auto-join* or `TALK_DISCORD_AUTO_JOIN=1`. It works
+  only for users in `TALK_DISCORD_OPERATOR_USER_IDS`, uses the invoking
+  profile's bot, refuses clearly when you are not in voice or the bot lacks
+  permission, and closes only a connection it opened. Experimental. Requested by @Akm0d (#224).
+- Cascade mode can speak through any OpenAI-compatible `/audio/speech` server
+  (self-hosted models, LiteLLM gateways): `TALK_CASCADE_TTS=openai` with
+  `TALK_CASCADE_OPENAI_BASE_URL`, `_MODEL`, `_VOICE` and an optional `_API_KEY`,
+  or the matching *Experimental* settings. ElevenLabs stays the default. No new
+  dependency, plain `http://` only on loopback, and the key never falls back
+  to `OPENAI_API_KEY`. Experimental. Requested by @HearthCore (#151).
+- Git deployments can version optional `TALK.md` voice preferences in their
+  plugin branch. New Realtime and GPT-Live sessions load the bounded UTF-8 file
+  alongside the existing host contracts and identity sections. Contributed by @tancou.
+
+## [0.24.0] — 2026-11-21
+
+A big community release. Talk gets a one-button panel in Hermes Desktop and the
+dashboard, and a new **Experimental** section in its plugin settings, where
+community features ship off by default: Amazon Echo as a speaker and mic, a
+text-only call journal, voice language, a speaker echo hold, and a standalone
+Twilio phone server. Pressing Talk works exactly as before. On a compatible
+Hermes host, you can also say “Switch to my Codex chat and read its last
+reply,” then “Ask it to check mobile too.” This works with Claude Code too (see
+the [voice commands and host requirements](docs/recipient-routing.md)). The
+release also carries fixes for profile isolation on multiplexed gateways,
+Discord playback, honest run outcomes, the transcript review loop and Gemini
+tool calls. Thanks to everyone who contributed and reported issues.
+
+### Added
+- `python -m talk_twilio_server` answers calls to your own Twilio number with
+  a fresh Gemini Live voice session (no task, no tools), over Twilio Media
+  Streams. It is a separate opt-in server, not the Dograh Phone mode, and
+  normal Talk never loads it. Every webhook is signature-checked, callers
+  must be on an allowlist (`*` for anyone), and refused calls are never
+  answered. See [docs/TWILIO.md](docs/TWILIO.md). Experimental. Contributed by @computator1200.
+- Select an open Codex or Claude Code chat by app name alone when exactly one
+  matches. Talk asks which chat you mean when it finds several. A single spoken
+  request can select a chat and read its latest visible assistant reply.
+- GPT-Live directs follow-ups to the chat selected when it heard the request.
+  If the selection changes while Hermes decides, it asks you to select the chat again.
+- Experimental controls in Hermes Talk plugin settings for a saved Echo,
+  the text-only call journal, and voice language. New users start with Echo
+  and Journal off and language on Auto.
+- Opt-in call journal (`TALK_CALL_JOURNAL=1`). A dashboard or Desktop Realtime
+  call without a bound task leaves a text-only JSONL record on the Hermes host:
+  final utterances on both sides, barge-ins, tool calls and results, the
+  sessions it created, errors and the hang-up — written as the call happens.
+  `hermes talk journal` lists calls and prints one as Markdown. Retention is
+  bounded (`TALK_CALL_JOURNAL_DAYS`, default 30). Off by default.
+  Contributed by @Philibergus.
+- `hermes talk echo HOST` uses an Amazon Echo running echo-dot-assist's hassmic
+  in Wyoming mode as an optional Talk surface. Each wake word starts a session
+  on the Echo's microphone and speaker. The session ends after `--idle` seconds
+  of quiet. Full duplex needs hassmic's `-D`. Experimental: not yet confirmed
+  on physical Echo hardware. Thanks to
+  [@patrickhaahr](https://github.com/patrickhaahr).
+- Spoken-language knobs for OpenAI sessions: `TALK_TRANSCRIPTION_LANGUAGES`
+  (ISO codes for the input transcriber), `TALK_TRANSCRIPTION_PROMPT` (one-line
+  transcription context) and `TALK_REPLY_LANGUAGE` (the language the voice
+  answers in). A short greeting no longer gets answered in a guessed language.
+  All three are fail-closed, resolved at call time, and leave the wire and the
+  prompt byte-identical when unset. `hermes talk doctor` gains a `language`
+  check that reports the prompt's length, never its text. Contributed by @Philibergus.
+- Experimental echo gate hold for loudspeakers with output latency, such as a
+  TV over HDMI: `TALK_ECHO_GATE_HOLD_MS`, or **Experimental · Speaker echo
+  hold (ms)** in the plugin settings, keeps the terminal echo gate closed that
+  long after playback goes quiet, so the tail of the model's own speech is not
+  heard as the operator. Barge-in above the floor still works during the hold.
+  Off (`0`) by default, which is the gate exactly as before. Not yet confirmed
+  on the reporter's hardware with this build. Thanks to @gocoelho for
+  reporting #228.
+
+### Changed
+- In gated mode (dashboard sign-in engaged), a request the dashboard's own
+  sign-in already verified can open Talk. An explicit `TALK_DASHBOARD_TOKEN`
+  continues to protect deployments that configure one. The Talk
+  tab works right after signing in, on any browser of a private network, with
+  nothing to paste per tab. Cross-site requests (`Sec-Fetch-Site: cross-site`)
+  are still refused; loopback and token behaviour without a gate are unchanged.
+  Contributed by @Philibergus.
+
+### Fixed
+- The dashboard Talk tab shows the `TALK_DASHBOARD_TOKEN` field again on
+  current Hermes dashboards. Their `fetchJSON` throws an `ApiError` whose
+  message is the route's detail alone, with the HTTP code on `status`; the tab
+  only matched a `401`/`403` prefix in the message, so a browser off loopback
+  got the refusal and no way to answer it. Contributed by @Philibergus.
+- The end-of-call transcript memory review no longer re-spawns itself. The
+  detached `hermes -z` review loads hermes-talk too, and its own session-end
+  sweep could claim the same transcript again once the Talk process that
+  started it had exited, starting a new review each time. The review child is
+  now marked in its environment and skips the sweep. A transcript left claimed
+  by an exited Talk process is still reviewed once more by the next normal
+  sweep. Thanks to @gocoelho for reporting #229.
+- The Gemini Live lane no longer fails to start with close code 1007
+  (`Unknown name "additionalProperties"`). Tool schemas are now sent in
+  `parametersJsonSchema`, which accepts `additionalProperties`, instead of the
+  OpenAPI-style `parameters` field, so closed and nested object rules are kept
+  rather than stripped. Not yet confirmed with a live Gemini tool call.
+  Thanks to @gocoelho for reporting #227.
+- On a multiplexed gateway, Talk settings and API keys resolved by
+  `talk_config` come from the profile serving the turn (Hermes's profile secret
+  scope) instead of the process environment, and a read with no profile bound
+  fails closed. Discord voice uses that profile's own bot; a profile without
+  one is refused rather than speaking through the default bot. The OpenAI,
+  Grok and GPT-Live auth resolvers (`talk_auth`, `talk_grok_auth`,
+  `talk_live_config`) still read the process environment.
+  Contributed by @Akm0d.
+- Background host and run workers, transcript handoffs, approval workers, SSE
+  readers and timeout timers, and API/catalog refreshes keep the caller's
+  profile context, so work that outlives a turn still runs as the profile
+  that started it. Contributed by @tancou.
+- In-process capability-catalog discovery waits at most
+  `TALK_API_SERVER_PROBE_TIMEOUT_S`, so a stuck registry no longer pins the
+  caller. One pending read is kept per profile and shared instead of piling up
+  workers, and a read that finishes late answers the next probe.
+  Contributed by Kiven (@abaichuan1017).
+- Discord playback pads the last partial frame when native provider output ends,
+  preserving response boundaries even with a full queue so queued announcements
+  can resume after playback drains. Canonical native output, and Live sessions
+  that report output turns, also signal completion; interrupted audio is
+  discarded. Cascade replies end when their ElevenLabs stream settles, and a
+  fragment with no end marker at all (GPT-Live) plays after about 200 ms of
+  silence. A finished background result is no longer held back for a safe
+  opening that never came. Contributed by @tancou in #218; thanks to
+  @rmccaincns for reporting #239.
+- API-server runs reported as `failed`, `cancelled`, or `interrupted` are no
+  longer recorded or announced as finished. Memory handoffs use the same typed
+  outcome instead of interpreting answer text; lost tracking reports an
+  unknown remote outcome. Remote terminal statuses survive long reasons and
+  bounded spoken reports. Contributed by @tancou in #219. Announcements and
+  `check_work` name the outcome: a run "failed", "was stopped" (remote
+  `cancelled`, as a `stop_work` stop ends, or a detached run `stop_work`
+  signalled), or "was interrupted" (gateway shutdown or restart).
+- `hermes talk doctor` and `hermes talk check` no longer crash on a host with
+  no audio system. `import sounddevice` raises its own `PortAudioError` when
+  PortAudio finds no PulseAudio or ALSA, and that escaped as a traceback; the
+  audio check now reports a warning that no audio device was found and that
+  Discord voice may still be usable. Thanks to @marcablanca for reporting #236.
+- Talk offers `/talk core join` only where it can run: on the Discord gateway,
+  on a host that carries the core voice contract. The terminal session prompt,
+  `talk_status`, and the Discord join, status and refusal lines no longer point
+  at it elsewhere. The README and `docs/OPERATING.md` no longer describe
+  NousResearch/hermes-agent#101808 as landed: it was closed without merging.
+  Thanks to @kvnloo for reporting #215.
+- Delegated work no longer fills the call with empty progress lines. The
+  terminal and Discord Realtime lanes stopped speaking the once-a-minute
+  "still working" heartbeat, the "accepted" milestone that repeated the start
+  receipt, and an `executing` milestone with no real step label; approval
+  waits, a step whose label is known when it starts, results and errors are
+  still spoken, and `check_work`
+  still answers "how's it going?". On GPT-Live, a delegation the model makes
+  without new operator speech is now answered as reference context instead of
+  a line to speak, so retries while work is pending stop turning into "still
+  checking" fillers. Not yet confirmed in a live call. Thanks to @JoshCollis
+  for reporting #202.
+
 ## [0.23.1] — 2026-11-17
 
 Fix the intermittent CI failure caused by a test worker finishing after its
@@ -85,6 +259,8 @@ release that meets the current Hermes plugin catalog rules.
   durable delivery receipt, preventing slow Windows CI runners from expiring an
   unrefreshed test lease or racing receipt persistence. Production timeouts and
   explicit lease-expiry/revocation coverage are unchanged.
+- Plugin-guard CI downloads the upstream scanner's credential-analysis helper
+  from the same resolved commit, preventing an import failure before scanning.
 
 ## [0.22.0] — 2026-10-25
 

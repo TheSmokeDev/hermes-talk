@@ -188,6 +188,23 @@ def test_duplicate_names_need_named_choice_and_explicit_app_resolves(bundle):
     assert selected["recipient"]["recipient_id"] == "claude-a"
 
 
+def test_app_only_switch_needs_one_open_chat_and_a_complete_list(bundle, monkeypatch):
+    backend = bundle[1]
+    args = {"app": "codex_desktop", "read_last_reply": True}
+    assert call(bundle, "select_recipient", args)["recipient"]["recipient_id"] == "desktop-a"
+    backend.rows.append(recipient("another", "codex_desktop", title="Website"))
+    ambiguous = call(bundle, "select_recipient", args, operation_id="choose")
+    assert ambiguous["state"] == "ambiguous"
+    assert bundle[0].snapshot(bundle[2])["selected"] is None
+    backend.rows.pop()
+    listing = backend.list_recipients
+    monkeypatch.setattr(backend, "list_recipients", lambda app: {**listing(app), "truncated": True})
+    partial = call(bundle, "select_recipient", args, operation_id="incomplete")
+    assert partial["state"] == "ambiguous"
+    assert "partial" in partial["output"]
+    assert [item for item in backend.calls if item[0] == "select"] == [("select", "desktop-a")]
+
+
 def test_missing_selection_does_not_choose_only_matching_app_or_create_worker(bundle):
     first = send(bundle)
     assert first["state"] == "selection_required"

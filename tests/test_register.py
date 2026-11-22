@@ -116,8 +116,13 @@ class StubCtx:
 
 
 @pytest.fixture
-def plugin():
+def plugin(monkeypatch):
     module = load_plugin()
+    # The plugin-loaded talk_config is a separate module from the flat one the
+    # conftest isolates; keep a saved Experimental setting on this box (or an
+    # exported TALK_DISCORD_AUTO_JOIN) from changing what `/talk join` does here.
+    monkeypatch.setattr(module.talk_config, "plugin_setting", lambda key: None)
+    monkeypatch.delenv("TALK_DISCORD_AUTO_JOIN", raising=False)
     module.REGISTRATION_FAILURES.clear()
     yield module
     module.REGISTRATION_FAILURES.clear()

@@ -131,3 +131,54 @@ def test_plugin_manifest_does_not_block_codex_oauth_only_installs():
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
 
     assert "requires_env:" not in manifest
+
+
+#: The ``type`` names the Hermes plugin manifest loader knows
+#: (``hermes_cli.plugins_manifest._CONFIG_SCHEMA_TYPES``). Any other name logs a
+#: warning on every plugin load; a ``str`` with ``choices`` renders as a picker.
+HERMES_CONFIG_SCHEMA_TYPES = frozenset({
+    "str", "string", "int", "integer", "float", "number", "bool", "boolean",
+    "list", "array", "dict", "object", "secret",
+})
+
+
+@pytest.fixture(scope="module")
+def config_schema() -> dict:
+    import yaml
+
+    plugin = yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    return plugin["config_schema"]
+
+
+def test_experimental_settings_ship_off_and_on_auto(config_schema):
+    """Pressing Talk behaves exactly as before until the operator opts in."""
+
+    import talk_config
+
+    assert config_schema["journal_enabled"]["default"] is False
+    assert config_schema["echo_enabled"]["default"] is False
+    hold = config_schema["echo_gate_hold_ms"]
+    assert hold["type"] == "int" and hold["default"] == 0
+    assert hold["label"].startswith("Experimental · ")
+    language = config_schema["voice_language"]
+    assert language["default"] == "Auto"
+    assert set(language["choices"]) == {"Auto", *talk_config._EXPERIMENTAL_LANGUAGE_CODES}
+    auto_join = config_schema["discord_auto_join"]
+    assert auto_join["type"] == "bool" and auto_join["default"] is False
+    backend = config_schema["cascade_tts"]
+    assert backend["default"] == talk_config.DEFAULT_CASCADE_TTS == "elevenlabs"
+    assert tuple(backend["choices"]) == talk_config.TALK_CASCADE_TTS_PROVIDERS
+    for key in ("cascade_openai_base_url", "cascade_openai_model", "cascade_openai_voice"):
+        assert config_schema[key]["default"] == ""
+    for key in ("discord_auto_join", "cascade_tts", "cascade_openai_base_url"):
+        assert config_schema[key]["label"].startswith("Experimental · ")
+
+
+def test_every_setting_declares_a_type_the_hermes_loader_knows(config_schema):
+    unknown = {
+        key: spec.get("type")
+        for key, spec in config_schema.items()
+        if str(spec.get("type", "str")).lower() not in HERMES_CONFIG_SCHEMA_TYPES
+    }
+    assert unknown == {}
+    assert config_schema["voice_language"]["type"] == "str"

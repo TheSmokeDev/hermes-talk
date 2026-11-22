@@ -127,6 +127,7 @@ def test_json_shape_is_stable_and_machine_readable(monkeypatch):
         "auth",
         "model",
         "voice",
+        "language",
         "cascade",
         "audio",
         "identity",
@@ -171,6 +172,25 @@ def test_doctor_does_not_create_missing_home_or_codex_directories(monkeypatch, t
 
     assert not hermes_home.exists()
     assert not codex_home.exists()
+
+
+def test_headless_host_reports_missing_audio_device_instead_of_crashing(headless_sounddevice):
+    # hermes-talk#236: doctor and check aborted with a PortAudioError traceback.
+    import talk_check
+
+    audio = _checks(talk_doctor.collect_report())["audio"]
+
+    assert audio["status"] == "warn"
+    assert "no audio device" in audio["summary"]
+    assert "Discord voice may still be usable" in audio["summary"]
+    assert audio["details"]["dependency_available"] is False
+    assert any("headless" in action for action in audio["remediation"])
+    assert not any("pip install" in action for action in audio["remediation"])
+
+    step = talk_check.run_static_step()
+    folded = {check["id"]: check for check in step["details"]["checks"]}
+    assert folded["audio"]["status"] == "warn"
+    assert "no audio device" in folded["audio"]["summary"]
 
 
 def test_metered_key_wins_by_old_precedence_and_warns_when_codex_is_ready(monkeypatch):
@@ -1101,3 +1121,23 @@ def test_live_api_auth_requires_an_openai_key(monkeypatch, _no_host):
     check = _checks(talk_doctor.collect_report())["auth"]
     assert check["status"] == "pass"
     assert check["details"]["winning_lane"] == "env"
+
+
+def test_language_check_reports_hints_without_the_prompt_text(monkeypatch):
+    monkeypatch.setenv("TALK_TRANSCRIPTION_LANGUAGES", "fr,en")
+    monkeypatch.setenv("TALK_TRANSCRIPTION_PROMPT", "Mostly French. Names: Example Clinic.")
+    monkeypatch.setenv("TALK_REPLY_LANGUAGE", "French")
+    check = talk_doctor._language_check()
+    assert check["status"] == "pass"
+    assert check["details"]["transcription_languages"] == ["fr", "en"]
+    assert check["details"]["reply_language"] == "French"
+    assert "Example Clinic" not in str(check)
+
+
+def test_language_check_fails_on_an_invalid_setting(monkeypatch):
+    monkeypatch.delenv("TALK_TRANSCRIPTION_PROMPT", raising=False)
+    monkeypatch.delenv("TALK_REPLY_LANGUAGE", raising=False)
+    monkeypatch.setenv("TALK_TRANSCRIPTION_LANGUAGES", "french")
+    check = talk_doctor._language_check()
+    assert check["status"] == "fail"
+    assert check["details"]["transcription_languages"] == "invalid"

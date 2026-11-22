@@ -423,6 +423,10 @@ class NativeLiveTaskController(NativeTaskController):
                 raise NativeTaskError("Provider repeated tool proposals without new operator input")
             self.delegations[event.delegation_id] = _Delegation(event, {}, finished=True)
             self.notice({"state": "refused", "reason": "delegation_has_no_new_operator_input"})
+            # Reference context, never speakable commentary (hermes-talk#202): a
+            # model that re-delegates while work is pending ("let me check") was
+            # handed a line to SAY each time, so every retry became an empty
+            # "still checking" filler. Nothing new happened; nothing new is said.
             await self._send_synthetic(
                 [
                     rt.SubmitDelegationResult(
@@ -430,6 +434,7 @@ class NativeLiveTaskController(NativeTaskController):
                         "No new operator input was captured. No action or approval was authorized. "
                         "Continue listening; do not propose another tool "
                         "until the operator speaks.",
+                        kind="context",
                     )
                 ],
                 source_sequence=self.claimed_sequence,
@@ -549,6 +554,10 @@ class NativeLiveTaskController(NativeTaskController):
             self.provider_response_active = False
             self.presentation = None
         elif isinstance(event, rt.OutputTurnCompleted):
+            if self.provider_response_active:
+                finish_playback = getattr(self.audio, "finish_playback", None)
+                if callable(finish_playback):
+                    finish_playback()
             self.provider_response_active = False
         elif isinstance(event, rt.OutputAudio):
             if self.service_paused:

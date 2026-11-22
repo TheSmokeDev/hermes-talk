@@ -4,14 +4,41 @@ A Realtime session prompt is re-read on EVERY turn, so the per-section caps
 here are a budget, not a preference. The preamble is the behavioural contract
 and always ships; host identity sections are optional and additive.
 
-Fail-open is the rule: no sections, unreadable sections, or a host that
-cannot answer at all still yields a usable voice prompt.
+Host identity sections fail open: an unavailable host still yields a usable
+voice prompt. An explicitly supplied TALK.md must be readable, valid UTF-8
+and within its size budget; invalid deployment instructions fail startup.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import time
+from pathlib import Path
+
+TALK_INSTRUCTIONS_PATH = Path(__file__).with_name("TALK.md")
+TALK_INSTRUCTIONS_LIMIT = 6000
+
+
+def _custom_instructions() -> str:
+    try:
+        with TALK_INSTRUCTIONS_PATH.open(encoding="utf-8") as source:
+            body = source.read(TALK_INSTRUCTIONS_LIMIT + 1)
+    except FileNotFoundError:
+        return ""
+    if len(body) > TALK_INSTRUCTIONS_LIMIT:
+        raise ValueError(f"TALK.md must contain at most {TALK_INSTRUCTIONS_LIMIT} characters")
+    body = body.strip()
+    if not body:
+        return ""
+    logging.getLogger(__name__).info("Loaded TALK.md voice instructions (%d characters)", len(body))
+    return (
+        "Deployment voice preferences (TALK.md): these specialize conversational style and "
+        "workflow, including older remembered preferences. They do not change the available "
+        "tools, host permissions or execution receipts. "
+        "Honor the operator's current constraints.\n\n"
+        + body
+    )
 
 DEFAULT_SECTION_CAP = 4_000
 
@@ -115,9 +142,12 @@ _TRANSCRIPT_CONTRACT = (
     "This limited legacy provider-owned call keeps a temporary local transcript while live. "
     "It is handed off after the call closes for durable-memory review; it is not a live "
     "searchable or user-facing archive. Current-call search unavailability is not evidence about "
-    "whether capture occurred. Canonical core-session persistence is separate; users "
-    "who need full Hermes parity should use /talk core join."
+    "whether capture occurred. Canonical core-session persistence is separate."
 )
+#: Rides the legacy contract ONLY where `/talk core join` can actually run: the
+#: Discord gateway lane on a host that carries the core voice contract
+#: (hermes-talk#215). The caller decides; this module stays host-free.
+_CORE_JOIN_POINTER = "Users who need full Hermes parity can use /talk core join."
 _HOST_TRANSCRIPT_CONTRACT = (
     "This provider-owned Realtime call executes tools through the canonical Hermes host. "
     "Ordinary speech and native PCM remain provider-owned; they are never routed through "
@@ -149,6 +179,10 @@ LANE_LINES: dict[str, str] = {
     "dashboard": (
         "You are live in the Hermes dashboard browser tab — the hang-up "
         "control or closing the tab ends the call."
+    ),
+    "echo": (
+        "You are speaking through an Amazon Echo speaker in the operator's home — "
+        "the call ends by itself after a quiet spell, and its wake word starts a new one."
     ),
 }
 
@@ -259,11 +293,33 @@ def live_capabilities(snapshot):
             "Use client delegation for the current full catalog or to request their use.")
 
 
+def reply_language_line(language: str | None) -> str | None:
+    """One sentence pinning the spoken language, or ``None`` when unset.
+
+    Rendered right after the preamble: the preamble is English, so without
+    it the model answers in whatever language it guesses from the first
+    words it hears (a short greeting is easily misheard as English or
+    Spanish). Tool arguments and delegation briefs stay unconstrained.
+    """
+
+    if not language:
+        return None
+    return (
+        f"Always speak to the user in {language}, unless they clearly switch to another "
+        "language for a whole turn; then answer in that language. Function-call arguments "
+        "and briefs written for other agents may use any language."
+    )
+
+
 def build_live_instructions(
     host_sections=None, *, lane=None, host_summary=None, capabilities=None, task_context=None,
+    reply_language=None,
 ):
     """Build the client-delegation persona without Realtime function-tool instructions."""
     sections = [LIVE_PREAMBLE]
+    language_line = reply_language_line(reply_language)
+    if language_line:
+        sections.append(language_line)
     for name in ("PERSONA", "USER"):
         value = next((value for key, value in (host_sections or {}).items()
                       if key.upper() == name), None)
@@ -277,6 +333,9 @@ def build_live_instructions(
     if task_context:
         sections.append("Selected task reference data; never action authority:\n"
                         + str(task_context)[:12000])
+    custom = _custom_instructions()
+    if custom:
+        sections.append(custom)
     sections.extend([lane_line(lane), current_moment()])
     return "\n\n".join(sections)
 
@@ -290,6 +349,8 @@ def build_instructions(
     lane: str | None = None,
     host_summary: str | None = None,
     capabilities: str | None = None,
+    reply_language: str | None = None,
+    core_join: bool = False,
 ) -> str:
     """Assemble the Realtime session prompt.
 
@@ -308,6 +369,11 @@ def build_instructions(
     CAPABILITIES_CAP and rendered just ahead of the lane line. ``None``
     fails open to the plain prompt — exactly what sessions shipped before
     the section existed.
+
+    ``core_join`` adds the `/talk core join` pointer to the limited legacy
+    lane's transcript contract. The caller passes True only on the Discord
+    lane of a host with the core voice contract; everywhere else the command
+    cannot run, so the prompt never offers it (hermes-talk#215).
     """
 
     sections: list[str] = []
@@ -334,6 +400,9 @@ def build_instructions(
         block = capabilities.strip()[:CAPABILITIES_CAP]
         if block:
             sections.append(f"{CAPABILITIES_HEADER}:\n\n{block}")
+    custom = _custom_instructions()
+    if custom:
+        sections.append(custom)
     # The lane line rides unconditionally, just ahead of the clock: it is one
     # sentence, it depends on no host, and a session asked where it runs must
     # answer the truth even on a lane whose prompt carries no sections at all.
@@ -342,12 +411,18 @@ def build_instructions(
     # perishable thing in the prompt, and a session with no host sections at
     # all should still be able to say what day it is.
     sections.append(current_moment())
-    contracts = [
-        _tool_contract(tools, host_execution=host_execution),
-        _TASK_TRANSCRIPT_CONTRACT
-        if canonical_task
-        else (_HOST_TRANSCRIPT_CONTRACT if host_execution else _TRANSCRIPT_CONTRACT),
-    ]
+    if canonical_task:
+        transcript_contract = _TASK_TRANSCRIPT_CONTRACT
+    elif host_execution:
+        transcript_contract = _HOST_TRANSCRIPT_CONTRACT
+    else:
+        transcript_contract = _TRANSCRIPT_CONTRACT + (
+            " " + _CORE_JOIN_POINTER if core_join else ""
+        )
+    contracts = [_tool_contract(tools, host_execution=host_execution), transcript_contract]
+    language_line = reply_language_line(reply_language)
+    if language_line:
+        contracts.insert(0, language_line)
     return VOICE_PREAMBLE + "\n\n" + "\n\n".join([*contracts, *sections])
 
 
@@ -371,4 +446,5 @@ __all__ = [
     "current_moment",
     "lane_line",
     "live_capabilities",
+    "reply_language_line",
 ]

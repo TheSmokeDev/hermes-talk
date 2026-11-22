@@ -9,6 +9,10 @@ const desktopOpeners = new Set();
 const INCOMPLETE_TALK_CONTRACT = 'This Hermes Desktop build reports an incomplete Talk contract.';
 const STOCK_SCOPE_MOVED = 'Talk follows the active profile on this Hermes Desktop. ' +
   "Switch to this conversation's profile, then try again.";
+// Shown under Settings, not in the main view: the popover works fully; this
+// only says why this build has no floating window.
+const COMPOSER_MODE_NOTE = 'Talk runs in this popover. ' +
+  'The floating window needs the Talk-enabled Hermes Desktop build.';
 
 function ownerKey(owner) {
   return JSON.stringify([owner?.connectionId, owner?.profile,
@@ -62,7 +66,7 @@ export function hasTalkHostCapabilities(controller) {
 async function prepareStockSession(snapshot) {
   // A stock draft carries no runtime or stored id until its first prompt.
   if (!snapshot?.sessionId || !snapshot.storedSessionId) {
-    throw new Error('Send one message in this conversation first, then Connect. ' +
+    throw new Error('Send one message in this conversation first, then try again. ' +
       'Hermes Desktop saves a conversation on its first message.');
   }
   const ambient = readHostScope();
@@ -647,7 +651,12 @@ function DesktopTalkPresentation(props) {
     (active || starting) && h('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
     },
-    h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '0.75rem' } },
+    h('span', { 'aria-hidden': true, style: { width: '0.4rem', height: '0.4rem', borderRadius: '50%',
+      background: active ? 'var(--ui-success, #2ea043)' : 'var(--ui-text-tertiary, currentColor)',
+      boxShadow: active ? '0 0 0 2px color-mix(in srgb, var(--ui-success, #2ea043) 25%, transparent)'
+        : 'none' } }),
+    h('span', { role: 'status', 'aria-live': 'polite',
+      style: { fontSize: '0.75rem', color: 'var(--ui-text-secondary, inherit)' } },
       active ? 'Connected' : 'Connecting…'),
     h(HermesSDK.Button, {
       type: 'button', variant: 'ghost', size: 'sm',
@@ -662,26 +671,25 @@ function DesktopTalkPresentation(props) {
       // Dismissal stays on outside click and Escape (docs/DESKTOP.md).
       onFocusOutside: event => event.preventDefault(),
       style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
-        overflowY: 'auto', padding: '1rem' },
+        overflowY: 'auto', padding: '.875rem 1rem .25rem' },
       onSubmit: event => event.stopPropagation(),
-    }, h('p', { role: 'status', style: { fontSize: '.75rem', marginBottom: '.75rem' } },
-      'Composer mode · The floating Talk window needs the Talk-enabled Hermes Desktop build ' +
-      '(docs/DESKTOP.md).'),
-    h(DesktopTalkView, props)));
+    }, h(DesktopTalkView, { ...props, hostNote: COMPOSER_MODE_NOTE })));
 }
 
 const TALK_HUD_CSS = `
-.ht-hud { display:grid; gap:.5rem; color:inherit; font:inherit; --ht-hud-surface:var(--background, Canvas); }
+.ht-hud { display:grid; gap:.5rem; color:var(--ui-text-primary, inherit); font:inherit; font-size:.8125rem; --ht-hud-surface:var(--ui-bg-elevated, var(--background, Canvas)); --ht-hud-line:var(--ui-stroke-secondary, color-mix(in srgb, currentColor 16%, transparent)); --ht-hud-accent:var(--ui-accent, var(--theme-primary, #4a84fe)); }
 .ht-hud-compact { position:relative; display:flex; align-items:center; gap:.5rem; }
-.ht-hud-toggle { min-width:3rem; min-height:3rem; border-radius:50%; font:inherit; color:inherit; background:var(--ht-hud-surface); border:1px solid currentColor; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.35); }
-.ht-hud-toggle:focus-visible { outline:2px solid currentColor; outline-offset:3px; }
-.ht-hud-preview { display:none; margin:0; padding:.375rem .625rem; border-radius:.5rem; background:var(--ht-hud-surface); font-size:.75rem; overflow-wrap:anywhere; }
+.ht-hud-toggle { min-width:3rem; min-height:3rem; border-radius:50%; font:inherit; font-size:.75rem; font-weight:600; color:inherit; background:var(--ht-hud-surface); border:1px solid var(--ht-hud-line); cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,.25), 0 8px 24px -8px rgba(0,0,0,.6); transition:background-color .2s, color .2s, border-color .2s, transform .15s; }
+.ht-hud-toggle:hover { transform:scale(1.04); }
+.ht-hud[data-active="true"] .ht-hud-toggle { color:#fff; background:var(--ht-hud-accent); border-color:transparent; }
+.ht-hud-toggle:focus-visible { outline:2px solid var(--ht-hud-accent); outline-offset:3px; }
+.ht-hud-preview { display:none; margin:0; padding:.375rem .625rem; border:1px solid var(--ht-hud-line); border-radius:4px; background:var(--ht-hud-surface); color:var(--ui-text-secondary, inherit); font-size:.75rem; overflow-wrap:anywhere; }
 .ht-hud-compact:hover .ht-hud-preview, .ht-hud-compact:focus-within .ht-hud-preview { display:block; }
-.ht-hud-panel { width:min(380px,calc(100vw - 24px)); max-height:calc(100vh - 5rem); overflow:auto; padding:.75rem; border-radius:.75rem; background:var(--ht-hud-surface); }
-.ht-hud[data-skin="contrast"] { color:CanvasText; --ht-hud-surface:Canvas; }
+.ht-hud-panel { width:min(380px,calc(100vw - 24px)); max-height:calc(100vh - 5rem); overflow:auto; padding:.875rem 1rem .25rem; border:1px solid var(--ht-hud-line); border-radius:6px; background:var(--ht-hud-surface); box-shadow:0 12px 32px -12px rgba(0,0,0,.6); }
+.ht-hud[data-skin="contrast"] { color:CanvasText; --ht-hud-surface:Canvas; --ht-hud-line:CanvasText; }
 .ht-hud[data-animate="true"][data-active="true"] .ht-hud-toggle { animation:ht-hud-connected 2s ease-in-out infinite; }
-@keyframes ht-hud-connected { 50% { border-color:transparent; } }
-@media (prefers-reduced-motion:reduce) { .ht-hud-toggle { animation:none !important; } }
+@keyframes ht-hud-connected { 50% { box-shadow:0 0 0 6px color-mix(in srgb, var(--ht-hud-accent) 25%, transparent); } }
+@media (prefers-reduced-motion:reduce) { .ht-hud-toggle { animation:none !important; transition:none !important; } }
 `;
 
 function TalkHudPresentation(props) {
@@ -826,7 +834,7 @@ function DesktopTalkLauncher() {
   }, []);
   return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '.5rem' } },
     h(HermesSDK.Button, { type: 'button', variant: 'ghost', size: 'sm', disabled: opening || !!unavailable,
-      title: unavailable || 'Open the floating Talk window. Audio stays off until Connect.',
+      title: unavailable || 'Open the floating Talk window. Audio stays off until you start talking.',
       'aria-label': 'Open floating Hermes Talk', onClick: () => void open() }, opening ? 'Opening…' : 'Talk'),
     error && h('span', { role: 'alert', style: { fontSize: '.75rem' } }, error));
 }

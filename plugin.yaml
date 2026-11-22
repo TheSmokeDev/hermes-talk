@@ -1,5 +1,5 @@
 name: hermes-talk
-version: 0.23.1
+version: 0.24.1
 requires_hermes: ">=0.23.0"
 manifest_version: 1
 kind: standalone
@@ -27,6 +27,58 @@ provides_hooks:
   - pre_tool_call
   - pre_llm_call
 config_schema:
+  journal_enabled:
+    type: bool
+    default: false
+    label: "Experimental · Call journal"
+    description: Save text from standalone dashboard and Desktop Realtime calls. Off by default.
+  voice_language:
+    type: str
+    choices: [Auto, English, Spanish, French, German, Portuguese, Chinese, Japanese, Korean]
+    default: Auto
+    label: "Experimental · Voice language"
+    description: Auto follows the usual voice behavior. Choose a language to guide OpenAI transcription and replies on new calls.
+  echo_enabled:
+    type: bool
+    default: false
+    label: "Experimental · Use saved Echo"
+    description: Let the Echo command use your saved speaker. Echo only connects when you run the command.
+  echo_address:
+    type: str
+    default: ""
+    label: "Experimental · Echo address"
+    description: Hostname or local IP of a compatible Echo running hassmic. Used by hermes talk echo.
+  echo_gate_hold_ms:
+    type: int
+    default: 0
+    label: "Experimental · Speaker echo hold (ms)"
+    description: Terminal calls on loudspeakers with output delay, such as a TV over HDMI. Keeps the echo gate closed this many milliseconds after the voice stops so its last words are not heard as you. 0 keeps today's behavior.
+  discord_auto_join:
+    type: bool
+    default: false
+    label: "Experimental · Discord auto-join"
+    description: Let /talk join connect to the voice channel you are in when the bot is not in one yet. Only for users in TALK_DISCORD_OPERATOR_USER_IDS. Off keeps today's behavior (run /voice join first).
+  cascade_tts:
+    type: str
+    choices: [elevenlabs, openai]
+    default: elevenlabs
+    label: "Experimental · Cascade voice backend"
+    description: Text-to-speech used when TALK_VOICE_MODE=cascade. openai means any OpenAI-compatible /audio/speech server, such as a self-hosted model or a LiteLLM gateway. elevenlabs keeps today's behavior.
+  cascade_openai_base_url:
+    type: str
+    default: ""
+    label: "Experimental · Cascade OpenAI-compatible address"
+    description: Base URL of the OpenAI-compatible speech server, for example http://127.0.0.1:4000/v1. Plain http only on this computer. The key, if any, goes in TALK_CASCADE_OPENAI_API_KEY.
+  cascade_openai_model:
+    type: str
+    default: ""
+    label: "Experimental · Cascade OpenAI-compatible model"
+    description: Speech model id the server expects.
+  cascade_openai_voice:
+    type: str
+    default: ""
+    label: "Experimental · Cascade OpenAI-compatible voice"
+    description: Voice or speaker id the server expects.
   phone_enabled:
     type: bool
     default: false

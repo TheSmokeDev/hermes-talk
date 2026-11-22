@@ -339,8 +339,8 @@ const runtime=voiceRenders[0]({controller:nativeController});
 render(runtime,'hud'); flushEffects(); await tick();
 let tree=render(runtime,'hud'); flushEffects();
 assert.equal(captures,0); assert.equal(acquires,0);
-assert.equal(button(tree,'Connect').props.disabled,false);
-button(tree,'Connect').props.onClick();
+assert.equal(button(tree,'Start talking').props.disabled,false);
+button(tree,'Start talking').props.onClick();
 await waitFor(()=>offers===1); await tick();
 tree=render(runtime,'hud'); flushEffects();
 tree=render(runtime,'hud');
@@ -431,8 +431,14 @@ const popover=find(tree,node=>node.type==='popover');
 assert(popover); assert.equal(popover.props.modal,false);
 popover.props.onOpenChange(true);
 tree=render(registered[0].render(),'composer');
-assert(text(tree).includes('Composer mode'));
-assert(text(tree).includes('The floating Talk window needs the Talk-enabled Hermes Desktop build'));
+// The popover is a complete Talk surface; why there is no floating window is a
+// settings detail, not a banner above the controls.
+const settings=find(tree,node=>node.type==='details'&&text(node).includes('Settings'));
+assert(settings,'the composer panel has a Settings disclosure');
+assert(text(settings).includes('The floating window needs the Talk-enabled Hermes Desktop build'));
+const view=find(tree,node=>node.props.className==='ht-desktop-view');
+assert(!view.children.some(child=>child&&child.type==='p'&&text(child).includes('floating window')),
+  'the build note stays out of the main view');
 assert(!text(tree).includes('update Hermes Desktop'));
 assert.equal(acquires,0); assert.equal(captures,0);
 """)
@@ -563,7 +569,7 @@ assert.equal(registered[1].area,'titleBar.tools.right');
 let tree=render(registered[0].render(),'composer'); flushEffects();
 find(tree,node=>node.type==='popover').props.onOpenChange(true);
 tree=render(registered[0].render(),'composer'); flushEffects(); await tick();
-assert(text(tree).includes('Composer mode'));
+assert(text(tree).includes('Talk runs in this popover.'));
 const catalog=calls.find(row=>row.path==='/targets');
 assert(catalog,'the stock lane drives the shared catalog');
 assert.equal(catalog.options.body.session_id,'stored-stock');

@@ -9,10 +9,24 @@ both the host and Talk; the plugin alone cannot add desktop control to a remote
 host. Availability is reported per application and per task. A discovered title
 or stored conversation is not proof that the task can receive instructions.
 
+The companion Hermes host implements live chat selection and delivery in
+[host PR 11](https://github.com/TheSmokeDev/hermes-agent/pull/11) and native
+history reads in [host PR 13](https://github.com/TheSmokeDev/hermes-agent/pull/13).
+[Host PR 19](https://github.com/TheSmokeDev/hermes-agent/pull/19) confirms
+delivery to Claude Code 2.1.330 chats, and
+[host PR 20](https://github.com/TheSmokeDev/hermes-agent/pull/20) supports the
+Codex Desktop 26.1117 chat layout. Codex Desktop and Claude Code each need a
+chat the host can verify. On Windows, run the host as the same user as those
+chats and outside any sandbox. A sandboxed host can read a Claude Code chat but
+cannot send to it.
+
 ## Say what you want to address
 
 | Request | Result |
 |---|---|
+| "Switch to my Codex chat and tell me what it said." | If the host lists one open Codex chat, Talk selects it and reads its last visible assistant reply. If several are open, Talk asks which one. |
+| "Switch to the Claude Code chat named Website and read its last reply." | Talk selects that title in Claude Code. You hear when its replies are unavailable or only an excerpt is available. |
+| "Now ask it to check mobile too." | GPT-Live sends the follow-up to the selected chat if the host can deliver it. |
 | "List my Codex tasks" | Lists verified recipients on the selected execution host. |
 | "Select Codex task NAME" | Selects that exact recipient; duplicate names require a choice. |
 | "Tell Codex: focus on the login bug" | Sends to the selected existing Codex recipient. A selected Claude task cannot receive this request. |

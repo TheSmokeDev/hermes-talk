@@ -92,7 +92,7 @@ def _doctor_report(**overrides):
         "command": "hermes talk doctor",
         "read_only": True,
         "ok": True,
-        "summary": {"pass": 10, "warn": 0, "fail": 0},
+        "summary": {"pass": len(talk_doctor.CHECK_ORDER), "warn": 0, "fail": 0},
         "checks": checks,
         "planted_top_level": SECRET,
     }
@@ -157,7 +157,8 @@ def test_bundle_shape_is_stable_and_machine_readable():
         set(check) == {"id", "status", "summary", "details", "remediation"}
         for check in bundle["doctor"]["checks"]
     )
-    assert bundle["doctor"]["summary"] == {"pass": 10, "warn": 0, "fail": 0}
+    passed = len(talk_doctor.CHECK_ORDER)
+    assert bundle["doctor"]["summary"] == {"pass": passed, "warn": 0, "fail": 0}
     json.dumps(bundle)
 
 
@@ -496,7 +497,7 @@ def test_cli_json_prints_the_bundle_and_human_prints_the_summary(monkeypatch, ca
     assert human.startswith("Hermes Talk diagnostics (redacted: names and outcomes only)")
     assert "config names: TALK_OPENAI_API_KEY" in human
     assert "[PASS] auth: auth looks fine" in human
-    assert "Doctor: 10 pass, 0 warn, 0 fail." in human
+    assert f"Doctor: {len(talk_doctor.CHECK_ORDER)} pass, 0 warn, 0 fail." in human
     assert "--bundle" in human
     assert SECRET not in human
 

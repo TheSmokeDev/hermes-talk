@@ -12,10 +12,12 @@ operator key):
 - ``{"setup": {...}}`` is the first client message, acked with
   ``{"setupComplete": {}}``. Setup carries the model as ``models/<id>``,
   ``generationConfig.responseModalities: ["AUDIO"]`` with a prebuilt voice,
-  ``systemInstruction.parts[].text``, function tools whose parameter schema
-  types are UPPERCASE (``"OBJECT"``, ``"STRING"``), and empty
+  ``systemInstruction.parts[].text``, function tools, and empty
   ``outputAudioTranscription`` / ``inputAudioTranscription`` objects enabling
-  both transcript lanes.
+  both transcript lanes. The probe sent tool schemas in ``parameters`` with
+  UPPERCASE types (``"OBJECT"``, ``"STRING"``); that OpenAPI-style field
+  rejects ``additionalProperties`` with close code 1007 (#227), so tools now
+  send the unchanged JSON Schema in ``parametersJsonSchema`` instead.
 - Tool calls arrive as ``toolCall.functionCalls[]`` whose ``args`` are a
   PARSED DICT (OpenAI/xAI send a JSON string) and are answered with a
   ``toolResponse.functionResponses[]`` envelope keyed by the call ``id``;
@@ -204,24 +206,13 @@ def _wire_model(model: str) -> str:
     return model if model.startswith("models/") else f"models/{model}"
 
 
-def _schema_wire(value: Any) -> Any:
-    """Uppercase JSON-Schema ``type`` names into the Live API's enum vocabulary."""
-
-    if isinstance(value, dict):
-        return {
-            key: item.upper() if key == "type" and isinstance(item, str) else _schema_wire(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_schema_wire(item) for item in value]
-    return value
-
-
 def _tool_wire(tool: rt.ToolDefinition) -> dict[str, Any]:
+    # Live's OpenAPI parameters cannot carry JSON Schema keywords such as
+    # additionalProperties. The JSON Schema field preserves those constraints.
     return {
         "name": tool.name,
         "description": tool.description,
-        "parameters": _schema_wire(dict(tool.parameters)),
+        "parametersJsonSchema": dict(tool.parameters),
     }
 
 

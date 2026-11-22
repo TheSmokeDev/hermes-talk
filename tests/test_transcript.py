@@ -154,8 +154,12 @@ def test_other_process_skips_live_capture_then_recovers_it_after_force_kill(tmp_
             "time.sleep(60)",
         ]
     )
+    # The Windows venv launcher can exit while its Python child still owns the lease.
+    executable = (
+        getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
+    )
     child = subprocess.Popen(
-        [sys.executable, "-c", code],
+        [executable, "-c", code],
         cwd=Path(__file__).parents[1],
         stdout=subprocess.PIPE,
         text=True,
@@ -678,6 +682,52 @@ def test_session_end_sweep_flushes_without_a_bound_owner(tmp_path, monkeypatch, 
     assert talk_transcript.handoff_status()["state"] == "handoff pending"
 
 
+def test_detached_review_child_cannot_reclaim_an_abandoned_transcript(
+    tmp_path, monkeypatch, flush_lanes,
+):
+    import talk_host
+
+    _finished_capture(tmp_path, "prior owner exited")
+    root = tmp_path / "state" / "talk-transcripts"
+    original = next(root.glob("*.jsonl"))
+    claim = original.with_name(f"{original.name}.claimed-1000-dead")
+    original.rename(claim)
+
+    marker = "TALK_TRANSCRIPT_REVIEW_CHILD"
+    monkeypatch.delenv(marker, raising=False)
+    monkeypatch.setenv("TALK_TEST_PARENT_ENV", "preserved")
+    monkeypatch.setattr(talk_host, "hermes_binary", lambda: "fixture-hermes")
+    reentered = []
+    inherited = []
+
+    class Review:
+        returncode = 0
+
+        def communicate(self, *, timeout):
+            return "reviewed", ""
+
+    def launch_review(_argv, **kwargs):
+        child_env = kwargs.get("env", os.environ)
+        inherited.append(child_env["TALK_TEST_PARENT_ENV"])
+        with monkeypatch.context() as child:
+            if marker in child_env:
+                child.setenv(marker, child_env[marker])
+            talk_transcript.sweep_transcripts(tmp_path, run_agent=reentered.append)
+        return Review()
+
+    monkeypatch.setattr(talk_host.subprocess, "Popen", launch_review)
+
+    assert talk_host.host().flush_agent("review existing memory").startswith("FLUSH_DONE")
+    assert inherited == ["preserved"]
+    assert not reentered
+    assert claim.is_file()
+    assert marker not in os.environ
+
+    talk_transcript.sweep_transcripts(tmp_path, run_agent=reentered.append)
+    assert len(reentered) == 1
+    assert not claim.exists()
+
+
 def test_a_flush_with_no_lane_defers_and_the_next_sweep_retries(
     tmp_path, monkeypatch, flush_lanes
 ):
@@ -811,8 +861,9 @@ def test_the_detached_spawn_tier_flushes_when_nothing_else_is_up(
     assert _wait_for(lambda: not list(root.glob("*.claimed-*")))
 
 
+@pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted"])
 def test_an_api_server_flush_failure_keeps_the_transcript(
-    tmp_path, monkeypatch, flush_lanes
+    tmp_path, monkeypatch, flush_lanes, status
 ):
     """WORK_STARTED-then-dead was the drop class: the api-server tier now
     completes synchronously, and a failed run keeps the only copy for the
@@ -823,7 +874,7 @@ def test_an_api_server_flush_failure_keeps_the_transcript(
     capture = _finished_capture(tmp_path, "failed flush")
 
     def failing_run(prompt, *, session_id, session_key):
-        return "the agent run failed: model overloaded"
+        raise talk_apiserver.TalkApiRunError("remote-run", status, "model overloaded")
 
     monkeypatch.setattr(talk_apiserver, "is_available", lambda: True)
     monkeypatch.setattr(talk_apiserver, "run_to_completion", failing_run)

@@ -21,11 +21,12 @@ from dataclasses import dataclass
 import httpx
 
 try:
-    from . import talk_auth
+    from . import talk_auth, talk_config
     from . import talk_realtime as rt
     from .talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_auth
+    import talk_config
     import talk_realtime as rt
     from talk_config import DEFAULT_TALK_MODEL, DEFAULT_TALK_VOICE
 
@@ -99,6 +100,32 @@ def encode_turn_detection(
     raise ValueError(f"unsupported OpenAI turn detection mode: {mode!r}")
 
 
+def encode_input_transcription(
+    *,
+    model: str = INPUT_TRANSCRIPTION_MODEL,
+    languages: tuple[str, ...] = (),
+    prompt: str | None = None,
+) -> dict:
+    """Encode the input-transcription block of a Realtime session.
+
+    ``gpt-live-transcribe`` takes the plural ``languages`` list and rejects the
+    singular field; the older transcription models take one ``language``.
+    With several expected languages on such a model no code is sent: forcing
+    one of them would mis-transcribe the other, so detection stays automatic
+    and the ``prompt`` carries the hint instead.
+    """
+
+    block: dict = {"model": model}
+    if languages:
+        if model.startswith("gpt-live-transcribe"):
+            block["languages"] = list(languages)
+        elif len(languages) == 1:
+            block["language"] = languages[0]
+    if prompt:
+        block["prompt"] = prompt
+    return block
+
+
 def build_session_payload(
     *,
     model: str = DEFAULT_TALK_MODEL,
@@ -108,6 +135,8 @@ def build_session_payload(
     automatic_response: bool = True,
     turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
+    transcription_languages: tuple[str, ...] | None = None,
+    transcription_prompt: str | None = None,
 ) -> dict:
     """OpenAI Realtime session config — server VAD, barge-in enabled.
 
@@ -116,7 +145,18 @@ def build_session_payload(
     calling tools, but emits text deltas instead of synthesized audio. The
     ``audio.output`` block carries no voice then — there is no provider
     voice to configure, and sending one would pretend a choice nobody made.
+
+    ``transcription_languages`` left at ``None`` is resolved at CALL time from
+    ``TALK_TRANSCRIPTION_LANGUAGES`` / ``TALK_TRANSCRIPTION_PROMPT``, so every
+    OpenAI lane (terminal, Discord, dashboard, Desktop, core) gets the same
+    hint without each caller re-implementing it. Unset knobs leave the block
+    byte-identical to the pre-knob payload.
     """
+
+    if transcription_languages is None:
+        transcription_languages = talk_config.transcription_languages()
+        if transcription_prompt is None:
+            transcription_prompt = talk_config.transcription_prompt()
 
     audio: dict = {
         "input": {
@@ -125,7 +165,10 @@ def build_session_payload(
                 turn_detection,
                 automatic_response=automatic_response,
             ),
-            "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
+            "transcription": encode_input_transcription(
+                languages=transcription_languages,
+                prompt=transcription_prompt,
+            ),
         },
     }
     if not text_output:
@@ -213,12 +256,17 @@ def mint_ephemeral_session(
     turn_detection: rt.RealtimeTurnDetection = _DEFAULT_TURN_DETECTION,
     text_output: bool = False,
     hermes_signed: bool = False,
+    transcription_languages: tuple[str, ...] | None = None,
+    transcription_prompt: str | None = None,
 ) -> TalkSessionDescriptor:
     """Mint an ephemeral Realtime client secret for one client session.
 
     The caller resolves auth and assembles instructions; this function owns
     only the wire exchange. The returned descriptor carries the ephemeral
-    secret — never the auth token that minted it.
+    secret — never the auth token that minted it. A caller that already
+    resolved the transcription knobs (the dashboard, which must refuse a
+    malformed one with a 400 before it spends anything) passes them here;
+    left at ``None`` they resolve at call time as before.
     """
 
     session = build_session_payload(
@@ -229,6 +277,8 @@ def mint_ephemeral_session(
         automatic_response=automatic_response,
         text_output=text_output,
         turn_detection=turn_detection,
+        transcription_languages=transcription_languages,
+        transcription_prompt=transcription_prompt,
     )
     payload = (
         post_signed_client_secret(session)
@@ -254,6 +304,7 @@ __all__ = [
     "TalkUpstreamError",
     "TalkWireError",
     "build_session_payload",
+    "encode_input_transcription",
     "encode_turn_detection",
     "mint_ephemeral_session",
     "parse_client_secret",
