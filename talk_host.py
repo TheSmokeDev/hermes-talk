@@ -45,7 +45,6 @@ import json
 import logging
 import os
 import queue
-import re
 import shutil
 import subprocess
 import threading
@@ -258,70 +257,6 @@ DELEGATE_TOOL_NAME = "delegate_task"
 STEER_TOOL_NAME = "steer_subagent"
 
 
-def _plugin_inventory(records: dict) -> list[dict]:
-    """Project the manager's status to public identifiers and facts about its own loader."""
-    rows = []
-    for key, record in records.items():
-        # Hermes uses bare IDs and category/name keys. Paths, config, load error text
-        # and Python handlers do not belong in spoken discovery.
-        if not isinstance(key, str) or not re.fullmatch(r"[\w-][\w.-]*(?:/[\w-][\w.-]*)?", key):
-            continue
-        manifest = getattr(record, "manifest", None)
-        enabled = getattr(record, "enabled", None)
-        if manifest is None or not isinstance(enabled, bool):
-            continue
-        row = {"name": key, "enabled": enabled}
-        label = getattr(manifest, "name", None)
-        if isinstance(label, str) and label != key and re.fullmatch(r"[\w-][\w .-]*", label):
-            row["label"] = label
-        if getattr(manifest, "kind", None) in {"exclusive", "model-provider"}:
-            # The host records placeholders for integrations managed by another loader.
-            row["load_state"] = "managed_separately"
-        elif not hasattr(record, "error") or type(getattr(record, "deferred", None)) is not bool:
-            row["load_state"] = "unknown"
-        elif record.error or not enabled:
-            row["load_state"] = "not_loaded"
-        elif record.deferred:
-            row["load_state"] = "deferred"
-        else:
-            row["load_state"] = "loaded"
-        rows.append(row)
-    return rows
-
-
-def _registered_plugin_inventory() -> dict:
-    """Read the current profile's plugin and command registries without starting discovery."""
-    try:
-        from hermes_cli.plugins import get_plugin_manager
-
-        manager = get_plugin_manager()
-        # get_plugin_commands() starts discovery, which executes plugins' register hooks.
-        # A missing or busy registry is unknown, not an empty command list.
-        lock = manager._discovery_lock
-        if not lock.acquire(blocking=False):
-            return {}
-        try:
-            if not manager._discovered:
-                return {}
-            inventory = {}
-            commands = getattr(manager, "_plugin_commands", None)
-            if isinstance(commands, dict):
-                inventory["commands"] = [
-                    {"name": "/" + name.lstrip("/"), "description": info.get("description", "")}
-                    for name, info in commands.items()
-                    if isinstance(name, str) and name.strip("/") and isinstance(info, dict)
-                ]
-            records = getattr(manager, "_plugins", None)
-            if isinstance(records, dict):
-                inventory["plugins"] = _plugin_inventory(records)
-            return inventory
-        finally:
-            lock.release()
-    except Exception as exc:  # noqa: BLE001 — optional across host versions
-        _log.debug("registered plugin inventory unavailable: %s", type(exc).__name__)
-        return {}
-
-
 def _catalog_from_host_modules() -> dict | None:
     """Enumerate the capability catalog from the host's own registries.
 
@@ -421,7 +356,6 @@ def _catalog_from_host_modules() -> dict | None:
     return {
         "skills": [entry for entry in skills if isinstance(entry, dict)],
         "toolsets": toolsets,
-        **_registered_plugin_inventory(),
         "tools": resolved,
         "tools_resolved": tools_resolved,
         # The in-process tier has no gateway feature document or run counters;

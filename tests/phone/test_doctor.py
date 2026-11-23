@@ -1,6 +1,8 @@
 import argparse
 import json
+import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +13,37 @@ from talk_phone.doctor import cli_report, inspect
 
 from .test_client import dograh_http
 from .test_plugin import Context
+
+
+@pytest.mark.parametrize("entry,state", [
+    ({}, "missing"), ({"settings": {"allow_gateway_injection": True}}, "missing"),
+    ({"allow_gateway_injection": "true"}, "missing"),
+    ({"allow_gateway_injection": True}, "granted"), (None, "unverified"),
+])
+def test_doctor_reports_only_the_owner_gate_from_the_active_profile(entry, state, monkeypatch):
+    def read_config():
+        if entry is None:
+            raise OSError("private fixture details")
+        return {"plugins": {"entries": {
+            "hermes-talk": entry, "other": {"allow_gateway_injection": True},
+        }}}
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace(
+        load_config_readonly=read_config
+    ))
+    monkeypatch.setitem(
+        sys.modules, "agent.secret_scope", SimpleNamespace(get_secret=lambda _: None)
+    )
+    report = doctor_module.doctor(Context())
+    for projection in (report, cli_report(report)):
+        assert projection["gateway_injection"] == state
+        assert "private fixture details" not in str(projection)
+        if state == "granted":
+            assert "gateway_injection_help" not in projection
+        else:
+            assert "plugins.entries.hermes-talk.allow_gateway_injection: true" in (
+                projection["gateway_injection_help"]
+            )
 
 
 def test_connected_profile_can_keep_dialing_disabled(setup_phone):

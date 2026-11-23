@@ -12,9 +12,10 @@ conversation. `/phone review CALL_ID` opens the host's native approval picker;
 Desktop/dashboard and mobile viewers use the host's message stream; Discord uses
 its existing adapter and channel/thread. There is no separate Phone dashboard.
 
-An existing separate Dograh test setup can be imported explicitly with
-`hermes talk phone setup --import-dograh`. The original journal is preserved and
-previous approvals are revoked. Use `hermes talk phone doctor` for connection checks.
+To import an existing separate Dograh setup, run `hermes plugins disable hermes-dograh`,
+then `hermes plugins enable hermes-talk` and `hermes talk phone setup --import-dograh`.
+The import preserves the original journal and revokes prior approvals in the copy.
+Use `hermes talk phone doctor` for connection checks.
 The optional authenticated in-call bridge starts explicitly with
 `hermes talk phone bridge`; configure its existing private relay or HTTPS proxy
 before accepting remote caller questions. Installation never dials or buys a number.
@@ -255,13 +256,19 @@ existing history, memory and tools. It is part of Hermes Talk, powered by
 Dograh, and off by default. Normal Talk
 needs no Dograh account.
 
-To set it up, enable it in Hermes's plugin settings, then connect a dedicated
-Dograh account and a caller number you already own:
+In Hermes's plugin settings, enter `DOGRAH_API_KEY` and `DOGRAH_BRIDGE_TOKEN`
+through the secret fields. Then connect a dedicated Dograh account and a caller
+number you already own.
 
 ```bash
+hermes plugins config hermes-talk
 hermes talk phone setup     # connect Dograh and your number
 hermes talk phone doctor    # connection checks
 ```
+
+To let the bridge pass a caller's words into the current Hermes conversation,
+the profile owner grants `plugins.entries.hermes-talk.allow_gateway_injection: true`.
+`/phone doctor` reports whether the grant is present.
 
 Call tools, review controls, status and caller questions all run through the
 Hermes conversation you already have. `/phone review CALL_ID` opens the host's
@@ -283,9 +290,8 @@ Some ground rules:
 - The optional in-call bridge starts only with `hermes talk phone bridge`.
   Configure its private relay or HTTPS proxy before you accept remote caller
   questions.
-- An existing separate Dograh test setup can be imported with
-  `hermes talk phone setup --import-dograh`. The original journal is kept and
-  its old approvals are revoked.
+- When migrating from the separate Dograh plugin, the owner disables
+  `hermes-dograh` and enables `hermes-talk` before running the import.
 
 The [Twilio phone server](docs/TWILIO.md) is a different, standalone experiment
 and is not part of Phone mode.

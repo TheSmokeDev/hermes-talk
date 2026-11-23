@@ -953,6 +953,11 @@ def _search_capabilities(snapshot: talk_capabilities.CatalogSnapshot, arguments:
     if needle == "hey slash" or needle.startswith("hey slash "):
         needle = needle[len("hey slash"):].strip()
     plugins_only = needle == "plugins"
+    if plugins_only and not snapshot.plugins_resolved:
+        return _render_catalog({
+            "source": snapshot.source, "available": False, "plugins_resolved": False,
+            "detail": "Plugin inventory is unavailable on this voice connection.",
+        })
     if plugins_only:
         needle = ""
     terms = needle.split()

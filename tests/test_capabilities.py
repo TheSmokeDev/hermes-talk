@@ -222,11 +222,22 @@ def test_public_skill_builders_work_without_legacy_aliases(monkeypatch, rest_lan
     del skills._sort_skills
     _no_rest(monkeypatch)
 
+    # Stock Python plugins have no public ready-only inventory. Reading skills and
+    # tools must not acquire a plugin manager or start plugin command discovery.
+    from types import SimpleNamespace
+
+    def unexpected():
+        pytest.fail("catalog lookup accessed the plugin manager or started discovery")
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", SimpleNamespace(
+        get_plugin_manager=unexpected, get_plugin_commands=unexpected,
+    ))
     snapshot = talk_capabilities.warm()
 
     assert snapshot.source == talk_capabilities.SOURCE_IN_PROCESS
     assert snapshot.skills == tuple(FAKE_SKILLS)
     assert snapshot.tools_resolved is True
+    assert snapshot.plugins_resolved is False and snapshot.commands_resolved is False
 
 
 def test_no_host_modules_falls_through_to_the_api_server(monkeypatch, rest_lane_on):

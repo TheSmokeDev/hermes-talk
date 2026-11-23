@@ -13,7 +13,8 @@ bounded phone dependencies so enabling the feature does not require a second plu
 Explicit import reads only the current profile's separate Dograh configuration,
 verifies its account/workflow/caller, refuses active or unresolved calls, copies
 the journal with SQLite backup, cancels old approvals and revokes old bridge grants.
-The original journal remains available. The separate plugin is disabled, not deleted.
+The owner switches the active plugin with `hermes plugins disable hermes-dograh`
+and `hermes plugins enable hermes-talk`. The original journal remains available.
 
 Tests cover disabled tool visibility, schema/handler/voice authority classification,
 native owner choices, cancellation, single-use dialing, session isolation, packaging

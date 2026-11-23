@@ -13,6 +13,17 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Catalog review of 0.25.0
+
+- Enter Phone secrets through `hermes plugins config hermes-talk`. Setup saves
+  ordinary settings through Hermes's plugin API. Only the profile owner grants
+  gateway injection, and `/phone doctor` reports the permission state.
+- The owner switches plugins before importing a legacy Dograh configuration.
+  The import preserves the old journal and cancels copied approvals.
+- Python voice sessions report plugin inventory as unavailable while Hermes
+  lacks a public, profile-scoped API to read it without triggering discovery.
+  Hermes Desktop continues to use its public catalog.
+
 ## [0.25.0] — 2026-11-21 (catalog build)
 
 Run a Hermes skill by name during an unbound OpenAI Realtime call in Desktop.

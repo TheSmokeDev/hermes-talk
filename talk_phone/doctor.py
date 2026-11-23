@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from . import __version__
 from .client import DograhClient
+from .context import INJECTION_OPT_IN
 from .policy import PhoneError, Settings, validate_number
 
 
@@ -96,15 +97,27 @@ def doctor(ctx):
 
     from .context import enabled, phone_context
 
-    if not enabled(ctx):
-        return {
+    if enabled(ctx):
+        report = inspect(Settings.read(phone_context(ctx).get_config), get_secret)
+    else:
+        report = {
             "phone_enabled": False,
             "connection_ready": False,
             "call_attempted": False,
             "next_step": "Enable Phone mode in Hermes Talk plugin settings, or run hermes "
             "talk phone setup.",
         }
-    return inspect(Settings.read(phone_context(ctx).get_config), get_secret)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        entry = load_config_readonly().get("plugins", {}).get("entries", {}).get("hermes-talk", {})
+        gate = "granted" if entry.get("allow_gateway_injection") is True else "missing"
+    except Exception:  # noqa: BLE001 - failed host reads cannot establish a grant
+        gate = "unverified"
+    report["gateway_injection"] = gate
+    if gate != "granted":
+        report["gateway_injection_help"] = INJECTION_OPT_IN
+    return report
 
 
 def cli_report(report):
@@ -131,7 +144,7 @@ def cli_report(report):
         }
         for name in names
     ]
-    return {
+    safe = {
         "version": __version__,
         "connection_ready": report.get("connection_ready") is True,
         "dialing_configuration_ready": report.get("dialing_configuration_ready") is True,
@@ -139,3 +152,9 @@ def cli_report(report):
         "call_attempted": False,
         "help": "Check failed settings in Hermes Settings > Plugins > hermes-talk.",
     }
+    gate = report.get("gateway_injection")
+    if gate in ("granted", "missing", "unverified"):
+        safe["gateway_injection"] = gate
+        if gate != "granted":
+            safe["gateway_injection_help"] = INJECTION_OPT_IN
+    return safe
