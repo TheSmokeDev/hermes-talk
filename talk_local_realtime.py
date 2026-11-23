@@ -33,21 +33,31 @@ except ImportError:  # pragma: no cover - flat-module fallback
     import talk_wire
 
 
+#: The PCM Talk captures and plays (``talk_audio.SAMPLE_RATE``), declared on
+#: both directions. OpenAI's GA endpoint defaults to exactly this, so the
+#: OpenAI update never states it; a local server need not share that default.
+#: speech-to-speech 1.1.0 falls back to its 16 kHz pipeline rate when the
+#: client is silent: Talk's 24 kHz microphone is then read 1.5x slow, and
+#: the 16 kHz reply is played 1.5x fast and pitched up.
+LOCAL_PCM_FORMAT = {"type": "audio/pcm", "rate": 24_000}
+
+
 def build_session_update(setup: rt.SessionSetup) -> dict[str, Any]:
-    """The OpenAI GA update minus the OpenAI-hosted ids a local server lacks."""
+    """The OpenAI GA update minus the OpenAI-hosted ids a local server lacks,
+    plus the audio format the OpenAI endpoint would have assumed."""
 
     update = talk_openai_realtime.build_session_update(setup)
     session = update["session"]
-    audio = session.get("audio", {})
-    audio_input = audio.get("input", {})
+    audio = session.setdefault("audio", {})
+    audio_input = audio.setdefault("input", {})
     audio_input.pop("transcription", None)
     audio_input.pop("noise_reduction", None)
-    output = audio.get("output")
+    audio_input["format"] = dict(LOCAL_PCM_FORMAT)
+    output = audio.setdefault("output", {})
     server_default = (None, "", talk_config.DEFAULT_LOCAL_VOICE)
-    if isinstance(output, dict) and output.get("voice") in server_default:
+    if output.get("voice") in server_default:
         output.pop("voice", None)
-        if not output:
-            audio.pop("output")
+    output["format"] = dict(LOCAL_PCM_FORMAT)
     return update
 
 
