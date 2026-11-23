@@ -1,4 +1,6 @@
-from dataclasses import replace
+import sys
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -6,6 +8,101 @@ from talk_phone.policy import DISCLOSURE, PhoneError, Settings
 from talk_phone.setup import choose, collect, phone_workflow
 
 from .conftest import NUMBER, OWNER
+
+
+class PluginSettings:
+    def __init__(self, settings):
+        self.values = {"phone_" + key: list(value) if isinstance(value, tuple) else value
+                       for key, value in asdict(settings).items()}
+        self.writes = []
+
+    def get_config(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set_config(self, key, value):
+        self.writes.append((key, value))
+        self.values[key] = value
+
+
+@pytest.fixture
+def setup_secrets(monkeypatch):
+    secrets = {"DOGRAH_API_KEY": "fixture-secret-api-key", "DOGRAH_BRIDGE_TOKEN": "fixture-" * 6}
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", SimpleNamespace(get_secret=secrets.get))
+    monkeypatch.setitem(sys.modules, "hermes_cli.setup", SimpleNamespace(
+        prompt=lambda *a, **kw: pytest.fail("Unexpected prompt"),
+        prompt_choice=lambda *a, **kw: pytest.fail("Unexpected choice"),
+        prompt_yes_no=lambda *a, **kw: True,
+    ))
+    return secrets
+
+
+@pytest.mark.parametrize("name,value", [
+    ("DOGRAH_API_KEY", None), ("DOGRAH_BRIDGE_TOKEN", None), ("DOGRAH_BRIDGE_TOKEN", "short"),
+])
+def test_missing_owner_secrets_stop_before_network_or_writes(
+    setup_secrets, name, value, monkeypatch, capsys
+):
+    from talk_phone import setup
+
+    setup_secrets[name] = value
+    monkeypatch.setattr(setup, "DograhClient", lambda *a: pytest.fail("Unexpected Dograh access"))
+    ctx = PluginSettings(Settings())
+    assert setup.run(ctx) == 1 and ctx.writes == []
+    output = capsys.readouterr().out
+    assert "hermes plugins config hermes-talk" in output
+    assert "plugins.entries.hermes-talk.allow_gateway_injection: true" in output.splitlines()
+    assert "fixture-secret" not in output
+
+
+@pytest.mark.parametrize("initial,keep", [(True, False), (False, True), (False, False)])
+def test_setup_saves_only_namespaced_settings_in_both_paths(
+    setup_secrets, setup_phone, initial, keep, monkeypatch, capsys
+):
+    from talk_phone import setup
+
+    configured = setup_phone[0].settings
+    ctx = PluginSettings(Settings() if initial else configured)
+    collected = []
+
+    def collect(settings, key, prompts, confirm):
+        assert key == setup_secrets["DOGRAH_API_KEY"]
+        collected.append(True)
+        return configured
+
+    def connect(client, settings, token, prompt):
+        assert token == setup_secrets["DOGRAH_BRIDGE_TOKEN"]
+        return replace(settings, bridge_enabled=True, bridge_public_url="https://test.invalid")
+
+    monkeypatch.setattr(sys.modules["hermes_cli.setup"], "prompt_yes_no", lambda *a, **kw: keep)
+    monkeypatch.setattr(setup, "DograhClient", Provider().factory)
+    monkeypatch.setattr(setup, "collect", collect)
+    monkeypatch.setattr(setup, "connect_conversation", connect)
+    assert setup.run(ctx) == 0
+    assert bool(collected) is (initial or not keep)
+    assert ctx.writes[-1] == ("phone_enabled", True)
+    assert ctx.values["phone_dialing_enabled"] is True
+    assert ctx.values["phone_bridge_public_url"] == "https://test.invalid"
+    assert all(key.startswith("phone_") for key, _ in ctx.writes)
+    output = capsys.readouterr().out
+    assert "plugins.entries.hermes-talk.allow_gateway_injection: true" in output
+    assert not any(value in output or value in repr(ctx.writes) for value in setup_secrets.values())
+
+
+def test_interrupted_reconfiguration_leaves_dialing_disabled(setup_phone):
+    from talk_phone.context import save_phone_settings
+
+    configured = setup_phone[0].settings
+
+    class FailingSettings(PluginSettings):
+        def set_config(self, key, value):
+            if key == "phone_owner_user_ids":
+                raise OSError("Failed fixture write")
+            super().set_config(key, value)
+
+    ctx = FailingSettings(configured)
+    with pytest.raises(OSError):
+        save_phone_settings(ctx, replace(configured, owner_user_ids=("local:new-owner",)))
+    assert ctx.writes == [("phone_dialing_enabled", False)]
 
 
 def test_fallback_selection_does_not_log_private_contact_metadata(capsys):

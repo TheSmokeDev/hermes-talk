@@ -1,28 +1,56 @@
 """Explicit, same-profile migration; previous call approvals are never transferred."""
 
+import os
 import sqlite3
-from dataclasses import asdict
+import tempfile
+from contextlib import closing
+from pathlib import Path
 
 from .client import DograhClient
-from .context import data_path
+from .context import data_path, enabled, save_phone_settings
 from .policy import PhoneError, Settings
 
+OWNER_COMMANDS = ("hermes plugins disable hermes-dograh", "hermes plugins enable hermes-talk")
 
-def import_dograh():
+
+def _copy_history(source_path, staged):
+    with (
+        closing(sqlite3.connect(source_path)) as reader,
+        closing(sqlite3.connect(staged)) as copied,
+    ):
+        reader.backup(copied)
+        copied.execute(
+            "UPDATE calls SET status='cancelled',approved_until=NULL WHERE "
+            "status IN ('prepared','approved')"
+        )
+        if copied.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='bridge_connections'"
+        ).fetchone():
+            copied.execute("UPDATE bridge_connections SET revoked=1")
+        copied.commit()
+
+
+def import_dograh(ctx):
     from agent.secret_scope import get_secret
-    from hermes_cli.config import load_config, save_config
+    from hermes_cli.config import load_config_readonly
     from plugins.plugin_storage import plugin_data_dir
 
-    config = load_config()
-    plugins = config.setdefault("plugins", {})
-    entries = plugins.setdefault("entries", {})
-    raw = entries.get("hermes-dograh", {}).get("settings")
+    config = load_config_readonly()
+    plugins = config.get("plugins", {})
+    raw = plugins.get("entries", {}).get("hermes-dograh", {}).get("settings")
     if not isinstance(raw, dict):
         raise PhoneError("No separate Dograh configuration exists in this Hermes profile.")
-    target = entries.setdefault("hermes-talk", {}).setdefault("settings", {})
-    if target.get("phone_enabled"):
+    if enabled(ctx):
         raise PhoneError(
             "Phone mode is already configured; keep its existing settings or edit them in Hermes."
+        )
+    if "hermes-dograh" in (plugins.get("enabled") or []) and (
+        "hermes-dograh" not in (plugins.get("disabled") or [])
+    ):
+        raise PhoneError(
+            "Switch the active Phone plugin before importing: "
+            + " then ".join(OWNER_COMMANDS)
+            + ". Then rerun hermes talk phone setup --import-dograh."
         )
     settings = Settings.read(lambda key, default=None: raw.get(key, default))
     client = DograhClient(settings, get_secret("DOGRAH_API_KEY"))
@@ -38,7 +66,7 @@ def import_dograh():
     if old.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
         # Hold the source writer lock through the snapshot so no new dial can race it.
-        with sqlite3.connect(old, isolation_level=None) as source:
+        with closing(sqlite3.connect(old, isolation_level=None)) as source:
             source.execute("BEGIN IMMEDIATE")
             active = source.execute(
                 "SELECT 1 FROM calls WHERE status IN ('started','dialing','unknown') LIMIT 1"
@@ -46,33 +74,33 @@ def import_dograh():
             if active:
                 source.rollback()
                 raise PhoneError("End or reconcile the existing Dograh call before migrating.")
-            # A separate reader can snapshot the committed data while the writer lock is held.
-            with sqlite3.connect(old) as reader, sqlite3.connect(destination) as copied:
-                reader.backup(copied)
-                copied.execute(
-                    "UPDATE calls SET status='cancelled',approved_until=NULL WHERE "
-                    "status IN ('prepared','approved')"
-                )
-                if copied.execute(
-                    "SELECT 1 FROM sqlite_master WHERE name='bridge_connections'"
-                ).fetchone():
-                    copied.execute("UPDATE bridge_connections SET revoked=1")
+            with tempfile.TemporaryDirectory(dir=destination.parent) as stage:
+                staged = Path(stage) / "calls.db"
+                _copy_history(old, staged)
+                save_phone_settings(ctx, settings, enable=False)
+                try:
+                    # Publish without replacing a journal created during the import.
+                    if os.name == "nt":
+                        staged.rename(destination)
+                    else:
+                        os.link(staged, destination)
+                except FileExistsError as exc:
+                    raise PhoneError("A Talk phone journal already exists.") from exc
             source.rollback()
-    values = {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(settings).items()}
-    target.update({"phone_" + k: v for k, v in values.items()})
-    target["phone_enabled"] = True
-    plugins["enabled"] = [p for p in plugins.get("enabled", []) if p != "hermes-dograh"]
-    if "hermes-talk" not in plugins["enabled"]:
-        plugins["enabled"].append("hermes-talk")
-    plugins["disabled"] = [p for p in plugins.get("disabled", []) if p != "hermes-talk"]
-    if "hermes-dograh" not in plugins["disabled"]:
-        plugins["disabled"].append("hermes-dograh")
-    save_config(config)
+    else:
+        save_phone_settings(ctx, settings, enable=False)
+    try:
+        ctx.set_config("phone_enabled", True)
+    except Exception as exc:
+        raise PhoneError(
+            "Phone settings were imported. Enable phone_enabled in "
+            "'hermes plugins config hermes-talk' to finish."
+        ) from exc
     return {
         "phone_enabled": True,
         "connection_verified": True,
         "previous_approvals_revoked": True,
         "old_journal_preserved": True,
-        "separate_plugin_disabled": True,
+        "owner_commands": list(OWNER_COMMANDS),
         "call_placed": False,
     }

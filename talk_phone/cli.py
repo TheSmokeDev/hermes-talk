@@ -26,7 +26,7 @@ def run(ctx, args):
             if getattr(args, "import_dograh", False):
                 from .migration import import_dograh
 
-                result = import_dograh()
+                result = import_dograh(ctx)
                 print(json.dumps(result, indent=2))
                 return 0
             from .setup import run as setup

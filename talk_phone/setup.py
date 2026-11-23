@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 from .client import DograhClient
@@ -332,21 +332,31 @@ def collect(settings, key, prompt, confirm, client_factory=DograhClient):
 
 def run(ctx):
     from agent.secret_scope import get_secret
-    from hermes_cli.config import load_config, save_config, save_env_value_secure
     from hermes_cli.setup import prompt, prompt_choice, prompt_yes_no
 
-    from .context import phone_context
+    from .context import INJECTION_OPT_IN, phone_context, save_phone_settings
 
     ctx = phone_context(ctx)
     print(
         "Hermes Talk Phone setup. Use a dedicated Dograh account and an existing outbound number."
     )
     print("Phone settings are stored in Hermes Talk. Setup does not dial or purchase numbers.")
+    print(INJECTION_OPT_IN)
     try:
         settings = Settings.read(ctx.get_config)
         key = get_secret("DOGRAH_API_KEY")
+        bridge_token = get_secret("DOGRAH_BRIDGE_TOKEN")
+        if not isinstance(key, str) or not key.strip() or (
+            not isinstance(bridge_token, str) or len(bridge_token.strip()) < 32
+        ):
+            print(
+                "Run hermes plugins config hermes-talk in this profile and fill the Phone "
+                "Dograh API key and bridge bearer secret. Use a random bridge token of at "
+                "least 32 characters, then rerun hermes talk phone setup."
+            )
+            return 1
         current_ready = False
-        if key and settings.workflow_id:
+        if settings.workflow_id:
             try:
                 settings.connection_settings()
                 client = DograhClient(settings, key)
@@ -355,39 +365,6 @@ def run(ctx):
                 current_ready = bool(settings.owner_user_ids and settings.allowed_numbers)
             except PhoneError:
                 pass
-        if current_ready and prompt_yes_no(
-            "Keep the existing verified connection and settings", default=True
-        ):
-            import secrets
-
-            bridge_token = get_secret("DOGRAH_BRIDGE_TOKEN") or secrets.token_urlsafe(32)
-            save_env_value_secure("DOGRAH_BRIDGE_TOKEN", bridge_token)
-            settings = connect_conversation(client, settings, bridge_token, prompt)
-            config = load_config()
-            entry = (
-                config.setdefault("plugins", {})
-                .setdefault("entries", {})
-                .setdefault("hermes-talk", {})
-            )
-            entry.setdefault("settings", {}).update(
-                {
-                    **{
-                        "phone_" + k: list(v) if isinstance(v, tuple) else v
-                        for k, v in asdict(settings).items()
-                    },
-                    "phone_enabled": True,
-                }
-            )
-            entry["allow_gateway_injection"] = True
-            save_config(config)
-            print(
-                "Connection ready. Open Hermes and ask it to prepare a call, then "
-                "review /phone approve."
-            )
-            return 0
-        new_key = not key
-        if new_key:
-            key = prompt("Dograh API key (hidden)", password=True)
 
         class HermesInputs:
             def __call__(self, question, **kwargs):
@@ -412,26 +389,14 @@ def run(ctx):
                     raise PhoneError("Setup cancelled before selecting a caller.")
                 return rows[index]
 
-        result = collect(settings, key, HermesInputs(), prompt_yes_no)
-        import secrets
-
-        bridge_token = get_secret("DOGRAH_BRIDGE_TOKEN") or secrets.token_urlsafe(32)
-        save_env_value_secure("DOGRAH_BRIDGE_TOKEN", bridge_token)
-        result = connect_conversation(DograhClient(result, key), result, bridge_token, prompt)
-        if new_key:
-            save_env_value_secure("DOGRAH_API_KEY", key)
-        config = load_config()
-        entry = (
-            config.setdefault("plugins", {}).setdefault("entries", {}).setdefault("hermes-talk", {})
-        )
-        values = {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(result).items()}
-        entry["settings"] = {
-            **entry.get("settings", {}),
-            **{"phone_" + k: v for k, v in values.items()},
-            "phone_enabled": True,
-        }
-        entry["allow_gateway_injection"] = True
-        save_config(config)
+        if current_ready and prompt_yes_no(
+            "Keep the existing verified connection and settings", default=True
+        ):
+            result = connect_conversation(client, settings, bridge_token, prompt)
+        else:
+            chosen = collect(settings, key, HermesInputs(), prompt_yes_no)
+            result = connect_conversation(DograhClient(chosen, key), chosen, bridge_token, prompt)
+        save_phone_settings(ctx, result)
         print(
             "Saved in this Hermes profile. Ask Hermes to prepare a call, "
             "review the card, then /phone approve."

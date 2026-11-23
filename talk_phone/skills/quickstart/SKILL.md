@@ -5,9 +5,10 @@ description: Continue this Hermes conversation over an optional phone call.
 
 # Hermes Talk Phone
 
-Install Hermes Talk normally, then run `hermes talk phone setup` for the optional
-Dograh carrier connection. Settings and masked secrets live in Hermes's native
-plugin settings. No separate Phone dashboard is needed.
+For the optional Dograh carrier connection, enter both Phone secrets through
+`hermes plugins config hermes-talk`, then run `hermes talk phone setup`.
+The profile owner grants `plugins.entries.hermes-talk.allow_gateway_injection: true`
+to allow caller input in the current session. Check the grant with `/phone doctor`.
 
 Phone is another input/output for the original Hermes chat. It uses that session's
 history, memory, tools and existing permissions. It does not create a separate
