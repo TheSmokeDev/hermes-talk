@@ -95,6 +95,16 @@ def test_delegated_prompt_does_not_advertise_legacy_tools():
     assert "delegate_task" not in prompt and "talk_capabilities" not in prompt
     assert "Be helpful." in prompt
 
+    talk_identity.TALK_INSTRUCTIONS_PATH.write_text(
+        "Keep development updates brief.", encoding="utf-8"
+    )
+    customized = talk_identity.build_instructions(
+        {"SOUL": "Be helpful."}, tools=talk_delegated.TOOLS, delegated_work=True, lane="discord"
+    )
+    assert "Keep development updates brief." in customized
+    assert customized.startswith(talk_identity.DELEGATED_PREAMBLE)
+    assert "Admission means queued, not completed" in customized
+
 
 def test_terminal_watcher_uses_exact_status_result_and_closes_on_revocation():
     async def run():

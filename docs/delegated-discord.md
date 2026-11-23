@@ -45,3 +45,9 @@ it short; ask for the result again. The audio transport reuses upstream's existi
 private Discord adapter bridge, whose compatibility is separate from the public
 submission/persistence APIs. Real microphone, Discord reconnect and provider audio
 behavior require live acceptance testing.
+
+Versioned `TALK.md` preferences use the upstream loader and remain additive to this
+route's execution contract. An invalid file refuses session startup. The 0.25
+spoken workflow feature targets unbound Desktop sessions; it does not replace this
+route or grant Discord voice access to private slash-command catalogs. Discord's
+permission-checked text-channel picker remains the workflow entry point.
