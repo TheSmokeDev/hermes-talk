@@ -175,3 +175,29 @@ def test_hybrid_catalog_refusal_stops_before_provider_connection():
     )
     assert result != 0
     assert factories == [] and fake.setup is None
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_hybrid_session_uses_upstream_custom_instructions_or_refuses(monkeypatch, valid):
+    import talk_identity
+
+    custom = "Keep application development updates brief."
+    talk_identity.TALK_INSTRUCTIONS_PATH.write_text(
+        custom if valid else "x" * (talk_identity.TALK_INSTRUCTIONS_LIMIT + 1), encoding="utf-8"
+    )
+    monkeypatch.setattr(talk_delegated.ConversationTail, "read", lambda _tail: [])
+    fake, audio, factories = FakeProviderSession(), Audio(), []
+    audio.discord_speaker_authorization = True
+    ctx = SimpleNamespace(conversation_tools=lambda **_: {"ok": True, "tools": []})
+    result = asyncio.run(talk_cli.run_talk_session(
+        audio=audio, delegated_binding=binding(ctx), lane="discord",
+        session_factory=lambda auth: factories.append(auth) or fake,
+    ))
+    if valid:
+        assert result == 0 and len(factories) == 1
+        assert custom in fake.setup.instructions
+        assert fake.setup.instructions.startswith(talk_identity.HYBRID_PREAMBLE)
+        assert "permissions and approvals still apply" in fake.setup.instructions
+        assert "delegation_control" in fake.setup.instructions
+    else:
+        assert result != 0 and not factories and fake.setup is None
