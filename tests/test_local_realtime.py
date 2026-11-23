@@ -13,6 +13,7 @@ import types
 
 import pytest
 
+import talk_audio
 import talk_cli
 import talk_config
 import talk_doctor
@@ -186,7 +187,7 @@ def test_session_update_drops_openai_hosted_ids_and_the_default_voice():
     assert "model" not in session
     assert "transcription" not in session["audio"]["input"]
     assert "noise_reduction" not in session["audio"]["input"]
-    assert "output" not in session["audio"]
+    assert "voice" not in session["audio"]["output"]
     assert session["tools"][0]["name"] == "delegate_task"
     assert session["tool_choice"] == "auto"
 
@@ -194,7 +195,18 @@ def test_session_update_drops_openai_hosted_ids_and_the_default_voice():
 def test_session_update_keeps_an_explicit_voice():
     update = local_rt.build_session_update(_setup(voice="Aiden"))
 
-    assert update["session"]["audio"]["output"] == {"voice": "Aiden"}
+    assert update["session"]["audio"]["output"]["voice"] == "Aiden"
+
+
+def test_session_update_declares_the_24khz_pcm_talk_actually_uses():
+    # speech-to-speech 1.1.0 assumes its 16 kHz pipeline rate when the client
+    # states no format: the reply then plays 1.5x fast (pitched up) and the
+    # 24 kHz microphone is read 1.5x slow. OpenAI's GA default hides this.
+    pcm = {"type": "audio/pcm", "rate": talk_audio.SAMPLE_RATE}
+    for voice in ("default", "Aiden"):
+        audio = local_rt.build_session_update(_setup(voice=voice))["session"]["audio"]
+        assert audio["input"]["format"] == pcm
+        assert audio["output"]["format"] == pcm
 
 
 # -- wire ----------------------------------------------------------------------------

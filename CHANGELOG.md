@@ -13,6 +13,12 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- The local lane now declares 24 kHz PCM for input and output in its session
+  update. huggingface/speech-to-speech falls back to its 16 kHz pipeline rate
+  when the client states no format, so replies played 1.5x fast and pitched up,
+  and the 24 kHz microphone was read 1.5x slow. Contributed by @gocoelho.
+
 ## [0.25.0] — 2026-11-21
 
 Run a Hermes skill by name during an unbound OpenAI Realtime call in Desktop.
