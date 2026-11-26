@@ -12,10 +12,11 @@ Before joining:
 
 1. Send Hermes a text message in the intended server channel to establish a session.
 2. Join the bot to the intended Discord voice channel using its existing controls.
-3. Set `/voice off` in that text chat. Talk owns spoken replies while this call is
-   active; leaving host automatic TTS enabled can produce duplicate audio. Talk
-   does not change or restore the host's voice settings on your behalf.
-4. Run `/talk delegate join`. The user who invoked it is the only speaker allowed
+3. Run `/talk delegate join`. It automatically disables Hermes automatic speech
+   in that text chat, equivalent to `/voice off`, including audio attachments for
+   background completion notifications. The setting stays off after Talk ends
+   (or fails to connect); `/voice join` or `/voice tts` enables it again.
+   The user who invoked it is the only speaker allowed
    to submit work and the only user allowed to control this call from its text chat.
 
 Ask for a task, keep talking while it runs, then ask for its result. `submit_task`

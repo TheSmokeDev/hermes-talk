@@ -2302,6 +2302,22 @@ def start_session(
         existing = _SESSION.get("task")
         if existing is not None and not existing.done():
             return "I'm already live in a voice channel — say `talk leave` first."
+        if delegated_binding is not None:
+            try:
+                from gateway.config import Platform
+                from gateway.run import _gateway_runner_ref
+
+                runner = _gateway_runner_ref()
+                adapter = bridge["adapter"]
+                chat_id = delegated_binding.chat_id
+                key = runner._voice_key(
+                    Platform.DISCORD, chat_id, profile=getattr(adapter, "_owner_profile", None),
+                )
+                # The runner also sends TTS attachments for background notifications.
+                runner._apply_voice_mode(adapter, key, chat_id, "off")
+            except Exception as exc:  # noqa: BLE001 - host internals must fail with a safe receipt
+                _log.warning("could not disable host speech (%s)", _safe_exception_name(exc))
+                return "Could not disable Hermes automatic speech; no Talk session was started."
         _LAST_FAILURE = None
         _LAST_FAILURE_GENERATION = None
         _SESSION_GENERATION += 1
@@ -2345,8 +2361,8 @@ def start_session(
     # those can refuse. Overclaiming here would be the one thing this
     # plugin refuses to do anywhere else.
     if delegated_binding is not None:
-        return ("Starting same-chat delegated voice. Set /voice off in this chat to prevent "
-                "duplicate host speech. Use /talk status or /talk leave.")
+        return ("Starting same-chat delegated voice. Hermes automatic speech is off in this chat. "
+                "Use /talk status or /talk leave.")
     if native_task is not None:
         return "Starting canonical task voice; say `talk status` to check or `talk leave` to stop."
     if host_execution_attachment is not None:

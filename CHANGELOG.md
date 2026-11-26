@@ -23,7 +23,8 @@ named rather than smoothed.
 - Opt-in `/talk delegate join` submits work to the current Discord conversation
   through the host's durable plugin submission API, keeps voice available, and
   brings exact turn results and background delegation updates into the call.
-  Requires a compatible host and `/voice off`; ordinary `/talk join` is unchanged.
+  Requires a compatible host; automatically disables host speech in the text chat
+  to prevent duplicate audio. Ordinary `/talk join` is unchanged.
 
 ## [0.25.0] — 2026-11-21
 
