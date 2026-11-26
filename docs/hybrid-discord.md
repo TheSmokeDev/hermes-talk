@@ -11,8 +11,9 @@ It requires the host plugin APIs `submit_message`, `submission_status`,
 setup. There is no fallback to detached API-server work or bare tool dispatch.
 Realtime and cascade use this route; GPT-Live does not.
 
-Follow the delegated-mode setup, including `/voice off` in the text chat, then
-use `/talk hybrid join`. The initiating speaker can ask for a short operation,
+Follow the delegated-mode setup, then use `/talk hybrid join`. It automatically
+disables Hermes automatic speech in the text chat, just like delegated mode.
+The initiating speaker can ask for a short operation,
 start a longer task, and discuss another subject while the child works. Host
 tool availability, permissions and approvals still apply. This change does not
 add a spoken approval bridge: an approval may still require the host's interface.

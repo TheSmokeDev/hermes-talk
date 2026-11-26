@@ -463,7 +463,8 @@ def test_status_with_no_session():
 
 
 @pytest.mark.parametrize("profile", [None, "secondary"])
-def test_delegated_join_disables_host_speech_before_starting(monkeypatch, profile):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_delegated_join_disables_host_speech_before_starting(monkeypatch, profile, hybrid):
     async def scenario():
         _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
         adapter._owner_profile = profile
@@ -471,7 +472,7 @@ def test_delegated_join_disables_host_speech_before_starting(monkeypatch, profil
         applied = []
         runner._voice_key = lambda platform, chat_id, *, profile: (profile, platform, chat_id)
         runner._apply_voice_mode = lambda *args: applied.append(args)
-        binding = types.SimpleNamespace(chat_id="123")
+        binding = types.SimpleNamespace(chat_id="123", hybrid=hybrid)
         expected = (adapter, (profile, "discord", "123"), "123", "off")
         gate = asyncio.Event()
 
