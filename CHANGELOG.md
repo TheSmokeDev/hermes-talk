@@ -13,6 +13,24 @@ named rather than smoothed.
 
 ## [Unreleased]
 
+### Fixed
+- Same-chat delegated voice uses a dedicated worker pool for blocking host receipt
+  calls, leaving the gateway's workers available for admission storage. Session
+  cleanup does not wait for already-started calls or claim to cancel their work.
+  Contributed by @tancou.
+
+### Added
+- Experimental `/talk hybrid join` combines short host tool operations with native
+  background delegation in the current Discord conversation. Exact submitted turns
+  and native children have separate controls; background launch refuses inline
+  fallback. Requires the complementary host APIs; see `docs/hybrid-discord.md`.
+  Contributed by @tancou.
+- Opt-in `/talk delegate join` submits work to the current Discord conversation
+  through the host's durable plugin submission API, keeps voice available, and
+  brings exact turn results and background delegation updates into the call.
+  Requires a compatible host; automatically disables host speech in the text chat
+  to prevent duplicate audio. Ordinary `/talk join` is unchanged.
+
 ## [0.25.0] — 2026-11-21
 
 Run a Hermes skill by name during an unbound OpenAI Realtime call in Desktop.

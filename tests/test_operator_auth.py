@@ -121,13 +121,14 @@ def test_read_only_tools_remain_available_to_non_operators(monkeypatch):
         assert ledger.authorize_tool(tool, {}) is None
 
 
+@pytest.mark.parametrize("initiating_user", [None, str(OPERATOR_ID)])
 @pytest.mark.parametrize("speaker", [OTHER_ID, OPERATOR_ID])
 @pytest.mark.parametrize("arguments", [{"query": "private-example"}, {"query": ""}, {"offset": 8}])
 def test_discord_catalog_lookup_hands_off_before_reading_private_entries(
-    monkeypatch, speaker, arguments
+    monkeypatch, speaker, arguments, initiating_user
 ):
     monkeypatch.setenv("TALK_DISCORD_OPERATOR_USER_IDS", str(OPERATOR_ID))
-    ledger = talk_operator_auth.DiscordToolAuthorizationLedger()
+    ledger = talk_operator_auth.DiscordToolAuthorizationLedger(initiating_user_id=initiating_user)
     ledger.record_packet(_speaker(speaker), _pcm(20))
     _bind_response(ledger)
     event = ledger.bind_tool_event({

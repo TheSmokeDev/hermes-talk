@@ -462,6 +462,67 @@ def test_status_with_no_session():
     assert "No live voice session" in talk_discord.session_status()
 
 
+@pytest.mark.parametrize("profile", [None, "secondary"])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_delegated_join_disables_host_speech_before_starting(monkeypatch, profile, hybrid):
+    async def scenario():
+        _connection, _receiver, _vc, adapter = _wired_host(monkeypatch)
+        adapter._owner_profile = profile
+        runner = sys.modules["gateway.run"]._gateway_runner_ref()
+        applied = []
+        runner._voice_key = lambda platform, chat_id, *, profile: (profile, platform, chat_id)
+        runner._apply_voice_mode = lambda *args: applied.append(args)
+        binding = types.SimpleNamespace(chat_id="123", hybrid=hybrid)
+        expected = (adapter, (profile, "discord", "123"), "123", "off")
+        gate = asyncio.Event()
+
+        async def keep_open(audio, **kwargs):
+            assert applied == [expected]
+            assert kwargs["delegated_binding"] is binding
+            await gate.wait()
+            return 0
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", keep_open)
+        receipt = talk_discord.start_session(7, delegated_binding=binding)
+        assert "automatic speech is off" in receipt
+        assert applied == [expected]
+        assert "already live" in talk_discord.start_session(7, delegated_binding=binding)
+        assert applied == [expected], "a refused second join must not change settings"
+        gate.set()
+        await talk_discord._SESSION["task"]
+        await asyncio.sleep(0)
+        assert applied == [expected], "leaving must not re-enable host speech"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("missing_api", [False, True])
+def test_delegated_join_refuses_when_host_speech_cannot_be_disabled(monkeypatch, missing_api):
+    async def scenario():
+        _wired_host(monkeypatch)
+        runner = sys.modules["gateway.run"]._gateway_runner_ref()
+        if not missing_api:
+            runner._voice_key = lambda *args, **kwargs: "discord:123"
+
+            def fail(*args):
+                raise RuntimeError("private diagnostic")
+
+            runner._apply_voice_mode = fail
+
+        def unexpected(**kwargs):
+            pytest.fail("must not launch a session with duplicate host speech enabled")
+
+        monkeypatch.setattr(talk_cli, "run_talk_session", unexpected)
+        receipt = talk_discord.start_session(
+            7, delegated_binding=types.SimpleNamespace(chat_id="123"),
+        )
+        assert "Could not disable" in receipt
+        assert "private diagnostic" not in receipt
+        assert not talk_discord._SESSION
+
+    asyncio.run(scenario())
+
+
 def _core_contract(monkeypatch, available: bool) -> None:
     monkeypatch.setattr(talk_core_realtime, "core_provider_available", lambda: available)
 
